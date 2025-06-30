@@ -145,6 +145,15 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		enableDirectPath = true
 		o = append(o, internaloption.EnableDirectPath(true), internaloption.EnableDirectPathXds())
 		o = append(o, internaloption.AllowNonDefaultServiceAccount(true))
+
+		// Explicitly disable some gRPC experiments as they are not stable yet.
+		gRPCPickFirstEnvVarName := "GRPC_EXPERIMENTAL_ENABLE_NEW_PICK_FIRST"
+		if os.Getenv(gRPCPickFirstEnvVarName) == "" {
+			err := os.Setenv(gRPCPickFirstEnvVarName, "false")
+			if err != nil {
+				return nil, errors.New("bigtable: Error overriding GRPC_EXPERIMENTAL_ENABLE_NEW_PICK_FIRST to false:")
+			}
+		}
 	}
 
 	// Allow non-default service account in DirectPath.
