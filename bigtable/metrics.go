@@ -234,12 +234,11 @@ func newBuiltinMetricsTracerFactory(ctx context.Context, project, instance, appP
 				option.WithGRPCDialOption(
 					grpc.WithDefaultCallOptions(grpc.StaticMethodCallOption{})),
 			}
-
-			tracerFactory.enabled = true
-			tracerFactory.shutdown = func() {
-				meterProvider.ForceFlush(ctx)
-				meterProvider.Shutdown(ctx)
-			}
+		}
+		tracerFactory.enabled = true
+		tracerFactory.shutdown = func() {
+			meterProvider.ForceFlush(ctx)
+			meterProvider.Shutdown(ctx)
 		}
 	} else {
 		switch metricsProvider.(type) {
