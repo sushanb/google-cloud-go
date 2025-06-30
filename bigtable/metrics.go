@@ -217,6 +217,8 @@ func newBuiltinMetricsTracerFactory(ctx context.Context, project, instance, appP
 		meterProvider = sdkmetric.NewMeterProvider(mpOptions...)
 
 		isEnableDirectpath := strings.EqualFold("false", os.Getenv("CBT_ENABLE_DIRECTPATH"))
+		fmt.Print("isEnableDirectpath")
+		fmt.Print(isEnableDirectpath)
 		if isEnableDirectpath {
 			mo := opentelemetry.MetricsOptions{
 				MeterProvider:  meterProvider,
