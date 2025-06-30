@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/bigtable/internal"
@@ -30,6 +31,9 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/experimental/stats"
+	"google.golang.org/grpc/stats/opentelemetry"
 )
 
 const (
@@ -73,6 +77,14 @@ const (
 
 // These are effectively constant, but for testing purposes they are mutable
 var (
+	grpcMetricsToEnable = []string{
+		"grpc.lb.rls.default_target_picks",
+		"grpc.lb.rls.target_picks",
+		"grpc.xds_client.server_failure",
+		"grpc.xds_client.resource_updates_invalid",
+		"grpc.xds_client.resource_updates_valid",
+	}
+
 	// duration between two metric exports
 	defaultSamplePeriod = time.Minute
 
@@ -162,6 +174,8 @@ type builtinMetricsTracerFactory struct {
 	// To be called on client close
 	shutdown func()
 
+	// client options passed to gRPC channels
+	clientOpts []option.ClientOption
 	// attributes that are specific to a client instance and
 	// do not change across different function calls on client
 	clientAttributes []attribute.KeyValue
@@ -202,8 +216,31 @@ func newBuiltinMetricsTracerFactory(ctx context.Context, project, instance, appP
 		}
 		meterProvider = sdkmetric.NewMeterProvider(mpOptions...)
 
-		tracerFactory.enabled = true
-		tracerFactory.shutdown = func() { meterProvider.Shutdown(ctx) }
+		isEnableDirectpath := strings.EqualFold("false", os.Getenv("CBT_ENABLE_DIRECTPATH"))
+		if isEnableDirectpath {
+			mo := opentelemetry.MetricsOptions{
+				MeterProvider:  meterProvider,
+				Metrics:        stats.NewMetrics(grpcMetricsToEnable...),
+				OptionalLabels: []string{"grpc.lb.locality"},
+			}
+
+			// Configure gRPC dial options to enable gRPC metrics collection and static method call option.
+			// The static method call option ensures consistent method names in metrics by preventing gRPC from
+			// automatically adding service prefixes to method names. This helps maintain consistent metric
+			// naming across different gRPC calls.
+			tracerFactory.clientOpts = []option.ClientOption{
+				option.WithGRPCDialOption(
+					opentelemetry.DialOption(opentelemetry.Options{MetricsOptions: mo})),
+				option.WithGRPCDialOption(
+					grpc.WithDefaultCallOptions(grpc.StaticMethodCallOption{})),
+			}
+
+			tracerFactory.enabled = true
+			tracerFactory.shutdown = func() {
+				meterProvider.ForceFlush(ctx)
+				meterProvider.Shutdown(ctx)
+			}
+		}
 	} else {
 		switch metricsProvider.(type) {
 		case NoopMetricsProvider:
@@ -228,12 +265,31 @@ func builtInMeterProviderOptions(project string, opts ...option.ClientOption) ([
 		return nil, err
 	}
 
+	var views []sdkmetric.View
+
+	for _, m := range grpcMetricsToEnable {
+		views = append(views, sdkmetric.NewView(
+			sdkmetric.Instrument{
+				Name: m,
+			},
+			sdkmetric.Stream{
+				Aggregation: sdkmetric.AggregationSum{},
+				AttributeFilter: func(kv attribute.KeyValue) bool {
+					if _, ok := allowedMetricLabels[string(kv.Key)]; ok {
+						return true
+					}
+					return false
+				},
+			},
+		))
+	}
+
 	return []sdkmetric.Option{sdkmetric.WithReader(
 		sdkmetric.NewPeriodicReader(
 			defaultExporter,
 			sdkmetric.WithInterval(defaultSamplePeriod),
 		),
-	)}, nil
+	), sdkmetric.WithView(views...)}, nil
 }
 
 func (tf *builtinMetricsTracerFactory) createInstruments(meter metric.Meter) error {

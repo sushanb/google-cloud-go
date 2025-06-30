@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,6 +55,10 @@ var (
 		monitoredResLabelKeyCluster:  true,
 		monitoredResLabelKeyTable:    true,
 		monitoredResLabelKeyZone:     true,
+	}
+
+	allowedMetricLabels = map[string]bool{
+		"as": true,
 	}
 
 	errShutdown = fmt.Errorf("exporter is shutdown")
@@ -170,8 +175,7 @@ func (me *monitoringExporter) recordToMetricAndMonitoredResourcePbs(metrics otel
 		iter := attr.Iter()
 		for iter.Next() {
 			kv := iter.Attribute()
-			labelKey := string(kv.Key)
-
+			labelKey := strings.Replace(string(kv.Key), ".", "_", -1)
 			if _, isResLabel := monitoredResLabelsSet[labelKey]; isResLabel {
 				// Add labels to monitored resource
 				mr.Labels[labelKey] = kv.Value.Emit()

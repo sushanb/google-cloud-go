@@ -76,6 +76,7 @@ type Client struct {
 	disableRetryInfo        bool
 	retryOption             gax.CallOption
 	executeQueryRetryOption gax.CallOption
+	enableDirectPath        bool
 }
 
 // ClientConfig has configurations for the client.
@@ -129,6 +130,10 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 	// Add gRPC client interceptors to supply Google client information. No external interceptors are passed.
 	o = append(o, btopt.ClientInterceptorOptions(nil, nil)...)
 
+	if len(metricsTracerFactory.clientOpts) > 0 {
+		o = append(o, metricsTracerFactory.clientOpts...)
+	}
+
 	// Default to a small connection pool that can be overridden.
 	o = append(o,
 		option.WithGRPCConnectionPool(4),
@@ -136,8 +141,13 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		option.WithGRPCDialOption(grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(1<<28), grpc.MaxCallRecvMsgSize(1<<28))),
 	)
 
+	if useDirectPath, _ := strconv.ParseBool(os.Getenv("CBT_ENABLE_DIRECTPATH")); useDirectPath {
+		enableDirectPath = true
+		o = append(o, internaloption.EnableDirectPath(true), internaloption.EnableDirectPathXds())
+		o = append(o, internaloption.AllowNonDefaultServiceAccount(true))
+	}
+
 	// Allow non-default service account in DirectPath.
-	o = append(o, internaloption.AllowNonDefaultServiceAccount(true))
 	o = append(o, opts...)
 
 	// TODO(b/372244283): Remove after b/358175516 has been fixed
@@ -181,6 +191,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		disableRetryInfo:        disableRetryInfo,
 		retryOption:             retryOption,
 		executeQueryRetryOption: executeQueryRetryOption,
+		enableDirectPath:        enableDirectPath,
 	}, nil
 }
 
@@ -208,6 +219,7 @@ var (
 		Max:        2 * time.Second,
 		Multiplier: 1.2,
 	}
+	enableDirectPath                  = false
 	clientOnlyRetryOption             = newRetryOption(clientOnlyRetry, true)
 	clientOnlyExecuteQueryRetryOption = newRetryOption(clientOnlyExecuteQueryRetry, true)
 	defaultRetryOption                = newRetryOption(clientOnlyRetry, false)
@@ -403,6 +415,8 @@ func (c *Client) newFeatureFlags() metadata.MD {
 		LastScannedRowResponses:  true,
 		ClientSideMetricsEnabled: c.metricsTracerFactory.enabled,
 		RetryInfo:                !c.disableRetryInfo,
+		TrafficDirectorEnabled:   c.enableDirectPath,
+		DirectAccessRequested:    c.enableDirectPath,
 	}
 
 	val := ""
