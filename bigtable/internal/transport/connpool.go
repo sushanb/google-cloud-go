@@ -45,7 +45,7 @@ var maxDrainingTimeout = 30 * time.Minute
 
 const requestParamsHeader = "x-goog-request-params"
 
-// BigtableChannelPool options
+// BigtableChannelPoolOption options for configurable
 type BigtableChannelPoolOption func(*BigtableChannelPool)
 
 // WithAppProfile provides the appProfile
