@@ -21,6 +21,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net/url"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -29,11 +30,9 @@ import (
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"go.opentelemetry.io/otel/metric"
 	gtransport "google.golang.org/api/transport/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/alts"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
-
-	"google.golang.org/grpc/status"
 
 	btopt "cloud.google.com/go/bigtable/internal/option"
 
@@ -44,8 +43,45 @@ import (
 // We cap the max draining timeout to 30mins as there might be a long running stream (such as full table scan).
 var maxDrainingTimeout = 30 * time.Minute
 
+const requestParamsHeader = "x-goog-request-params"
+
 // BigtableChannelPool options
 type BigtableChannelPoolOption func(*BigtableChannelPool)
+
+// WithAppProfile provides the appProfile
+func WithAppProfile(appProfile string) BigtableChannelPoolOption {
+	return func(p *BigtableChannelPool) {
+		p.appProfile = appProfile
+	}
+}
+
+// WithMeterProvider provides the meter provider for writing metrics
+func WithMeterProvider(mp metric.MeterProvider) BigtableChannelPoolOption {
+	return func(p *BigtableChannelPool) {
+		p.meterProvider = mp
+	}
+}
+
+// WithLogger provides the logger for logging events
+func WithLogger(logger *log.Logger) BigtableChannelPoolOption {
+	return func(p *BigtableChannelPool) {
+		p.logger = logger
+	}
+}
+
+// WithInstanceName provides the full instance Name
+func WithInstanceName(instanceName string) BigtableChannelPoolOption {
+	return func(p *BigtableChannelPool) {
+		p.instanceName = instanceName
+	}
+}
+
+// WithFeatureFlagsMetadata provides the feature flags metadata
+func WithFeatureFlagsMetadata(featureFlagsMd metadata.MD) BigtableChannelPoolOption {
+	return func(p *BigtableChannelPool) {
+		p.featureFlagsMD = featureFlagsMd
+	}
+}
 
 const (
 	primeRPCTimeout = 10 * time.Second
@@ -57,28 +93,26 @@ var _ gtransport.ConnPool = &BigtableChannelPool{}
 // BigtableConn wraps grpc.ClientConn to add Bigtable specific methods.
 type BigtableConn struct {
 	*grpc.ClientConn
-	instanceName string // Needed for PingAndWarm
-	appProfile   string // Needed for PingAndWarm,
-	isALTSConn   atomic.Bool
+	isALTSConn atomic.Bool
 }
 
 // Prime sends a PingAndWarm request to warm up the connection.
-func (bc *BigtableConn) Prime(ctx context.Context) error {
-	if bc.instanceName == "" {
-		return status.Error(codes.FailedPrecondition, "bigtable: instanceName is required for conn:Prime operation")
-	}
-	if bc.appProfile == "" {
-		return status.Error(codes.FailedPrecondition, "bigtable: appProfile is required for conn:Prime operation")
-
-	}
-
-	// TODO: Plumb featureflag
-	// TODO: Plumb RLS headers
+func (bc *BigtableConn) Prime(ctx context.Context, fullInstanceName, appProfileID string, featureFlagsMd metadata.MD) error {
 	client := btpb.NewBigtableClient(bc.ClientConn)
 	req := &btpb.PingAndWarmRequest{
-		Name:         bc.instanceName,
-		AppProfileId: bc.appProfile,
+		Name:         fullInstanceName,
+		AppProfileId: appProfileID,
 	}
+
+	requestParamsMD := metadata.Pairs(requestParamsHeader,
+		fmt.Sprintf("name=%s&app_profile_id=%s", url.QueryEscape(fullInstanceName), url.QueryEscape(appProfileID)))
+
+	mds := metadata.Join(
+		requestParamsMD, featureFlagsMd)
+
+	originalContextMd, _ := metadata.FromOutgoingContext(ctx)
+	allMDs := append([]metadata.MD{originalContextMd}, mds)
+	ctx = metadata.NewOutgoingContext(ctx, metadata.Join(allMDs...))
 
 	// Use a timeout for the prime operation
 	primeCtx, cancel := context.WithTimeout(ctx, primeRPCTimeout)
@@ -98,11 +132,9 @@ func (bc *BigtableConn) Prime(ctx context.Context) error {
 	return nil
 }
 
-func newBigtableConn(conn *grpc.ClientConn, instanceName, appProfileID string) *BigtableConn {
+func NewBigtableConn(conn *grpc.ClientConn) *BigtableConn {
 	return &BigtableConn{
-		ClientConn:   conn,
-		instanceName: instanceName,
-		appProfile:   appProfileID,
+		ClientConn: conn,
 	}
 }
 
@@ -185,7 +217,11 @@ type BigtableChannelPool struct {
 	poolCtx    context.Context    // Context for the pool's background tasks
 	poolCancel context.CancelFunc // Function to cancel the poolCtx
 
-	logger *log.Logger // logging events
+	logger         *log.Logger // logging events
+	appProfile     string
+	instanceName   string
+	featureFlagsMD metadata.MD
+	meterProvider  metric.MeterProvider
 }
 
 // getConns safely loads the current slice of connections.
@@ -200,7 +236,7 @@ func (p *BigtableChannelPool) getConns() []*connEntry {
 // NewBigtableChannelPool creates a pool of connPoolSize and takes the dial func()
 // NewBigtableChannelPool primes the new connection in a non-blocking goroutine to warm it up.
 // We keep it consistent with the current channelpool behavior which is lazily initialized.
-func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btopt.LoadBalancingStrategy, dial func() (*BigtableConn, error), logger *log.Logger, mp metric.MeterProvider, opts ...BigtableChannelPoolOption) (*BigtableChannelPool, error) {
+func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btopt.LoadBalancingStrategy, dial func() (*BigtableConn, error), opts ...BigtableChannelPoolOption) (*BigtableChannelPool, error) {
 	if connPoolSize <= 0 {
 		return nil, fmt.Errorf("bigtable_connpool: connPoolSize must be positive")
 	}
@@ -216,7 +252,6 @@ func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btop
 		rrIndex:    0,
 		poolCtx:    poolCtx,
 		poolCancel: poolCancel,
-		logger:     logger,
 	}
 
 	for _, opt := range opts {
@@ -260,7 +295,7 @@ func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btop
 		go func(e *connEntry) {
 			primeCtx, cancel := context.WithTimeout(pool.poolCtx, primeRPCTimeout)
 			defer cancel()
-			err := e.conn.Prime(primeCtx)
+			err := e.conn.Prime(primeCtx, pool.instanceName, pool.appProfile, pool.featureFlagsMD)
 			if err != nil {
 				btopt.Debugf(pool.logger, "bigtable_connpool: failed to prime initial connection: %v\n", err)
 			}
@@ -342,7 +377,7 @@ func (p *BigtableChannelPool) replaceConnection(oldEntry *connEntry) {
 	}
 
 	primeCtx, cancel := context.WithTimeout(p.poolCtx, primeRPCTimeout)
-	err = newConn.Prime(primeCtx)
+	err = newConn.Prime(primeCtx, p.instanceName, p.appProfile, p.featureFlagsMD)
 	cancel() // cancel the prime context
 
 	if err != nil {
