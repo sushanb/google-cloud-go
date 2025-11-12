@@ -132,6 +132,7 @@ func (bc *BigtableConn) Prime(ctx context.Context, fullInstanceName, appProfileI
 	return nil
 }
 
+// NewBigtableConn creates a wrapped grpc Client Conn
 func NewBigtableConn(conn *grpc.ClientConn) *BigtableConn {
 	return &BigtableConn{
 		ClientConn: conn,
