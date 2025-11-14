@@ -143,8 +143,8 @@ func NewBigtableConn(conn *grpc.ClientConn) *BigtableConn {
 type connEntry struct {
 	conn          *BigtableConn
 	unaryLoad     atomic.Int32 // In-flight unary requests
-	streamingLoad atomic.Int32 // Active streams
-	errorCount    int64        // Errors since the last metric report
+	streamingLoad atomic.Int32 // In-flight streaming requests
+	errorCount    atomic.Int64 // Errors since the last metric report
 	drainingState atomic.Bool  // True if the connection is being gracefully drained.
 
 }
@@ -206,7 +206,7 @@ func (e *connEntry) calculateConnLoad() int32 {
 // BigtableChannelPool implements ConnPool and routes requests to the connection
 // pool according to load balancing strategy.
 type BigtableChannelPool struct {
-	conns atomic.Value // Stores []*connEntry
+	conns atomic.Pointer[[]*connEntry] // Stores []*connEntry
 
 	dial       func() (*BigtableConn, error)
 	strategy   btopt.LoadBalancingStrategy
@@ -227,11 +227,11 @@ type BigtableChannelPool struct {
 
 // getConns safely loads the current slice of connections.
 func (p *BigtableChannelPool) getConns() []*connEntry {
-	val := p.conns.Load()
-	if val == nil {
+	connsPtr := p.conns.Load()
+	if connsPtr == nil {
 		return nil
 	}
-	return val.([]*connEntry)
+	return *connsPtr
 }
 
 // NewBigtableChannelPool creates a pool of connPoolSize and takes the dial func()
@@ -280,7 +280,6 @@ func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btop
 		}
 
 		if exitSignal != nil {
-			// Manually close connections
 			break
 		}
 
@@ -294,9 +293,7 @@ func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btop
 		initialConns[i] = entry // Note, we keep non primed conns in conns
 		// Prime the new connection in a non-blocking goroutine to warm it up.
 		go func(e *connEntry) {
-			primeCtx, cancel := context.WithTimeout(pool.poolCtx, primeRPCTimeout)
-			defer cancel()
-			err := e.conn.Prime(primeCtx, pool.instanceName, pool.appProfile, pool.featureFlagsMD)
+			err := e.conn.Prime(ctx, pool.instanceName, pool.appProfile, pool.featureFlagsMD)
 			if err != nil {
 				btopt.Debugf(pool.logger, "bigtable_connpool: failed to prime initial connection: %v\n", err)
 			}
@@ -313,7 +310,7 @@ func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btop
 		return nil, exitSignal
 	}
 
-	pool.conns.Store(initialConns)
+	pool.conns.Store(&initialConns)
 	return pool, nil
 }
 
@@ -328,7 +325,9 @@ func (p *BigtableChannelPool) Close() error {
 	conns := p.getConns()
 	var errs multiError
 
-	p.conns.Store(([]*connEntry)(nil)) // Mark as closed
+	// immediately store zero-length slice
+	p.conns.Store((&[]*connEntry{}))
+
 	for _, entry := range conns {
 		if err := entry.conn.Close(); err != nil {
 			errs = append(errs, err)
@@ -377,9 +376,7 @@ func (p *BigtableChannelPool) replaceConnection(oldEntry *connEntry) {
 		return
 	}
 
-	primeCtx, cancel := context.WithTimeout(p.poolCtx, primeRPCTimeout)
-	err = newConn.Prime(primeCtx, p.instanceName, p.appProfile, p.featureFlagsMD)
-	cancel() // cancel the prime context
+	err = newConn.Prime(p.poolCtx, p.instanceName, p.appProfile, p.featureFlagsMD)
 
 	if err != nil {
 		btopt.Debugf(p.logger, "bigtable_connpool: Failed to prime replacement connection at index %d: %v. Closing new conn. Old connection remains (draining).\n", idx, err)
@@ -396,10 +393,7 @@ func (p *BigtableChannelPool) replaceConnection(oldEntry *connEntry) {
 	newConns := make([]*connEntry, len(currentConns))
 	copy(newConns, currentConns)
 	newConns[idx] = newEntry
-	p.conns.Store(newConns)
-
-	btopt.Debugf(p.logger, "bigtable_connpool: Replacing connection at index %d\n", idx)
-
+	p.conns.Store(&newConns)
 	// Start the graceful shutdown process for the old connection
 	go p.waitForDrainAndClose(oldEntry)
 }
@@ -417,7 +411,7 @@ func (p *BigtableChannelPool) Invoke(ctx context.Context, method string, args in
 
 	err = entry.conn.Invoke(ctx, method, args, reply, opts...)
 	if err != nil {
-		atomic.AddInt64(&entry.errorCount, 1)
+		entry.errorCount.Add(1)
 	}
 	return err
 
@@ -451,7 +445,7 @@ func (p *BigtableChannelPool) NewStream(ctx context.Context, desc *grpc.StreamDe
 	entry.streamingLoad.Add(1)
 	stream, err := entry.conn.NewStream(ctx, desc, method, opts...)
 	if err != nil {
-		atomic.AddInt64(&entry.errorCount, 1)
+		entry.errorCount.Add(1)
 		entry.streamingLoad.Add(-1) // Decrement immediately on creation failure
 		return nil, err
 	}
@@ -567,7 +561,7 @@ type refCountedStream struct {
 func (s *refCountedStream) SendMsg(m interface{}) error {
 	err := s.ClientStream.SendMsg(m)
 	if err != nil {
-		atomic.AddInt64(&s.entry.errorCount, 1)
+		s.entry.errorCount.Add(1)
 		s.decrementLoad()
 	}
 	return err
@@ -579,7 +573,7 @@ func (s *refCountedStream) RecvMsg(m interface{}) error {
 	if err != nil { // io.EOF is also an error, indicating stream end.
 		// io.EOF is a normal stream termination, not an error to be counted.
 		if !errors.Is(err, io.EOF) {
-			atomic.AddInt64(&s.entry.errorCount, 1)
+			s.entry.errorCount.Add(1)
 		}
 		s.decrementLoad()
 	}

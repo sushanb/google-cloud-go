@@ -74,7 +74,8 @@ func TestSelectRoundRobin(t *testing.T) {
 	}
 
 	// Test single connection pool
-	pool.conns.Store([]*connEntry{{}})
+	conns := []*connEntry{{}}
+	pool.conns.Store(&conns)
 	entry, err = pool.selectRoundRobin()
 	if entry == nil {
 		t.Errorf("selectRoundRobin on single conn pool got nil entry")
@@ -85,11 +86,11 @@ func TestSelectRoundRobin(t *testing.T) {
 
 	// Test multiple connections
 	poolSize := 3
-	conns := make([]*connEntry, poolSize)
+	conns = make([]*connEntry, poolSize)
 	for i := 0; i < poolSize; i++ {
 		conns[i] = &connEntry{}
 	}
-	pool.conns.Store(conns)
+	pool.conns.Store(&conns)
 	pool.rrIndex = 0
 
 	for i := 0; i < poolSize*2; i++ {
@@ -544,18 +545,16 @@ func TestNewBigtableChannelPool(t *testing.T) {
 
 func TestSelectLeastLoaded(t *testing.T) {
 	pool := &BigtableChannelPool{}
-	pool.conns.Store(([]*connEntry)(nil)) // Ensure it's empty
-
+	pool.conns.Store((&[]*connEntry{}))
 	_, err := pool.selectLeastLoaded()
 	if !errors.Is(err, errNoConnections) {
 		t.Errorf("Empty pool: got err %v, want %v", err, errNoConnections)
 	}
 
-	// streamingLoadFactor is 2, unaryLoadFactor is 1
 	testLoads := []struct{ unary, stream int32 }{
 		{3, 0}, // Load: 3
-		{1, 1}, // Load: 1*1 + 2*1 = 3
-		{0, 2}, // Load: 4
+		{1, 1}, // Load: 2
+		{0, 2}, // Load: 2
 		{5, 0}, // Load: 5
 		{1, 0}, // Load: 1 (Smallest)
 	}
@@ -566,7 +565,7 @@ func TestSelectLeastLoaded(t *testing.T) {
 		conns[i].unaryLoad.Store(loads.unary)
 		conns[i].streamingLoad.Store(loads.stream)
 	}
-	pool.conns.Store(conns)
+	pool.conns.Store(&conns)
 
 	entry, err := pool.selectLeastLoaded()
 	if err != nil {
@@ -586,19 +585,18 @@ func TestSelectLeastLoadedRandomOfTwo(t *testing.T) {
 	}
 
 	conns := []*connEntry{{}}
-	pool.conns.Store(conns)
+	pool.conns.Store(&conns)
 	entry, err = pool.selectLeastLoadedRandomOfTwo()
 	if entry != conns[0] || err != nil {
 		t.Errorf("Single conn: got %v, %v, want %v, nil", entry, err, conns[0])
 	}
 
-	// streamingLoadFactor is 2, unaryLoadFactor is 1
 	testLoads := []struct{ unary, stream int32 }{
 		{10, 0}, // Load: 10
-		{0, 4},  // Load: 8
-		{20, 5}, // Load: 30
-		{2, 1},  // Load: 4
-		{0, 20}, // Load: 40
+		{0, 4},  // Load: 4
+		{20, 5}, // Load: 25
+		{2, 1},  // Load: 3
+		{0, 20}, // Load: 20
 	}
 	conns = make([]*connEntry, len(testLoads))
 	for i, loads := range testLoads {
@@ -606,8 +604,10 @@ func TestSelectLeastLoadedRandomOfTwo(t *testing.T) {
 		conns[i].unaryLoad.Store(loads.unary)
 		conns[i].streamingLoad.Store(loads.stream)
 	}
-	pool.conns.Store(conns)
-	for i := 0; i < 100; i++ {
+	pool.conns.Store(&conns)
+	counts := make([]int, len(testLoads))
+	iters := 1000
+	for i := 0; i < iters; i++ {
 		entry, err = pool.selectLeastLoadedRandomOfTwo()
 		if err != nil {
 			t.Fatalf("Multi conn: got unexpected error: %v", err)
@@ -615,7 +615,22 @@ func TestSelectLeastLoadedRandomOfTwo(t *testing.T) {
 		if entry == nil {
 			t.Fatalf("Multi conn: got nil entry")
 		}
-		// We can't deterministically know which one was chosen, just that one was.
+
+		for j, conn := range conns {
+			if entry == conn {
+				counts[j]++
+				break
+			}
+		}
+	}
+
+	// numConns = 5, iterations = 1000.
+	// P(most loaded, most loaded conn) = (1/5)^2 = 1/25
+	// Expected conn being Most loaded = 1000/25 == 40
+
+	mostLoadedSelections := counts[2]
+	if mostLoadedSelections > iters/10 {
+		t.Errorf("Most loaded entry (index 2, load 25) selected too often: %d times out of %d", mostLoadedSelections, iters)
 	}
 }
 
@@ -812,10 +827,13 @@ func TestPoolClose(t *testing.T) {
 
 	pool.Close()
 
-	if pool.getConns() != nil {
-		t.Errorf("pool.getConns() got non-nil after Close, want nil")
+	if pool.Num() != 0 {
+		t.Errorf("pool.Num() got %d, want 0", pool.Num())
 	}
 
+	if len(pool.getConns()) != 0 {
+		t.Errorf("pool.getConns() got non-nil after Close, want nil")
+	}
 }
 
 func TestGracefulDraining(t *testing.T) {
