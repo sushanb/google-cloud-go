@@ -31,6 +31,8 @@ const (
 	outstandingRPCsMetricName = "connection_pool/outstanding_rpcs"
 	// perConnErrorCountMetricName is the name for the per-connection error count histogram.
 	perConnErrorCountMetricName = "per_connection_error_count"
+	// clientMeterName is the prefix for metrics name
+	clientMeterName = "bigtable.googleapis.com/internal/client/"
 )
 
 // MetricsReporter periodically collects and reports metrics for the connection pool.
@@ -69,7 +71,7 @@ func NewMetricsReporter(config btopt.MetricsReporterConfig, connPoolStatsSupplie
 	}
 
 	// create meter
-	meter := mp.Meter("bigtable.googleapis.com/internal/client/")
+	meter := mp.Meter(clientMeterName)
 	var err error
 
 	// fail if meter cannot be created.
