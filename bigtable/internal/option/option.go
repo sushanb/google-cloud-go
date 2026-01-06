@@ -267,3 +267,39 @@ func DefaultMetricsReporterConfig() MetricsReporterConfig {
 		ReportingInterval: 1 * time.Minute,
 	}
 }
+
+// HealthCheckConfig holds the parameters for channel pool health checking.
+type HealthCheckConfig struct {
+	// Enabled for toggle
+	Enabled bool
+	// ProbeInterval is the interval at which channel health is probed.
+	ProbeInterval time.Duration
+	// ProbeTimeout is the deadline for each individual health check probe RPC.
+	ProbeTimeout time.Duration
+	// WindowDuration is the duration over which probe results are kept for health evaluation.
+	WindowDuration time.Duration
+	// MinProbesForEval is the minimum number of probes required before a channel's health is evaluated.
+	MinProbesForEval int
+	// FailurePercentThresh is the percentage of failed probes within the window duration
+	// that will cause a channel to be considered unhealthy.
+	FailurePercentThresh int
+	// PoolwideBadThreshPercent is the "circuit breaker" threshold. If this percentage
+	// of channels in the pool are unhealthy, no evictions will occur.
+	PoolwideBadThreshPercent int
+	// MinEvictionInterval is the minimum time that must pass between eviction of unhealthy channels.
+	MinEvictionInterval time.Duration
+}
+
+// DefaultHealthCheckConfig for HealthCheckConfig
+func DefaultHealthCheckConfig() HealthCheckConfig {
+	return HealthCheckConfig{
+		Enabled:                  true,
+		ProbeInterval:            30 * time.Second,
+		ProbeTimeout:             1 * time.Second,
+		WindowDuration:           5 * time.Minute,
+		MinProbesForEval:         4,
+		FailurePercentThresh:     60,
+		PoolwideBadThreshPercent: 70,
+		MinEvictionInterval:      1 * time.Minute,
+	}
+}
