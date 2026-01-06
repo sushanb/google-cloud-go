@@ -187,11 +187,130 @@ func (bc *BigtableConn) creationTime() int64 {
 // connEntry represents a single connection in the pool.
 type connEntry struct {
 	conn          *BigtableConn
-	unaryLoad     atomic.Int32 // In-flight unary requests
-	streamingLoad atomic.Int32 // In-flight streaming requests
-	errorCount    atomic.Int64 // Errors since the last metric report
-	drainingState atomic.Bool  // True if the connection is being gracefully drained.
+	unaryLoad     atomic.Int32    // In-flight unary requests
+	streamingLoad atomic.Int32    // In-flight streaming requests
+	errorCount    atomic.Int64    // Errors since the last metric report
+	drainingState atomic.Bool     // True if the connection is being gracefully drained.
+	health        connHealthState // Embedded health state
+}
 
+// connHealthState holds the health monitoring state for a single connection.
+type connHealthState struct {
+	mu               sync.Mutex // Guards fields below
+	probeHistory     []probeResult
+	successfulProbes int
+	failedProbes     int
+	lastProbeTime    time.Time
+}
+
+// probeResult stores a single health check outcome.
+type probeResult struct {
+	t          time.Time
+	successful bool
+}
+
+// addProbeResult records a new probe outcome and prunes old history.
+func (chs *connHealthState) addProbeResult(successful bool, windowDuration time.Duration) {
+	chs.mu.Lock()
+	defer chs.mu.Unlock()
+
+	now := time.Now()
+	chs.lastProbeTime = now
+	chs.probeHistory = append(chs.probeHistory, probeResult{t: now, successful: successful})
+
+	if successful {
+		chs.successfulProbes++
+	} else {
+		chs.failedProbes++
+	}
+	chs.pruneHistoryLocked(windowDuration)
+}
+
+// pruneHistoryLocked removes probe results older than WindowDuration. Assumes chs.mu is held.
+func (chs *connHealthState) pruneHistoryLocked(windowDuration time.Duration) {
+	windowStart := time.Now().Add(-windowDuration)
+	firstValid := 0
+	for firstValid < len(chs.probeHistory) && chs.probeHistory[firstValid].t.Before(windowStart) {
+		result := chs.probeHistory[firstValid]
+		if result.successful {
+			chs.successfulProbes--
+		} else {
+			chs.failedProbes--
+		}
+		firstValid++
+	}
+	if firstValid > 0 {
+		chs.probeHistory = chs.probeHistory[firstValid:]
+	}
+}
+
+// isHealthy reports if the connection is currently considered healthy based on probe history.
+func (chs *connHealthState) isHealthy(minProbesForEval int, failurePercentThresh int) bool {
+	chs.mu.Lock()
+	defer chs.mu.Unlock()
+	totalProbes := chs.successfulProbes + chs.failedProbes
+	if totalProbes < minProbesForEval {
+		return true // Not enough data to make a judgment
+	}
+	failureRate := float64(chs.failedProbes) / float64(totalProbes) * 100.0
+	return failureRate < float64(failurePercentThresh)
+}
+
+// getFailedProbes returns the number of failed probes in the current window.
+func (chs *connHealthState) getFailedProbes() int {
+	chs.mu.Lock()
+	defer chs.mu.Unlock()
+	return chs.failedProbes
+}
+
+// detectAndEvictUnhealthy checks connection health and evicts the worst unhealthy one if allowed.
+func (p *BigtableChannelPool) detectAndEvictUnhealthy(hcConfig btopt.HealthCheckConfig, allowEviction func() bool, recordEviction func()) bool {
+	if !allowEviction() {
+		return false // Too soon since the last eviction.
+	}
+
+	conns := p.getConns()
+	numConns := len(conns)
+	if numConns == 0 {
+		return false
+	}
+
+	var unhealthyIndices []int
+	for i, entry := range conns {
+		if !entry.health.isHealthy(hcConfig.MinProbesForEval, hcConfig.FailurePercentThresh) { // isHealthy() locks internally
+			unhealthyIndices = append(unhealthyIndices, i)
+		}
+	}
+
+	if len(unhealthyIndices) == 0 {
+		return false // All connections are healthy.
+	}
+
+	unhealthyPercent := float64(len(unhealthyIndices)) / float64(numConns) * 100.0
+	if unhealthyPercent >= float64(hcConfig.PoolwideBadThreshPercent) {
+		btopt.Debugf(p.logger, "bigtable_connpool: Circuit breaker tripped, %d%% unhealthy, not evicting\n", int(unhealthyPercent))
+		return false // Too many unhealthy connections, don't evict.
+	}
+
+	// Find the connection with the most failed probes among the unhealthy ones.
+	var worstEntry *connEntry
+	maxFailed := -1
+	for _, idx := range unhealthyIndices {
+		entry := conns[idx]                      // Safe, using snapshot
+		failed := entry.health.getFailedProbes() // getFailedProbes() locks internally
+		if failed > maxFailed {
+			maxFailed = failed
+			worstEntry = entry
+		}
+	}
+
+	if worstEntry != nil {
+		recordEviction() // Record eviction time *before* replacing. // Record eviction time *before* replacing.
+		p.replaceConnection(worstEntry)
+		return true // Eviction happened
+	}
+
+	return false
 }
 
 // isALTSUsed reports whether the connection is using ALTS aka Direct Access.
@@ -931,4 +1050,31 @@ func (m multiError) Error() string {
 		return s + " (and 1 other error)"
 	}
 	return fmt.Sprintf("%s (and %d other errors)", s, n-1)
+}
+
+// runProbes executes a Prime check on all connections concurrently.
+func (p *BigtableChannelPool) runProbes(ctx context.Context, hcConfig btopt.HealthCheckConfig) {
+	conns := p.getConns()
+
+	var wg sync.WaitGroup
+	for _, entry := range conns {
+		wg.Add(1)
+		go func(e *connEntry, cfg btopt.HealthCheckConfig) {
+			defer wg.Done()
+			// Derive the probe context from the passed-in context
+			probeCtx, cancel := context.WithTimeout(ctx, cfg.ProbeTimeout)
+			defer cancel()
+			// Check if context was already done before priming
+			select {
+			case <-probeCtx.Done():
+				e.health.addProbeResult(false, cfg.WindowDuration) // Count as failure if context is done
+				return
+			default:
+			}
+			// don't update conn  isAlts used entry for now.
+			err := e.conn.Prime(ctx, p.instanceName, p.appProfile, p.featureFlagsMD)
+			e.health.addProbeResult(err == nil, cfg.WindowDuration)
+		}(entry, hcConfig)
+	}
+	wg.Wait()
 }

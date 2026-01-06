@@ -82,6 +82,7 @@ type Client struct {
 	enableDirectAccess      bool
 	featureFlagsMD          metadata.MD // Pre-computed feature flags metadata to be sent with each request.
 	dynamicScaleMonitor     *btransport.DynamicScaleMonitor
+	connsHealthMonitor      *btransport.ChannelHealthMonitor
 }
 
 // ClientConfig has configurations for the client.
@@ -99,6 +100,9 @@ type ClientConfig struct {
 
 	// If true, enable dynamic channel pool
 	EnableDynamicChannelPool bool
+
+	// If true, enable channel health monitor
+	EnableChannelHealthMonitor bool
 }
 
 // MetricsProvider is a wrapper for built in metrics meter provider
@@ -186,6 +190,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 	var connPool gtransport.ConnPool
 	var connPoolErr error
 	var dsm *btransport.DynamicScaleMonitor
+	var chm *btransport.ChannelHealthMonitor
 	enableBigtableConnPool := btopt.EnableBigtableConnectionPool()
 	if enableBigtableConnPool {
 		fullInstanceName := fmt.Sprintf("projects/%s/instances/%s", project, instance)
@@ -223,6 +228,12 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 				dsm = btransport.NewDynamicScaleMonitor(btopt.DefaultDynamicChannelPoolConfig(), btPool)
 				dsm.Start(ctx) // Start the monitor's background goroutine
 			}
+
+			// channel health monitor
+			if config.EnableChannelHealthMonitor {
+				chm = btransport.NewChannelHealthMonitor(btopt.DefaultHealthCheckConfig(), btPool)
+				chm.Start(ctx) // Start the monitor's background goroutine
+			}
 		}
 
 	} else {
@@ -247,6 +258,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		enableDirectAccess:      enableDirectAccess,
 		featureFlagsMD:          ffMD,
 		dynamicScaleMonitor:     dsm,
+		connsHealthMonitor:      chm,
 	}, nil
 }
 
