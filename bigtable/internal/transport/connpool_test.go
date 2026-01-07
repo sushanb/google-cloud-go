@@ -129,7 +129,7 @@ func TestNewBigtableChannelPoolEdgeCases(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			pool, err := NewBigtableChannelPool(ctx, tc.size, btopt.RoundRobin, tc.dial, time.Now(), poolOpts()...)
+			pool, err := NewBigtableChannelPool(ctx, tc.size, btopt.RoundRobin, tc.dial, nil, time.Now(), poolOpts()...)
 			if tc.wantErr {
 				if err == nil {
 					t.Errorf("NewBigtableChannelPool(%d) succeeded, want error containing %q", tc.size, tc.errMatch)
@@ -421,7 +421,7 @@ func TestPoolInvoke(t *testing.T) {
 			addr := setupTestServer(t, fake)
 			dialFunc := func() (*BigtableConn, error) { return dialBigtableserver(addr) }
 
-			pool, err := NewBigtableChannelPool(ctx, poolSize, strategy, dialFunc, time.Now(), poolOpts()...)
+			pool, err := NewBigtableChannelPool(ctx, poolSize, strategy, dialFunc, nil, time.Now(), poolOpts()...)
 			if err != nil {
 				t.Fatalf("Failed to create pool: %v", err)
 			}
@@ -493,7 +493,7 @@ func TestPoolNewStream(t *testing.T) {
 			addr := setupTestServer(t, fake)
 			dialFunc := func() (*BigtableConn, error) { return dialBigtableserver(addr) }
 
-			pool, err := NewBigtableChannelPool(ctx, poolSize, strategy, dialFunc, time.Now(), poolOpts()...)
+			pool, err := NewBigtableChannelPool(ctx, poolSize, strategy, dialFunc, nil, time.Now(), poolOpts()...)
 			if err != nil {
 				t.Fatalf("Failed to create pool: %v", err)
 			}
@@ -557,7 +557,7 @@ func TestPoolNewStream(t *testing.T) {
 		fake := &fakeService{}
 		addr := setupTestServer(t, fake)
 		dialFunc := func() (*BigtableConn, error) { return dialBigtableserver(addr) }
-		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, dialFunc, time.Now(), poolOpts()...)
+		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, dialFunc, nil, time.Now(), poolOpts()...)
 		if err != nil {
 			t.Fatalf("Failed to create pool: %v", err)
 		}
@@ -608,7 +608,7 @@ func TestNewBigtableChannelPool(t *testing.T) {
 		addr := setupTestServer(t, fake)
 		dialFunc := func() (*BigtableConn, error) { return dialBigtableserver(addr) }
 
-		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.LeastInFlight, dialFunc, time.Now(), poolOpts()...)
+		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.LeastInFlight, dialFunc, nil, time.Now(), poolOpts()...)
 		if err != nil {
 			t.Fatalf("NewBigtableChannelPool failed: %v", err)
 		}
@@ -655,7 +655,7 @@ func TestNewBigtableChannelPool(t *testing.T) {
 			return dialBigtableserver(addr)
 		}
 
-		_, err := NewBigtableChannelPool(ctx, poolSize, btopt.LeastInFlight, dialFunc, time.Now(), poolOpts()...)
+		_, err := NewBigtableChannelPool(ctx, poolSize, btopt.LeastInFlight, dialFunc, nil, time.Now(), poolOpts()...)
 		if err == nil {
 			t.Errorf("NewBigtableChannelPool should have failed due to dial error")
 		}
@@ -761,7 +761,7 @@ func TestCachingStreamDecrement(t *testing.T) {
 	addr := setupTestServer(t, fake)
 	dialFunc := func() (*BigtableConn, error) { return dialBigtableserver(addr) }
 
-	pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.LeastInFlight, dialFunc, time.Now(), poolOpts()...)
+	pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.LeastInFlight, dialFunc, nil, time.Now(), poolOpts()...)
 	if err != nil {
 		t.Fatalf("Failed to create pool: %v", err)
 	}
@@ -865,7 +865,7 @@ func TestMultipleStreamsSingleConn(t *testing.T) {
 	addr := setupTestServer(t, fake)
 	dialFunc := func() (*BigtableConn, error) { return dialBigtableserver(addr) }
 
-	pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.LeastInFlight, dialFunc, time.Now(), poolOpts()...)
+	pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.LeastInFlight, dialFunc, nil, time.Now(), poolOpts()...)
 	if err != nil {
 		t.Fatalf("Failed to create pool: %v", err)
 	}
@@ -940,7 +940,7 @@ func TestPoolClose(t *testing.T) {
 	fake := &fakeService{}
 	addr := setupTestServer(t, fake)
 	dialFunc := func() (*BigtableConn, error) { return dialBigtableserver(addr) }
-	pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.LeastInFlight, dialFunc, time.Now(), poolOpts()...)
+	pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.LeastInFlight, dialFunc, nil, time.Now(), poolOpts()...)
 	if err != nil {
 		t.Fatalf("Failed to create pool: %v", err)
 	}
@@ -963,7 +963,7 @@ func TestGracefulDraining(t *testing.T) {
 	dialFunc := func() (*BigtableConn, error) { return dialBigtableserver(addr) }
 
 	t.Run("DrainingOnReplaceConnection", func(t *testing.T) {
-		pool, err := NewBigtableChannelPool(ctx, 1, btopt.RoundRobin, dialFunc, time.Now(), poolOpts()...)
+		pool, err := NewBigtableChannelPool(ctx, 1, btopt.RoundRobin, dialFunc, nil, time.Now(), poolOpts()...)
 		if err != nil {
 			t.Fatalf("Failed to create pool: %v", err)
 		}
@@ -1031,7 +1031,7 @@ func TestGracefulDraining(t *testing.T) {
 	})
 
 	t.Run("SelectionSkipsDrainingConns", func(t *testing.T) {
-		pool, err := NewBigtableChannelPool(ctx, 3, btopt.RoundRobin, dialFunc, time.Now(), poolOpts()...)
+		pool, err := NewBigtableChannelPool(ctx, 3, btopt.RoundRobin, dialFunc, nil, time.Now(), poolOpts()...)
 		if err != nil {
 			t.Fatalf("Failed to create pool: %v", err)
 		}
@@ -1068,7 +1068,7 @@ func TestGracefulDraining(t *testing.T) {
 		maxDrainingTimeout = 100 * time.Millisecond
 		defer func() { maxDrainingTimeout = originalTimeout }()
 
-		pool, err := NewBigtableChannelPool(ctx, 1, btopt.RoundRobin, dialFunc, time.Now(), poolOpts()...)
+		pool, err := NewBigtableChannelPool(ctx, 1, btopt.RoundRobin, dialFunc, nil, time.Now(), poolOpts()...)
 		if err != nil {
 			t.Fatalf("Failed to create pool: %v", err)
 		}
@@ -1127,7 +1127,7 @@ func TestReplaceConnection(t *testing.T) {
 		mu.Unlock()
 		atomic.StoreInt32(&dialCount, 0)
 
-		pool, err := NewBigtableChannelPool(ctx, 2, btopt.RoundRobin, dialFunc, time.Now(), poolOpts()...)
+		pool, err := NewBigtableChannelPool(ctx, 2, btopt.RoundRobin, dialFunc, nil, time.Now(), poolOpts()...)
 		if err != nil {
 			t.Fatalf("Failed to create pool: %v", err)
 		}
@@ -1161,7 +1161,7 @@ func TestReplaceConnection(t *testing.T) {
 		mu.Unlock()
 		atomic.StoreInt32(&dialCount, 0)
 
-		pool, err := NewBigtableChannelPool(ctx, 2, btopt.RoundRobin, dialFunc, time.Now(), poolOpts()...)
+		pool, err := NewBigtableChannelPool(ctx, 2, btopt.RoundRobin, dialFunc, nil, time.Now(), poolOpts()...)
 		if err != nil {
 			t.Fatalf("Failed to create pool: %v", err)
 		}
@@ -1190,7 +1190,7 @@ func TestReplaceConnection(t *testing.T) {
 		mu.Unlock()
 		atomic.StoreInt32(&dialCount, 0)
 
-		poolCancelled, err := NewBigtableChannelPool(ctx, 2, btopt.RoundRobin, dialFunc, time.Now(), poolOpts()...)
+		poolCancelled, err := NewBigtableChannelPool(ctx, 2, btopt.RoundRobin, dialFunc, nil, time.Now(), poolOpts()...)
 		if err != nil {
 			t.Fatalf("Failed to create poolCancelled: %v", err)
 		}
@@ -1216,7 +1216,7 @@ func TestReplaceConnection(t *testing.T) {
 		mu.Lock()
 		dialSucceed = true
 		mu.Unlock()
-		pool, err := NewBigtableChannelPool(ctx, 2, btopt.RoundRobin, dialFunc, time.Now(), poolOpts()...)
+		pool, err := NewBigtableChannelPool(ctx, 2, btopt.RoundRobin, dialFunc, nil, time.Now(), poolOpts()...)
 		if err != nil {
 			t.Fatalf("Failed to create pool: %v", err)
 		}
@@ -1335,7 +1335,7 @@ func TestAddConnections(t *testing.T) {
 			innerCtx, cancel := context.WithCancel(ctx)
 			defer cancel()
 
-			pool, err := NewBigtableChannelPool(innerCtx, tc.initialSize, btopt.RoundRobin, baseDialFunc, time.Now(), poolOpts()...)
+			pool, err := NewBigtableChannelPool(innerCtx, tc.initialSize, btopt.RoundRobin, baseDialFunc, nil, time.Now(), poolOpts()...)
 			if err != nil {
 				t.Fatalf("Failed to create pool: %v", err)
 			}
@@ -1442,7 +1442,7 @@ func TestRemoveConnections(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			pool, err := NewBigtableChannelPool(ctx, tc.initialSize, btopt.RoundRobin, dialFunc, time.Now(), poolOpts()...)
+			pool, err := NewBigtableChannelPool(ctx, tc.initialSize, btopt.RoundRobin, dialFunc, nil, time.Now(), poolOpts()...)
 			if err != nil {
 				t.Fatalf("Failed to create pool: %v", err)
 			}
@@ -1464,7 +1464,7 @@ func TestRemoveConnections(t *testing.T) {
 
 	t.Run("VerifyOldestIsRemoved", func(t *testing.T) {
 		poolSize := 5
-		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, dialFunc, time.Now(), poolOpts()...)
+		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, dialFunc, nil, time.Now(), poolOpts()...)
 		if err != nil {
 			t.Fatalf("Failed to create pool: %v", err)
 		}
@@ -1515,7 +1515,7 @@ func TestConnPoolStatisticsVisitor(t *testing.T) {
 	addr := setupTestServer(t, fake)
 	dialFunc := func() (*BigtableConn, error) { return dialBigtableserver(addr) }
 
-	pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, dialFunc, time.Now(), poolOpts()...)
+	pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, dialFunc, nil, time.Now(), poolOpts()...)
 	if err != nil {
 		t.Fatalf("Failed to create pool: %v", err)
 	}
@@ -1589,6 +1589,143 @@ func TestConnPoolStatisticsVisitor(t *testing.T) {
 	}
 }
 
+func TestDirectAccessLogic(t *testing.T) {
+	ctx := context.Background()
+	fake := &fakeService{}
+	addr := setupTestServer(t, fake)
+	baseDialFunc := func() (*BigtableConn, error) { return dialBigtableserver(addr) }
+
+	t.Run("DirectAccessAvailable_ReuseConnection", func(t *testing.T) {
+		fake.reset()
+		// Mock direct access dialer
+		daDialCalled := false
+		var daConn *BigtableConn
+		daDial := func() (*BigtableConn, error) {
+			c, err := baseDialFunc()
+			if err != nil {
+				return nil, err
+			}
+			if !daDialCalled {
+				daConn = c
+				daDialCalled = true
+			}
+			// poor man's direct access
+			c.isALTSConn.Store(true)
+			return c, nil
+		}
+
+		poolSize := 3
+		fake.setPingCount(0)
+
+		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, baseDialFunc, daDial, time.Now(), poolOpts()...)
+		if err != nil {
+			t.Fatalf("Failed to create pool: %v", err)
+		}
+		defer pool.Close()
+
+		if !daDialCalled {
+			t.Error("Direct Access dialer was not called")
+		}
+
+		conns := pool.getConns()
+		if len(conns) != poolSize {
+			t.Errorf("Pool size got %d, want %d", len(conns), poolSize)
+		}
+
+		// Verify reuse: the first connection should be the one from daDial
+		if conns[0].conn != daConn {
+			t.Error("Pool did not reuse the Direct Access connection as the first entry")
+		}
+
+		// Verify the first connection is ALTS
+		if !conns[0].isALTSUsed() {
+			t.Error("Reused connection does not report ALTS usage")
+		}
+	})
+
+	t.Run("DirectAccess_NotAlts", func(t *testing.T) {
+		fake.reset()
+		var daConn *BigtableConn
+		daDial := func() (*BigtableConn, error) {
+			c, err := baseDialFunc()
+			if err != nil {
+				return nil, err
+			}
+			daConn = c
+			// poor man's alts
+			c.isALTSConn.Store(false)
+			return c, nil
+		}
+
+		poolSize := 2
+		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, baseDialFunc, daDial, time.Now(), poolOpts()...)
+		if err != nil {
+			t.Fatalf("Failed to create pool: %v", err)
+		}
+		defer pool.Close()
+
+		conns := pool.getConns()
+		if conns[0].conn == daConn {
+			t.Error("Pool incorrectly reused non-ALTS connection")
+		}
+
+		// Verify the discarded connection is closed
+		if !isConnClosed(daConn.ClientConn) {
+			t.Error("Discarded non-ALTS connection was not closed")
+		}
+	})
+
+	t.Run("DirectAccess_DialFail_Fallback", func(t *testing.T) {
+		fake.reset()
+		daDial := func() (*BigtableConn, error) {
+			return nil, errors.New("da dial failed")
+		}
+
+		poolSize := 1
+		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, baseDialFunc, daDial, time.Now(), poolOpts()...)
+		if err != nil {
+			t.Fatalf("Failed to create pool: %v", err)
+		}
+		defer pool.Close()
+
+		if pool.Num() != 1 {
+			t.Errorf("Pool size got %d, want 1", pool.Num())
+		}
+	})
+
+	t.Run("DirectAccess_PrimeFailed", func(t *testing.T) {
+		fake.reset()
+		// Let's make the FIRST Prime call fail (DA check), and subsequent ones succeed (standard dial).
+		fake.setPingErr(status.Error(codes.Internal, "da prime fail"), nil, nil, nil)
+
+		var daConn *BigtableConn
+		daDial := func() (*BigtableConn, error) {
+			c, err := baseDialFunc()
+			if err != nil {
+				return nil, err
+			}
+			daConn = c
+			return c, nil
+		}
+
+		poolSize := 1
+		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, baseDialFunc, daDial, time.Now(), poolOpts()...)
+		if err != nil {
+			t.Fatalf("Failed to create pool: %v", err)
+		}
+		defer pool.Close()
+
+		// Verify fallback
+		if pool.getConns()[0].conn == daConn {
+			t.Error("Pool reused connection despite Prime failure")
+		}
+
+		if !isConnClosed(daConn.ClientConn) {
+			t.Error("Failed DA connection was not closed")
+		}
+	})
+}
+
 // --- Benchmarks ---
 
 func createBenchmarkFake() *fakeService {
@@ -1603,7 +1740,7 @@ func setupBenchmarkPool(b *testing.B, strategy btopt.LoadBalancingStrategy, pool
 	}
 
 	ctx := context.Background()
-	pool, err := NewBigtableChannelPool(ctx, poolSize, strategy, dialFunc, time.Now(), poolOpts()...)
+	pool, err := NewBigtableChannelPool(ctx, poolSize, strategy, dialFunc, nil, time.Now(), poolOpts()...)
 	if err != nil {
 		b.Fatalf("Failed to create pool: %v", err)
 	}
