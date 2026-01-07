@@ -187,6 +187,9 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 	// Create the feature flags metadata once
 	ffMD := createFeatureFlagsMD(metricsTracerFactory.enabled, disableRetryInfo, enableDirectAccess)
 
+	// Set direct Access to be true.
+	directAccessFFMD := createFeatureFlagsMD(metricsTracerFactory.enabled, disableRetryInfo, true)
+
 	var connPool gtransport.ConnPool
 	var connPoolErr error
 	var dsm *btransport.DynamicScaleMonitor
@@ -194,7 +197,14 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 	enableBigtableConnPool := btopt.EnableBigtableConnectionPool()
 	if enableBigtableConnPool {
 		fullInstanceName := fmt.Sprintf("projects/%s/instances/%s", project, instance)
-
+		directAccessDialer := func() (*btransport.BigtableConn, error) {
+			directAccessOptions := append(o, internaloption.EnableDirectPath(true), internaloption.EnableDirectPathXds())
+			grpcConn, err := gtransport.Dial(ctx, directAccessOptions...)
+			if err != nil {
+				return nil, err
+			}
+			return btransport.NewBigtableConn(grpcConn), nil
+		}
 		btPool, err := btransport.NewBigtableChannelPool(ctx,
 			defaultBigtableConnPoolSize,
 			btopt.BigtableLoadBalancingStrategy(),
@@ -205,11 +215,13 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 				}
 				return btransport.NewBigtableConn(grpcConn), nil
 			},
+			directAccessDialer,
 			clientCreationTimestamp,
 			// options
 			btransport.WithInstanceName(fullInstanceName),
 			btransport.WithAppProfile(config.AppProfile),
 			btransport.WithFeatureFlagsMetadata(ffMD),
+			btransport.WithDirectAccessFeatureFlagsMetadata(directAccessFFMD),
 			btransport.WithMetricsReporterConfig(btopt.DefaultMetricsReporterConfig()),
 			btransport.WithMeterProvider(metricsTracerFactory.otelMeterProvider),
 		)

@@ -95,7 +95,7 @@ func TestRunProbesWhenContextDone(t *testing.T) {
 	fake := &fakeService{}
 	addr := setupTestServer(t, fake)
 	dialFunc := func() (*BigtableConn, error) { return dialBigtableserver(addr) }
-	pool, err := NewBigtableChannelPool(ctx, 2, btopt.RoundRobin, dialFunc, time.Now())
+	pool, err := NewBigtableChannelPool(ctx, 2, btopt.RoundRobin, dialFunc, nil, time.Now())
 	hcConfig := option.DefaultHealthCheckConfig()
 	if err != nil {
 		t.Fatalf("Failed to create pool: %v", err)
@@ -179,7 +179,7 @@ func TestDetectAndEvictUnhealthy(t *testing.T) {
 	}
 
 	t.Run("EvictOneUnhealthy", func(t *testing.T) {
-		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, dialFunc, time.Now())
+		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, dialFunc, nil, time.Now())
 		if err != nil {
 			t.Fatalf("Failed to create pool: %v", err)
 		}
@@ -207,7 +207,7 @@ func TestDetectAndEvictUnhealthy(t *testing.T) {
 	})
 
 	t.Run("CircuitBreakerTooManyUnhealthy", func(t *testing.T) {
-		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, dialFunc, time.Now())
+		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, dialFunc, nil, time.Now())
 		if err != nil {
 			t.Fatalf("Failed to create pool: %v", err)
 		}
@@ -258,7 +258,7 @@ func TestHealthCheckerIntegration(t *testing.T) {
 		return dialBigtableserver(addr)
 	}
 
-	pool, err := NewBigtableChannelPool(ctx, 2, btopt.RoundRobin, dialFunc, time.Now())
+	pool, err := NewBigtableChannelPool(ctx, 2, btopt.RoundRobin, dialFunc, nil, time.Now())
 	if err != nil {
 		t.Fatalf("Failed to create pool: %v", err)
 	}
