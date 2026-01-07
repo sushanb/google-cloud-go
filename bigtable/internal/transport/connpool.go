@@ -101,7 +101,7 @@ func WithFeatureFlagsMetadata(featureFlagsMd metadata.MD) BigtableChannelPoolOpt
 	}
 }
 
-// WithFeatureFlagsMetadata provides the feature flags metadata
+// WithDirectAccessFeatureFlagsMetadata provides the feature flags metadata
 func WithDirectAccessFeatureFlagsMetadata(directAccessFeatureFlagsMD metadata.MD) BigtableChannelPoolOption {
 	return func(p *BigtableChannelPool) {
 		p.directAccessFeatureFlagsMD = directAccessFeatureFlagsMD
