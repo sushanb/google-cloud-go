@@ -101,6 +101,13 @@ func WithFeatureFlagsMetadata(featureFlagsMd metadata.MD) BigtableChannelPoolOpt
 	}
 }
 
+// WithFeatureFlagsMetadata provides the feature flags metadata
+func WithDirectAccessFeatureFlagsMetadata(directAccessFeatureFlagsMD metadata.MD) BigtableChannelPoolOption {
+	return func(p *BigtableChannelPool) {
+		p.directAccessFeatureFlagsMD = directAccessFeatureFlagsMD
+	}
+}
+
 const (
 	primeRPCTimeout = 10 * time.Second
 )
@@ -391,10 +398,11 @@ type BigtableChannelPool struct {
 	poolCtx    context.Context    // Context for the pool's background tasks
 	poolCancel context.CancelFunc // Function to cancel the poolCtx
 
-	logger         *log.Logger // logging events
-	appProfile     string
-	instanceName   string
-	featureFlagsMD metadata.MD
+	logger                     *log.Logger // logging events
+	appProfile                 string
+	instanceName               string
+	featureFlagsMD             metadata.MD
+	directAccessFeatureFlagsMD metadata.MD
 
 	factory *connectionFactory // Use the factory for connection creation
 
@@ -447,6 +455,7 @@ func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btop
 
 	// Determine which dial function to use for the factory
 	factoryDial := dial
+	factoryFeatureFlagsMD := pool.featureFlagsMD // Use standard one
 	var firstConn *BigtableConn
 	if directAccessDial != nil {
 		var isDirectAccess bool
@@ -454,6 +463,7 @@ func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btop
 		if isDirectAccess {
 			btopt.Debugf(pool.logger, "bigtable_connpool: Direct Access is available. Using Direct Access now.")
 			factoryDial = directAccessDial
+			factoryFeatureFlagsMD = pool.directAccessFeatureFlagsMD
 		} else {
 			btopt.Debugf(pool.logger, "bigtable_connpool: Direct Access is not available. Falling back to cloud path.")
 		}
@@ -464,7 +474,7 @@ func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btop
 		dial:           factoryDial,
 		instanceName:   pool.instanceName,
 		appProfile:     pool.appProfile,
-		featureFlagsMD: pool.featureFlagsMD,
+		featureFlagsMD: factoryFeatureFlagsMD,
 		logger:         pool.logger,
 	}
 
@@ -544,7 +554,7 @@ func (p *BigtableChannelPool) checkIfDirectAccessIsAvailable(directAccessDial fu
 		return nil, false
 	}
 
-	err = conn.Prime(p.poolCtx, p.instanceName, p.appProfile, p.featureFlagsMD)
+	err = conn.Prime(p.poolCtx, p.instanceName, p.appProfile, p.directAccessFeatureFlagsMD)
 	if err != nil {
 		btopt.Debugf(p.logger, "bigtable_connpool: Prime() failed during Direct Access check: %v", err)
 		conn.Close()
