@@ -83,6 +83,7 @@ type Client struct {
 	featureFlagsMD          metadata.MD // Pre-computed feature flags metadata to be sent with each request.
 	dynamicScaleMonitor     *btransport.DynamicScaleMonitor
 	connsHealthMonitor      *btransport.ChannelHealthMonitor
+	connsRecycler           *btransport.ConnectionRecycler
 }
 
 // ClientConfig has configurations for the client.
@@ -98,11 +99,17 @@ type ClientConfig struct {
 	// TODO: support user provided meter provider
 	MetricsProvider MetricsProvider
 
-	// If true, enable dynamic channel pool
-	EnableDynamicChannelPool bool
+	// DisableDynamicChannelPool disables the dynamic channel resizing based on load
+	// Dynamic channel resizing  is enabled by default to resize based on load and avoid queuing of requests.
+	DisableDynamicChannelPool bool
 
-	// If true, enable channel health monitor
-	EnableChannelHealthMonitor bool
+	// DisableChannelHealthMonitor disables the automatic connection health checking.
+	// Connection health checking is enabled by default to evict bad connections.
+	DisableChannelHealthMonitor bool
+
+	// DisableConnectionRecycler disables the automatic connection recycling.
+	// Connection recycling is enabled by default to prevent long-lived connection issues.
+	DisableConnectionRecycler bool
 }
 
 // MetricsProvider is a wrapper for built in metrics meter provider
@@ -194,6 +201,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 	var connPoolErr error
 	var dsm *btransport.DynamicScaleMonitor
 	var chm *btransport.ChannelHealthMonitor
+	var connRecycler *btransport.ConnectionRecycler
 	enableBigtableConnPool := btopt.EnableBigtableConnectionPool()
 	if enableBigtableConnPool {
 		fullInstanceName := fmt.Sprintf("projects/%s/instances/%s", project, instance)
@@ -232,7 +240,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 			connPool = btPool
 
 			// Validate dynamic config early if enabled
-			if config.EnableDynamicChannelPool {
+			if !config.DisableDynamicChannelPool {
 				if err := btransport.ValidateDynamicConfig(btopt.DefaultDynamicChannelPoolConfig(), defaultBigtableConnPoolSize); err != nil {
 					return nil, fmt.Errorf("invalid DynamicChannelPoolConfig: %w", err)
 				}
@@ -242,9 +250,15 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 			}
 
 			// channel health monitor
-			if config.EnableChannelHealthMonitor {
+			if !config.DisableChannelHealthMonitor {
 				chm = btransport.NewChannelHealthMonitor(btopt.DefaultHealthCheckConfig(), btPool)
 				chm.Start(ctx) // Start the monitor's background goroutine
+			}
+
+			// connection recyler.
+			if !config.DisableConnectionRecycler {
+				connRecycler = btransport.NewConnectionRecycler(btopt.DefaultConnectionRecycleConfig(), btPool)
+				connRecycler.Start(ctx) // Start the monitor's background goroutine
 			}
 		}
 
@@ -271,6 +285,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		featureFlagsMD:          ffMD,
 		dynamicScaleMonitor:     dsm,
 		connsHealthMonitor:      chm,
+		connsRecycler:           connRecycler,
 	}, nil
 }
 
