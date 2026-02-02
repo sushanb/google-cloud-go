@@ -146,6 +146,12 @@ func (bc *BigtableConn) ipProtocol() string {
 	return ipProtocol(bc.remoteAddrType.Load()).addressType()
 }
 
+// IsDirectAccess reports whether the connection is using ALTS aka Direct Access.
+// best effort basis
+func (bc *BigtableConn) IsDirectAccess() bool {
+	return bc.isALTSConn.Load()
+}
+
 // Prime sends a PingAndWarm request to warm up the connection.
 func (bc *BigtableConn) Prime(ctx context.Context, fullInstanceName, appProfileID string, featureFlagsMd metadata.MD) error {
 	client := btpb.NewBigtableClient(bc.ClientConn)
