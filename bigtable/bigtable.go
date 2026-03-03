@@ -224,7 +224,10 @@ func (t *Table) ReadRows(ctx context.Context, arg RowSet, f func(Row) bool, opts
 	defer func() { trace.EndSpan(ctx, err) }()
 
 	mt := t.newBuiltinMetricsTracer(ctx, true)
-	defer mt.recordOperationCompletion()
+	defer func() {
+		mt.recordOperationCompletion()
+		metricsTracerPool.Put(mt)
+	}()
 
 	err = t.readRows(ctx, arg, f, mt, opts...)
 	statusCode, statusErr := convertToGrpcStatusErr(err)
@@ -905,7 +908,10 @@ func (t *Table) Apply(ctx context.Context, row string, m *Mutation, opts ...Appl
 	ctx = trace.StartSpan(ctx, "cloud.google.com/go/bigtable/Apply")
 	defer func() { trace.EndSpan(ctx, err) }()
 	mt := t.newBuiltinMetricsTracer(ctx, false)
-	defer mt.recordOperationCompletion()
+	defer func() {
+		mt.recordOperationCompletion()
+		metricsTracerPool.Put(mt)
+	}()
 
 	err = t.apply(ctx, mt, row, m, opts...)
 	statusCode, statusErr := convertToGrpcStatusErr(err)
@@ -1137,21 +1143,22 @@ func (ts Timestamp) TruncateToMilliseconds() Timestamp {
 // - then, calls gax.Invoke with 'callWrapper' as an argument
 func gaxInvokeWithRecorder(ctx context.Context, mt *builtinMetricsTracer, method string,
 	f func(ctx context.Context, headerMD, trailerMD *metadata.MD, _ gax.CallSettings) error, opts ...gax.CallOption) error {
-	attemptHeaderMD := metadata.New(nil)
-	attempTrailerMD := metadata.New(nil)
+	var attemptHeaderMD, attempTrailerMD metadata.MD
 	mt.setMethod(method)
 
 	callWrapper := func(ctx context.Context, callSettings gax.CallSettings) error {
 		op := &mt.currOp
-		// Inject cookie and attempt information
-		md := metadata.New(nil)
-		for k, v := range op.cookies {
-			md.Append(k, v)
-		}
 
-		existingMD, _ := metadata.FromOutgoingContext(ctx)
-		finalMD := metadata.Join(existingMD, md)
-		newCtx := metadata.NewOutgoingContext(ctx, finalMD)
+		newCtx := ctx
+
+		// Inject cookie information ONLY if they exist
+		if len(op.cookies) > 0 {
+			kv := make([]string, 0, len(op.cookies)*2)
+			for k, v := range op.cookies {
+				kv = append(kv, k, v)
+			}
+			newCtx = metadata.AppendToOutgoingContext(ctx, kv...)
+		}
 
 		mt.recordAttemptStart()
 

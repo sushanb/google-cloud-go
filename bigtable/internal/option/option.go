@@ -50,31 +50,14 @@ const (
 	BigtableConnectionPoolEnvVar = "CBT_BIGTABLE_CONN_POOL"
 )
 
+const clientAttemptEpochHeader = "bigtable-client-attempt-epoch-usec"
+
 var schemeRegexp = regexp.MustCompile("^(http://|https://|passthrough:///)")
 
-// mergeOutgoingMetadata returns a context populated by the existing outgoing
-// metadata merged with the provided mds.
-func mergeOutgoingMetadata(ctx context.Context, mds ...metadata.MD) context.Context {
-	// There may not be metadata in the context, only insert the existing
-	// metadata if it exists (ok).
-	ctxMD, ok := metadata.FromOutgoingContext(ctx)
-	if ok {
-		// The ordering matters, hence why ctxMD is added to the front.
-		mds = append([]metadata.MD{ctxMD}, mds...)
-	}
+var googleClientInfoMD metadata.MD
 
-	return metadata.NewOutgoingContext(ctx, metadata.Join(mds...))
-}
-
-// withClientAttemptEpochUsec sets the client epoch in usec.
-func withClientAttemptEpochUsec() metadata.MD {
-	return metadata.Pairs("bigtable-client-attempt-epoch-usec", strconv.FormatInt(time.Now().UnixMicro(), 10))
-}
-
-// withGoogleClientInfo sets the name and version of the application in
-// the `x-goog-api-client` header passed on each request. Intended for
-// use by Google-written clients.
-func withGoogleClientInfo() metadata.MD {
+// Compute the static client info exactly once at startup.
+func init() {
 	kv := []string{
 		"gl-go",
 		version.Go(),
@@ -85,14 +68,46 @@ func withGoogleClientInfo() metadata.MD {
 		"gccl",
 		internal.Version,
 	}
-	return metadata.Pairs("x-goog-api-client", gax.XGoogHeader(kv...))
+	googleClientInfoMD = metadata.Pairs("x-goog-api-client", gax.XGoogHeader(kv...))
+}
+
+// mergeOutgoingMetadata returns a context populated by the existing outgoing
+// metadata merged with the provided mds.
+func mergeOutgoingMetadata(ctx context.Context, mds ...metadata.MD) context.Context {
+	// There may not be metadata in the context, only insert the existing
+	// metadata if it exists (ok).
+	ctxMD, ok := metadata.FromOutgoingContext(ctx)
+
+	// there is no existing metadata in ctx.
+	if !ok || len(ctxMD) == 0 {
+		if len(mds) == 1 {
+			return metadata.NewOutgoingContext(ctx, mds[0])
+		}
+		if len(mds) == 0 {
+			return ctx
+		}
+		return metadata.NewOutgoingContext(ctx, metadata.Join(mds...))
+	}
+	// ctx should be enough.
+	if len(mds) == 0 {
+		return ctx
+	}
+
+	// otherwise, join both mds.
+	allMDs := make([]metadata.MD, 0, len(mds)+1)
+	// ctxMD at first
+	allMDs = append(allMDs, ctxMD)
+	allMDs = append(allMDs, mds...)
+	return metadata.NewOutgoingContext(ctx, metadata.Join(allMDs...))
 }
 
 // streamInterceptor intercepts the creation of ClientStream within the bigtable
 // client to inject Google client information into the context metadata for
 // streaming RPCs.
 func streamInterceptor(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-	ctx = mergeOutgoingMetadata(ctx, withGoogleClientInfo(), withClientAttemptEpochUsec())
+	ctx = mergeOutgoingMetadata(ctx, googleClientInfoMD)
+	epochStr := strconv.FormatInt(time.Now().UnixMicro(), 10)
+	ctx = metadata.AppendToOutgoingContext(ctx, clientAttemptEpochHeader, epochStr)
 	return streamer(ctx, desc, cc, method, opts...)
 }
 
@@ -100,7 +115,9 @@ func streamInterceptor(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.Clie
 // client to inject Google client information into the context metadata for
 // unary RPCs.
 func unaryInterceptor(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-	ctx = mergeOutgoingMetadata(ctx, withGoogleClientInfo(), withClientAttemptEpochUsec())
+	ctx = mergeOutgoingMetadata(ctx, googleClientInfoMD)
+	epochStr := strconv.FormatInt(time.Now().UnixMicro(), 10)
+	ctx = metadata.AppendToOutgoingContext(ctx, clientAttemptEpochHeader, epochStr)
 	return invoker(ctx, method, req, reply, cc, opts...)
 }
 

@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
@@ -343,7 +344,10 @@ func (c *Client) PingAndWarm(ctx context.Context) (err error) {
 	ctx = trace.StartSpan(ctx, "cloud.google.com/go/bigtable/PingAndWarm")
 	defer func() { trace.EndSpan(ctx, err) }()
 	mt := c.newBuiltinMetricsTracer(ctx, "", false)
-	defer mt.recordOperationCompletion()
+	defer func() {
+		mt.recordOperationCompletion()
+		metricsTracerPool.Put(mt)
+	}()
 
 	err = c.pingerWithMetadata(ctx, mt)
 	statusCode, statusErr := convertToGrpcStatusErr(err)
@@ -366,7 +370,18 @@ func (c *Client) pingerWithMetadata(ctx context.Context, mt *builtinMetricsTrace
 
 }
 
+var metricsTracerPool = sync.Pool{
+	New: func() interface{} {
+		return new(builtinMetricsTracer)
+	},
+}
+
 func (c *Client) newBuiltinMetricsTracer(ctx context.Context, table string, isStreaming bool) *builtinMetricsTracer {
-	mt := c.metricsTracerFactory.createBuiltinMetricsTracer(ctx, table, isStreaming)
-	return &mt
+	// Fetch a pre-allocated pointer from the pool
+	mt := metricsTracerPool.Get().(*builtinMetricsTracer)
+
+	// Assuming your factory has an initialization/reset method to clear old data:
+	c.metricsTracerFactory.initBuiltinMetricsTracer(mt, ctx, table, isStreaming)
+
+	return mt
 }

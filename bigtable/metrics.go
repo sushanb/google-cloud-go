@@ -582,7 +582,8 @@ func (mt *builtinMetricsTracer) setMethod(m string) {
 // to OpenTelemetry attributes format,
 // - combines these with common client attributes and returns
 func (mt *builtinMetricsTracer) toOtelMetricAttrs(metricName string) (attribute.Set, error) {
-	attrKeyValues := make([]attribute.KeyValue, 0, maxAttrsLen)
+	var attrBuffer [maxAttrsLen]attribute.KeyValue
+	attrKeyValues := attrBuffer[:0]
 	// Create attribute key value pairs for attributes common to all metricss
 	attrKeyValues = append(attrKeyValues,
 		attribute.String(metricLabelKeyMethod, mt.method),
@@ -798,3 +799,45 @@ func (h *latencyStatsHandler) TagConn(ctx context.Context, info *stats.ConnTagIn
 }
 
 func (h *latencyStatsHandler) HandleConn(context.Context, stats.ConnStats) {}
+
+// initBuiltinMetricsTracer resets a pooled tracer to a clean state for a new operation.
+func (tf *builtinMetricsTracerFactory) initBuiltinMetricsTracer(mt *builtinMetricsTracer, ctx context.Context, tableName string, isStreaming bool) {
+	// 1. Reset standard configuration fields
+	mt.ctx = ctx
+	mt.builtInEnabled = tf.enabled
+	mt.clientAttributes = tf.clientAttributes
+
+	// 2. Re-assign instruments (fast pointer copies)
+	mt.instrumentOperationLatencies = tf.operationLatencies
+	mt.instrumentServerLatencies = tf.serverLatencies
+	mt.instrumentAttemptLatencies = tf.attemptLatencies
+	mt.instrumentFirstRespLatencies = tf.firstRespLatencies
+	mt.instrumentAppBlockingLatencies = tf.appBlockingLatencies
+	mt.instrumentClientBlockingLatencies = tf.clientBlockingLatencies
+	mt.instrumentRetryCount = tf.retryCount
+	mt.instrumentConnErrCount = tf.connErrCount
+	mt.instrumentDebugTags = tf.debugTags
+
+	// 3. Reset operation-specific identifiers
+	mt.tableName = tableName
+	mt.method = "" // Will be set later via setMethod
+	mt.isStreaming = isStreaming
+
+	// 4. Zero out the operation state (currOp)
+	mt.currOp.attemptCount = 0
+	mt.currOp.startTime = time.Now()
+	mt.currOp.firstRespTime = time.Time{}
+	mt.currOp.status = ""
+	mt.currOp.currAttempt = attemptTracer{} // Zeroes out the entire embedded struct
+	mt.currOp.appBlockingLatency = 0.0
+
+	// 5. Critically: Clear the cookies map without reallocating it!
+	if mt.currOp.cookies == nil {
+		mt.currOp.cookies = make(map[string]string)
+	} else {
+		// Clears the map while preserving its underlying capacity
+		for k := range mt.currOp.cookies {
+			delete(mt.currOp.cookies, k)
+		}
+	}
+}
