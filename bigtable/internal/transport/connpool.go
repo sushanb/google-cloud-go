@@ -27,6 +27,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,15 +36,18 @@ import (
 	"github.com/googleapis/gax-go/v2"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"golang.org/x/oauth2/google"
 	gtransport "google.golang.org/api/transport/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/alts"
+	"google.golang.org/grpc/credentials/oauth"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
 	"cloud.google.com/go/bigtable/internal/directaccess"
 	btopt "cloud.google.com/go/bigtable/internal/option"
+	gcpmetadata "cloud.google.com/go/compute/metadata"
 
 	"google.golang.org/grpc"
 )
@@ -579,6 +583,7 @@ func (p *BigtableChannelPool) checkIfDirectAccessCompatible() (*BigtableConn, bo
 	if conn.isALTSConn.Load() {
 		ipProtocol := conn.ipProtocol()
 		p.reportDirectAccessSuccess(ipProtocol)
+		go p.investigateDirectAccessFailure(nil)
 		return conn, true
 	}
 
@@ -1191,13 +1196,135 @@ func (p *BigtableChannelPool) investigateDirectAccessFailure(originalErr error) 
 
 	// If the metadata server assigned IPs, but the guest OS hasn't configured any of them on an interface
 	if !v4Plumbed && !v6Plumbed {
-		btopt.Debugf(p.logger, "bigtable_connpool: Direct Access investigation: No metadata IPs are plumbed to local interfaces. Original error: %v", originalErr)
-		p.reportDirectAccessFailure("nic_misconfigured")
-		return
+		btopt.Debugf(p.logger, "bigtable_connpool: Direct Access investigation: Metadata IPs are not plumbed to local interfaces (likely containerized). Relying on kernel default routing.")
 	}
 
 	btopt.Debugf(p.logger, "bigtable_connpool: Direct Access investigation: Running on GCP, metadata reachable, IPs assigned and plumbed, but Direct Access still failed. Original error: %v", originalErr)
-	p.reportDirectAccessFailure("unknown")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	zone, zoneErr := gcpmetadata.ZoneWithContext(ctx)
+	instanceID, idErr := gcpmetadata.InstanceIDWithContext(ctx)
+	btopt.Debugf(p.logger, "bigtable_connpool: Direct Access investigation: Metadata fetch - Zone: %q (err: %v), InstanceID: %q (err: %v)", zone, zoneErr, instanceID, idErr)
+
+	if zoneErr != nil || idErr != nil {
+		btopt.Debugf(p.logger, "bigtable_connpool: Direct Access investigation: Skipping xDS checks (failed to fetch zone or instanceID)")
+		p.reportDirectAccessFailure("metadata_missing")
+		return
+	}
+
+	region := zone
+	if lastDash := strings.LastIndex(zone, "-"); lastDash != -1 {
+		region = zone[:lastDash]
+	}
+
+	btopt.Debugf(p.logger, "bigtable_connpool: Direct Access investigation: Checking xDS reachability for Node %s in %s...", instanceID, zone)
+
+	// Note this is a Multi Regional Directpath address for the given region. Sending PingAndWarm to this address is fine
+	cdsURI := fmt.Sprintf("xdstp://traffic-director-c2p.xds.googleapis.com/envoy.config.cluster.v3.Cluster/%s-bigtable.googleapis.com/eds_cluster", region)
+
+	btopt.Debugf(p.logger, "bigtable_connpool: Direct Access investigation: Checking xDS reachability for Node %s in region %s using URI: %s", instanceID, region, cdsURI)
+	// Run EDS
+	endpoints, failReason, err := directaccess.FetchXdsEndpoints(ctx, instanceID, zone, cdsURI)
+	if err != nil {
+		btopt.Debugf(p.logger, "bigtable_connpool: Direct Access investigation: xDS check failed: %v", err)
+		p.reportDirectAccessFailure(failReason)
+		return
+	}
+
+	if len(endpoints) > 0 {
+		endpoint := endpoints[0]
+		host, _, err := net.SplitHostPort(endpoint)
+
+		if err == nil {
+			ip := net.ParseIP(host)
+			var routeErr error
+
+			if ip != nil && ip.To4() != nil {
+				// If we are in a container and the IPv4 isn't plumbed, pass nil so the kernel picks the Pod IP
+				var srcIP *net.IP
+				if v4Plumbed {
+					srcIP = ipv4
+				}
+				routeErr = directaccess.CheckLocalIPv4Routes(srcIP, endpoint)
+			} else {
+				// Same for IPv6
+				var srcIP *net.IP
+				if v6Plumbed {
+					srcIP = ipv6
+				}
+				routeErr = directaccess.CheckLocalIPv6Routes(srcIP, endpoint)
+			}
+
+			if routeErr != nil {
+				btopt.Debugf(p.logger, "bigtable_connpool: Direct Access investigation: Kernel route check failed to %s: %v", endpoint, routeErr)
+				p.reportDirectAccessFailure("route_unreachable")
+				return
+			}
+			probeErr := p.probeSingleEndpoint(ctx, endpoint)
+			if probeErr != nil {
+				btopt.Debugf(p.logger, "bigtable_connpool: Direct Access investigation: End-to-end ALTS probe failed: %v", probeErr)
+				p.reportDirectAccessFailure("alts_handshake_failed")
+				return
+			}
+		} else {
+			btopt.Debugf(p.logger, "bigtable_connpool: Direct Access investigation: xDS returned 0 endpoints.")
+			p.reportDirectAccessFailure("xds_empty_endpoints")
+			return
+		}
+
+		btopt.Debugf(p.logger, "bigtable_connpool: Direct Access investigation: Running on GCP, metadata reachable, IPs assigned and plumbed, xDS and routes successful, but Direct Access originally failed. Original error: %v", originalErr)
+		p.reportDirectAccessFailure("unknown")
+
+	}
+}
+
+// probeSingleEndpoint attempts an ALTS-authenticated Prime() request directly against a specific IP.
+func (p *BigtableChannelPool) probeSingleEndpoint(ctx context.Context, targetEndpoint string) error {
+	btopt.Debugf(p.logger, "bigtable_connpool: Direct Access investigation: Creating direct ALTS channel to %s...", targetEndpoint)
+
+	altsCreds := alts.NewClientCreds(alts.DefaultClientOptions())
+	// Include both the specific Bigtable scope and the general Cloud Platform scope
+	scopes := []string{
+		"https://www.googleapis.com/auth/bigtable.data",
+		"https://www.googleapis.com/auth/cloud-platform",
+	}
+
+	googleCreds, err := google.FindDefaultCredentials(ctx, scopes...)
+	if err != nil {
+		return fmt.Errorf("failed to find default credentials for probe: %w", err)
+	}
+
+	perRPCCreds := oauth.TokenSource{TokenSource: googleCreds.TokenSource}
+
+	// 1. Create the gRPC Client bypassing normal name resolution, pointing straight at the IP.
+	// We MUST set the authority so ALTS and the Google frontends know we are talking to Bigtable.
+	conn, err := grpc.NewClient(targetEndpoint,
+		grpc.WithTransportCredentials(altsCreds),
+		grpc.WithPerRPCCredentials(perRPCCreds),
+		grpc.WithAuthority("test-bigtable.sandbox.googleapis.com"),
+	)
+	if err != nil {
+		return fmt.Errorf("grpc.NewClient failed for %s: %w", targetEndpoint, err)
+	}
+	defer conn.Close()
+
+	// 2. Wrap it in the internal BigtableConn
+	btc := NewBigtableConn(conn)
+
+	// 3. Attempt a single Prime() request with a strict timeout
+	primeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	btopt.Debugf(p.logger, "bigtable_connpool: Direct Access investigation: Executing ALTS Prime() on %s...", targetEndpoint)
+	err = btc.Prime(primeCtx, p.instanceName, p.appProfile, p.directAccessFeatureFlagsMD)
+	if err != nil {
+		return fmt.Errorf("Prime() failed: %w", err)
+	}
+
+	btopt.Debugf(p.logger, "bigtable_connpool: Direct Access investigation: ALTS Prime() SUCCESS on %s!", targetEndpoint)
+	return nil
 }
 
 type multiError []error
