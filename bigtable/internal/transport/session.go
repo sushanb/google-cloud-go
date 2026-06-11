@@ -106,12 +106,32 @@ type Stream interface {
 	Header() (metadata.MD, error)
 }
 
-// Listener receives Session lifecycle notifications. Implementations must not
-// block in callbacks; dispatch long work to a goroutine.
-type Listener interface {
-	OnStart(ctx context.Context)
-	OnActive(s *Session)
-	OnClose(s *Session, err error)
+// SessionHooks contains optional callbacks invoked at points in a session's
+// lifecycle. Any field may be nil; the session calls only the non-nil hooks.
+// Hooks must not block; dispatch long work to a goroutine. This follows the
+// net/http/httptrace.ClientTrace pattern.
+type SessionHooks struct {
+	OnStart  func(ctx context.Context)
+	OnActive func(s *Session)
+	OnClose  func(s *Session, err error)
+}
+
+func (h SessionHooks) onStart(ctx context.Context) {
+	if h.OnStart != nil {
+		h.OnStart(ctx)
+	}
+}
+
+func (h SessionHooks) onActive(s *Session) {
+	if h.OnActive != nil {
+		h.OnActive(s)
+	}
+}
+
+func (h SessionHooks) onClose(s *Session, err error) {
+	if h.OnClose != nil {
+		h.OnClose(s, err)
+	}
 }
 
 // vrpcResult is the single value delivered to ExecuteVRpc through resultChan.
@@ -142,14 +162,14 @@ type Session struct {
 	logger      *log.Logger
 	logName     string
 	stream      Stream
-	listener    Listener
+	hooks       SessionHooks
 	sessionType SessionType
 	tracer      *sessionTracer
 	vrpcSem     *semaphore.Weighted
 
 	state           State
 	lastStateChange time.Time
-	// closeOnce serializes Listener.OnClose and tracer.recordClose so they
+	// closeOnce serializes hooks.OnClose and tracer.recordClose so they
 	// fire exactly once even if multiple paths race to close the session.
 	closeOnce sync.Once
 
@@ -180,14 +200,15 @@ func WithSessionLogger(logger *log.Logger) SessionOption {
 	return func(s *Session) { s.logger = logger }
 }
 
-// NewSession constructs a Session bound to the given stream and listener.
-func NewSession(logName string, stream Stream, listener Listener, sessionType SessionType, opts ...SessionOption) *Session {
+// NewSession constructs a Session bound to the given stream. Pass a zero-value
+// SessionHooks if you don't need lifecycle callbacks.
+func NewSession(logName string, stream Stream, hooks SessionHooks, sessionType SessionType, opts ...SessionOption) *Session {
 	s := &Session{
 		state:                 StateNew,
 		lastStateChange:       time.Now(),
 		logName:               logName,
 		stream:                stream,
-		listener:              listener,
+		hooks:                 hooks,
 		activeRPCs:            make(map[int64]*vrpcImpl),
 		heartbeatInterval:     defaultHeartbeatInterval,
 		nextHeartbeatDeadline: time.Now().Add(initialHeartbeatGrace),

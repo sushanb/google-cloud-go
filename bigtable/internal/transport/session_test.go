@@ -87,8 +87,8 @@ func (f *fakeStream) snapshotSent() []*spb.SessionRequest {
 	return out
 }
 
-// fakeListener captures lifecycle callbacks.
-type fakeListener struct {
+// hookCounts captures lifecycle callbacks via a SessionHooks value.
+type hookCounts struct {
 	mu          sync.Mutex
 	startCount  int
 	activeCount int
@@ -96,29 +96,31 @@ type fakeListener struct {
 	closeErr    error
 }
 
-func (f *fakeListener) OnStart(ctx context.Context) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.startCount++
+func (c *hookCounts) hooks() SessionHooks {
+	return SessionHooks{
+		OnStart: func(context.Context) {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.startCount++
+		},
+		OnActive: func(*Session) {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.activeCount++
+		},
+		OnClose: func(_ *Session, err error) {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.closeCount++
+			c.closeErr = err
+		},
+	}
 }
 
-func (f *fakeListener) OnActive(s *Session) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.activeCount++
-}
-
-func (f *fakeListener) OnClose(s *Session, err error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.closeCount++
-	f.closeErr = err
-}
-
-func (f *fakeListener) counts() (start, active, closed int) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.startCount, f.activeCount, f.closeCount
+func (c *hookCounts) counts() (start, active, closed int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.startCount, c.activeCount, c.closeCount
 }
 
 // fakeDesc is a minimal VRpcDescriptor for ExecuteVRpc tests.
@@ -132,9 +134,9 @@ func (f *fakeDesc) Method() string                              { return f.metho
 func (f *fakeDesc) Encode(req interface{}) ([]byte, error)      { return f.enc(req) }
 func (f *fakeDesc) Decode(buf []byte) (interface{}, error)      { return f.dec(buf) }
 
-func newTestSession(t *testing.T, stream Stream, listener Listener) *Session {
+func newTestSession(t *testing.T, stream Stream, hooks SessionHooks) *Session {
 	t.Helper()
-	return NewSession("test-session", stream, listener, SessionTypeTable)
+	return NewSession("test-session", stream, hooks, SessionTypeTable)
 }
 
 // waitFor polls cond every 5ms up to timeout, failing the test if cond never
@@ -180,8 +182,7 @@ func TestState_String(t *testing.T) {
 
 func TestNewSession_Defaults(t *testing.T) {
 	stream := newFakeStream()
-	listener := &fakeListener{}
-	s := NewSession("log", stream, listener, SessionTypeAuthorizedView)
+	s := NewSession("log", stream, SessionHooks{}, SessionTypeAuthorizedView)
 
 	if got := s.State(); got != StateNew {
 		t.Errorf("initial state = %v, want StateNew", got)
@@ -268,10 +269,10 @@ func TestUnavailable_WrapsCauseAndStatus(t *testing.T) {
 
 // makeActive constructs a session and forces it into StateActive without going
 // through the handshake.
-func makeActive(t *testing.T, listener Listener) (*Session, *fakeStream) {
+func makeActive(t *testing.T, hooks SessionHooks) (*Session, *fakeStream) {
 	t.Helper()
 	stream := newFakeStream()
-	s := newTestSession(t, stream, listener)
+	s := newTestSession(t, stream, hooks)
 	s.mu.Lock()
 	s.state = StateActive
 	s.mu.Unlock()
@@ -280,8 +281,8 @@ func makeActive(t *testing.T, listener Listener) (*Session, *fakeStream) {
 
 func TestHandleOpenSession_TransitionsToActive(t *testing.T) {
 	stream := newFakeStream()
-	listener := &fakeListener{}
-	s := newTestSession(t, stream, listener)
+	listener := &hookCounts{}
+	s := newTestSession(t, stream, listener.hooks())
 	s.mu.Lock()
 	s.state = StateStarting
 	s.mu.Unlock()
@@ -303,7 +304,7 @@ func TestHandleOpenSession_TransitionsToActive(t *testing.T) {
 }
 
 func TestHandleVRPCResponse_RoutesByRpcID(t *testing.T) {
-	s, _ := makeActive(t, &fakeListener{})
+	s, _ := makeActive(t, SessionHooks{})
 
 	rpc := &vrpcImpl{id: 7, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
 	s.mu.Lock()
@@ -329,7 +330,7 @@ func TestHandleVRPCResponse_RoutesByRpcID(t *testing.T) {
 }
 
 func TestHandleVRPCErrorResponse_RoutesByRpcID(t *testing.T) {
-	s, _ := makeActive(t, &fakeListener{})
+	s, _ := makeActive(t, SessionHooks{})
 
 	rpc := &vrpcImpl{id: 3, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
 	s.mu.Lock()
@@ -359,8 +360,8 @@ func TestHandleVRPCErrorResponse_RoutesByRpcID(t *testing.T) {
 }
 
 func TestHandleErrorResponse_SessionFatalForcesClose(t *testing.T) {
-	listener := &fakeListener{}
-	s, _ := makeActive(t, listener)
+	listener := &hookCounts{}
+	s, _ := makeActive(t, listener.hooks())
 
 	// Pre-existing in-flight RPC; should be cancelled by ForceClose.
 	rpc := &vrpcImpl{id: 11, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
@@ -390,7 +391,7 @@ func TestHandleErrorResponse_SessionFatalForcesClose(t *testing.T) {
 }
 
 func TestHandleGoAway_CancelsBeyondAdmitted(t *testing.T) {
-	s, _ := makeActive(t, &fakeListener{})
+	s, _ := makeActive(t, SessionHooks{})
 
 	// rpc 1 and 2 admitted; 3 and 4 should be cancelled.
 	for _, id := range []int64{1, 2, 3, 4} {
@@ -419,7 +420,7 @@ func TestHandleGoAway_CancelsBeyondAdmitted(t *testing.T) {
 }
 
 func TestHandleSessionParameters_UpdatesIntervalAndDeadline(t *testing.T) {
-	s, _ := makeActive(t, &fakeListener{})
+	s, _ := makeActive(t, SessionHooks{})
 	before := time.Now()
 
 	s.handleSessionParameters(&spb.SessionParametersResponse{
@@ -452,7 +453,7 @@ func TestHandleSessionParameters_UpdatesIntervalAndDeadline(t *testing.T) {
 }
 
 func TestHandleSessionRefreshConfig_Stored(t *testing.T) {
-	s, _ := makeActive(t, &fakeListener{})
+	s, _ := makeActive(t, SessionHooks{})
 
 	cfg := &spb.SessionRefreshConfig{
 		OptimizedOpenRequest: &spb.OpenSessionRequest{ProtocolVersion: 7},
@@ -466,7 +467,7 @@ func TestHandleSessionRefreshConfig_Stored(t *testing.T) {
 }
 
 func TestHandleSessionResponse_UnknownDoesNotResetDeadline(t *testing.T) {
-	s, _ := makeActive(t, &fakeListener{})
+	s, _ := makeActive(t, SessionHooks{})
 	s.mu.Lock()
 	s.nextHeartbeatDeadline = time.Unix(0, 0) // way in the past
 	s.mu.Unlock()
@@ -509,7 +510,7 @@ func newRoundTripDesc() *fakeDesc {
 
 func TestExecuteVRpc_RejectsWhenNotActive(t *testing.T) {
 	stream := newFakeStream()
-	s := newTestSession(t, stream, &fakeListener{}) // state = New
+	s := newTestSession(t, stream, SessionHooks{}) // state = New
 	_, _, err := s.ExecuteVRpc(context.Background(), newRoundTripDesc(), "hello")
 	if !errors.Is(err, ErrSessionNotActive) {
 		t.Errorf("err = %v, want ErrSessionNotActive in chain", err)
@@ -520,8 +521,7 @@ func TestExecuteVRpc_RejectsWhenNotActive(t *testing.T) {
 }
 
 func TestExecuteVRpc_HappyPath(t *testing.T) {
-	listener := &fakeListener{}
-	s, stream := makeActive(t, listener)
+	s, stream := makeActive(t, SessionHooks{})
 	desc := newRoundTripDesc()
 
 	done := make(chan struct{})
@@ -564,7 +564,7 @@ func TestExecuteVRpc_HappyPath(t *testing.T) {
 }
 
 func TestExecuteVRpc_ContextCancel(t *testing.T) {
-	s, _ := makeActive(t, &fakeListener{})
+	s, _ := makeActive(t, SessionHooks{})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -579,7 +579,7 @@ func TestExecuteVRpc_SendFailureCleansUpMap(t *testing.T) {
 	stream.sendFn = func(req *spb.SessionRequest) error {
 		return fmt.Errorf("network down")
 	}
-	s := newTestSession(t, stream, &fakeListener{})
+	s := newTestSession(t, stream, SessionHooks{})
 	s.mu.Lock()
 	s.state = StateActive
 	s.mu.Unlock()
@@ -599,8 +599,8 @@ func TestExecuteVRpc_SendFailureCleansUpMap(t *testing.T) {
 // --- Close / ForceClose ------------------------------------------------------
 
 func TestForceClose_Idempotent(t *testing.T) {
-	listener := &fakeListener{}
-	s, _ := makeActive(t, listener)
+	listener := &hookCounts{}
+	s, _ := makeActive(t, listener.hooks())
 
 	s.ForceClose(nil)
 	s.ForceClose(nil)
@@ -615,7 +615,7 @@ func TestForceClose_Idempotent(t *testing.T) {
 }
 
 func TestForceClose_CancelsInflightWithReason(t *testing.T) {
-	s, _ := makeActive(t, &fakeListener{})
+	s, _ := makeActive(t, SessionHooks{})
 	rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
 	s.mu.Lock()
 	s.activeRPCs[1] = rpc
@@ -638,7 +638,7 @@ func TestForceClose_CancelsInflightWithReason(t *testing.T) {
 
 func TestClose_Graceful_NoInflightSendsCloseRequest(t *testing.T) {
 	stream := newFakeStream()
-	s := newTestSession(t, stream, &fakeListener{})
+	s := newTestSession(t, stream, SessionHooks{})
 	s.mu.Lock()
 	s.state = StateActive
 	s.mu.Unlock()
@@ -659,7 +659,7 @@ func TestClose_Graceful_NoInflightSendsCloseRequest(t *testing.T) {
 
 func TestClose_AlreadyClosingIsNoop(t *testing.T) {
 	stream := newFakeStream()
-	s := newTestSession(t, stream, &fakeListener{})
+	s := newTestSession(t, stream, SessionHooks{})
 	s.mu.Lock()
 	s.state = StateClosed
 	s.mu.Unlock()
@@ -676,8 +676,7 @@ func TestClose_AlreadyClosingIsNoop(t *testing.T) {
 }
 
 func TestClose_CtxCancelDuringDrainForceCloses(t *testing.T) {
-	listener := &fakeListener{}
-	s, _ := makeActive(t, listener)
+	s, _ := makeActive(t, SessionHooks{})
 	// Pin an in-flight RPC so the drain loop is forced to wait.
 	rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
 	s.mu.Lock()
@@ -716,8 +715,7 @@ func TestClose_CtxCancelDuringDrainForceCloses(t *testing.T) {
 // --- heartbeat ---------------------------------------------------------------
 
 func TestHeartBeatLoop_ForceClosesOnMissedHeartbeat(t *testing.T) {
-	listener := &fakeListener{}
-	s, _ := makeActive(t, listener)
+	s, _ := makeActive(t, SessionHooks{})
 	rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
 	s.mu.Lock()
 	s.activeRPCs[1] = rpc
@@ -741,7 +739,7 @@ func TestHeartBeatLoop_ForceClosesOnMissedHeartbeat(t *testing.T) {
 }
 
 func TestHeartBeatLoop_ExitsOnCtxCancel(t *testing.T) {
-	s, _ := makeActive(t, &fakeListener{})
+	s, _ := makeActive(t, SessionHooks{})
 	s.mu.Lock()
 	s.nextHeartbeatDeadline = time.Now().Add(time.Hour) // never expires
 	s.mu.Unlock()
@@ -766,7 +764,7 @@ func TestHeartBeatLoop_ExitsOnCtxCancel(t *testing.T) {
 // --- peerInfoExtracter -------------------------------------------------------
 
 func TestPeerInfoExtracter_ParsesValidHeader(t *testing.T) {
-	s := newTestSession(t, newFakeStream(), &fakeListener{})
+	s := newTestSession(t, newFakeStream(), SessionHooks{})
 
 	pi := &spb.PeerInfo{
 		ApplicationFrontendSubzone: "us-central1-a",
@@ -793,7 +791,7 @@ func TestPeerInfoExtracter_ParsesValidHeader(t *testing.T) {
 }
 
 func TestPeerInfoExtracter_EmptyAndBadInputs(t *testing.T) {
-	s := newTestSession(t, newFakeStream(), &fakeListener{})
+	s := newTestSession(t, newFakeStream(), SessionHooks{})
 
 	s.peerInfoExtracter(nil)
 	s.peerInfoExtracter([]string{})
@@ -811,8 +809,8 @@ func TestPeerInfoExtracter_EmptyAndBadInputs(t *testing.T) {
 
 func TestStart_HandshakeAndClose(t *testing.T) {
 	stream := newFakeStream()
-	listener := &fakeListener{}
-	s := newTestSession(t, stream, listener)
+	listener := &hookCounts{}
+	s := newTestSession(t, stream, listener.hooks())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -843,7 +841,7 @@ func TestStart_HandshakeAndClose(t *testing.T) {
 }
 
 func TestStart_RejectsIfNotNew(t *testing.T) {
-	s, _ := makeActive(t, &fakeListener{})
+	s, _ := makeActive(t, SessionHooks{})
 	if err := s.Start(context.Background(), &spb.OpenSessionRequest{}); err == nil {
 		t.Error("Start on active session should return error")
 	}

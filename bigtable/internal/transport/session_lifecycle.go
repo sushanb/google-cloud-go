@@ -49,9 +49,7 @@ func (s *Session) Start(ctx context.Context, req *spb.OpenSessionRequest) error 
 	go s.readLoop(ctx)
 	go s.heartBeatLoop(ctx)
 
-	if s.listener != nil {
-		s.listener.OnStart(ctx)
-	}
+	s.hooks.onStart(ctx)
 	return nil
 }
 
@@ -77,9 +75,7 @@ func (s *Session) ForceClose(req *spb.CloseSessionRequest) {
 func (s *Session) notifyClosed(streamErr error) {
 	s.closeOnce.Do(func() {
 		s.tracer.recordClose(context.Background())
-		if s.listener != nil {
-			s.listener.OnClose(s, streamErr)
-		}
+		s.hooks.onClose(s, streamErr)
 	})
 }
 
@@ -204,9 +200,7 @@ func (s *Session) handleOpenSession(_ *spb.OpenSessionResponse) {
 		return
 	}
 	s.tracer.recordOpen(context.Background(), nil)
-	if s.listener != nil {
-		s.listener.OnActive(s)
-	}
+	s.hooks.onActive(s)
 }
 
 // handleErrorResponse splits per-RPC errors (rpc_id != 0) from session-level
