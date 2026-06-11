@@ -31,15 +31,9 @@ const peerInfoHeaderKey = "bigtable-peer-info"
 // session closed. Unblocking the underlying Recv requires the caller to also
 // cancel the stream's context.
 func (s *Session) Start(ctx context.Context, req *spb.OpenSessionRequest) error {
-	s.mu.Lock()
-	if s.state != StateNew {
-		st := s.state
-		s.mu.Unlock()
-		return fmt.Errorf("session already started or closed (state: %v)", st)
+	if prev, ok := s.transitionTo(StateStarting, isState(StateNew)); !ok {
+		return fmt.Errorf("session already started or closed (state: %v)", prev)
 	}
-	s.state = StateStarting
-	s.lastStateChange = time.Now()
-	s.mu.Unlock()
 
 	openReq := &spb.SessionRequest{
 		Payload: &spb.SessionRequest_OpenSession{OpenSession: req},
@@ -65,92 +59,60 @@ func (s *Session) Start(ctx context.Context, req *spb.OpenSessionRequest) error 
 // every in-flight RPC. It is safe to call multiple times; only the first call
 // fires listener/tracer callbacks.
 func (s *Session) ForceClose(req *spb.CloseSessionRequest) {
-	s.mu.Lock()
-	if s.state == StateClosed {
-		s.mu.Unlock()
+	if _, ok := s.transitionTo(StateClosed, notState(StateClosed)); !ok {
 		return
 	}
-	s.state = StateClosed
-	s.lastStateChange = time.Now()
-	s.mu.Unlock()
 
 	desc := "session force closed"
 	if req != nil && req.Description != "" {
-		desc = fmt.Sprintf("session force closed: %s", req.Description)
+		desc = "session force closed: " + req.Description
 	}
-	cause := closeReasonToCause(req)
-	s.cancelActiveRPCs(unavailable(cause, "%s", desc), nil)
-
+	s.cancelActiveRPCs(unavailable(closeReasonToCause(req), "%s", desc), nil)
+	s.signalQuiescent()
 	s.notifyClosed(nil)
 }
 
 // notifyClosed fires tracer.recordClose and listener.OnClose exactly once over
-// the lifetime of a Session, regardless of how many code paths race to close.
+// the lifetime of a Session.
 func (s *Session) notifyClosed(streamErr error) {
-	s.mu.Lock()
-	if s.closeNotified {
-		s.mu.Unlock()
-		return
-	}
-	s.closeNotified = true
-	s.mu.Unlock()
-
-	s.tracer.recordClose(context.Background())
-	if s.listener != nil {
-		s.listener.OnClose(s, streamErr)
-	}
+	s.closeOnce.Do(func() {
+		s.tracer.recordClose(context.Background())
+		if s.listener != nil {
+			s.listener.OnClose(s, streamErr)
+		}
+	})
 }
 
 // Close requests a graceful shutdown: it transitions to StateClosing, waits
-// for in-flight RPCs to drain (or for ctx to fire), sends CloseSessionRequest,
-// and transitions to StateWaitServerClose. The server's EOF eventually drives
-// handleClose, which moves to StateClosed.
+// for in-flight RPCs to drain (or for ctx to fire), then sends
+// CloseSessionRequest. The server's EOF eventually drives handleClose, which
+// moves to StateClosed.
 func (s *Session) Close(ctx context.Context, req *spb.CloseSessionRequest) error {
-	s.mu.Lock()
-	switch s.state {
-	case StateClosed, StateClosing, StateWaitServerClose:
-		s.mu.Unlock()
+	if _, ok := s.transitionTo(StateClosing, isState(StateNew, StateStarting, StateActive)); !ok {
 		return nil
 	}
-	s.state = StateClosing
-	s.lastStateChange = time.Now()
-	s.mu.Unlock()
 
-	ticker := time.NewTicker(closeDrainPollPeriod)
-	defer ticker.Stop()
-	for {
-		s.mu.Lock()
-		state := s.state
-		active := len(s.activeRPCs)
-		s.mu.Unlock()
-		// If a concurrent ForceClose flipped us to StateClosed during the drain,
-		// stop trying to advance to WaitServerClose; the close is already done.
-		if state == StateClosed {
-			return nil
-		}
-		if active == 0 {
-			break
-		}
+	// Wait for active RPCs to drain. The quiescent channel is closed by the
+	// last RPC's cleanup defer when it sees state==Closing && empty, or by
+	// ForceClose if it races us.
+	s.mu.Lock()
+	empty := len(s.activeRPCs) == 0
+	s.mu.Unlock()
+	if empty {
+		s.signalQuiescent()
+	} else {
 		select {
+		case <-s.quiescent:
 		case <-ctx.Done():
-			// Propagate ctx error as the close cause; ignore req-derived cause
-			// because the user's req describes intent, not the actual failure.
 			s.ForceClose(nil)
 			return ctx.Err()
-		case <-ticker.C:
 		}
 	}
 
-	// Only advance to WaitServerClose if we are still in Closing; ForceClose
-	// may have raced us in between the drain check and this transition.
-	s.mu.Lock()
-	if s.state != StateClosing {
-		s.mu.Unlock()
+	// If ForceClose raced us during the drain, our work is done.
+	if s.State() == StateClosed {
 		return nil
 	}
-	s.state = StateWaitServerClose
-	s.lastStateChange = time.Now()
-	s.mu.Unlock()
 
 	closeReq := &spb.SessionRequest{
 		Payload: &spb.SessionRequest_CloseSession{CloseSession: req},
@@ -238,16 +200,7 @@ func (s *Session) handleSessionResponse(resp *spb.SessionResponse) {
 
 // handleOpenSession transitions Starting -> Active and signals listeners.
 func (s *Session) handleOpenSession(_ *spb.OpenSessionResponse) {
-	s.mu.Lock()
-	starting := s.state == StateStarting
-	if starting {
-		s.state = StateActive
-		s.lastStateChange = time.Now()
-		close(s.handshakeDone)
-	}
-	s.mu.Unlock()
-
-	if !starting {
+	if _, ok := s.transitionTo(StateActive, isState(StateStarting)); !ok {
 		return
 	}
 	s.tracer.recordOpen(context.Background(), nil)
@@ -303,12 +256,10 @@ func (s *Session) handleSessionRefreshConfig(cfg *spb.SessionRefreshConfig) {
 }
 
 // handleGoAway transitions to StateClosing and cancels every RPC with an id
-// greater than the last admitted one.
+// greater than the last admitted one. A late-arriving GOAWAY from an already
+// terminal session is ignored — we do not move backwards.
 func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
-	s.mu.Lock()
-	s.state = StateClosing
-	s.lastStateChange = time.Now()
-	s.mu.Unlock()
+	s.transitionTo(StateClosing, notState(StateClosing, StateClosed))
 
 	lastAdmitted := goAway.GetLastRpcIdAdmitted()
 	s.debugf("received GOAWAY reason=%q description=%q last_rpc_id_admitted=%d",
@@ -322,25 +273,11 @@ func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
 // handleClose is invoked when Recv returns an error. It transitions to
 // StateClosed and cancels every remaining in-flight RPC.
 func (s *Session) handleClose(err error) {
-	s.mu.Lock()
-	if s.state == StateClosed {
-		s.mu.Unlock()
+	if _, ok := s.transitionTo(StateClosed, notState(StateClosed)); !ok {
 		return
 	}
-	wasStarting := s.state == StateStarting || s.state == StateNew
-	s.state = StateClosed
-	s.lastStateChange = time.Now()
-	if wasStarting {
-		s.handshakeErr = err
-		select {
-		case <-s.handshakeDone:
-		default:
-			close(s.handshakeDone)
-		}
-	}
-	s.mu.Unlock()
-
 	s.cancelActiveRPCs(unavailable(err, "session closed: %v", err), nil)
+	s.signalQuiescent()
 	s.notifyClosed(err)
 }
 
@@ -353,30 +290,40 @@ func (s *Session) resetHeartbeatDeadline() {
 	s.mu.Unlock()
 }
 
-// heartBeatLoop polls at heartbeatPollPeriod and force-closes the session if
-// nextHeartbeatDeadline has elapsed.
+// heartBeatLoop watches the session's heartbeat deadline using a single Timer
+// that re-arms itself when a frame extends the deadline. It is the only
+// place that calls ForceClose for missed heartbeats.
 func (s *Session) heartBeatLoop(ctx context.Context) {
-	ticker := time.NewTicker(heartbeatPollPeriod)
-	defer ticker.Stop()
+	s.mu.Lock()
+	deadline := s.nextHeartbeatDeadline
+	s.mu.Unlock()
+
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			s.mu.Lock()
 			if s.state == StateClosed {
 				s.mu.Unlock()
 				return
 			}
-			missed := time.Now().After(s.nextHeartbeatDeadline)
+			remaining := time.Until(s.nextHeartbeatDeadline)
 			s.mu.Unlock()
-			if missed {
-				s.ForceClose(&spb.CloseSessionRequest{
-					Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_MISSED_HEARTBEAT,
-					Description: "client terminated session due to missed server heartbeats",
-				})
-				return
+			if remaining > 0 {
+				// Deadline was pushed out while we were sleeping; re-arm.
+				// timer.C was just drained, so Reset is safe here.
+				timer.Reset(remaining)
+				continue
 			}
+			s.ForceClose(&spb.CloseSessionRequest{
+				Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_MISSED_HEARTBEAT,
+				Description: "client terminated session due to missed server heartbeats",
+			})
+			return
 		}
 	}
 }

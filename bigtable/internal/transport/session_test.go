@@ -168,7 +168,6 @@ func TestState_String(t *testing.T) {
 		{StateStarting, "Starting"},
 		{StateActive, "Active"},
 		{StateClosing, "Closing"},
-		{StateWaitServerClose, "WaitServerClose"},
 		{StateClosed, "Closed"},
 		{State(99), "Unknown"},
 	}
@@ -196,8 +195,8 @@ func TestNewSession_Defaults(t *testing.T) {
 	if s.activeRPCs == nil {
 		t.Error("activeRPCs map not initialized")
 	}
-	if s.handshakeDone == nil {
-		t.Error("handshakeDone channel not initialized")
+	if s.quiescent == nil {
+		t.Error("quiescent channel not initialized")
 	}
 	if s.heartbeatInterval != defaultHeartbeatInterval {
 		t.Errorf("heartbeatInterval = %v, want %v", s.heartbeatInterval, defaultHeartbeatInterval)
@@ -295,14 +294,8 @@ func TestHandleOpenSession_TransitionsToActive(t *testing.T) {
 	if _, active, _ := listener.counts(); active != 1 {
 		t.Errorf("OnActive called %d times, want 1", active)
 	}
-	select {
-	case <-s.handshakeDone:
-	default:
-		t.Error("handshakeDone not closed")
-	}
 
-	// Re-delivery (idempotent): no extra listener firings, no panic on
-	// closed channel.
+	// Re-delivery (idempotent): no extra listener firings.
 	s.handleOpenSession(&spb.OpenSessionResponse{})
 	if _, active, _ := listener.counts(); active != 1 {
 		t.Errorf("OnActive called %d times after re-delivery, want 1", active)
@@ -655,8 +648,8 @@ func TestClose_Graceful_NoInflightSendsCloseRequest(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Close returned error: %v", err)
 	}
-	if got := s.State(); got != StateWaitServerClose {
-		t.Errorf("state = %v, want StateWaitServerClose", got)
+	if got := s.State(); got != StateClosing {
+		t.Errorf("state = %v, want StateClosing", got)
 	}
 	sent := stream.snapshotSent()
 	if len(sent) != 1 || sent[0].GetCloseSession() == nil {

@@ -41,8 +41,6 @@ const multiPlexingLimit = 1
 const (
 	defaultHeartbeatInterval = 10 * time.Second
 	initialHeartbeatGrace    = 30 * time.Minute
-	heartbeatPollPeriod      = 50 * time.Millisecond
-	closeDrainPollPeriod     = 10 * time.Millisecond
 )
 
 // Sentinel session-level error codes. They are wrapped in a gRPC Unavailable
@@ -63,7 +61,9 @@ var (
 	ErrUnavailableSessionError = errors.New("bigtable: session unavailable: server reported session error")
 )
 
-// State represents the lifecycle state of a Session.
+// State represents the lifecycle state of a Session. Sessions move strictly
+// forward through the values; once StateClosed is reached the session is
+// terminal.
 type State int
 
 const (
@@ -73,11 +73,10 @@ const (
 	StateStarting
 	// StateActive indicates the session is active and ready for RPCs.
 	StateActive
-	// StateClosing indicates the session is in the process of closing.
+	// StateClosing indicates the session is draining and shutting down. It
+	// covers both the pre-CloseSession drain and the post-CloseSession wait
+	// for the server's EOF.
 	StateClosing
-	// StateWaitServerClose indicates the session has requested close and is
-	// waiting for the server-side EOF.
-	StateWaitServerClose
 	// StateClosed indicates the session is closed.
 	StateClosed
 )
@@ -93,8 +92,6 @@ func (s State) String() string {
 		return "Active"
 	case StateClosing:
 		return "Closing"
-	case StateWaitServerClose:
-		return "WaitServerClose"
 	case StateClosed:
 		return "Closed"
 	default:
@@ -152,24 +149,26 @@ type Session struct {
 
 	state           State
 	lastStateChange time.Time
-	// closeNotified is set the first time the session transitions to
-	// StateClosed, so Listener.OnClose and tracer.recordClose fire exactly
-	// once even if multiple paths race to close.
-	closeNotified bool
+	// closeOnce serializes Listener.OnClose and tracer.recordClose so they
+	// fire exactly once even if multiple paths race to close the session.
+	closeOnce sync.Once
 
 	activeRPCs map[int64]*vrpcImpl
 
 	heartbeatInterval     time.Duration
 	nextHeartbeatDeadline time.Time
 
+	// quiescent is closed when no vRPCs remain in activeRPCs after the
+	// session enters StateClosing, or when ForceClose runs. Close() waits on
+	// it to drain in-flight RPCs without polling.
+	quiescent     chan struct{}
+	quiescentOnce sync.Once
+
 	peerInfo      *spb.PeerInfo
 	refreshConfig *spb.SessionRefreshConfig
 
 	hasOkRpcs    bool
 	hasErrorRpcs bool
-
-	handshakeDone chan struct{}
-	handshakeErr  error
 }
 
 // SessionOption configures a Session at construction time.
@@ -192,7 +191,7 @@ func NewSession(logName string, stream Stream, listener Listener, sessionType Se
 		activeRPCs:            make(map[int64]*vrpcImpl),
 		heartbeatInterval:     defaultHeartbeatInterval,
 		nextHeartbeatDeadline: time.Now().Add(initialHeartbeatGrace),
-		handshakeDone:         make(chan struct{}),
+		quiescent:             make(chan struct{}),
 		tracer:                newSessionTracer(sessionType),
 		sessionType:           sessionType,
 		vrpcSem:               semaphore.NewWeighted(multiPlexingLimit),
@@ -215,11 +214,6 @@ func (s *Session) State() State {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.state
-}
-
-// StateString returns the current state as a human-readable string.
-func (s *Session) StateString() string {
-	return s.State().String()
 }
 
 // PeerInfo returns the peer info, or nil if it has not been parsed yet.
@@ -257,6 +251,51 @@ func (s *Session) debugf(format string, args ...interface{}) {
 		return
 	}
 	btopt.Debugf(s.logger, "bigtable_session %s: "+format, append([]interface{}{s.logName}, args...)...)
+}
+
+// transitionTo sets the session state to `to` iff ok(currentState) returns
+// true. Returns the previous state and whether the transition was applied.
+// All callers using this helper share the same lock/timestamp/transition
+// pattern, so adding/removing transitions does not duplicate that bookkeeping.
+func (s *Session) transitionTo(to State, ok func(State) bool) (prev State, applied bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev = s.state
+	if !ok(prev) {
+		return prev, false
+	}
+	s.state = to
+	s.lastStateChange = time.Now()
+	return prev, true
+}
+
+// isState returns a predicate matching any of `allowed`.
+func isState(allowed ...State) func(State) bool {
+	return func(s State) bool {
+		for _, a := range allowed {
+			if s == a {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// notState returns a predicate matching any state NOT in `forbidden`.
+func notState(forbidden ...State) func(State) bool {
+	return func(s State) bool {
+		for _, f := range forbidden {
+			if s == f {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+// signalQuiescent closes the quiescent channel exactly once.
+func (s *Session) signalQuiescent() {
+	s.quiescentOnce.Do(func() { close(s.quiescent) })
 }
 
 // sessionErr couples a gRPC Unavailable status with a sentinel cause so that

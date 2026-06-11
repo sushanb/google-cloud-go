@@ -63,7 +63,11 @@ func (s *Session) ExecuteVRpc(ctx context.Context, desc VRpcDescriptor, req inte
 	defer func() {
 		s.mu.Lock()
 		delete(s.activeRPCs, rpcID)
+		drained := s.state == StateClosing && len(s.activeRPCs) == 0
 		s.mu.Unlock()
+		if drained {
+			s.signalQuiescent()
+		}
 	}()
 
 	// Reset the heartbeat deadline whenever we send an outbound frame: the
