@@ -733,8 +733,41 @@ func TestHeartBeatLoop_ForceClosesOnMissedHeartbeat(t *testing.T) {
 		if !errors.Is(res.err, ErrUnavailableHeartBeatMissed) {
 			t.Errorf("cancelled cause = %v, want ErrUnavailableHeartBeatMissed", res.err)
 		}
+		if code := status.Code(res.err); code != codes.Unavailable {
+			t.Errorf("status.Code = %v, want Unavailable (so existing retry plumbing applies)", code)
+		}
 	default:
 		t.Error("in-flight RPC not cancelled on heartbeat miss")
+	}
+}
+
+func TestHeartBeatLoop_HeartbeatsKeepInflightVRPCAlive(t *testing.T) {
+	// Positive case: while a VRPC is in flight and the server is sending
+	// Heartbeats, the watchdog must NOT fire. This proves the dispatch in
+	// handleSessionResponse correctly resets the deadline on every
+	// recognized frame.
+	s, _ := makeActive(t, SessionHooks{})
+	s.mu.Lock()
+	s.heartbeatInterval = 30 * time.Millisecond
+	s.nextHeartbeatDeadline = time.Now().Add(90 * time.Millisecond) // 3 * interval
+	s.activeRPCs[1] = &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
+	s.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.heartBeatLoop(ctx)
+
+	// Pump heartbeats for longer than 3*interval; without the deadline
+	// reset on each frame, the watchdog would have fired by now.
+	for i := 0; i < 8; i++ {
+		time.Sleep(25 * time.Millisecond)
+		s.handleSessionResponse(&spb.SessionResponse{
+			Payload: &spb.SessionResponse_Heartbeat{Heartbeat: &spb.HeartbeatResponse{}},
+		})
+	}
+
+	if got := s.State(); got != StateActive {
+		t.Errorf("session torn down despite arriving heartbeats; state = %v", got)
 	}
 }
 
