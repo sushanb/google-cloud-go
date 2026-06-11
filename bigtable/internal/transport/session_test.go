@@ -738,6 +738,37 @@ func TestHeartBeatLoop_ForceClosesOnMissedHeartbeat(t *testing.T) {
 	}
 }
 
+func TestHeartBeatLoop_IdleSessionIsNotTornDown(t *testing.T) {
+	// Server sends Heartbeats only during in-flight VRPCs. An idle session
+	// with an elapsed deadline must NOT be force-closed; the loop should
+	// keep checking until activity returns.
+	s, _ := makeActive(t, SessionHooks{})
+	s.mu.Lock()
+	s.heartbeatInterval = 20 * time.Millisecond // make idle re-check fast
+	s.nextHeartbeatDeadline = time.Now().Add(-time.Hour)
+	s.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		s.heartBeatLoop(ctx)
+		close(done)
+	}()
+
+	// Give the loop time to wake up several times on the idle interval.
+	time.Sleep(150 * time.Millisecond)
+	if s.State() == StateClosed {
+		t.Fatal("idle session was force-closed despite having no in-flight VRPCs")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("heartBeatLoop did not exit on ctx cancel")
+	}
+}
+
 func TestHeartBeatLoop_ExitsOnCtxCancel(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 	s.mu.Lock()

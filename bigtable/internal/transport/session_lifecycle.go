@@ -182,7 +182,8 @@ func (s *Session) handleSessionResponse(resp *spb.SessionResponse) {
 	case *spb.SessionResponse_SessionParameters:
 		s.handleSessionParameters(p.SessionParameters)
 	case *spb.SessionResponse_Heartbeat:
-		// No-op; the deadline reset below is the only effect.
+		// Server emits Heartbeats during long-running VRPCs; the deadline
+		// reset below is what keeps the watchdog from firing on them.
 	case *spb.SessionResponse_GoAway:
 		s.handleGoAway(p.GoAway)
 	case *spb.SessionResponse_SessionRefreshConfig:
@@ -285,8 +286,10 @@ func (s *Session) resetHeartbeatDeadline() {
 }
 
 // heartBeatLoop watches the session's heartbeat deadline using a single Timer
-// that re-arms itself when a frame extends the deadline. It is the only
-// place that calls ForceClose for missed heartbeats.
+// that re-arms itself when a frame extends the deadline. The watchdog is
+// only enforced while at least one VRPC is in flight: the server emits
+// Heartbeats during long-running VRPCs, so an idle session legitimately
+// receives no heartbeats and must not be torn down.
 func (s *Session) heartBeatLoop(ctx context.Context) {
 	s.mu.Lock()
 	deadline := s.nextHeartbeatDeadline
@@ -305,11 +308,19 @@ func (s *Session) heartBeatLoop(ctx context.Context) {
 				s.mu.Unlock()
 				return
 			}
+			active := len(s.activeRPCs)
 			remaining := time.Until(s.nextHeartbeatDeadline)
+			interval := s.heartbeatInterval
 			s.mu.Unlock()
+
+			if active == 0 {
+				// Idle session: no heartbeats are expected. Re-check after
+				// one interval so a freshly-started VRPC is picked up.
+				timer.Reset(interval)
+				continue
+			}
 			if remaining > 0 {
 				// Deadline was pushed out while we were sleeping; re-arm.
-				// timer.C was just drained, so Reset is safe here.
 				timer.Reset(remaining)
 				continue
 			}
