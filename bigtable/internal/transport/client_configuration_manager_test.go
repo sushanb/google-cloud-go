@@ -283,6 +283,72 @@ func TestClose_WaitsForInFlightPolls(t *testing.T) {
 	}
 }
 
+func TestAddSessionLoadListener_FiresImmediatelyWithCurrentLoad(t *testing.T) {
+	client := &mockBigtableClient{}
+	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
+
+	got := make(chan float64, 1)
+	unregister := manager.AddSessionLoadListener(func(load float64) {
+		select {
+		case got <- load:
+		default:
+		}
+	})
+	defer unregister()
+
+	select {
+	case load := <-got:
+		// defaultClientConfig.Session.SessionLoad is 0.
+		if load != 0.0 {
+			t.Errorf("immediate SessionLoad fire = %v, want 0.0 (default)", load)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AddSessionLoadListener did not fire immediately on registration")
+	}
+}
+
+func TestAddSessionLoadListener_UnregisterStopsCallbacks(t *testing.T) {
+	client := &mockBigtableClient{}
+	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
+
+	var mu sync.Mutex
+	var totalCalls int
+	unregister := manager.AddSessionLoadListener(func(load float64) {
+		mu.Lock()
+		defer mu.Unlock()
+		totalCalls++
+	})
+
+	// Drop the immediate fire from the count, then unregister.
+	mu.Lock()
+	if totalCalls != 1 {
+		mu.Unlock()
+		t.Fatalf("expected 1 immediate call, got %d", totalCalls)
+	}
+	totalCalls = 0
+	mu.Unlock()
+
+	unregister()
+
+	// Now drive a successful poll. The listener was removed, so its counter
+	// must stay at 0 even though the manager re-notifies all currently
+	// registered listeners.
+	client.getConfigFunc = func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
+		return &bigtablepb.ClientConfiguration{
+			SessionConfiguration: &bigtablepb.SessionClientConfiguration{
+				SessionLoad: 0.75,
+			},
+		}, nil
+	}
+	manager.poll(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if totalCalls != 0 {
+		t.Errorf("listener fired %d times after unregister; want 0", totalCalls)
+	}
+}
+
 func TestManagerNotifyListeners_Race(t *testing.T) {
 	client := &mockBigtableClient{}
 	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
