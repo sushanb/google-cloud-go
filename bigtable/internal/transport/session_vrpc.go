@@ -25,12 +25,51 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// ExecuteVRpc executes a single virtual RPC over the session stream and
-// blocks for its response. Calls are serialized by vrpcSem; concurrent callers
-// queue behind the in-flight RPC until the semaphore is released.
-func (s *Session) ExecuteVRpc(ctx context.Context, desc VRpcDescriptor, req interface{}) (resp interface{}, clusterInfo *spb.ClusterInformation, err error) {
+// ExecuteResult carries the full set of outputs from a vRPC execution.
+// Returned by ExecuteVRpcEx; the back-compat ExecuteVRpc wrapper exposes
+// the (Response, ClusterInfo, error) subset.
+//
+// Fields:
+//   - Response: decoded vRPC payload (typed per VRpcDescriptor.Decode); nil on error.
+//   - ClusterInfo: server-reported routing/cluster identity; may be set on
+//     both success and error paths if the server included it.
+//   - Stats: server-reported per-request statistics (notably BackendLatency);
+//     nil if the server did not populate Stats on the success frame.
+//   - SentAt: local monotonic timestamp captured immediately before the vRPC
+//     frame was handed to the bidi Send. Used downstream to derive
+//     client-side blocking latency (sentAt - attemptStart).
+//
+// ErrorResponse.RetryInfo from the server is plumbed via the returned error
+// using gRPC status details — callers can extract it with
+// status.FromError(err).Details() and type-asserting to *errdetails.RetryInfo
+// (this is exactly how RetryingVRpc already consumes it).
+type ExecuteResult struct {
+	Response    interface{}
+	ClusterInfo *spb.ClusterInformation
+	Stats       *spb.SessionRequestStats
+	SentAt      time.Time
+}
+
+// ExecuteVRpc is a back-compat wrapper around ExecuteVRpcEx that returns the
+// historic (response, clusterInfo, error) triple. New callers that need Stats
+// or SentAt should use ExecuteVRpcEx directly.
+func (s *Session) ExecuteVRpc(ctx context.Context, desc VRpcDescriptor, req interface{}) (interface{}, *spb.ClusterInformation, error) {
+	res, err := s.ExecuteVRpcEx(ctx, desc, req)
+	return res.Response, res.ClusterInfo, err
+}
+
+// ExecuteVRpcEx is the full-fidelity vRPC execution path. It returns every
+// observable output of a single vRPC roundtrip — decoded response, cluster
+// info, server-reported Stats, and the local SentAt timestamp — so callers
+// can populate metrics (client_blocking_latency, server_backend_latency) and
+// respect server-supplied retry hints without losing data on the way out of
+// the transport.
+//
+// Calls are serialized by vrpcSem; concurrent callers queue behind the
+// in-flight RPC until the semaphore is released.
+func (s *Session) ExecuteVRpcEx(ctx context.Context, desc VRpcDescriptor, req interface{}) (result ExecuteResult, err error) {
 	if err := s.vrpcSem.Acquire(ctx, multiPlexingLimit); err != nil {
-		return nil, nil, err
+		return ExecuteResult{}, err
 	}
 	defer s.vrpcSem.Release(multiPlexingLimit)
 
@@ -43,13 +82,13 @@ func (s *Session) ExecuteVRpc(ctx context.Context, desc VRpcDescriptor, req inte
 	if s.state != StateActive {
 		st := s.state
 		s.mu.Unlock()
-		return nil, nil, unavailable(ErrSessionNotActive, "session is not active (state: %v)", st)
+		return ExecuteResult{}, unavailable(ErrSessionNotActive, "session is not active (state: %v)", st)
 	}
 	s.mu.Unlock()
 
 	reqBytes, err := desc.Encode(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("encode vRPC request: %w", err)
+		return ExecuteResult{}, fmt.Errorf("encode vRPC request: %w", err)
 	}
 
 	rpcID := s.nextRPCID.Add(1)
@@ -100,25 +139,33 @@ func (s *Session) ExecuteVRpc(ctx context.Context, desc VRpcDescriptor, req inte
 			VirtualRpc: virtRpc,
 		},
 	}
+	// Capture SentAt immediately before the frame is handed to Send so
+	// downstream metrics can compute client-side blocking latency as
+	// (SentAt - attemptStart) without double-counting encode/setup overhead.
+	sentAt := time.Now()
+	result.SentAt = sentAt
 	if err := s.Send(sessionReq); err != nil {
-		return nil, nil, fmt.Errorf("send vRPC request: %w", err)
+		return result, fmt.Errorf("send vRPC request: %w", err)
 	}
 
 	select {
 	case <-ctx.Done():
-		return nil, nil, ctx.Err()
+		return result, ctx.Err()
 	case res := <-rpc.resultChan:
+		result.ClusterInfo = res.clusterInfo
 		if res.err != nil {
-			return nil, res.clusterInfo, res.err
+			return result, res.err
 		}
 		if res.resp.RpcId != rpcID {
-			return nil, res.clusterInfo, fmt.Errorf("internal: response RpcId %d does not match request RpcId %d", res.resp.RpcId, rpcID)
+			return result, fmt.Errorf("internal: response RpcId %d does not match request RpcId %d", res.resp.RpcId, rpcID)
 		}
 		respMsg, decodeErr := desc.Decode(res.resp.Payload)
 		if decodeErr != nil {
-			return nil, res.clusterInfo, fmt.Errorf("decode vRPC response: %w", decodeErr)
+			return result, fmt.Errorf("decode vRPC response: %w", decodeErr)
 		}
-		return respMsg, res.clusterInfo, nil
+		result.Response = respMsg
+		result.Stats = res.resp.Stats
+		return result, nil
 	}
 }
 
@@ -156,7 +203,20 @@ func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 
 	var goErr error
 	if errResp.Status != nil {
-		goErr = status.FromProto(errResp.Status).Err()
+		st := status.FromProto(errResp.Status)
+		// If the server attached RetryInfo to the ErrorResponse envelope,
+		// pack it into the status details so downstream consumers
+		// (notably RetryingVRpc) can recover it via status.FromError(err).
+		// .Details() — the same path they already use for inline retry
+		// hints. WithDetails returns a fresh *Status on success; on the
+		// rare failure (e.g. anypb marshal) we fall back to the bare
+		// status so the error path still propagates the server's code.
+		if errResp.RetryInfo != nil {
+			if withDetails, derr := st.WithDetails(errResp.RetryInfo); derr == nil {
+				st = withDetails
+			}
+		}
+		goErr = st.Err()
 	} else {
 		goErr = fmt.Errorf("unknown vRPC error (rpc_id=%d)", errResp.RpcId)
 	}
