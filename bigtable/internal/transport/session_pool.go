@@ -34,6 +34,7 @@ type SessionPoolImpl struct {
 	picker             Picker
 	budget             SessionThrottler
 	sessions           []*SessionHandle
+	sessionCreatedAt   map[*SessionHandle]time.Time // Tracks when each SessionHandle was added to p.sessions
 	startingSessions   map[*Session]bool
 	closed             bool
 	scalingInProgress  bool
@@ -45,10 +46,19 @@ type SessionPoolImpl struct {
 	nextSessionID      uint64                  // Monotonically increasing counter for unique session naming
 	sessionType        SessionType
 	poolName           string
+
+	// poolCtx is a cancellable context scoped to the lifetime of the pool. It
+	// is passed (wrapped to strip deadlines but preserve cancellation) to the
+	// underlying streamFactory, budget.Acquire, and Session.Start so that
+	// pool teardown propagates into session loops and unblocks any goroutine
+	// waiting on the budget semaphore.
+	poolCtx    context.Context
+	poolCancel context.CancelFunc
 }
 
 // NewSessionPoolImpl creates a new SessionPoolImpl.
 func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx context.Context) (Stream, error), openSessionRequest *spb.OpenSessionRequest, md metadata.MD, sessionType SessionType) *SessionPoolImpl {
+	poolCtx, poolCancel := context.WithCancel(context.Background())
 	pool := &SessionPoolImpl{
 		poolName:           poolName,
 		minSessions:        min,
@@ -57,7 +67,10 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 		openSessionRequest: openSessionRequest,
 		metadata:           md,
 		startingSessions:   make(map[*Session]bool),
+		sessionCreatedAt:   make(map[*SessionHandle]time.Time),
 		sessionType:        sessionType,
+		poolCtx:            poolCtx,
+		poolCancel:         poolCancel,
 	}
 
 	fetcher := func() *PoolStats {
@@ -106,6 +119,7 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 				}
 			}
 			if idx != -1 {
+				delete(p.sessionCreatedAt, p.sessions[idx])
 				p.sessions = append(p.sessions[:idx], p.sessions[idx+1:]...)
 				p.picker = NewRandomPicker(p.sessions)
 			}
@@ -150,25 +164,57 @@ func (p *SessionPoolImpl) Stats() *PoolStats {
 	}
 }
 
-// Close gracefully closes all active sessions in the pool.
+// Close gracefully closes all active sessions in the pool, bounded by a 30s
+// timeout. Sessions are closed concurrently; Close blocks until every
+// per-session graceful Close returns (or the bounded ctx fires). Only after
+// the WaitGroup completes do we cancel poolCtx, which tears down any
+// remaining session goroutines (readLoop/heartBeatLoop) via Session.Start's
+// ctx supervisor.
 func (p *SessionPoolImpl) Close() error {
+	// Phase 1: take a snapshot under lock and mark the pool closed so no new
+	// sessions are admitted while we drain.
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.closed {
+		p.mu.Unlock()
 		return nil
 	}
 	p.closed = true
+	snapshot := p.sessions
+	p.sessions = nil
+	p.sessionCreatedAt = make(map[*SessionHandle]time.Time)
+	p.mu.Unlock()
 
-	for _, sh := range p.sessions {
-		if sh.session != nil {
-			go sh.session.Close(context.Background(), &spb.CloseSessionRequest{
+	// Phase 2: kick off graceful Close for every session with a bounded ctx
+	// that is independent of poolCtx — so Session.Close can attempt to drain
+	// in-flight RPCs without being immediately killed by poolCancel below.
+	closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, sh := range snapshot {
+		if sh.session == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(s *Session) {
+			defer wg.Done()
+			s.Close(closeCtx, &spb.CloseSessionRequest{
 				Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_USER,
 				Description: "graceful pool teardown",
 			})
-		}
+		}(sh.session)
 	}
-	p.sessions = nil
+
+	// Phase 3: wait for all graceful closes to finish (or for closeCtx to
+	// fire — Session.Close itself selects on its ctx and ForceCloses on
+	// expiry, so the WaitGroup will unblock either way).
+	wg.Wait()
+
+	// Phase 4: cancel poolCtx to bring down any lingering session goroutines
+	// (readLoop/heartBeatLoop supervisors) that were started from this pool.
+	if p.poolCancel != nil {
+		p.poolCancel()
+	}
 	return nil
 }
 
@@ -200,6 +246,7 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 
 	sh := NewSessionHandle(s)
 	p.sessions = append(p.sessions, sh)
+	p.sessionCreatedAt[sh] = time.Now()
 
 	// Re-initialize picker with updated sessions list
 	p.picker = NewRandomPicker(p.sessions)
@@ -225,6 +272,8 @@ func (p *SessionPoolImpl) OnClose(s *Session, err error) {
 
 	if idx != -1 {
 		// Remove session handle from slice
+		removed := p.sessions[idx]
+		delete(p.sessionCreatedAt, removed)
 		p.sessions = append(p.sessions[:idx], p.sessions[idx+1:]...)
 		// Re-initialize picker with updated active sessions
 		p.picker = NewRandomPicker(p.sessions)
@@ -332,8 +381,11 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 }
 
 func (p *SessionPoolImpl) createSession(ctx context.Context) error {
-	// Strip client deadline to prevent gRPC Bidi stream from having a user-set timeout
-	dialCtx := noDeadlineContext{Context: ctx}
+	// Use the pool-scoped ctx (not the per-request ctx) for the long-lived
+	// dial, budget acquisition, and Session.Start. The wrapper strips any
+	// deadline (a Bidi stream must not inherit a user-set timeout) but
+	// preserves cancellation so pool teardown propagates through.
+	dialCtx := noDeadlineButCancellableContext{Context: p.poolCtx}
 
 	// Acquire a token from the concurrency governor budget before dialing!
 	if err := p.budget.Acquire(dialCtx); err != nil {
@@ -396,24 +448,30 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 }
 
 func (p *SessionPoolImpl) pruneSessions(count int) {
+	// Phase 1: under lock, select prune candidates and remove them from
+	// p.sessions immediately so concurrent CheckoutSession callers don't
+	// pick them. Skip sessions younger than 5s so we don't churn through
+	// newly-minted sessions before they have a chance to absorb load.
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.closed {
+		p.mu.Unlock()
 		return
 	}
 
+	now := time.Now()
+	const minSessionAge = 5 * time.Second
+
 	pruned := 0
+	var toClose []*Session
 	var active []*SessionHandle
 	for _, sh := range p.sessions {
-		if pruned < count && atomic.LoadInt64(&sh.outstanding) == 0 {
-			// Prune this session by triggering full graceful close asynchronously
+		createdAt, ok := p.sessionCreatedAt[sh]
+		tooYoung := !ok || now.Sub(createdAt) < minSessionAge
+		if pruned < count && atomic.LoadInt64(&sh.outstanding) == 0 && !tooYoung {
 			if sh.session != nil {
-				go sh.session.Close(context.Background(), &spb.CloseSessionRequest{
-					Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_DOWNSIZE,
-					Description: "prune session downsize",
-				})
+				toClose = append(toClose, sh.session)
 			}
+			delete(p.sessionCreatedAt, sh)
 			pruned++
 		} else {
 			active = append(active, sh)
@@ -422,22 +480,44 @@ func (p *SessionPoolImpl) pruneSessions(count int) {
 
 	p.sessions = active
 	p.picker = NewRandomPicker(p.sessions)
+	p.mu.Unlock()
+
+	if len(toClose) == 0 {
+		return
+	}
+
+	// Phase 2: spawn graceful Close for every pruned session with a bounded
+	// 5s timeout, then wait so this call doesn't return until the closes
+	// finish (or the bounded ctx fires).
+	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, s := range toClose {
+		wg.Add(1)
+		go func(s *Session) {
+			defer wg.Done()
+			s.Close(closeCtx, &spb.CloseSessionRequest{
+				Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_DOWNSIZE,
+				Description: "prune session downsize",
+			})
+		}(s)
+	}
+	wg.Wait()
 }
 
-type noDeadlineContext struct {
+// noDeadlineButCancellableContext wraps a parent context to strip any
+// deadline (so a long-lived Bidi stream does not inherit a per-request
+// timeout) while preserving cancellation, error propagation, and value
+// lookups from the parent. Built on top of the pool-scoped poolCtx so that
+// pool teardown via poolCancel() unblocks anything dialing, waiting on the
+// session-creation budget, or running in Session.Start's loops.
+type noDeadlineButCancellableContext struct {
 	context.Context
 }
 
-func (noDeadlineContext) Deadline() (deadline time.Time, ok bool) {
+func (noDeadlineButCancellableContext) Deadline() (deadline time.Time, ok bool) {
 	return time.Time{}, false
-}
-
-func (noDeadlineContext) Done() <-chan struct{} {
-	return nil
-}
-
-func (noDeadlineContext) Err() error {
-	return nil
 }
 
 // ExecuteVRpc checks out a session, executes a virtual RPC request, and manages session outstanding counts.
