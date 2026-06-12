@@ -60,7 +60,7 @@ func NewSessionManager(
 	channelPool managedChannelPool,
 ) *SessionManager {
 	if metricsEnabled && meterProvider != nil {
-		_ = btransport.InitializeMetrics(meterProvider)
+		_ = btransport.InitializeSessionMetrics(meterProvider)
 	}
 	return &SessionManager{
 		enableSessionPool: enableSessionPool,

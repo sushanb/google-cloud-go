@@ -17,20 +17,20 @@ package internal
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-// ExecuteVRpc executes a virtual RPC sequentially and synchronously, multiplexing over the stream.
+// ExecuteVRpc executes a single virtual RPC over the session stream and
+// blocks for its response. Calls are serialized by vrpcSem; concurrent callers
+// queue behind the in-flight RPC until the semaphore is released.
 func (s *Session) ExecuteVRpc(ctx context.Context, desc VRpcDescriptor, req interface{}) (resp interface{}, clusterInfo *spb.ClusterInformation, err error) {
-	if err := s.vrpcSem.Acquire(ctx, sessionConcurrencyLimit); err != nil {
+	if err := s.vrpcSem.Acquire(ctx, multiPlexingLimit); err != nil {
 		return nil, nil, err
 	}
-	defer s.vrpcSem.Release(sessionConcurrencyLimit)
+	defer s.vrpcSem.Release(multiPlexingLimit)
 
 	startTime := time.Now()
 	defer func() {
@@ -39,76 +39,74 @@ func (s *Session) ExecuteVRpc(ctx context.Context, desc VRpcDescriptor, req inte
 
 	s.mu.Lock()
 	if s.state != StateActive {
+		st := s.state
 		s.mu.Unlock()
-		return nil, nil, status.Errorf(codes.Unavailable, "session is not active (state: %v)", s.state)
+		return nil, nil, unavailable(ErrSessionNotActive, "session is not active (state: %v)", st)
 	}
 	s.mu.Unlock()
 
 	reqBytes, err := desc.Encode(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to encode request: %w", err)
+		return nil, nil, fmt.Errorf("encode vRPC request: %w", err)
 	}
 
-	rpcID := atomic.AddInt64(&s.nextRPCID, 1)
-
-	resultChan := make(chan vrpcResult, 1)
-	rpcImpl := &VRPCImpl{
+	rpcID := s.nextRPCID.Add(1)
+	rpc := &vrpcImpl{
 		id:         rpcID,
 		method:     desc.Method(),
-		resultChan: resultChan,
+		resultChan: make(chan vrpcResult, 1),
 	}
 
 	s.mu.Lock()
-	s.activeRPCs[rpcID] = rpcImpl
+	s.activeRPCs[rpcID] = rpc
 	s.mu.Unlock()
-
 	defer func() {
 		s.mu.Lock()
 		delete(s.activeRPCs, rpcID)
+		drained := s.state == StateClosing && len(s.activeRPCs) == 0
 		s.mu.Unlock()
+		if drained {
+			s.signalQuiescent()
+		}
 	}()
 
-	vrpcReq := &spb.VirtualRpcRequest{
-		RpcId:   rpcID,
-		Payload: reqBytes,
-	}
+	// Reset the heartbeat deadline whenever we send an outbound frame: the
+	// server's keepalive clock is implicitly reset by our activity.
+	s.resetHeartbeatDeadline()
 
 	sessionReq := &spb.SessionRequest{
 		Payload: &spb.SessionRequest_VirtualRpc{
-			VirtualRpc: vrpcReq,
+			VirtualRpc: &spb.VirtualRpcRequest{
+				RpcId:   rpcID,
+				Payload: reqBytes,
+			},
 		},
 	}
-
-	s.resetHeartbeatDeadline() // Reset deadline when sending active request!
-
 	if err := s.Send(sessionReq); err != nil {
-		return nil, nil, fmt.Errorf("failed to send vRPC request: %w", err)
+		return nil, nil, fmt.Errorf("send vRPC request: %w", err)
 	}
 
 	select {
 	case <-ctx.Done():
 		return nil, nil, ctx.Err()
-	case res := <-resultChan:
+	case res := <-rpc.resultChan:
 		if res.err != nil {
 			return nil, res.clusterInfo, res.err
 		}
 		if res.resp.RpcId != rpcID {
-			return nil, nil, fmt.Errorf("internal error: response RpcId %d does not match request RpcId %d", res.resp.RpcId, rpcID)
+			return nil, res.clusterInfo, fmt.Errorf("internal: response RpcId %d does not match request RpcId %d", res.resp.RpcId, rpcID)
 		}
-		respMsg, err := desc.Decode(res.resp.Payload)
-		if err != nil {
-			return nil, res.clusterInfo, fmt.Errorf("failed to decode response: %w", err)
+		respMsg, decodeErr := desc.Decode(res.resp.Payload)
+		if decodeErr != nil {
+			return nil, res.clusterInfo, fmt.Errorf("decode vRPC response: %w", decodeErr)
 		}
-		// if res.clusterInfo != nil {
-		// 	fmt.Printf(">>> ExecuteVRpc response served by Cluster: Id=%s, Zone=%s <<<\n", res.clusterInfo.ClusterId, res.clusterInfo.ZoneId)
-		// }
-		// fmt.Printf(">>> ExecuteVRpc response decoded: Type=%T <<<\n", respMsg)
 		return respMsg, res.clusterInfo, nil
 	}
 }
 
+// handleVRPCResponse delivers a server VirtualRpcResponse to the waiting
+// ExecuteVRpc caller, if any.
 func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
-	// fmt.Printf(">>> Session handleVRPCResponse: RpcId=%d, PayloadLength=%d <<<\n", resp.RpcId, len(resp.Payload))
 	s.mu.Lock()
 	rpc, ok := s.activeRPCs[resp.RpcId]
 	if ok {
@@ -117,15 +115,14 @@ func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
 	s.mu.Unlock()
 
 	if !ok {
+		s.debugf("dropping VirtualRpcResponse for unknown rpc_id=%d", resp.RpcId)
 		return
 	}
-
-	select {
-	case rpc.resultChan <- vrpcResult{resp: resp, clusterInfo: resp.ClusterInfo}:
-	default:
-	}
+	s.deliver(rpc, vrpcResult{resp: resp, clusterInfo: resp.ClusterInfo})
 }
 
+// handleVRPCErrorResponse routes per-vRPC errors to the waiting caller.
+// Session-level errors (rpc_id == 0) are handled in handleSessionResponse.
 func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 	s.mu.Lock()
 	rpc, ok := s.activeRPCs[errResp.RpcId]
@@ -135,6 +132,7 @@ func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 	s.mu.Unlock()
 
 	if !ok {
+		s.debugf("dropping ErrorResponse for unknown rpc_id=%d", errResp.RpcId)
 		return
 	}
 
@@ -142,11 +140,36 @@ func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 	if errResp.Status != nil {
 		goErr = status.FromProto(errResp.Status).Err()
 	} else {
-		goErr = fmt.Errorf("unknown vRPC error")
+		goErr = fmt.Errorf("unknown vRPC error (rpc_id=%d)", errResp.RpcId)
 	}
+	s.deliver(rpc, vrpcResult{err: goErr, clusterInfo: errResp.ClusterInfo})
+}
 
+// deliver writes a result onto the RPC's buffered (cap 1) channel. The
+// non-blocking send protects against duplicate server frames for the same
+// rpc_id; the first wins, subsequent ones are dropped.
+func (s *Session) deliver(rpc *vrpcImpl, res vrpcResult) {
 	select {
-	case rpc.resultChan <- vrpcResult{err: goErr, clusterInfo: errResp.ClusterInfo}:
+	case rpc.resultChan <- res:
 	default:
+		s.debugf("duplicate result for rpc_id=%d (%s) dropped", rpc.id, rpc.method)
+	}
+}
+
+// cancelActiveRPCs removes and notifies every in-flight RPC matching filter
+// (or all, if filter is nil) with the given error.
+func (s *Session) cancelActiveRPCs(err error, filter func(rpcID int64) bool) {
+	s.mu.Lock()
+	cancelled := make([]*vrpcImpl, 0, len(s.activeRPCs))
+	for id, rpc := range s.activeRPCs {
+		if filter == nil || filter(id) {
+			cancelled = append(cancelled, rpc)
+			delete(s.activeRPCs, id)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, rpc := range cancelled {
+		s.deliver(rpc, vrpcResult{err: err})
 	}
 }

@@ -162,7 +162,7 @@ func (p *SessionPoolImpl) Close() error {
 
 	for _, sh := range p.sessions {
 		if sh.session != nil {
-			go sh.session.Close(&spb.CloseSessionRequest{
+			go sh.session.Close(context.Background(), &spb.CloseSessionRequest{
 				Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_USER,
 				Description: "graceful pool teardown",
 			})
@@ -373,13 +373,17 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 	p.mu.Unlock()
 
 	// Create and start new session wrapper passing pool pointer as the lifecycle listener!
-	s := NewSession(sessionName, stream, p, p.sessionType)
+	s := NewSession(sessionName, stream, SessionHooks{
+		OnStart:  p.OnStart,
+		OnActive: p.OnActive,
+		OnClose:  p.OnClose,
+	}, p.sessionType)
 
 	p.mu.Lock()
 	p.startingSessions[s] = true
 	p.mu.Unlock()
 
-	if err := s.Start(dialCtx, p.openSessionRequest, nil); err != nil {
+	if err := s.Start(dialCtx, p.openSessionRequest); err != nil {
 		p.mu.Lock()
 		delete(p.startingSessions, s)
 		p.mu.Unlock()
@@ -405,7 +409,7 @@ func (p *SessionPoolImpl) pruneSessions(count int) {
 		if pruned < count && atomic.LoadInt64(&sh.outstanding) == 0 {
 			// Prune this session by triggering full graceful close asynchronously
 			if sh.session != nil {
-				go sh.session.Close(&spb.CloseSessionRequest{
+				go sh.session.Close(context.Background(), &spb.CloseSessionRequest{
 					Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_DOWNSIZE,
 					Description: "prune session downsize",
 				})

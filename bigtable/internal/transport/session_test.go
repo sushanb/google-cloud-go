@@ -16,337 +16,897 @@ package internal
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
-type mockSessionStream struct {
-	mu        sync.Mutex
-	sent      []*spb.SessionRequest
-	recvChan  chan *spb.SessionResponse
-	recvErr   error
-	headerMD  metadata.MD
-	headerErr error
+// fakeStream implements Stream and exposes channels so tests can drive both
+// sides of the conversation.
+type fakeStream struct {
+	sentMu sync.Mutex
+	sent   []*spb.SessionRequest
+	recv   chan recvOp
+	hdr    metadata.MD
+	hdrErr error
+	sendFn func(*spb.SessionRequest) error
 }
 
-func newMockSessionStream() *mockSessionStream {
-	return &mockSessionStream{
-		recvChan: make(chan *spb.SessionResponse, 100),
-		headerMD: metadata.New(nil),
+type recvOp struct {
+	resp *spb.SessionResponse
+	err  error
+}
+
+func newFakeStream() *fakeStream {
+	return &fakeStream{
+		recv: make(chan recvOp, 32),
+		hdr:  metadata.MD{},
 	}
 }
 
-func (m *mockSessionStream) Send(req *spb.SessionRequest) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.sent = append(m.sent, req)
+func (f *fakeStream) Send(req *spb.SessionRequest) error {
+	if f.sendFn != nil {
+		if err := f.sendFn(req); err != nil {
+			return err
+		}
+	}
+	f.sentMu.Lock()
+	f.sent = append(f.sent, req)
+	f.sentMu.Unlock()
 	return nil
 }
 
-func (m *mockSessionStream) Recv() (*spb.SessionResponse, error) {
-	if m.recvErr != nil {
-		return nil, m.recvErr
+func (f *fakeStream) Recv() (*spb.SessionResponse, error) {
+	op, ok := <-f.recv
+	if !ok {
+		return nil, fmt.Errorf("stream closed")
 	}
-	select {
-	case resp, ok := <-m.recvChan:
-		if !ok {
-			return nil, errors.New("stream closed")
-		}
-		return resp, nil
-	}
+	return op.resp, op.err
 }
 
-func (m *mockSessionStream) Header() (metadata.MD, error) {
-	return m.headerMD, m.headerErr
+func (f *fakeStream) Header() (metadata.MD, error) {
+	return f.hdr, f.hdrErr
 }
 
-type mockSessionListener struct {
-	mu       sync.Mutex
-	started  bool
-	active   bool
-	closed   bool
-	closeErr error
+func (f *fakeStream) snapshotSent() []*spb.SessionRequest {
+	f.sentMu.Lock()
+	defer f.sentMu.Unlock()
+	out := make([]*spb.SessionRequest, len(f.sent))
+	copy(out, f.sent)
+	return out
 }
 
-func (m *mockSessionListener) OnStart(ctx context.Context) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.started = true
+// hookCounts captures lifecycle callbacks via a SessionHooks value.
+type hookCounts struct {
+	mu          sync.Mutex
+	startCount  int
+	activeCount int
+	closeCount  int
+	closeErr    error
 }
 
-func (m *mockSessionListener) OnActive(s *Session) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.active = true
-}
-
-func (m *mockSessionListener) OnClose(s *Session, err error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.closed = true
-	m.closeErr = err
-}
-
-type mockVRpcDescriptor struct {
-	method string
-}
-
-func (d *mockVRpcDescriptor) Method() string { return d.method }
-func (d *mockVRpcDescriptor) Encode(req interface{}) ([]byte, error) {
-	return []byte(req.(string)), nil
-}
-func (d *mockVRpcDescriptor) Decode(buf []byte) (interface{}, error) {
-	return string(buf), nil
-}
-
-func TestSession_Lifecycle(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	stream := newMockSessionStream()
-	listener := &mockSessionListener{}
-	session := NewSession("test-session", stream, listener, SessionTypeTable)
-
-	if session.State() != StateNew {
-		t.Errorf("Expected state to be StateNew, got %v", session.State())
-	}
-
-	// Start the session
-	req := &spb.OpenSessionRequest{}
-	err := session.Start(ctx, req, nil)
-	if err != nil {
-		t.Fatalf("Failed to start session: %v", err)
-	}
-
-	// Check initial state transition and listener
-	if session.State() != StateStarting {
-		t.Errorf("Expected state to be StateStarting, got %v", session.State())
-	}
-
-	listener.mu.Lock()
-	if !listener.started {
-		t.Error("Expected OnStart to be called on listener")
-	}
-	listener.mu.Unlock()
-
-	// Complete handshake by writing OpenSessionResponse
-	stream.recvChan <- &spb.SessionResponse{
-		Payload: &spb.SessionResponse_OpenSession{
-			OpenSession: &spb.OpenSessionResponse{},
+func (c *hookCounts) hooks() SessionHooks {
+	return SessionHooks{
+		OnStart: func(context.Context) {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.startCount++
+		},
+		OnActive: func(*Session) {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.activeCount++
+		},
+		OnClose: func(_ *Session, err error) {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.closeCount++
+			c.closeErr = err
 		},
 	}
-
-	// Wait for handshake completion
-	select {
-	case <-session.handshakeDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timed out waiting for handshake completion")
-	}
-
-	if session.State() != StateActive {
-		t.Errorf("Expected state to be StateActive, got %v", session.State())
-	}
-
-	// Wait briefly for the asynchronous OnActive listener hook to run
-	time.Sleep(20 * time.Millisecond)
-
-	listener.mu.Lock()
-	if !listener.active {
-		t.Error("Expected OnActive to be called on listener")
-	}
-	listener.mu.Unlock()
-
-	// Force close session
-	session.ForceClose(&spb.CloseSessionRequest{Description: "test close"})
-
-	if session.State() != StateClosed {
-		t.Errorf("Expected state to be StateClosed, got %v", session.State())
-	}
-
-	listener.mu.Lock()
-	if !listener.closed {
-		t.Error("Expected OnClose to be called on listener")
-	}
-	listener.mu.Unlock()
 }
 
-func TestSession_ExecuteVRpc_Success(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func (c *hookCounts) counts() (start, active, closed int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.startCount, c.activeCount, c.closeCount
+}
 
-	stream := newMockSessionStream()
-	session := NewSession("test-session", stream, nil, SessionTypeTable)
+// fakeDesc is a minimal VRpcDescriptor for ExecuteVRpc tests.
+type fakeDesc struct {
+	method string
+	enc    func(req interface{}) ([]byte, error)
+	dec    func(buf []byte) (interface{}, error)
+}
 
-	// Pre-activate the session for direct testing of ExecuteVRpc
-	session.state = StateActive
-	close(session.handshakeDone)
+func (f *fakeDesc) Method() string                              { return f.method }
+func (f *fakeDesc) Encode(req interface{}) ([]byte, error)      { return f.enc(req) }
+func (f *fakeDesc) Decode(buf []byte) (interface{}, error)      { return f.dec(buf) }
 
-	// Start background readLoop
-	go session.readLoop(ctx)
+func newTestSession(t *testing.T, stream Stream, hooks SessionHooks) *Session {
+	t.Helper()
+	return NewSession("test-session", stream, hooks, SessionTypeTable)
+}
 
-	// Start executing vRPC in a separate goroutine so we can inject the response
-	var respVal interface{}
-	var errVal error
-	desc := &mockVRpcDescriptor{method: "TestMethod"}
-	var wg sync.WaitGroup
-	wg.Add(1)
+// waitFor polls cond every 5ms up to timeout, failing the test if cond never
+// becomes true.
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %v waiting for: %s", timeout, msg)
+}
+
+// --- pure value tests --------------------------------------------------------
+
+func TestMultiPlexingLimit(t *testing.T) {
+	if multiPlexingLimit != 1 {
+		t.Errorf("multiPlexingLimit = %d, want 1 (multiplexing unsupported)", multiPlexingLimit)
+	}
+}
+
+func TestState_String(t *testing.T) {
+	tests := []struct {
+		s    State
+		want string
+	}{
+		{StateNew, "New"},
+		{StateStarting, "Starting"},
+		{StateActive, "Active"},
+		{StateClosing, "Closing"},
+		{StateClosed, "Closed"},
+		{State(99), "Unknown"},
+	}
+	for _, tt := range tests {
+		if got := tt.s.String(); got != tt.want {
+			t.Errorf("State(%d).String() = %q, want %q", int(tt.s), got, tt.want)
+		}
+	}
+}
+
+func TestNewSession_Defaults(t *testing.T) {
+	stream := newFakeStream()
+	s := NewSession("log", stream, SessionHooks{}, SessionTypeAuthorizedView)
+
+	if got := s.State(); got != StateNew {
+		t.Errorf("initial state = %v, want StateNew", got)
+	}
+	if got := s.LogName(); got != "log" {
+		t.Errorf("LogName = %q, want %q", got, "log")
+	}
+	if got := s.sessionType; got != SessionTypeAuthorizedView {
+		t.Errorf("sessionType = %v, want SessionTypeAuthorizedView", got)
+	}
+	if s.activeRPCs == nil {
+		t.Error("activeRPCs map not initialized")
+	}
+	if s.quiescent == nil {
+		t.Error("quiescent channel not initialized")
+	}
+	if s.heartbeatInterval != defaultHeartbeatInterval {
+		t.Errorf("heartbeatInterval = %v, want %v", s.heartbeatInterval, defaultHeartbeatInterval)
+	}
+	if s.vrpcSem == nil {
+		t.Error("vrpcSem not initialized")
+	}
+	if s.PeerInfo() != nil {
+		t.Error("PeerInfo should start nil")
+	}
+	if s.RefreshConfig() != nil {
+		t.Error("RefreshConfig should start nil")
+	}
+	if s.HasOkRpcs() || s.HasErrorRpcs() {
+		t.Error("HasOkRpcs/HasErrorRpcs should start false")
+	}
+}
+
+func TestCloseReasonToCause(t *testing.T) {
+	tests := []struct {
+		name string
+		req  *spb.CloseSessionRequest
+		want error
+	}{
+		{"nil request maps to nil", nil, nil},
+		{"unset reason → nil", &spb.CloseSessionRequest{Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_UNSET}, nil},
+		{"user-initiated → nil", &spb.CloseSessionRequest{Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_USER}, nil},
+		{"downsize → nil", &spb.CloseSessionRequest{Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_DOWNSIZE}, nil},
+		{"missed heartbeat", &spb.CloseSessionRequest{Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_MISSED_HEARTBEAT}, ErrUnavailableHeartBeatMissed},
+		{"goaway", &spb.CloseSessionRequest{Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_GOAWAY}, ErrUnavailableGoAway},
+		{"error", &spb.CloseSessionRequest{Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR}, ErrUnavailableSessionError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := closeReasonToCause(tt.req); !errors.Is(got, tt.want) && got != tt.want {
+				t.Errorf("closeReasonToCause(%v) = %v, want %v", tt.req, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUnavailable_WrapsCauseAndStatus(t *testing.T) {
+	err := unavailable(ErrUnavailableHeartBeatMissed, "heartbeat dead for %s", "test")
+
+	if !errors.Is(err, ErrUnavailableHeartBeatMissed) {
+		t.Error("errors.Is should match ErrUnavailableHeartBeatMissed")
+	}
+	if errors.Is(err, ErrUnavailableGoAway) {
+		t.Error("errors.Is should not match unrelated sentinel")
+	}
+	if code := status.Code(err); code != codes.Unavailable {
+		t.Errorf("status.Code = %v, want Unavailable", code)
+	}
+	if msg := err.Error(); msg == "" {
+		t.Error("error string should be non-empty")
+	}
+
+	// nil cause should not crash and should still be Unavailable.
+	err = unavailable(nil, "no cause")
+	if code := status.Code(err); code != codes.Unavailable {
+		t.Errorf("nil-cause: status.Code = %v, want Unavailable", code)
+	}
+	if errors.Is(err, ErrUnavailableHeartBeatMissed) {
+		t.Error("nil-cause: errors.Is should not match any sentinel")
+	}
+}
+
+// --- handler-level tests (no Start/readLoop) ---------------------------------
+
+// makeActive constructs a session and forces it into StateActive without going
+// through the handshake.
+func makeActive(t *testing.T, hooks SessionHooks) (*Session, *fakeStream) {
+	t.Helper()
+	stream := newFakeStream()
+	s := newTestSession(t, stream, hooks)
+	s.mu.Lock()
+	s.state = StateActive
+	s.mu.Unlock()
+	return s, stream
+}
+
+func TestHandleOpenSession_TransitionsToActive(t *testing.T) {
+	stream := newFakeStream()
+	listener := &hookCounts{}
+	s := newTestSession(t, stream, listener.hooks())
+	s.mu.Lock()
+	s.state = StateStarting
+	s.mu.Unlock()
+
+	s.handleOpenSession(&spb.OpenSessionResponse{})
+
+	if got := s.State(); got != StateActive {
+		t.Errorf("state = %v, want StateActive", got)
+	}
+	if _, active, _ := listener.counts(); active != 1 {
+		t.Errorf("OnActive called %d times, want 1", active)
+	}
+
+	// Re-delivery (idempotent): no extra listener firings.
+	s.handleOpenSession(&spb.OpenSessionResponse{})
+	if _, active, _ := listener.counts(); active != 1 {
+		t.Errorf("OnActive called %d times after re-delivery, want 1", active)
+	}
+}
+
+func TestHandleVRPCResponse_RoutesByRpcID(t *testing.T) {
+	s, _ := makeActive(t, SessionHooks{})
+
+	rpc := &vrpcImpl{id: 7, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
+	s.mu.Lock()
+	s.activeRPCs[7] = rpc
+	s.mu.Unlock()
+
+	resp := &spb.VirtualRpcResponse{RpcId: 7, Payload: []byte("p")}
+	s.handleVRPCResponse(resp)
+
+	select {
+	case res := <-rpc.resultChan:
+		if res.resp != resp {
+			t.Errorf("got resp %p, want %p", res.resp, resp)
+		}
+	default:
+		t.Fatal("no result delivered")
+	}
+	if !s.HasOkRpcs() {
+		t.Error("HasOkRpcs should be true after successful response")
+	}
+	// Unknown rpc_id is dropped silently.
+	s.handleVRPCResponse(&spb.VirtualRpcResponse{RpcId: 999})
+}
+
+func TestHandleVRPCErrorResponse_RoutesByRpcID(t *testing.T) {
+	s, _ := makeActive(t, SessionHooks{})
+
+	rpc := &vrpcImpl{id: 3, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
+	s.mu.Lock()
+	s.activeRPCs[3] = rpc
+	s.mu.Unlock()
+
+	errResp := &spb.ErrorResponse{
+		RpcId:  3,
+		Status: &rpcstatus.Status{Code: int32(codes.FailedPrecondition), Message: "boom"},
+	}
+	s.handleVRPCErrorResponse(errResp)
+
+	select {
+	case res := <-rpc.resultChan:
+		if res.err == nil {
+			t.Fatal("expected error result")
+		}
+		if got := status.Code(res.err); got != codes.FailedPrecondition {
+			t.Errorf("status code = %v, want FailedPrecondition", got)
+		}
+	default:
+		t.Fatal("no result delivered")
+	}
+	if !s.HasErrorRpcs() {
+		t.Error("HasErrorRpcs should be true after error response")
+	}
+}
+
+func TestHandleErrorResponse_SessionFatalForcesClose(t *testing.T) {
+	listener := &hookCounts{}
+	s, _ := makeActive(t, listener.hooks())
+
+	// Pre-existing in-flight RPC; should be cancelled by ForceClose.
+	rpc := &vrpcImpl{id: 11, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
+	s.mu.Lock()
+	s.activeRPCs[11] = rpc
+	s.mu.Unlock()
+
+	s.handleErrorResponse(&spb.ErrorResponse{
+		RpcId:  0,
+		Status: &rpcstatus.Status{Code: int32(codes.Internal), Message: "fatal"},
+	})
+
+	if got := s.State(); got != StateClosed {
+		t.Errorf("state = %v, want StateClosed", got)
+	}
+	select {
+	case res := <-rpc.resultChan:
+		if !errors.Is(res.err, ErrUnavailableSessionError) {
+			t.Errorf("cancelled cause = %v, want ErrUnavailableSessionError", res.err)
+		}
+	default:
+		t.Fatal("in-flight RPC not cancelled by session-fatal error")
+	}
+	if _, _, closed := listener.counts(); closed != 1 {
+		t.Errorf("OnClose called %d times, want 1", closed)
+	}
+}
+
+func TestHandleGoAway_CancelsBeyondAdmitted(t *testing.T) {
+	s, _ := makeActive(t, SessionHooks{})
+
+	// rpc 1 and 2 admitted; 3 and 4 should be cancelled.
+	for _, id := range []int64{1, 2, 3, 4} {
+		s.mu.Lock()
+		s.activeRPCs[id] = &vrpcImpl{id: id, resultChan: make(chan vrpcResult, 1)}
+		s.mu.Unlock()
+	}
+
+	s.handleGoAway(&spb.GoAwayResponse{LastRpcIdAdmitted: 2, Reason: "test"})
+
+	if got := s.State(); got != StateClosing {
+		t.Errorf("state = %v, want StateClosing", got)
+	}
+	s.mu.Lock()
+	_, has1 := s.activeRPCs[1]
+	_, has2 := s.activeRPCs[2]
+	_, has3 := s.activeRPCs[3]
+	_, has4 := s.activeRPCs[4]
+	s.mu.Unlock()
+	if !has1 || !has2 {
+		t.Error("admitted RPCs (1, 2) should remain in activeRPCs")
+	}
+	if has3 || has4 {
+		t.Error("RPCs beyond admitted (3, 4) should have been removed")
+	}
+}
+
+func TestHandleSessionParameters_UpdatesIntervalAndDeadline(t *testing.T) {
+	s, _ := makeActive(t, SessionHooks{})
+	before := time.Now()
+
+	s.handleSessionParameters(&spb.SessionParametersResponse{
+		KeepAlive: durationpb.New(2 * time.Second),
+	})
+
+	s.mu.Lock()
+	gotInterval := s.heartbeatInterval
+	gotDeadline := s.nextHeartbeatDeadline
+	s.mu.Unlock()
+
+	if gotInterval != 2*time.Second {
+		t.Errorf("heartbeatInterval = %v, want 2s", gotInterval)
+	}
+	// Expect deadline ≈ now + 6s (3 * 2s).
+	wantMin := before.Add(5 * time.Second)
+	if gotDeadline.Before(wantMin) {
+		t.Errorf("nextHeartbeatDeadline = %v, want >= %v", gotDeadline, wantMin)
+	}
+
+	// Zero / nil keepalive should be ignored.
+	s.handleSessionParameters(&spb.SessionParametersResponse{})
+	s.handleSessionParameters(&spb.SessionParametersResponse{KeepAlive: durationpb.New(0)})
+
+	s.mu.Lock()
+	if s.heartbeatInterval != 2*time.Second {
+		t.Errorf("heartbeatInterval changed after no-op updates: %v", s.heartbeatInterval)
+	}
+	s.mu.Unlock()
+}
+
+func TestHandleSessionRefreshConfig_Stored(t *testing.T) {
+	s, _ := makeActive(t, SessionHooks{})
+
+	cfg := &spb.SessionRefreshConfig{
+		OptimizedOpenRequest: &spb.OpenSessionRequest{ProtocolVersion: 7},
+	}
+	s.handleSessionRefreshConfig(cfg)
+
+	got := s.RefreshConfig()
+	if got != cfg {
+		t.Errorf("RefreshConfig = %v, want %v", got, cfg)
+	}
+}
+
+func TestHandleSessionResponse_UnknownDoesNotResetDeadline(t *testing.T) {
+	s, _ := makeActive(t, SessionHooks{})
+	s.mu.Lock()
+	s.nextHeartbeatDeadline = time.Unix(0, 0) // way in the past
+	s.mu.Unlock()
+
+	// SessionResponse with no oneof set → unknown payload path.
+	s.handleSessionResponse(&spb.SessionResponse{})
+
+	s.mu.Lock()
+	got := s.nextHeartbeatDeadline
+	s.mu.Unlock()
+	if !got.Equal(time.Unix(0, 0)) {
+		t.Errorf("unknown payload reset deadline to %v; expected unchanged", got)
+	}
+
+	// A recognized variant must reset.
+	s.handleSessionResponse(&spb.SessionResponse{
+		Payload: &spb.SessionResponse_Heartbeat{Heartbeat: &spb.HeartbeatResponse{}},
+	})
+	s.mu.Lock()
+	got = s.nextHeartbeatDeadline
+	s.mu.Unlock()
+	if got.Equal(time.Unix(0, 0)) {
+		t.Error("recognized heartbeat did not reset deadline")
+	}
+}
+
+// --- ExecuteVRpc tests -------------------------------------------------------
+
+func newRoundTripDesc() *fakeDesc {
+	return &fakeDesc{
+		method: "RoundTrip",
+		enc: func(req interface{}) ([]byte, error) {
+			return []byte(fmt.Sprintf("req:%v", req)), nil
+		},
+		dec: func(buf []byte) (interface{}, error) {
+			return string(buf), nil
+		},
+	}
+}
+
+func TestExecuteVRpc_RejectsWhenNotActive(t *testing.T) {
+	stream := newFakeStream()
+	s := newTestSession(t, stream, SessionHooks{}) // state = New
+	_, _, err := s.ExecuteVRpc(context.Background(), newRoundTripDesc(), "hello")
+	if !errors.Is(err, ErrSessionNotActive) {
+		t.Errorf("err = %v, want ErrSessionNotActive in chain", err)
+	}
+	if code := status.Code(err); code != codes.Unavailable {
+		t.Errorf("status.Code = %v, want Unavailable", code)
+	}
+}
+
+func TestExecuteVRpc_HappyPath(t *testing.T) {
+	s, stream := makeActive(t, SessionHooks{})
+	desc := newRoundTripDesc()
+
+	done := make(chan struct{})
+	var resp interface{}
+	var cluster *spb.ClusterInformation
+	var execErr error
 	go func() {
-		defer wg.Done()
-		respVal, _, errVal = session.ExecuteVRpc(ctx, desc, "request_payload")
+		defer close(done)
+		resp, cluster, execErr = s.ExecuteVRpc(context.Background(), desc, "hello")
 	}()
 
-	// Wait a brief moment to ensure request is sent to mockStream
-	time.Sleep(50 * time.Millisecond)
+	// Wait for the request to be sent.
+	waitFor(t, time.Second, func() bool { return len(stream.snapshotSent()) > 0 }, "Send called")
 
-	stream.mu.Lock()
-	if len(stream.sent) == 0 {
-		stream.mu.Unlock()
-		t.Fatal("Expected request to be sent on stream")
+	sent := stream.snapshotSent()[0].GetVirtualRpc()
+	if sent == nil {
+		t.Fatal("sent frame is not a VirtualRpcRequest")
 	}
-	sentReq := stream.sent[0]
-	stream.mu.Unlock()
-
-	vrpcReq := sentReq.GetVirtualRpc()
-	if vrpcReq == nil {
-		t.Fatal("Expected SessionRequest to contain VirtualRpc payload")
+	if string(sent.Payload) != "req:hello" {
+		t.Errorf("encoded payload = %q, want %q", sent.Payload, "req:hello")
 	}
 
-	if string(vrpcReq.Payload) != "request_payload" {
-		t.Errorf("Expected payload %q, got %q", "request_payload", string(vrpcReq.Payload))
+	// Deliver response.
+	s.handleVRPCResponse(&spb.VirtualRpcResponse{
+		RpcId:       sent.RpcId,
+		Payload:     []byte("world"),
+		ClusterInfo: &spb.ClusterInformation{ClusterId: "c1"},
+	})
+
+	<-done
+	if execErr != nil {
+		t.Fatalf("ExecuteVRpc error: %v", execErr)
 	}
-
-	// Inject successful mock response matching the rpcID
-	stream.recvChan <- &spb.SessionResponse{
-		Payload: &spb.SessionResponse_VirtualRpc{
-			VirtualRpc: &spb.VirtualRpcResponse{
-				RpcId:   vrpcReq.RpcId,
-				Payload: []byte("response_payload"),
-			},
-		},
+	if got := resp.(string); got != "world" {
+		t.Errorf("resp = %q, want %q", got, "world")
 	}
-
-	wg.Wait()
-
-	if errVal != nil {
-		t.Fatalf("Expected successful vRPC execution, got error: %v", errVal)
-	}
-
-	if respVal.(string) != "response_payload" {
-		t.Errorf("Expected response payload %q, got %q", "response_payload", respVal.(string))
+	if cluster == nil || cluster.ClusterId != "c1" {
+		t.Errorf("clusterInfo = %v, want ClusterId=c1", cluster)
 	}
 }
 
-func TestSession_ExecuteVRpc_ClosedSession(t *testing.T) {
+func TestExecuteVRpc_ContextCancel(t *testing.T) {
+	s, _ := makeActive(t, SessionHooks{})
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	cancel()
 
-	stream := newMockSessionStream()
-	session := NewSession("test-session", stream, nil, SessionTypeTable)
+	_, _, err := s.ExecuteVRpc(ctx, newRoundTripDesc(), "hello")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled", err)
+	}
+}
 
-	// Ensure state is closed
-	session.state = StateClosed
+func TestExecuteVRpc_SendFailureCleansUpMap(t *testing.T) {
+	stream := newFakeStream()
+	stream.sendFn = func(req *spb.SessionRequest) error {
+		return fmt.Errorf("network down")
+	}
+	s := newTestSession(t, stream, SessionHooks{})
+	s.mu.Lock()
+	s.state = StateActive
+	s.mu.Unlock()
 
-	desc := &mockVRpcDescriptor{method: "TestMethod"}
-	_, _, err := session.ExecuteVRpc(ctx, desc, "request")
+	_, _, err := s.ExecuteVRpc(context.Background(), newRoundTripDesc(), "hello")
 	if err == nil {
-		t.Fatal("Expected error executing vRPC on closed session, got success")
+		t.Fatal("expected error from failed Send")
 	}
-
-	st, ok := status.FromError(err)
-	if !ok || st.Code() != codes.Unavailable {
-		t.Errorf("Expected Unavailable status error, got %v", err)
+	s.mu.Lock()
+	leftOver := len(s.activeRPCs)
+	s.mu.Unlock()
+	if leftOver != 0 {
+		t.Errorf("activeRPCs = %d, want 0 (defer should clean up on Send failure)", leftOver)
 	}
 }
 
-func TestSession_GoAway(t *testing.T) {
+// --- Close / ForceClose ------------------------------------------------------
+
+func TestForceClose_Idempotent(t *testing.T) {
+	listener := &hookCounts{}
+	s, _ := makeActive(t, listener.hooks())
+
+	s.ForceClose(nil)
+	s.ForceClose(nil)
+	s.ForceClose(&spb.CloseSessionRequest{Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR})
+
+	if got := s.State(); got != StateClosed {
+		t.Errorf("state = %v, want StateClosed", got)
+	}
+	if _, _, closed := listener.counts(); closed != 1 {
+		t.Errorf("OnClose fired %d times, want 1", closed)
+	}
+}
+
+func TestForceClose_CancelsInflightWithReason(t *testing.T) {
+	s, _ := makeActive(t, SessionHooks{})
+	rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
+	s.mu.Lock()
+	s.activeRPCs[1] = rpc
+	s.mu.Unlock()
+
+	s.ForceClose(&spb.CloseSessionRequest{
+		Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_MISSED_HEARTBEAT,
+		Description: "no heartbeat",
+	})
+
+	select {
+	case res := <-rpc.resultChan:
+		if !errors.Is(res.err, ErrUnavailableHeartBeatMissed) {
+			t.Errorf("cancelled cause = %v, want ErrUnavailableHeartBeatMissed", res.err)
+		}
+	default:
+		t.Fatal("in-flight RPC not notified")
+	}
+}
+
+func TestClose_Graceful_NoInflightSendsCloseRequest(t *testing.T) {
+	stream := newFakeStream()
+	s := newTestSession(t, stream, SessionHooks{})
+	s.mu.Lock()
+	s.state = StateActive
+	s.mu.Unlock()
+
+	if err := s.Close(context.Background(), &spb.CloseSessionRequest{
+		Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_USER,
+	}); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	if got := s.State(); got != StateClosing {
+		t.Errorf("state = %v, want StateClosing", got)
+	}
+	sent := stream.snapshotSent()
+	if len(sent) != 1 || sent[0].GetCloseSession() == nil {
+		t.Errorf("expected one CloseSession frame, got %d sent frames", len(sent))
+	}
+}
+
+func TestClose_AlreadyClosingIsNoop(t *testing.T) {
+	stream := newFakeStream()
+	s := newTestSession(t, stream, SessionHooks{})
+	s.mu.Lock()
+	s.state = StateClosed
+	s.mu.Unlock()
+
+	if err := s.Close(context.Background(), nil); err != nil {
+		t.Errorf("Close on closed session = %v, want nil", err)
+	}
+	if got := s.State(); got != StateClosed {
+		t.Errorf("state changed to %v", got)
+	}
+	if len(stream.snapshotSent()) != 0 {
+		t.Error("Close on closed session should not send")
+	}
+}
+
+func TestClose_CtxCancelDuringDrainForceCloses(t *testing.T) {
+	s, _ := makeActive(t, SessionHooks{})
+	// Pin an in-flight RPC so the drain loop is forced to wait.
+	rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
+	s.mu.Lock()
+	s.activeRPCs[1] = rpc
+	s.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelDone := make(chan struct{})
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+		close(cancelDone)
+	}()
+
+	err := s.Close(ctx, &spb.CloseSessionRequest{
+		Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_USER,
+	})
+	<-cancelDone
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Close err = %v, want context.Canceled", err)
+	}
+	if got := s.State(); got != StateClosed {
+		t.Errorf("state = %v, want StateClosed after ctx-cancel ForceClose", got)
+	}
+	// In-flight RPC should have been cancelled by ForceClose.
+	select {
+	case res := <-rpc.resultChan:
+		if res.err == nil {
+			t.Error("expected cancellation error on in-flight RPC")
+		}
+	default:
+		t.Error("in-flight RPC not cancelled")
+	}
+}
+
+// --- heartbeat ---------------------------------------------------------------
+
+func TestHeartBeatLoop_ForceClosesOnMissedHeartbeat(t *testing.T) {
+	s, _ := makeActive(t, SessionHooks{})
+	rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
+	s.mu.Lock()
+	s.activeRPCs[1] = rpc
+	s.nextHeartbeatDeadline = time.Now().Add(-time.Second) // already missed
+	s.mu.Unlock()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	go s.heartBeatLoop(ctx)
 
-	stream := newMockSessionStream()
-	session := NewSession("test-session", stream, nil, SessionTypeTable)
+	waitFor(t, time.Second, func() bool { return s.State() == StateClosed }, "ForceClose from missed heartbeat")
 
-	// Pre-activate the session
-	session.state = StateActive
-	close(session.handshakeDone)
-
-	// Start background readLoop
-	go session.readLoop(ctx)
-
-	resChan10 := make(chan vrpcResult, 1)
-	resChan11 := make(chan vrpcResult, 1)
-
-	session.mu.Lock()
-	session.activeRPCs[10] = &VRPCImpl{
-		id:         10,
-		method:     "TestMethod",
-		resultChan: resChan10,
-	}
-	session.activeRPCs[11] = &VRPCImpl{
-		id:         11,
-		method:     "TestMethod",
-		resultChan: resChan11,
-	}
-	session.mu.Unlock()
-
-	// Inject GoAway with last_rpc_id_admitted equal to 10.
-	// This means 10 was admitted (should not be aborted),
-	// and 11 was NOT admitted (should be aborted immediately).
-	stream.recvChan <- &spb.SessionResponse{
-		Payload: &spb.SessionResponse_GoAway{
-			GoAway: &spb.GoAwayResponse{
-				LastRpcIdAdmitted: 10,
-			},
-		},
-	}
-
-	// Provide 10 response payload on the stream to let it succeed
-	stream.recvChan <- &spb.SessionResponse{
-		Payload: &spb.SessionResponse_VirtualRpc{
-			VirtualRpc: &spb.VirtualRpcResponse{
-				RpcId:   10,
-				Payload: []byte("resp10"),
-			},
-		},
-	}
-
-	// Verify 10 (admitted) succeeded
-	var res10 vrpcResult
 	select {
-	case res10 = <-resChan10:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timed out waiting for vRPC 10 response")
-	}
-
-	if res10.err != nil {
-		t.Errorf("Expected vRPC 10 (admitted) to succeed, got error: %v", res10.err)
-	}
-	if string(res10.resp.Payload) != "resp10" {
-		t.Errorf("Expected vRPC 10 response payload 'resp10', got: %s", string(res10.resp.Payload))
-	}
-
-	// Verify 11 (unadmitted) failed with codes.Unavailable
-	var res11 vrpcResult
-	select {
-	case res11 = <-resChan11:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timed out waiting for vRPC 11 response")
-	}
-
-	if res11.err == nil {
-		t.Fatal("Expected vRPC 11 (unadmitted) to fail, but got success")
-	}
-
-	st, ok := status.FromError(res11.err)
-	if !ok || st.Code() != codes.Unavailable {
-		t.Errorf("Expected Unavailable status error for unadmitted vRPC, got: %v", res11.err)
+	case res := <-rpc.resultChan:
+		if !errors.Is(res.err, ErrUnavailableHeartBeatMissed) {
+			t.Errorf("cancelled cause = %v, want ErrUnavailableHeartBeatMissed", res.err)
+		}
+		if code := status.Code(res.err); code != codes.Unavailable {
+			t.Errorf("status.Code = %v, want Unavailable (so existing retry plumbing applies)", code)
+		}
+	default:
+		t.Error("in-flight RPC not cancelled on heartbeat miss")
 	}
 }
 
+func TestHeartBeatLoop_HeartbeatsKeepInflightVRPCAlive(t *testing.T) {
+	// Positive case: while a VRPC is in flight and the server is sending
+	// Heartbeats, the watchdog must NOT fire. This proves the dispatch in
+	// handleSessionResponse correctly resets the deadline on every
+	// recognized frame.
+	s, _ := makeActive(t, SessionHooks{})
+	s.mu.Lock()
+	s.heartbeatInterval = 30 * time.Millisecond
+	s.nextHeartbeatDeadline = time.Now().Add(90 * time.Millisecond) // 3 * interval
+	s.activeRPCs[1] = &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
+	s.mu.Unlock()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.heartBeatLoop(ctx)
+
+	// Pump heartbeats for longer than 3*interval; without the deadline
+	// reset on each frame, the watchdog would have fired by now.
+	for i := 0; i < 8; i++ {
+		time.Sleep(25 * time.Millisecond)
+		s.handleSessionResponse(&spb.SessionResponse{
+			Payload: &spb.SessionResponse_Heartbeat{Heartbeat: &spb.HeartbeatResponse{}},
+		})
+	}
+
+	if got := s.State(); got != StateActive {
+		t.Errorf("session torn down despite arriving heartbeats; state = %v", got)
+	}
+}
+
+func TestHeartBeatLoop_IdleSessionIsNotTornDown(t *testing.T) {
+	// Server sends Heartbeats only during in-flight VRPCs. An idle session
+	// with an elapsed deadline must NOT be force-closed; the loop should
+	// keep checking until activity returns.
+	s, _ := makeActive(t, SessionHooks{})
+	s.mu.Lock()
+	s.heartbeatInterval = 20 * time.Millisecond // make idle re-check fast
+	s.nextHeartbeatDeadline = time.Now().Add(-time.Hour)
+	s.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		s.heartBeatLoop(ctx)
+		close(done)
+	}()
+
+	// Give the loop time to wake up several times on the idle interval.
+	time.Sleep(150 * time.Millisecond)
+	if s.State() == StateClosed {
+		t.Fatal("idle session was force-closed despite having no in-flight VRPCs")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("heartBeatLoop did not exit on ctx cancel")
+	}
+}
+
+func TestHeartBeatLoop_ExitsOnCtxCancel(t *testing.T) {
+	s, _ := makeActive(t, SessionHooks{})
+	s.mu.Lock()
+	s.nextHeartbeatDeadline = time.Now().Add(time.Hour) // never expires
+	s.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.heartBeatLoop(ctx)
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("heartBeatLoop did not exit on ctx cancel")
+	}
+	if s.State() != StateActive {
+		t.Errorf("state = %v, want StateActive (no force-close on ctx exit)", s.State())
+	}
+}
+
+// --- peerInfoExtracter -------------------------------------------------------
+
+func TestPeerInfoExtracter_ParsesValidHeader(t *testing.T) {
+	s := newTestSession(t, newFakeStream(), SessionHooks{})
+
+	pi := &spb.PeerInfo{
+		ApplicationFrontendSubzone: "us-central1-a",
+		TransportType:              spb.PeerInfo_TRANSPORT_TYPE_DIRECT_ACCESS,
+	}
+	raw, err := proto.Marshal(pi)
+	if err != nil {
+		t.Fatalf("proto.Marshal: %v", err)
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(raw)
+
+	s.peerInfoExtracter([]string{encoded})
+
+	got := s.PeerInfo()
+	if got == nil {
+		t.Fatal("PeerInfo nil after extraction")
+	}
+	if got.GetApplicationFrontendSubzone() != "us-central1-a" {
+		t.Errorf("AFE = %q, want us-central1-a", got.GetApplicationFrontendSubzone())
+	}
+	if got.GetTransportType() != spb.PeerInfo_TRANSPORT_TYPE_DIRECT_ACCESS {
+		t.Errorf("TransportType = %v, want DIRECT_ACCESS", got.GetTransportType())
+	}
+}
+
+func TestPeerInfoExtracter_EmptyAndBadInputs(t *testing.T) {
+	s := newTestSession(t, newFakeStream(), SessionHooks{})
+
+	s.peerInfoExtracter(nil)
+	s.peerInfoExtracter([]string{})
+	if s.PeerInfo() != nil {
+		t.Error("PeerInfo should remain nil for empty input")
+	}
+
+	s.peerInfoExtracter([]string{"!!!not-base64!!!"})
+	if s.PeerInfo() != nil {
+		t.Error("PeerInfo should remain nil for undecodable input")
+	}
+}
+
+// --- Start integration -------------------------------------------------------
+
+func TestStart_HandshakeAndClose(t *testing.T) {
+	stream := newFakeStream()
+	listener := &hookCounts{}
+	s := newTestSession(t, stream, listener.hooks())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx, &spb.OpenSessionRequest{ProtocolVersion: 1}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitFor(t, time.Second, func() bool { _, _, _ = listener.counts(); start, _, _ := listener.counts(); return start == 1 }, "OnStart")
+
+	// Initial Open frame sent.
+	if sent := stream.snapshotSent(); len(sent) != 1 || sent[0].GetOpenSession() == nil {
+		t.Fatalf("expected OpenSession frame as first send, got %d frames", len(sent))
+	}
+
+	// Deliver the OpenSession response, then EOF.
+	stream.recv <- recvOp{resp: &spb.SessionResponse{
+		Payload: &spb.SessionResponse_OpenSession{OpenSession: &spb.OpenSessionResponse{}},
+	}}
+	waitFor(t, time.Second, func() bool { return s.State() == StateActive }, "StateActive")
+	if _, active, _ := listener.counts(); active != 1 {
+		t.Errorf("OnActive fired %d times, want 1", active)
+	}
+
+	stream.recv <- recvOp{err: fmt.Errorf("server EOF")}
+	waitFor(t, time.Second, func() bool { return s.State() == StateClosed }, "StateClosed after EOF")
+	if _, _, closed := listener.counts(); closed != 1 {
+		t.Errorf("OnClose fired %d times, want 1", closed)
+	}
+}
+
+func TestStart_RejectsIfNotNew(t *testing.T) {
+	s, _ := makeActive(t, SessionHooks{})
+	if err := s.Start(context.Background(), &spb.OpenSessionRequest{}); err == nil {
+		t.Error("Start on active session should return error")
+	}
+}
