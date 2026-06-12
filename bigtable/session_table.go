@@ -25,12 +25,18 @@ import (
 )
 
 // ExecuteVRpcer is the narrow surface SessionTable needs from a session pool:
-// the ability to dispatch a single virtual RPC and surface the cluster info
-// alongside the response (or error). It is satisfied by
-// *btransport.SessionPoolImpl; the interface exists so tests can substitute a
-// fake implementation without standing up a real pool.
+// the ability to dispatch a single virtual RPC and surface the full
+// ExecuteResult (response, cluster info, server-side Stats, and the local
+// SentAt timestamp). It is satisfied by *btransport.SessionPoolImpl; the
+// interface exists so tests can substitute a fake implementation without
+// standing up a real pool.
+//
+// Note: this interface intentionally requires ExecuteVRpcEx (not the
+// back-compat ExecuteVRpc wrapper) so SessionTable can populate
+// per-attempt clientBlockingLatency (from SentAt - attemptStart) and
+// serverLatency (from Stats.BackendLatency).
 type ExecuteVRpcer interface {
-	ExecuteVRpc(ctx context.Context, desc btransport.VRpcDescriptor, req interface{}) (interface{}, *btpb.ClusterInformation, error)
+	ExecuteVRpcEx(ctx context.Context, desc btransport.VRpcDescriptor, req interface{}) (btransport.ExecuteResult, error)
 }
 
 // SessionTable implements TableAPI by routing calls via virtual RPCs through dedicated session pools.
@@ -129,21 +135,32 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 	}
 
 	baseHandler := func(attemptCtx context.Context, request interface{}) (interface{}, error) {
+		result, err := t.readPool.ExecuteVRpcEx(attemptCtx, t.readVRpcDesc, request)
 		if mt := metricsTracerFromContext(attemptCtx); mt != nil {
-			mt.recordClientBlockingLatency()
-		}
-		resp, clusterInfo, err := t.readPool.ExecuteVRpc(attemptCtx, t.readVRpcDesc, request)
-		if clusterInfo != nil {
-			fmt.Printf(">>> SessionTable ReadRow attempt served by Cluster: Id=%s, Zone=%s <<<\n", clusterInfo.ClusterId, clusterInfo.ZoneId)
-			if mt := metricsTracerFromContext(attemptCtx); mt != nil {
-				mt.currOp.currAttempt.setClusterID(clusterInfo.ClusterId)
-				mt.currOp.currAttempt.setZoneID(clusterInfo.ZoneId)
+			if result.ClusterInfo != nil {
+				mt.currOp.currAttempt.setClusterID(result.ClusterInfo.ClusterId)
+				mt.currOp.currAttempt.setZoneID(result.ClusterInfo.ZoneId)
 			}
+			// Stamp client-blocking latency as (SentAt - attemptStart). The
+			// gRPC stats handler never fires for vRPC frames, so without
+			// this assignment clientBlockingLatency would stay at 0 on
+			// the session path.
+			if !result.SentAt.IsZero() && !mt.currOp.currAttempt.startTime.IsZero() {
+				mt.currOp.currAttempt.clientBlockingLatency = convertToMs(result.SentAt.Sub(mt.currOp.currAttempt.startTime))
+			}
+			// Pull server-reported backend latency out of the Stats
+			// payload when the server populated it on the success frame.
+			if result.Stats != nil && result.Stats.BackendLatency != nil {
+				mt.currOp.currAttempt.setServerLatency(convertToMs(result.Stats.GetBackendLatency().AsDuration()))
+			}
+		}
+		if result.ClusterInfo != nil {
+			fmt.Printf(">>> SessionTable ReadRow attempt served by Cluster: Id=%s, Zone=%s <<<\n", result.ClusterInfo.ClusterId, result.ClusterInfo.ZoneId)
 		}
 		if err != nil {
 			return nil, err
 		}
-		return resp, nil
+		return result.Response, nil
 	}
 
 	chained := btransport.ChainInterceptors(retryInterceptor)
@@ -205,21 +222,32 @@ func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts 
 	}
 
 	baseHandler := func(attemptCtx context.Context, request interface{}) (interface{}, error) {
+		result, err := t.writePool.ExecuteVRpcEx(attemptCtx, t.writeVRpcDesc, request)
 		if mt := metricsTracerFromContext(attemptCtx); mt != nil {
-			mt.recordClientBlockingLatency()
-		}
-		resp, clusterInfo, err := t.writePool.ExecuteVRpc(attemptCtx, t.writeVRpcDesc, request)
-		if clusterInfo != nil {
-			fmt.Printf(">>> SessionTable Apply attempt served by Cluster: Id=%s, Zone=%s <<<\n", clusterInfo.ClusterId, clusterInfo.ZoneId)
-			if mt := metricsTracerFromContext(attemptCtx); mt != nil {
-				mt.currOp.currAttempt.setClusterID(clusterInfo.ClusterId)
-				mt.currOp.currAttempt.setZoneID(clusterInfo.ZoneId)
+			if result.ClusterInfo != nil {
+				mt.currOp.currAttempt.setClusterID(result.ClusterInfo.ClusterId)
+				mt.currOp.currAttempt.setZoneID(result.ClusterInfo.ZoneId)
 			}
+			// Stamp client-blocking latency as (SentAt - attemptStart). The
+			// gRPC stats handler never fires for vRPC frames, so without
+			// this assignment clientBlockingLatency would stay at 0 on
+			// the session path.
+			if !result.SentAt.IsZero() && !mt.currOp.currAttempt.startTime.IsZero() {
+				mt.currOp.currAttempt.clientBlockingLatency = convertToMs(result.SentAt.Sub(mt.currOp.currAttempt.startTime))
+			}
+			// Pull server-reported backend latency out of the Stats
+			// payload when the server populated it on the success frame.
+			if result.Stats != nil && result.Stats.BackendLatency != nil {
+				mt.currOp.currAttempt.setServerLatency(convertToMs(result.Stats.GetBackendLatency().AsDuration()))
+			}
+		}
+		if result.ClusterInfo != nil {
+			fmt.Printf(">>> SessionTable Apply attempt served by Cluster: Id=%s, Zone=%s <<<\n", result.ClusterInfo.ClusterId, result.ClusterInfo.ZoneId)
 		}
 		if err != nil {
 			return nil, err
 		}
-		return resp, nil
+		return result.Response, nil
 	}
 
 	chained := btransport.ChainInterceptors(retryInterceptor)

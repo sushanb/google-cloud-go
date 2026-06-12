@@ -42,7 +42,7 @@ type fakeExecuteVRpcer struct {
 	onCall func(ctx context.Context)
 }
 
-func (f *fakeExecuteVRpcer) ExecuteVRpc(ctx context.Context, desc btransport.VRpcDescriptor, req interface{}) (interface{}, *btpb.ClusterInformation, error) {
+func (f *fakeExecuteVRpcer) ExecuteVRpcEx(ctx context.Context, desc btransport.VRpcDescriptor, req interface{}) (btransport.ExecuteResult, error) {
 	atomic.AddInt32(&f.calls, 1)
 	f.mu.Lock()
 	hook := f.onCall
@@ -50,7 +50,10 @@ func (f *fakeExecuteVRpcer) ExecuteVRpc(ctx context.Context, desc btransport.VRp
 	if hook != nil {
 		hook(ctx)
 	}
-	return f.resp, f.clusterInfo, f.err
+	return btransport.ExecuteResult{
+		Response:    f.resp,
+		ClusterInfo: f.clusterInfo,
+	}, f.err
 }
 
 func (f *fakeExecuteVRpcer) callCount() int32 {
