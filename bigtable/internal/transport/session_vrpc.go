@@ -21,6 +21,8 @@ import (
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // ExecuteVRpc executes a single virtual RPC over the session stream and
@@ -74,12 +76,28 @@ func (s *Session) ExecuteVRpc(ctx context.Context, desc VRpcDescriptor, req inte
 	// server's keepalive clock is implicitly reset by our activity.
 	s.resetHeartbeatDeadline()
 
+	attempt := int64(VRpcAttempt(ctx))
+	if attempt == 0 {
+		// Calls bypassing the retry interceptor have no attempt set in the
+		// context; treat them as the first attempt.
+		attempt = 1
+	}
+	virtRpc := &spb.VirtualRpcRequest{
+		RpcId:   rpcID,
+		Payload: reqBytes,
+		Metadata: &spb.VirtualRpcRequest_Metadata{
+			AttemptNumber: attempt,
+			AttemptStart:  timestamppb.New(startTime),
+		},
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(dl); remaining > 0 {
+			virtRpc.Deadline = durationpb.New(remaining)
+		}
+	}
 	sessionReq := &spb.SessionRequest{
 		Payload: &spb.SessionRequest_VirtualRpc{
-			VirtualRpc: &spb.VirtualRpcRequest{
-				RpcId:   rpcID,
-				Payload: reqBytes,
-			},
+			VirtualRpc: virtRpc,
 		},
 	}
 	if err := s.Send(sessionReq); err != nil {
