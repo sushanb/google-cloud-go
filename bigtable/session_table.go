@@ -16,6 +16,7 @@ package bigtable
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -72,6 +73,8 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 		return t.classic.ReadRow(ctx, row, opts...)
 	}
 
+	ctx = mergeOutgoingMetadata(ctx, t.classic.md)
+
 	mt := t.classic.newBuiltinMetricsTracer(ctx, false)
 	defer mt.recordOperationCompletion()
 	mt.setMethod("ReadRows")
@@ -98,7 +101,7 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 	retryInterceptor := btransport.RetryingVRpc(btransport.RetryingOptions{
 		MaxAttempts:       10, // Up to 10 attempts (initial attempt + 9 retries)
 		InitialBackoff:    10 * time.Millisecond,
-		MaxBackoff:        100 * time.Millisecond,
+		MaxBackoff:        32 * time.Second,
 		BackoffMultiplier: 1.5,
 		Listener:          sessionMetricsListener{},
 	})
@@ -113,15 +116,15 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 			mt.recordClientBlockingLatency()
 		}
 		resp, clusterInfo, err := t.readPool.ExecuteVRpc(attemptCtx, t.readVRpcDesc, request)
-		if err != nil {
-			return nil, err
-		}
 		if clusterInfo != nil {
 			fmt.Printf(">>> SessionTable ReadRow attempt served by Cluster: Id=%s, Zone=%s <<<\n", clusterInfo.ClusterId, clusterInfo.ZoneId)
 			if mt := metricsTracerFromContext(attemptCtx); mt != nil {
 				mt.currOp.currAttempt.setClusterID(clusterInfo.ClusterId)
 				mt.currOp.currAttempt.setZoneID(clusterInfo.ZoneId)
 			}
+		}
+		if err != nil {
+			return nil, err
 		}
 		return resp, nil
 	}
@@ -142,9 +145,14 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 
 // Apply applies a single mutation via vRPC.
 func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts ...ApplyOption) (err error) {
-	if t.writePool == nil || m.isConditional {
+	if m.isConditional {
 		return t.classic.Apply(ctx, row, m, opts...)
 	}
+	if t.writePool == nil {
+		return errors.New("bigtable: write operations not supported on this resource")
+	}
+
+	ctx = mergeOutgoingMetadata(ctx, t.classic.md)
 
 	mt := t.classic.newBuiltinMetricsTracer(ctx, false)
 	defer mt.recordOperationCompletion()
@@ -158,10 +166,18 @@ func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts 
 
 	fmt.Printf(">>> SessionTable Apply: row=%s via writePool=%p <<<\n", row, t.writePool)
 
+	// Only retry idempotent mutations. A SetCell with ServerTime timestamp is
+	// non-retryable because a retry would create duplicate cells with different
+	// server-assigned timestamps.
+	maxAttempts := int32(10)
+	if !mutationsAreRetryable(m.ops) {
+		maxAttempts = 1
+	}
+
 	retryInterceptor := btransport.RetryingVRpc(btransport.RetryingOptions{
-		MaxAttempts:       10, // Up to 10 attempts
+		MaxAttempts:       maxAttempts,
 		InitialBackoff:    10 * time.Millisecond,
-		MaxBackoff:        100 * time.Millisecond,
+		MaxBackoff:        32 * time.Second,
 		BackoffMultiplier: 1.5,
 		Listener:          sessionMetricsListener{},
 	})
@@ -176,15 +192,15 @@ func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts 
 			mt.recordClientBlockingLatency()
 		}
 		resp, clusterInfo, err := t.writePool.ExecuteVRpc(attemptCtx, t.writeVRpcDesc, request)
-		if err != nil {
-			return nil, err
-		}
 		if clusterInfo != nil {
 			fmt.Printf(">>> SessionTable Apply attempt served by Cluster: Id=%s, Zone=%s <<<\n", clusterInfo.ClusterId, clusterInfo.ZoneId)
 			if mt := metricsTracerFromContext(attemptCtx); mt != nil {
 				mt.currOp.currAttempt.setClusterID(clusterInfo.ClusterId)
 				mt.currOp.currAttempt.setZoneID(clusterInfo.ZoneId)
 			}
+		}
+		if err != nil {
+			return nil, err
 		}
 		return resp, nil
 	}
