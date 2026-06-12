@@ -24,12 +24,21 @@ import (
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 )
 
+// ExecuteVRpcer is the narrow surface SessionTable needs from a session pool:
+// the ability to dispatch a single virtual RPC and surface the cluster info
+// alongside the response (or error). It is satisfied by
+// *btransport.SessionPoolImpl; the interface exists so tests can substitute a
+// fake implementation without standing up a real pool.
+type ExecuteVRpcer interface {
+	ExecuteVRpc(ctx context.Context, desc btransport.VRpcDescriptor, req interface{}) (interface{}, *btpb.ClusterInformation, error)
+}
+
 // SessionTable implements TableAPI by routing calls via virtual RPCs through dedicated session pools.
 type SessionTable struct {
 	tableName     string
 	classic       *Table
-	readPool      *btransport.SessionPoolImpl
-	writePool     *btransport.SessionPoolImpl
+	readPool      ExecuteVRpcer
+	writePool     ExecuteVRpcer
 	readVRpcDesc  btransport.VRpcDescriptor
 	writeVRpcDesc btransport.VRpcDescriptor
 }
@@ -43,14 +52,22 @@ func NewSessionTable(
 	readVRpcDesc btransport.VRpcDescriptor,
 	writeVRpcDesc btransport.VRpcDescriptor,
 ) *SessionTable {
-	return &SessionTable{
+	st := &SessionTable{
 		tableName:     tableName,
 		classic:       classic,
-		readPool:      readPool,
-		writePool:     writePool,
 		readVRpcDesc:  readVRpcDesc,
 		writeVRpcDesc: writeVRpcDesc,
 	}
+	// Avoid storing a typed-nil *SessionPoolImpl in the interface field: the
+	// nil-pool checks in ReadRow/Apply use a plain `pool == nil` comparison,
+	// which is false for a typed-nil-wrapped-in-interface value.
+	if readPool != nil {
+		st.readPool = readPool
+	}
+	if writePool != nil {
+		st.writePool = writePool
+	}
+	return st
 }
 
 type sessionMetricsListener struct{}
