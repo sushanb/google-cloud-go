@@ -1158,19 +1158,10 @@ func gaxInvokeWithRecorder(ctx context.Context, method string,
 		finalMD := metadata.Join(existingMD, md)
 		newCtx := metadata.NewOutgoingContext(ctx, finalMD)
 
-		mt.recordAttemptStart()
-		blockTracker := &blockingLatencyTracker{}
-		mt.currOp.currAttempt.blockingLatencyTracker = blockTracker
-		newCtx = context.WithValue(newCtx, statsContextKey, blockTracker)
-
-		t4t7 := &t4t7Tracker{}
-		mt.currOp.currAttempt.t4t7Tracker = t4t7
-		newCtx = context.WithValue(newCtx, t4t7ContextKey, t4t7)
-		// f makes calls to CBT service
+		// Per-attempt metric setup (recordAttemptStart, blockingLatencyTracker,
+		// t4t7Tracker) is owned by latencyStatsHandler.TagRPC. f's headerMD /
+		// trailerMD are still needed for routing-cookie extraction below.
 		err := f(newCtx, &attemptHeaderMD, &attempTrailerMD, callSettings)
-
-		// Record attempt specific metrics
-		mt.recordAttemptCompletion(attemptHeaderMD, attempTrailerMD, err)
 
 		extractCookies(attemptHeaderMD, op)
 		extractCookies(attempTrailerMD, op)
