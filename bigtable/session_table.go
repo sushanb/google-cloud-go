@@ -24,7 +24,7 @@ import (
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 )
 
-// ExecuteVRpcer is the narrow surface SessionTable needs from a session pool:
+// VRpcExecutor is the narrow surface SessionTable needs from a session pool:
 // the ability to dispatch a single virtual RPC and surface the full
 // ExecuteResult (response, cluster info, server-side Stats, and the local
 // SentAt timestamp). It is satisfied by *btransport.SessionPoolImpl; the
@@ -35,7 +35,7 @@ import (
 // back-compat ExecuteVRpc wrapper) so SessionTable can populate
 // per-attempt clientBlockingLatency (from SentAt - attemptStart) and
 // serverLatency (from Stats.BackendLatency).
-type ExecuteVRpcer interface {
+type VRpcExecutor interface {
 	ExecuteVRpcEx(ctx context.Context, desc btransport.VRpcDescriptor, req interface{}) (btransport.ExecuteResult, error)
 }
 
@@ -43,8 +43,8 @@ type ExecuteVRpcer interface {
 type SessionTable struct {
 	tableName     string
 	classic       *Table
-	readPool      ExecuteVRpcer
-	writePool     ExecuteVRpcer
+	readPool      VRpcExecutor
+	writePool     VRpcExecutor
 	readVRpcDesc  btransport.VRpcDescriptor
 	writeVRpcDesc btransport.VRpcDescriptor
 }

@@ -30,13 +30,13 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
-// fakeExecuteVRpcer is a hand-rolled stub for the ExecuteVRpcer interface. It
+// fakeVRpcExecutor is a hand-rolled stub for the VRpcExecutor interface. It
 // counts invocations and returns a configurable ExecuteResult / err pair. A
 // capture hook lets tests inspect the per-attempt context (for metrics-tracer
 // assertions). Stats / sentAt are exposed so tests can exercise the
 // session_table.go branches that pull serverLatency from Stats and
 // clientBlockingLatency from (SentAt - attemptStart).
-type fakeExecuteVRpcer struct {
+type fakeVRpcExecutor struct {
 	mu          sync.Mutex
 	calls       int32
 	resp        interface{}
@@ -51,7 +51,7 @@ type fakeExecuteVRpcer struct {
 	onCall func(ctx context.Context)
 }
 
-func (f *fakeExecuteVRpcer) ExecuteVRpcEx(ctx context.Context, desc btransport.VRpcDescriptor, req interface{}) (btransport.ExecuteResult, error) {
+func (f *fakeVRpcExecutor) ExecuteVRpcEx(ctx context.Context, desc btransport.VRpcDescriptor, req interface{}) (btransport.ExecuteResult, error) {
 	atomic.AddInt32(&f.calls, 1)
 	f.mu.Lock()
 	hook := f.onCall
@@ -67,7 +67,7 @@ func (f *fakeExecuteVRpcer) ExecuteVRpcEx(ctx context.Context, desc btransport.V
 	}, f.err
 }
 
-func (f *fakeExecuteVRpcer) callCount() int32 {
+func (f *fakeVRpcExecutor) callCount() int32 {
 	return atomic.LoadInt32(&f.calls)
 }
 
@@ -75,7 +75,7 @@ func (f *fakeExecuteVRpcer) callCount() int32 {
 // read/write pool fakes and a minimal *Table backing object. It uses a
 // disabled metrics tracer factory so SessionTable's contextWithMetricsTracer
 // path stays exercised but doesn't try to emit OTel metrics.
-func newSessionTestTable(t *testing.T, readPool, writePool ExecuteVRpcer) *SessionTable {
+func newSessionTestTable(t *testing.T, readPool, writePool VRpcExecutor) *SessionTable {
 	t.Helper()
 	classic := &Table{
 		c: &Client{
@@ -99,7 +99,7 @@ func newSessionTestTable(t *testing.T, readPool, writePool ExecuteVRpcer) *Sessi
 // --- Apply: retry-idempotency ------------------------------------------------
 
 func TestSessionTable_Apply_ServerTimeMutationNotRetried(t *testing.T) {
-	writePool := &fakeExecuteVRpcer{
+	writePool := &fakeVRpcExecutor{
 		err: status.Error(codes.Unavailable, "transient"),
 	}
 	st := newSessionTestTable(t, nil, writePool)
@@ -117,7 +117,7 @@ func TestSessionTable_Apply_ServerTimeMutationNotRetried(t *testing.T) {
 }
 
 func TestSessionTable_Apply_TimestampedMutationRetries(t *testing.T) {
-	writePool := &fakeExecuteVRpcer{
+	writePool := &fakeVRpcExecutor{
 		err: status.Error(codes.Unavailable, "transient"),
 	}
 	st := newSessionTestTable(t, nil, writePool)
@@ -138,7 +138,7 @@ func TestSessionTable_Apply_TimestampedMutationRetries(t *testing.T) {
 func TestSessionTable_Apply_NilWritePoolReturnsError(t *testing.T) {
 	// readPool present, writePool nil — Apply must not panic and must surface
 	// a write-not-supported error.
-	readPool := &fakeExecuteVRpcer{}
+	readPool := &fakeVRpcExecutor{}
 	st := newSessionTestTable(t, readPool, nil)
 
 	m := NewMutation()
@@ -170,7 +170,7 @@ func TestSessionTable_ReadRow_ClusterInfoRecordedOnError(t *testing.T) {
 	var capturedCtx context.Context
 	var captureMu sync.Mutex
 
-	readPool := &fakeExecuteVRpcer{
+	readPool := &fakeVRpcExecutor{
 		clusterInfo: &btpb.ClusterInformation{ClusterId: "c1", ZoneId: "z1"},
 		err:         status.Error(codes.Internal, "boom"),
 	}
@@ -240,7 +240,7 @@ func TestSessionTable_ReadRow_ClusterInfoRecordedOnError(t *testing.T) {
 func TestSessionTable_ServerLatencyFromStats(t *testing.T) {
 	const wantBackend = 42 * time.Millisecond
 
-	readPool := &fakeExecuteVRpcer{
+	readPool := &fakeVRpcExecutor{
 		resp:   btransport.ReadRowResult{Row: &btpb.Row{Key: []byte("row1")}},
 		stats:  &btpb.SessionRequestStats{BackendLatency: durationpb.New(wantBackend)},
 		sentAt: time.Now(),
@@ -291,10 +291,10 @@ func TestSessionTable_ClientBlockingLatencyFromSentAt(t *testing.T) {
 	// just before the baseHandler reads it back. The cleanest way is to
 	// have onCall both stamp startTime AND mutate sentAt to a known offset
 	// from it — but sentAt is captured into the ExecuteResult before the
-	// hook runs (look at ExecuteVRpcEx in fakeExecuteVRpcer: the result
+	// hook runs (look at ExecuteVRpcEx in fakeVRpcExecutor: the result
 	// struct is built *after* hook returns). So if we set both in onCall,
 	// both land in the result correctly.
-	readPool := &fakeExecuteVRpcer{
+	readPool := &fakeVRpcExecutor{
 		resp: btransport.ReadRowResult{Row: &btpb.Row{Key: []byte("row1")}},
 	}
 	var capturedCtx context.Context
