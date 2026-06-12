@@ -557,24 +557,20 @@ func TestIntegration_SessionVRpc_RetriesOnUnavailable(t *testing.T) {
 	if len(vrpcs) < 2 {
 		t.Fatalf("server saw %d vRPCs after retry, want >= 2", len(vrpcs))
 	}
-	// Both attempts must arrive with vRPC metadata populated and
-	// AttemptNumber >= 1. NOTE: in the current SessionTable.ReadRow
-	// implementation the context passed into the retry interceptor is not
-	// pre-seeded by WithVRpcMetadata, so WithAttempt's update is a no-op
-	// (see internal/transport/vrpc.go: WithAttempt only mutates when
-	// vrpcMetadata is already present in the ctx). The ExecuteVRpcEx
-	// default kicks in and stamps AttemptNumber=1 on every frame. The
-	// retry itself is real — there are two wire frames — but the wire
-	// counter cannot distinguish them today. We assert what the code
-	// actually emits so this test fails loudly if the seeding gets fixed
-	// and AttemptNumber starts incrementing.
-	for i, v := range vrpcs[:2] {
+	// Both attempts must arrive with vRPC metadata populated, and
+	// AttemptNumber must strictly increment: attempt 1 = 1, attempt 2 = 2.
+	// SessionTable now seeds the ctx with WithVRpcMetadata before invoking
+	// RetryingVRpc, so retrying.go's WithAttempt(ctx, n) mutates the value
+	// that ExecuteVRpcEx subsequently reads via VRpcAttempt(ctx).
+	wantAttempts := []int64{1, 2}
+	for i, want := range wantAttempts {
+		v := vrpcs[i]
 		if v.GetMetadata() == nil {
 			t.Errorf("vrpcs[%d].Metadata = nil, want non-nil", i)
 			continue
 		}
-		if got := v.GetMetadata().GetAttemptNumber(); got < 1 {
-			t.Errorf("vrpcs[%d].AttemptNumber = %d, want >= 1", i, got)
+		if got := v.GetMetadata().GetAttemptNumber(); got != want {
+			t.Errorf("vrpcs[%d].AttemptNumber = %d, want %d", i, got, want)
 		}
 	}
 	// Sanity: at least one frame must be a ReadRow (both should be, but

@@ -283,7 +283,10 @@ func TestClose_WaitsForInFlightPolls(t *testing.T) {
 	}
 }
 
-func TestAddSessionLoadListener_FiresImmediatelyWithCurrentLoad(t *testing.T) {
+func TestAddSessionLoadListener_SkipsImmediateDefaultFire(t *testing.T) {
+	// AddSessionLoadListener intentionally suppresses the seq=0 registration-
+	// time fire so the Diverter's bootstrap value (e.g. NewDiverter(1.0)) is
+	// not silently overwritten by the default config's SessionLoad=0.
 	client := &mockBigtableClient{}
 	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
 
@@ -298,12 +301,44 @@ func TestAddSessionLoadListener_FiresImmediatelyWithCurrentLoad(t *testing.T) {
 
 	select {
 	case load := <-got:
-		// defaultClientConfig.Session.SessionLoad is 0.
-		if load != 0.0 {
-			t.Errorf("immediate SessionLoad fire = %v, want 0.0 (default)", load)
+		t.Fatalf("listener fired with load=%v at registration time; want no fire (seq=0 suppression)", load)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: no fire.
+	}
+}
+
+func TestAddSessionLoadListener_FiresOnFirstPoll(t *testing.T) {
+	// After the first successful poll, AddSessionLoadListener fires with the
+	// server-reported SessionLoad.
+	client := &mockBigtableClient{
+		getConfigFunc: func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
+			return &bigtablepb.ClientConfiguration{
+				SessionConfiguration: &bigtablepb.SessionClientConfiguration{
+					SessionLoad: 0.75,
+				},
+			}, nil
+		},
+	}
+	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
+
+	got := make(chan float64, 1)
+	unregister := manager.AddSessionLoadListener(func(load float64) {
+		select {
+		case got <- load:
+		default:
+		}
+	})
+	defer unregister()
+
+	manager.poll(context.Background())
+
+	select {
+	case load := <-got:
+		if load != 0.75 {
+			t.Errorf("post-poll SessionLoad fire = %v, want 0.75", load)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("AddSessionLoadListener did not fire immediately on registration")
+		t.Fatal("AddSessionLoadListener did not fire after first poll")
 	}
 }
 
@@ -319,13 +354,12 @@ func TestAddSessionLoadListener_UnregisterStopsCallbacks(t *testing.T) {
 		totalCalls++
 	})
 
-	// Drop the immediate fire from the count, then unregister.
+	// No immediate fire (seq=0 suppression); confirm baseline is 0.
 	mu.Lock()
-	if totalCalls != 1 {
+	if totalCalls != 0 {
 		mu.Unlock()
-		t.Fatalf("expected 1 immediate call, got %d", totalCalls)
+		t.Fatalf("listener fired %d times at registration; want 0 (seq=0 suppression)", totalCalls)
 	}
-	totalCalls = 0
 	mu.Unlock()
 
 	unregister()

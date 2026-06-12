@@ -163,6 +163,11 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 		return result.Response, nil
 	}
 
+	// Seed vRPC metadata so RetryingVRpc's WithAttempt(ctx, n) actually
+	// increments the per-attempt counter that ExecuteVRpcEx reads via
+	// VRpcAttempt(ctx). Without this seed, WithAttempt is a no-op and every
+	// retry wire-frame carries AttemptNumber=1.
+	ctx = btransport.WithVRpcMetadata(ctx, t.readVRpcDesc.Method(), 0)
 	chained := btransport.ChainInterceptors(retryInterceptor)
 	res, err := chained(ctx, args, baseHandler)
 	if err != nil {
@@ -250,6 +255,11 @@ func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts 
 		return result.Response, nil
 	}
 
+	// Seed vRPC metadata so RetryingVRpc's WithAttempt(ctx, n) actually
+	// increments the per-attempt counter that ExecuteVRpcEx reads via
+	// VRpcAttempt(ctx). Without this seed, WithAttempt is a no-op and every
+	// retry wire-frame carries AttemptNumber=1.
+	ctx = btransport.WithVRpcMetadata(ctx, t.writeVRpcDesc.Method(), 0)
 	chained := btransport.ChainInterceptors(retryInterceptor)
 	_, err = chained(ctx, args, baseHandler)
 	if err != nil {

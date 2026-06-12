@@ -267,9 +267,18 @@ func (m *ClientConfigurationManager) AddSessionPoolListener(listener func(*bigta
 
 // AddSessionLoadListener registers a callback that receives the server-driven
 // SessionLoad value (0.0 = all-classic, 1.0 = all-session) on every
-// configuration update. Returns an unregister thunk.
+// configuration update from a successful poll. Returns an unregister thunk.
+//
+// Unlike AddSessionPoolListener, this skips the immediate registration-time
+// fire that would otherwise deliver the default config (seq=0). Callers rely
+// on the bootstrap value they passed to NewDiverter remaining in effect until
+// the control plane actually responds — firing with seq=0's default
+// SessionLoad=0 would silently clobber that bootstrap.
 func (m *ClientConfigurationManager) AddSessionLoadListener(listener func(load float64)) func() {
 	return m.addListener(func(cfg clientConfig, seq int64) {
+		if seq == 0 {
+			return
+		}
 		listener(cfg.Session.SessionLoad)
 	})
 }
