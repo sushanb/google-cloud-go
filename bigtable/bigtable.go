@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -1177,4 +1178,16 @@ func extractCookies(md metadata.MD, op *opTracer) {
 			op.cookies[k] = v[len(v)-1]
 		}
 	}
+}
+
+// reqParamsHeaderValAuthorizedView returns the request-params header value for an
+// AuthorizedView. The routing key is authorized_view_name, NOT table_name.
+func (c *Client) reqParamsHeaderValAuthorizedView(table, av string) string {
+	return fmt.Sprintf("authorized_view_name=%s&app_profile_id=%s", url.QueryEscape(c.fullAuthorizedViewName(table, av)), url.QueryEscape(c.appProfile))
+}
+
+// reqParamsHeaderValMaterializedView returns the request-params header value for a
+// MaterializedView. The routing key is materialized_view_name, NOT table_name.
+func (c *Client) reqParamsHeaderValMaterializedView(mv string) string {
+	return fmt.Sprintf("materialized_view_name=%s&app_profile_id=%s", url.QueryEscape(c.fullMaterializedViewName(mv)), url.QueryEscape(c.appProfile))
 }

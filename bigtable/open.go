@@ -84,7 +84,7 @@ func (c *Client) OpenAuthorizedView(table, authorizedView string) TableAPI {
 		table: table,
 		md: metadata.Join(metadata.Pairs(
 			resourcePrefixHeader, c.fullAuthorizedViewName(table, authorizedView),
-			requestParamsHeader, c.reqParamsHeaderValTable(table),
+			requestParamsHeader, c.reqParamsHeaderValAuthorizedView(table, authorizedView),
 		), c.featureFlagsMD),
 		authorizedView: authorizedView,
 	}
@@ -133,7 +133,7 @@ func (c *Client) OpenMaterializedView(materializedView string) TableAPI {
 		c: c,
 		md: metadata.Join(metadata.Pairs(
 			resourcePrefixHeader, c.fullMaterializedViewName(materializedView),
-			requestParamsHeader, c.reqParamsHeaderValTable(materializedView),
+			requestParamsHeader, c.reqParamsHeaderValMaterializedView(materializedView),
 		), c.featureFlagsMD),
 		materializedView: materializedView,
 	}

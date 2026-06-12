@@ -16,6 +16,7 @@ package bigtable
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -225,6 +226,12 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 	configManager.Start(ctx)
 	c.configManager = configManager
 
+	// TODO: wire SessionLoad pump once ClientConfigurationManager exposes a
+	// SessionLoad listener API. The existing AddSessionPoolListener only emits
+	// SessionPoolConfiguration (Min/Max), not the top-level SessionLoad field.
+	// Once an exported AddSessionLoadListener(func(float64)) is available, register
+	// a callback here that invokes c.diverter.SetSessionLoad(load).
+
 	c.sessionMgr = NewSessionManager(
 		config.EnableSessionPool,
 		metricsTracerFactory.enabled,
@@ -243,28 +250,36 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 }
 
 // Close closes the Client.
+//
+// Shutdown order:
+//  1. SessionManager.Close — drain in-flight session work and stop new acquisitions.
+//  2. ClientConfigurationManager.Close — stop polling so it cannot fire UpdateConfig
+//     against pools that are about to be torn down.
+//  3. backgroundCancel — release any goroutines tied to the client's background ctx.
+//  4. metricsTracerFactory.shutdown — flush metrics now that no further RPCs will run.
+//  5. classicPool.Close — finally tear down the underlying connection pool.
 func (c *Client) Close() error {
 	fmt.Printf("Closing the client for project %s and instance %s\n", c.project, c.instance)
-	if c.backgroundCancel != nil {
-		c.backgroundCancel()
+	var errs []error
+	if c.sessionMgr != nil {
+		if err := c.sessionMgr.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if c.configManager != nil {
 		c.configManager.Close()
 	}
+	if c.backgroundCancel != nil {
+		c.backgroundCancel()
+	}
 	if c.metricsTracerFactory != nil {
 		c.metricsTracerFactory.shutdown()
 	}
-
-	var sessionErr error
-	if c.sessionMgr != nil {
-		sessionErr = c.sessionMgr.Close()
+	// managedChannelPool.Close is nil-safe internally.
+	if err := c.classicPool.Close(); err != nil {
+		errs = append(errs, err)
 	}
-
-	classicErr := c.classicPool.Close()
-	if sessionErr != nil {
-		return sessionErr
-	}
-	return classicErr
+	return errors.Join(errs...)
 }
 
 func (c *Client) fullInstanceName() string {
