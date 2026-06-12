@@ -19,6 +19,7 @@ import (
 	"log"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	bigtablepb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
@@ -101,6 +102,18 @@ type ClientConfigurationManager struct {
 	defaultConfig clientConfig
 	logger        *log.Logger
 
+	// closeOnce ensures Close()'s teardown logic runs exactly once, so a second
+	// Close() call cannot panic by re-closing m.done.
+	closeOnce sync.Once
+	// closed is set to true at the very start of Close()'s teardown, BEFORE
+	// m.done is closed. poll() consults it via isClosed() to suppress listener
+	// invocations against pools that may already be tearing down.
+	closed atomic.Bool
+	// pollsWG tracks in-flight poll() invocations spawned by Start() and
+	// pollingLoop(). Close() waits on it so callers can rely on no listener
+	// callbacks firing after Close() returns.
+	pollsWG sync.WaitGroup
+
 	mu            sync.RWMutex
 	currentConfig clientConfig
 	// configSeq is a monotonically increasing sequence number incremented every time the configuration changes.
@@ -170,7 +183,9 @@ func NewClientConfigurationManager(
 func (m *ClientConfigurationManager) Start(ctx context.Context) {
 	btopt.Debugf(m.logger, "bigtable: starting client configuration manager for instance %q, app profile %q", m.instanceName, m.appProfileId)
 	// We need a context for the initial poll.
+	m.pollsWG.Add(1)
 	go func() {
+		defer m.pollsWG.Done()
 		pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		m.poll(pollCtx)
@@ -181,9 +196,31 @@ func (m *ClientConfigurationManager) Start(ctx context.Context) {
 }
 
 // Close stops the polling process.
+//
+// Close is safe to call multiple times; only the first call performs teardown.
+// It also waits for any in-flight poll() invocations spawned by Start() and
+// pollingLoop() to return before it itself returns. Combined with the closed
+// gate that poll() consults before firing listeners, this guarantees no
+// listener callbacks fire after Close() returns — so SessionPools registered
+// via AddSessionPoolListener can be Close'd immediately after this returns
+// without racing against a late configuration callback.
 func (m *ClientConfigurationManager) Close() {
-	btopt.Debugf(m.logger, "bigtable: closing client configuration manager")
-	close(m.done)
+	m.closeOnce.Do(func() {
+		btopt.Debugf(m.logger, "bigtable: closing client configuration manager")
+		// Set closed BEFORE closing m.done so any poll() that observes the
+		// done channel after this point also observes closed == true.
+		m.closed.Store(true)
+		close(m.done)
+		// Wait for in-flight polls (including their listener callbacks, which
+		// are short-circuited by isClosed()) to finish before returning.
+		m.pollsWG.Wait()
+	})
+}
+
+// isClosed reports whether Close() has begun teardown. poll() consults this
+// before invoking listeners so callbacks do not fire after Close() returns.
+func (m *ClientConfigurationManager) isClosed() bool {
+	return m.closed.Load()
 }
 
 // getConfig returns the current configuration.
@@ -256,10 +293,14 @@ func (m *ClientConfigurationManager) pollingLoop(parentCtx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-time.After(interval):
-			// Poll with a 5-second timeout per RPC attempt
+			// Poll with a 5-second timeout per RPC attempt. Track it with
+			// pollsWG so Close() can wait for in-flight polls (and their
+			// listener callbacks) to finish before returning.
+			m.pollsWG.Add(1)
 			pollCtx, pollCancel := context.WithTimeout(ctx, 5*time.Second)
 			m.poll(pollCtx)
 			pollCancel()
+			m.pollsWG.Done()
 		}
 	}
 }
@@ -323,7 +364,9 @@ func (m *ClientConfigurationManager) poll(ctx context.Context) {
 		}
 		m.mu.Unlock()
 
-		if listeners != nil {
+		// Suppress listener fires after Close() has begun teardown — the
+		// SessionPools they target may already be Close'd.
+		if listeners != nil && !m.isClosed() {
 			for _, l := range listeners {
 				l(cfgToNotify.Clone(), seq)
 			}
@@ -347,6 +390,11 @@ func (m *ClientConfigurationManager) poll(ctx context.Context) {
 	cfgToNotify := m.currentConfig
 	m.mu.Unlock()
 
+	// Suppress listener fires after Close() has begun teardown — the
+	// SessionPools they target may already be Close'd.
+	if m.isClosed() {
+		return
+	}
 	for _, l := range listeners {
 		l(cfgToNotify.Clone(), seq)
 	}

@@ -185,6 +185,104 @@ func TestGetConfig_ReturnsCopy(t *testing.T) {
 	}
 }
 
+func TestClose_DoubleCloseDoesNotPanic(t *testing.T) {
+	client := &mockBigtableClient{}
+	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
+
+	// First Close performs the actual teardown; second Close must be a no-op
+	// rather than panicking with "close of closed channel".
+	manager.Close()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Second Close() panicked: %v", r)
+		}
+	}()
+	manager.Close()
+
+	if !manager.isClosed() {
+		t.Error("Expected manager to report closed after Close()")
+	}
+}
+
+func TestClose_SuppressesListenerCallbacks(t *testing.T) {
+	client := &mockBigtableClient{}
+	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
+
+	// Listener captures invocations made AFTER Close().
+	var mu sync.Mutex
+	var callsAfterClose int
+	manager.addListener(func(cfg clientConfig, seq int64) {
+		mu.Lock()
+		defer mu.Unlock()
+		if manager.isClosed() {
+			callsAfterClose++
+		}
+	})
+
+	// Drive a poll that, on the happy path, would fire listeners. Close
+	// flips the gate first; poll() must observe it and skip the fire.
+	client.getConfigFunc = func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
+		return &bigtablepb.ClientConfiguration{
+			Polling: &bigtablepb.ClientConfiguration_PollingConfiguration_{
+				PollingConfiguration: &bigtablepb.ClientConfiguration_PollingConfiguration{
+					PollingInterval: durationpb.New(600 * time.Second),
+				},
+			},
+		}, nil
+	}
+
+	manager.Close()
+	manager.poll(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if callsAfterClose != 0 {
+		t.Errorf("Expected no listener calls after Close(), got %d", callsAfterClose)
+	}
+}
+
+func TestClose_WaitsForInFlightPolls(t *testing.T) {
+	client := &mockBigtableClient{}
+	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
+
+	// Block the RPC so the poll() launched by Start() is in-flight when
+	// Close() is called. Close() must wait for it before returning.
+	rpcStarted := make(chan struct{})
+	releaseRPC := make(chan struct{})
+	client.getConfigFunc = func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
+		close(rpcStarted)
+		<-releaseRPC
+		return nil, status.Error(codes.Unavailable, "unavailable")
+	}
+
+	// Use a low retry count so the poll terminates after one attempt.
+	manager.currentConfig.Polling.MaxRpcRetryCount = 0
+
+	manager.Start(context.Background())
+	<-rpcStarted
+
+	closeReturned := make(chan struct{})
+	go func() {
+		manager.Close()
+		close(closeReturned)
+	}()
+
+	// Close() must not return while the poll() is in flight.
+	select {
+	case <-closeReturned:
+		t.Fatal("Close() returned before in-flight poll completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseRPC)
+
+	select {
+	case <-closeReturned:
+	case <-time.After(time.Second):
+		t.Fatal("Close() did not return after in-flight poll completed")
+	}
+}
+
 func TestManagerNotifyListeners_Race(t *testing.T) {
 	client := &mockBigtableClient{}
 	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
