@@ -16,29 +16,38 @@ package bigtable
 
 import (
 	"context"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 // fakeExecuteVRpcer is a hand-rolled stub for the ExecuteVRpcer interface. It
-// counts invocations and returns a configurable (resp, clusterInfo, err)
-// triple. A capture hook lets tests inspect the per-attempt context (for
-// metrics-tracer assertions).
+// counts invocations and returns a configurable ExecuteResult / err pair. A
+// capture hook lets tests inspect the per-attempt context (for metrics-tracer
+// assertions). Stats / sentAt are exposed so tests can exercise the
+// session_table.go branches that pull serverLatency from Stats and
+// clientBlockingLatency from (SentAt - attemptStart).
 type fakeExecuteVRpcer struct {
 	mu          sync.Mutex
 	calls       int32
 	resp        interface{}
 	clusterInfo *btpb.ClusterInformation
+	stats       *btpb.SessionRequestStats
+	sentAt      time.Time
 	err         error
 	// onCall, if non-nil, runs synchronously before the canned response is
-	// returned. Useful for capturing the per-attempt ctx.
+	// returned. Useful for capturing the per-attempt ctx (and for stamping
+	// per-attempt fields on the metrics tracer prior to the baseHandler's
+	// post-Execute writes).
 	onCall func(ctx context.Context)
 }
 
@@ -53,6 +62,8 @@ func (f *fakeExecuteVRpcer) ExecuteVRpcEx(ctx context.Context, desc btransport.V
 	return btransport.ExecuteResult{
 		Response:    f.resp,
 		ClusterInfo: f.clusterInfo,
+		Stats:       f.stats,
+		SentAt:      f.sentAt,
 	}, f.err
 }
 
@@ -207,6 +218,123 @@ func TestSessionTable_ReadRow_ClusterInfoRecordedOnError(t *testing.T) {
 	}
 	if got := mt.currOp.currAttempt.zoneID; got != "z1" {
 		t.Errorf("attempt zoneID = %q; want %q", got, "z1")
+	}
+}
+
+// --- ReadRow: serverLatency / clientBlockingLatency from ExecuteResult ------
+//
+// These tests pin the session-path metrics integration added in
+// 17cb90b429. They go through the real ReadRow → retry interceptor →
+// baseHandler path so the production code that copies result.SentAt and
+// result.Stats.BackendLatency into the attemptTracer is exercised end-to-end
+// against a fake pool.
+//
+// Note on tracer setup: newSessionTestTable installs a disabled
+// builtinMetricsTracerFactory, so recordAttemptStart is a no-op and
+// currAttempt.startTime stays zero. The session_table.go writes for
+// clientBlockingLatency guard on `!startTime.IsZero()`, so the onCall hook
+// stamps startTime directly on the attempt tracer before the baseHandler's
+// post-Execute writes run. This mirrors what recordAttemptStart would do in
+// production but avoids standing up an OTel meter.
+
+func TestSessionTable_ServerLatencyFromStats(t *testing.T) {
+	const wantBackend = 42 * time.Millisecond
+
+	readPool := &fakeExecuteVRpcer{
+		resp:   btransport.ReadRowResult{Row: &btpb.Row{Key: []byte("row1")}},
+		stats:  &btpb.SessionRequestStats{BackendLatency: durationpb.New(wantBackend)},
+		sentAt: time.Now(),
+	}
+	var capturedCtx context.Context
+	var captureMu sync.Mutex
+	readPool.onCall = func(ctx context.Context) {
+		captureMu.Lock()
+		defer captureMu.Unlock()
+		capturedCtx = ctx
+		// Stamp a non-zero startTime so the production write of
+		// clientBlockingLatency runs (we don't assert on it here, but it
+		// keeps the code path consistent with production).
+		if mt := metricsTracerFromContext(ctx); mt != nil {
+			mt.currOp.currAttempt.setStartTime(time.Now())
+		}
+	}
+
+	st := newSessionTestTable(t, readPool, nil)
+
+	_, err := st.ReadRow(context.Background(), "row1")
+	if err != nil {
+		t.Fatalf("ReadRow returned unexpected err: %v", err)
+	}
+
+	captureMu.Lock()
+	defer captureMu.Unlock()
+	if capturedCtx == nil {
+		t.Fatal("fake pool was never called — cannot inspect attempt tracer")
+	}
+	mt := metricsTracerFromContext(capturedCtx)
+	if mt == nil {
+		t.Fatal("no metricsTracer on attempt ctx")
+	}
+	// convertToMs returns float64 milliseconds; 42ms → 42.0.
+	const wantMs = 42.0
+	if got := mt.currOp.currAttempt.serverLatency; got != wantMs {
+		t.Errorf("attempt serverLatency = %v ms, want %v ms (must be sourced from ExecuteResult.Stats.BackendLatency)", got, wantMs)
+	}
+}
+
+func TestSessionTable_ClientBlockingLatencyFromSentAt(t *testing.T) {
+	const blocking = 100 * time.Millisecond
+
+	// We need SentAt to be exactly attemptStart + blocking. Since the
+	// production code computes clientBlockingLatency = SentAt - startTime,
+	// stamp startTime in onCall and pre-set SentAt = startTime + blocking
+	// just before the baseHandler reads it back. The cleanest way is to
+	// have onCall both stamp startTime AND mutate sentAt to a known offset
+	// from it — but sentAt is captured into the ExecuteResult before the
+	// hook runs (look at ExecuteVRpcEx in fakeExecuteVRpcer: the result
+	// struct is built *after* hook returns). So if we set both in onCall,
+	// both land in the result correctly.
+	readPool := &fakeExecuteVRpcer{
+		resp: btransport.ReadRowResult{Row: &btpb.Row{Key: []byte("row1")}},
+	}
+	var capturedCtx context.Context
+	var captureMu sync.Mutex
+	readPool.onCall = func(ctx context.Context) {
+		captureMu.Lock()
+		defer captureMu.Unlock()
+		capturedCtx = ctx
+		mt := metricsTracerFromContext(ctx)
+		if mt == nil {
+			return
+		}
+		now := time.Now()
+		mt.currOp.currAttempt.setStartTime(now)
+		// Mutate the fake's sentAt under its own mu so the post-hook
+		// ExecuteResult build picks up the new value.
+		readPool.mu.Lock()
+		readPool.sentAt = now.Add(blocking)
+		readPool.mu.Unlock()
+	}
+
+	st := newSessionTestTable(t, readPool, nil)
+
+	_, err := st.ReadRow(context.Background(), "row1")
+	if err != nil {
+		t.Fatalf("ReadRow returned unexpected err: %v", err)
+	}
+
+	captureMu.Lock()
+	defer captureMu.Unlock()
+	mt := metricsTracerFromContext(capturedCtx)
+	if mt == nil {
+		t.Fatal("no metricsTracer on attempt ctx")
+	}
+	// Want ≈ 100ms. convertToMs returns float64 millis (nanos/1e6) so this
+	// is exact for whole-millisecond inputs constructed from time.Add.
+	const wantMs = 100.0
+	got := mt.currOp.currAttempt.clientBlockingLatency
+	if math.Abs(got-wantMs) > 0.5 {
+		t.Errorf("attempt clientBlockingLatency = %v ms, want ≈%v ms (must be (SentAt - attemptStart) in ms)", got, wantMs)
 	}
 }
 
