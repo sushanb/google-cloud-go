@@ -284,3 +284,64 @@ func TestRetryingVRpc_NonGrpcError(t *testing.T) {
 		t.Errorf("Expected non-gRPC raw errors to be treated as non-retryable and fail immediately (1 attempt), got %d attempts", attempts)
 	}
 }
+
+// TestRetryingVRpc_SessionSentinelsAreRetried verifies that every session-level
+// "unavailable" sentinel produced by the unavailable() helper in session.go is
+// treated identically to a server-side codes.Unavailable error — i.e., the
+// retry interceptor extracts the status code via status.FromError and retries.
+// This is the contract that lets a heartbeat-missed teardown, a GOAWAY, a
+// fatal session error, or a not-yet-active session all recover through the
+// same retry path that catches server-side Unavailables.
+func TestRetryingVRpc_SessionSentinelsAreRetried(t *testing.T) {
+	cases := []struct {
+		name     string
+		sentinel error
+	}{
+		{"ErrSessionNotActive", ErrSessionNotActive},
+		{"ErrUnavailableHeartBeatMissed", ErrUnavailableHeartBeatMissed},
+		{"ErrUnavailableGoAway", ErrUnavailableGoAway},
+		{"ErrUnavailableSessionError", ErrUnavailableSessionError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var attempts int
+			baseHandler := func(ctx context.Context, req interface{}) (interface{}, error) {
+				attempts++
+				if attempts < 3 {
+					return nil, unavailable(tc.sentinel, "simulated %s", tc.name)
+				}
+				return "ok", nil
+			}
+			retryInterceptor := RetryingVRpc(RetryingOptions{
+				MaxAttempts:    5,
+				InitialBackoff: 1 * time.Millisecond,
+			})
+			ctx := WithVRpcMetadata(context.Background(), "TestMethod", 1)
+			resp, err := retryInterceptor(ctx, "req", baseHandler)
+			if err != nil {
+				t.Fatalf("expected success after retries, got %v", err)
+			}
+			if resp.(string) != "ok" {
+				t.Errorf("expected response 'ok', got %q", resp)
+			}
+			if attempts != 3 {
+				t.Errorf("expected 3 attempts, got %d", attempts)
+			}
+			// Sanity: the sentinel error must report codes.Unavailable via
+			// status.FromError (this is what retrying.go inspects).
+			sentinelErr := unavailable(tc.sentinel, "shape check")
+			st, ok := status.FromError(sentinelErr)
+			if !ok {
+				t.Fatalf("sentinel error did not satisfy status.FromError")
+			}
+			if st.Code() != codes.Unavailable {
+				t.Errorf("sentinel error code = %v, want Unavailable", st.Code())
+			}
+			// And the original sentinel must be retrievable via errors.Is so
+			// callers can distinguish the cause.
+			if !errors.Is(sentinelErr, tc.sentinel) {
+				t.Errorf("errors.Is(sentinelErr, %v) = false", tc.sentinel)
+			}
+		})
+	}
+}
