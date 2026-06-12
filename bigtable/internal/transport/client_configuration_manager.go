@@ -265,6 +265,15 @@ func (m *ClientConfigurationManager) AddSessionPoolListener(listener func(*bigta
 	})
 }
 
+// AddSessionLoadListener registers a callback that receives the server-driven
+// SessionLoad value (0.0 = all-classic, 1.0 = all-session) on every
+// configuration update. Returns an unregister thunk.
+func (m *ClientConfigurationManager) AddSessionLoadListener(listener func(load float64)) func() {
+	return m.addListener(func(cfg clientConfig, seq int64) {
+		listener(cfg.Session.SessionLoad)
+	})
+}
+
 // pollingLoop continuously polls the Bigtable control plane at the configured interval.
 // It enforces a minimum interval (MinPollingInterval) to protect the control plane from DDoSes.
 func (m *ClientConfigurationManager) pollingLoop(parentCtx context.Context) {

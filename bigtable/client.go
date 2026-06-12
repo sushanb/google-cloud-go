@@ -226,11 +226,12 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 	configManager.Start(ctx)
 	c.configManager = configManager
 
-	// TODO: wire SessionLoad pump once ClientConfigurationManager exposes a
-	// SessionLoad listener API. The existing AddSessionPoolListener only emits
-	// SessionPoolConfiguration (Min/Max), not the top-level SessionLoad field.
-	// Once an exported AddSessionLoadListener(func(float64)) is available, register
-	// a callback here that invokes c.diverter.SetSessionLoad(load).
+	// Pump server-driven SessionLoad into the Diverter so the classic/session
+	// traffic split honors the control plane's choice. NewDiverter(1.0) above
+	// is the bootstrap default; the first successful poll replaces it.
+	configManager.AddSessionLoadListener(func(load float64) {
+		c.diverter.SetSessionLoad(load)
+	})
 
 	c.sessionMgr = NewSessionManager(
 		config.EnableSessionPool,
