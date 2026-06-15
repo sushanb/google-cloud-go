@@ -31,6 +31,13 @@ type RetryingOptions struct {
 	MaxBackoff        time.Duration
 	BackoffMultiplier float64
 	Listener          VRpcListener
+	// ShouldRetry, if non-nil, overrides the default codes-based check.
+	// Callers use it to allow narrowly-defined safe retries for otherwise
+	// non-retryable operations — e.g. a non-idempotent mutation can still
+	// retry on errors that guarantee the request never reached the server.
+	// The default (when nil) retries on Aborted / DeadlineExceeded / Internal
+	// / ResourceExhausted / Unavailable.
+	ShouldRetry func(error) bool
 }
 
 // RetryingVRpc returns an Interceptor that retries failed virtual RPCs with
@@ -92,11 +99,21 @@ func RetryingVRpc(opts RetryingOptions) Interceptor {
 			var delay time.Duration
 			hasServerDelay := false
 
-			if s, ok := status.FromError(err); ok {
+			s, hasStatus := status.FromError(err)
+			if opts.ShouldRetry != nil {
+				if !opts.ShouldRetry(err) {
+					return nil, err
+				}
+			} else {
+				if !hasStatus {
+					return nil, err
+				}
 				if !isRetryableCode(s.Code()) {
 					return nil, err
 				}
+			}
 
+			if hasStatus {
 				for _, detail := range s.Details() {
 					if retryInfo, ok := detail.(*errdetails.RetryInfo); ok {
 						if retryInfo.GetRetryDelay().IsValid() {
@@ -106,8 +123,6 @@ func RetryingVRpc(opts RetryingOptions) Interceptor {
 						}
 					}
 				}
-			} else {
-				return nil, err
 			}
 
 

@@ -123,7 +123,7 @@ func (c *hookCounts) counts() (start, active, closed int) {
 	return c.startCount, c.activeCount, c.closeCount
 }
 
-// fakeDesc is a minimal VRpcDescriptor for ExecuteVRpc tests.
+// fakeDesc is a minimal VRpcDescriptor for Invoke tests.
 type fakeDesc struct {
 	method string
 	enc    func(req interface{}) ([]byte, error)
@@ -494,7 +494,7 @@ func TestHandleSessionResponse_UnknownDoesNotResetDeadline(t *testing.T) {
 	}
 }
 
-// --- ExecuteVRpc tests -------------------------------------------------------
+// --- Invoke tests -------------------------------------------------------
 
 func newRoundTripDesc() *fakeDesc {
 	return &fakeDesc{
@@ -508,10 +508,10 @@ func newRoundTripDesc() *fakeDesc {
 	}
 }
 
-func TestExecuteVRpc_RejectsWhenNotActive(t *testing.T) {
+func TestInvoke_RejectsWhenNotActive(t *testing.T) {
 	stream := newFakeStream()
 	s := newTestSession(t, stream, SessionHooks{}) // state = New
-	_, _, err := s.ExecuteVRpc(context.Background(), newRoundTripDesc(), "hello")
+	_, err := s.Invoke(context.Background(), newRoundTripDesc(), "hello")
 	if !errors.Is(err, ErrSessionNotActive) {
 		t.Errorf("err = %v, want ErrSessionNotActive in chain", err)
 	}
@@ -520,17 +520,16 @@ func TestExecuteVRpc_RejectsWhenNotActive(t *testing.T) {
 	}
 }
 
-func TestExecuteVRpc_HappyPath(t *testing.T) {
+func TestInvoke_HappyPath(t *testing.T) {
 	s, stream := makeActive(t, SessionHooks{})
 	desc := newRoundTripDesc()
 
 	done := make(chan struct{})
-	var resp interface{}
-	var cluster *spb.ClusterInformation
+	var res InvokeResult
 	var execErr error
 	go func() {
 		defer close(done)
-		resp, cluster, execErr = s.ExecuteVRpc(context.Background(), desc, "hello")
+		res, execErr = s.Invoke(context.Background(), desc, "hello")
 	}()
 
 	// Wait for the request to be sent.
@@ -553,28 +552,28 @@ func TestExecuteVRpc_HappyPath(t *testing.T) {
 
 	<-done
 	if execErr != nil {
-		t.Fatalf("ExecuteVRpc error: %v", execErr)
+		t.Fatalf("Invoke error: %v", execErr)
 	}
-	if got := resp.(string); got != "world" {
+	if got := res.Response.(string); got != "world" {
 		t.Errorf("resp = %q, want %q", got, "world")
 	}
-	if cluster == nil || cluster.ClusterId != "c1" {
-		t.Errorf("clusterInfo = %v, want ClusterId=c1", cluster)
+	if res.ClusterInfo == nil || res.ClusterInfo.ClusterId != "c1" {
+		t.Errorf("clusterInfo = %v, want ClusterId=c1", res.ClusterInfo)
 	}
 }
 
-func TestExecuteVRpc_ContextCancel(t *testing.T) {
+func TestInvoke_ContextCancel(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, _, err := s.ExecuteVRpc(ctx, newRoundTripDesc(), "hello")
+	_, err := s.Invoke(ctx, newRoundTripDesc(), "hello")
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want context.Canceled", err)
 	}
 }
 
-func TestExecuteVRpc_SendFailureCleansUpMap(t *testing.T) {
+func TestInvoke_SendFailureCleansUpMap(t *testing.T) {
 	stream := newFakeStream()
 	stream.sendFn = func(req *spb.SessionRequest) error {
 		return fmt.Errorf("network down")
@@ -584,7 +583,7 @@ func TestExecuteVRpc_SendFailureCleansUpMap(t *testing.T) {
 	s.state = StateActive
 	s.mu.Unlock()
 
-	_, _, err := s.ExecuteVRpc(context.Background(), newRoundTripDesc(), "hello")
+	_, err := s.Invoke(context.Background(), newRoundTripDesc(), "hello")
 	if err == nil {
 		t.Fatal("expected error from failed Send")
 	}

@@ -24,27 +24,27 @@ import (
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 )
 
-// VRpcExecutor is the narrow surface SessionTable needs from a session pool:
+// Invoker is the narrow surface SessionTable needs from a session pool:
 // the ability to dispatch a single virtual RPC and surface the full
-// ExecuteResult (response, cluster info, server-side Stats, and the local
+// InvokeResult (response, cluster info, server-side Stats, and the local
 // SentAt timestamp). It is satisfied by *btransport.SessionPoolImpl; the
 // interface exists so tests can substitute a fake implementation without
 // standing up a real pool.
 //
-// Note: this interface intentionally requires ExecuteVRpcEx (not the
-// back-compat ExecuteVRpc wrapper) so SessionTable can populate
+// Note: this interface intentionally requires Invoke (not the
+// back-compat Invoke wrapper) so SessionTable can populate
 // per-attempt clientBlockingLatency (from SentAt - attemptStart) and
 // serverLatency (from Stats.BackendLatency).
-type VRpcExecutor interface {
-	ExecuteVRpcEx(ctx context.Context, desc btransport.VRpcDescriptor, req interface{}) (btransport.ExecuteResult, error)
+type Invoker interface {
+	Invoke(ctx context.Context, desc btransport.VRpcDescriptor, req interface{}) (btransport.InvokeResult, error)
 }
 
 // SessionTable implements TableAPI by routing calls via virtual RPCs through dedicated session pools.
 type SessionTable struct {
 	tableName     string
 	classic       *Table
-	readPool      VRpcExecutor
-	writePool     VRpcExecutor
+	readPool      Invoker
+	writePool     Invoker
 	readVRpcDesc  btransport.VRpcDescriptor
 	writeVRpcDesc btransport.VRpcDescriptor
 }
@@ -135,7 +135,7 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 	}
 
 	baseHandler := func(attemptCtx context.Context, request interface{}) (interface{}, error) {
-		result, err := t.readPool.ExecuteVRpcEx(attemptCtx, t.readVRpcDesc, request)
+		result, err := t.readPool.Invoke(attemptCtx, t.readVRpcDesc, request)
 		if mt := metricsTracerFromContext(attemptCtx); mt != nil {
 			if result.ClusterInfo != nil {
 				mt.currOp.currAttempt.setClusterID(result.ClusterInfo.ClusterId)
@@ -164,7 +164,7 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 	}
 
 	// Seed vRPC metadata so RetryingVRpc's WithAttempt(ctx, n) actually
-	// increments the per-attempt counter that ExecuteVRpcEx reads via
+	// increments the per-attempt counter that Invoke reads via
 	// VRpcAttempt(ctx). Without this seed, WithAttempt is a no-op and every
 	// retry wire-frame carries AttemptNumber=1.
 	ctx = btransport.WithVRpcMetadata(ctx, t.readVRpcDesc.Method(), 0)
@@ -205,20 +205,27 @@ func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts 
 
 	fmt.Printf(">>> SessionTable Apply: row=%s via writePool=%p <<<\n", row, t.writePool)
 
-	// Only retry idempotent mutations. A SetCell with ServerTime timestamp is
-	// non-retryable because a retry would create duplicate cells with different
-	// server-assigned timestamps.
-	maxAttempts := int32(10)
+	// Non-idempotent mutations (SetCell with ServerTime) cannot blindly retry —
+	// a retry of an already-applied mutation would create duplicate cells with
+	// different server-assigned timestamps. They CAN safely retry on errors
+	// that prove the request never reached the server: ErrSessionNotActive
+	// (Invoke short-circuits before Send) and ErrUnavailableGoAway (the server
+	// explicitly reports the rpc id as not-admitted).
+	var shouldRetry func(error) bool
 	if !mutationsAreRetryable(m.ops) {
-		maxAttempts = 1
+		shouldRetry = func(err error) bool {
+			return errors.Is(err, btransport.ErrSessionNotActive) ||
+				errors.Is(err, btransport.ErrUnavailableGoAway)
+		}
 	}
 
 	retryInterceptor := btransport.RetryingVRpc(btransport.RetryingOptions{
-		MaxAttempts:       maxAttempts,
+		MaxAttempts:       10,
 		InitialBackoff:    10 * time.Millisecond,
 		MaxBackoff:        32 * time.Second,
 		BackoffMultiplier: 1.5,
 		Listener:          sessionMetricsListener{},
+		ShouldRetry:       shouldRetry,
 	})
 
 	args := btransport.MutateRowArgs{
@@ -227,7 +234,7 @@ func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts 
 	}
 
 	baseHandler := func(attemptCtx context.Context, request interface{}) (interface{}, error) {
-		result, err := t.writePool.ExecuteVRpcEx(attemptCtx, t.writeVRpcDesc, request)
+		result, err := t.writePool.Invoke(attemptCtx, t.writeVRpcDesc, request)
 		if mt := metricsTracerFromContext(attemptCtx); mt != nil {
 			if result.ClusterInfo != nil {
 				mt.currOp.currAttempt.setClusterID(result.ClusterInfo.ClusterId)
@@ -256,7 +263,7 @@ func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts 
 	}
 
 	// Seed vRPC metadata so RetryingVRpc's WithAttempt(ctx, n) actually
-	// increments the per-attempt counter that ExecuteVRpcEx reads via
+	// increments the per-attempt counter that Invoke reads via
 	// VRpcAttempt(ctx). Without this seed, WithAttempt is a no-op and every
 	// retry wire-frame carries AttemptNumber=1.
 	ctx = btransport.WithVRpcMetadata(ctx, t.writeVRpcDesc.Method(), 0)

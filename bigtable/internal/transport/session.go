@@ -47,7 +47,7 @@ const (
 // status (so existing retry plumbing sees codes.Unavailable) while errors.Is
 // lets callers distinguish the underlying cause.
 var (
-	// ErrSessionNotActive is returned by ExecuteVRpc when the session is not yet
+	// ErrSessionNotActive is returned by Invoke when the session is not yet
 	// active or has begun shutting down.
 	ErrSessionNotActive = errors.New("bigtable: session not active")
 	// ErrUnavailableHeartBeatMissed indicates the session was torn down because
@@ -134,7 +134,7 @@ func (h SessionHooks) onClose(s *Session, err error) {
 	}
 }
 
-// vrpcResult is the single value delivered to ExecuteVRpc through resultChan.
+// vrpcResult is the single value delivered to Invoke through resultChan.
 type vrpcResult struct {
 	resp        *spb.VirtualRpcResponse
 	clusterInfo *spb.ClusterInformation

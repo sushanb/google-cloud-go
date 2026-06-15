@@ -30,13 +30,13 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
-// fakeVRpcExecutor is a hand-rolled stub for the VRpcExecutor interface. It
-// counts invocations and returns a configurable ExecuteResult / err pair. A
+// fakeInvoker is a hand-rolled stub for the Invoker interface. It
+// counts invocations and returns a configurable InvokeResult / err pair. A
 // capture hook lets tests inspect the per-attempt context (for metrics-tracer
 // assertions). Stats / sentAt are exposed so tests can exercise the
 // session_table.go branches that pull serverLatency from Stats and
 // clientBlockingLatency from (SentAt - attemptStart).
-type fakeVRpcExecutor struct {
+type fakeInvoker struct {
 	mu          sync.Mutex
 	calls       int32
 	resp        interface{}
@@ -51,7 +51,7 @@ type fakeVRpcExecutor struct {
 	onCall func(ctx context.Context)
 }
 
-func (f *fakeVRpcExecutor) ExecuteVRpcEx(ctx context.Context, desc btransport.VRpcDescriptor, req interface{}) (btransport.ExecuteResult, error) {
+func (f *fakeInvoker) Invoke(ctx context.Context, desc btransport.VRpcDescriptor, req interface{}) (btransport.InvokeResult, error) {
 	atomic.AddInt32(&f.calls, 1)
 	f.mu.Lock()
 	hook := f.onCall
@@ -59,7 +59,7 @@ func (f *fakeVRpcExecutor) ExecuteVRpcEx(ctx context.Context, desc btransport.VR
 	if hook != nil {
 		hook(ctx)
 	}
-	return btransport.ExecuteResult{
+	return btransport.InvokeResult{
 		Response:    f.resp,
 		ClusterInfo: f.clusterInfo,
 		Stats:       f.stats,
@@ -67,7 +67,7 @@ func (f *fakeVRpcExecutor) ExecuteVRpcEx(ctx context.Context, desc btransport.VR
 	}, f.err
 }
 
-func (f *fakeVRpcExecutor) callCount() int32 {
+func (f *fakeInvoker) callCount() int32 {
 	return atomic.LoadInt32(&f.calls)
 }
 
@@ -75,7 +75,7 @@ func (f *fakeVRpcExecutor) callCount() int32 {
 // read/write pool fakes and a minimal *Table backing object. It uses a
 // disabled metrics tracer factory so SessionTable's contextWithMetricsTracer
 // path stays exercised but doesn't try to emit OTel metrics.
-func newSessionTestTable(t *testing.T, readPool, writePool VRpcExecutor) *SessionTable {
+func newSessionTestTable(t *testing.T, readPool, writePool Invoker) *SessionTable {
 	t.Helper()
 	classic := &Table{
 		c: &Client{
@@ -98,8 +98,25 @@ func newSessionTestTable(t *testing.T, readPool, writePool VRpcExecutor) *Sessio
 
 // --- Apply: retry-idempotency ------------------------------------------------
 
+// sessionUnavailableErr mirrors the unexported sessionErr produced by the
+// transport's unavailable() helper: a codes.Unavailable status wrapping a
+// sentinel cause. Tests use it to exercise the Apply carve-out that allows
+// retries on errors which prove the request never reached the server, even
+// for non-idempotent mutations.
+type sessionUnavailableErr struct {
+	sentinel error
+	msg      string
+}
+
+func (e *sessionUnavailableErr) Error() string              { return e.msg }
+func (e *sessionUnavailableErr) Unwrap() error              { return e.sentinel }
+func (e *sessionUnavailableErr) GRPCStatus() *status.Status { return status.New(codes.Unavailable, e.msg) }
+
 func TestSessionTable_Apply_ServerTimeMutationNotRetried(t *testing.T) {
-	writePool := &fakeVRpcExecutor{
+	// Generic Unavailable (no safe-sentinel cause) must bubble up after a
+	// single attempt for non-idempotent mutations — retrying could create
+	// duplicate cells with different server-assigned timestamps.
+	writePool := &fakeInvoker{
 		err: status.Error(codes.Unavailable, "transient"),
 	}
 	st := newSessionTestTable(t, nil, writePool)
@@ -112,12 +129,48 @@ func TestSessionTable_Apply_ServerTimeMutationNotRetried(t *testing.T) {
 		t.Fatal("Apply with ServerTime mutation succeeded; want Unavailable error to bubble up")
 	}
 	if got := writePool.callCount(); got != 1 {
-		t.Errorf("ExecuteVRpc called %d times; want exactly 1 (ServerTime mutations are non-idempotent and must not retry)", got)
+		t.Errorf("Invoke called %d times; want exactly 1 (ServerTime mutations are non-idempotent and must not retry on generic Unavailable)", got)
+	}
+}
+
+// TestSessionTable_Apply_ServerTimeMutationRetriesOnSafeSentinels pins the
+// carve-out: ServerTime (non-idempotent) mutations must still retry when the
+// error chain identifies one of the two sentinels that prove the request
+// never executed on the server. Without this, transient session lifecycle
+// events (state-not-active short-circuit, server GOAWAY) cause spurious
+// write failures even though re-sending is provably safe.
+func TestSessionTable_Apply_ServerTimeMutationRetriesOnSafeSentinels(t *testing.T) {
+	cases := []struct {
+		name     string
+		sentinel error
+	}{
+		{"ErrSessionNotActive", btransport.ErrSessionNotActive},
+		{"ErrUnavailableGoAway", btransport.ErrUnavailableGoAway},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			writePool := &fakeInvoker{
+				err: &sessionUnavailableErr{sentinel: tc.sentinel, msg: "session sentinel: " + tc.name},
+			}
+			st := newSessionTestTable(t, nil, writePool)
+
+			m := NewMutation()
+			m.Set("fam", "col", ServerTime, []byte{1})
+
+			err := st.Apply(context.Background(), "row1", m)
+			if err == nil {
+				t.Fatalf("Apply succeeded; want error after retries exhausted")
+			}
+			const wantAttempts = 10
+			if got := writePool.callCount(); got != wantAttempts {
+				t.Errorf("Invoke called %d times; want %d (ServerTime mutation must retry %s up to MaxAttempts)", got, wantAttempts, tc.name)
+			}
+		})
 	}
 }
 
 func TestSessionTable_Apply_TimestampedMutationRetries(t *testing.T) {
-	writePool := &fakeVRpcExecutor{
+	writePool := &fakeInvoker{
 		err: status.Error(codes.Unavailable, "transient"),
 	}
 	st := newSessionTestTable(t, nil, writePool)
@@ -131,14 +184,14 @@ func TestSessionTable_Apply_TimestampedMutationRetries(t *testing.T) {
 	}
 	const wantAttempts = 10
 	if got := writePool.callCount(); got != wantAttempts {
-		t.Errorf("ExecuteVRpc called %d times; want %d (MaxAttempts for idempotent mutations)", got, wantAttempts)
+		t.Errorf("Invoke called %d times; want %d (MaxAttempts for idempotent mutations)", got, wantAttempts)
 	}
 }
 
 func TestSessionTable_Apply_NilWritePoolReturnsError(t *testing.T) {
 	// readPool present, writePool nil — Apply must not panic and must surface
 	// a write-not-supported error.
-	readPool := &fakeVRpcExecutor{}
+	readPool := &fakeInvoker{}
 	st := newSessionTestTable(t, readPool, nil)
 
 	m := NewMutation()
@@ -170,7 +223,7 @@ func TestSessionTable_ReadRow_ClusterInfoRecordedOnError(t *testing.T) {
 	var capturedCtx context.Context
 	var captureMu sync.Mutex
 
-	readPool := &fakeVRpcExecutor{
+	readPool := &fakeInvoker{
 		clusterInfo: &btpb.ClusterInformation{ClusterId: "c1", ZoneId: "z1"},
 		err:         status.Error(codes.Internal, "boom"),
 	}
@@ -221,7 +274,7 @@ func TestSessionTable_ReadRow_ClusterInfoRecordedOnError(t *testing.T) {
 	}
 }
 
-// --- ReadRow: serverLatency / clientBlockingLatency from ExecuteResult ------
+// --- ReadRow: serverLatency / clientBlockingLatency from InvokeResult ------
 //
 // These tests pin the session-path metrics integration added in
 // 17cb90b429. They go through the real ReadRow → retry interceptor →
@@ -240,7 +293,7 @@ func TestSessionTable_ReadRow_ClusterInfoRecordedOnError(t *testing.T) {
 func TestSessionTable_ServerLatencyFromStats(t *testing.T) {
 	const wantBackend = 42 * time.Millisecond
 
-	readPool := &fakeVRpcExecutor{
+	readPool := &fakeInvoker{
 		resp:   btransport.ReadRowResult{Row: &btpb.Row{Key: []byte("row1")}},
 		stats:  &btpb.SessionRequestStats{BackendLatency: durationpb.New(wantBackend)},
 		sentAt: time.Now(),
@@ -278,7 +331,7 @@ func TestSessionTable_ServerLatencyFromStats(t *testing.T) {
 	// convertToMs returns float64 milliseconds; 42ms → 42.0.
 	const wantMs = 42.0
 	if got := mt.currOp.currAttempt.serverLatency; got != wantMs {
-		t.Errorf("attempt serverLatency = %v ms, want %v ms (must be sourced from ExecuteResult.Stats.BackendLatency)", got, wantMs)
+		t.Errorf("attempt serverLatency = %v ms, want %v ms (must be sourced from InvokeResult.Stats.BackendLatency)", got, wantMs)
 	}
 }
 
@@ -290,11 +343,11 @@ func TestSessionTable_ClientBlockingLatencyFromSentAt(t *testing.T) {
 	// stamp startTime in onCall and pre-set SentAt = startTime + blocking
 	// just before the baseHandler reads it back. The cleanest way is to
 	// have onCall both stamp startTime AND mutate sentAt to a known offset
-	// from it — but sentAt is captured into the ExecuteResult before the
-	// hook runs (look at ExecuteVRpcEx in fakeVRpcExecutor: the result
+	// from it — but sentAt is captured into the InvokeResult before the
+	// hook runs (look at Invoke in fakeInvoker: the result
 	// struct is built *after* hook returns). So if we set both in onCall,
 	// both land in the result correctly.
-	readPool := &fakeVRpcExecutor{
+	readPool := &fakeInvoker{
 		resp: btransport.ReadRowResult{Row: &btpb.Row{Key: []byte("row1")}},
 	}
 	var capturedCtx context.Context
@@ -310,7 +363,7 @@ func TestSessionTable_ClientBlockingLatencyFromSentAt(t *testing.T) {
 		now := time.Now()
 		mt.currOp.currAttempt.setStartTime(now)
 		// Mutate the fake's sentAt under its own mu so the post-hook
-		// ExecuteResult build picks up the new value.
+		// InvokeResult build picks up the new value.
 		readPool.mu.Lock()
 		readPool.sentAt = now.Add(blocking)
 		readPool.mu.Unlock()

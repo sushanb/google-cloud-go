@@ -28,7 +28,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
-// runVRpcCapture drives an ExecuteVRpc call to completion with a stub
+// runVRpcCapture drives an Invoke call to completion with a stub
 // VirtualRpcResponse, then returns the *VirtualRpcRequest that was sent on the
 // wire. All inspection of the deadline / metadata plumbing is done against
 // this snapshot.
@@ -40,7 +40,7 @@ func runVRpcCapture(t *testing.T, ctx context.Context) *spb.VirtualRpcRequest {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _, _ = s.ExecuteVRpc(ctx, desc, "hello")
+		_, _ = s.Invoke(ctx, desc, "hello")
 	}()
 
 	waitFor(t, time.Second, func() bool { return len(stream.snapshotSent()) > 0 }, "Send called")
@@ -49,7 +49,7 @@ func runVRpcCapture(t *testing.T, ctx context.Context) *spb.VirtualRpcRequest {
 		t.Fatal("sent frame was not a VirtualRpcRequest")
 	}
 
-	// Deliver a benign success so ExecuteVRpc returns and the goroutine exits.
+	// Deliver a benign success so Invoke returns and the goroutine exits.
 	s.handleVRPCResponse(&spb.VirtualRpcResponse{
 		RpcId:   sent.RpcId,
 		Payload: []byte("ok"),
@@ -58,7 +58,7 @@ func runVRpcCapture(t *testing.T, ctx context.Context) *spb.VirtualRpcRequest {
 	return sent
 }
 
-func TestExecuteVRpc_DeadlineCarriedInRequest(t *testing.T) {
+func TestInvoke_DeadlineCarriedInRequest(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(500*time.Millisecond))
 	defer cancel()
 
@@ -77,14 +77,14 @@ func TestExecuteVRpc_DeadlineCarriedInRequest(t *testing.T) {
 	}
 }
 
-func TestExecuteVRpc_NoDeadlineWhenCtxHasNone(t *testing.T) {
+func TestInvoke_NoDeadlineWhenCtxHasNone(t *testing.T) {
 	sent := runVRpcCapture(t, context.Background())
 	if sent.Deadline != nil {
 		t.Errorf("VirtualRpc.Deadline = %v, want nil when ctx has no deadline", sent.Deadline.AsDuration())
 	}
 }
 
-func TestExecuteVRpc_AttemptNumberFromCtx(t *testing.T) {
+func TestInvoke_AttemptNumberFromCtx(t *testing.T) {
 	// WithAttempt is a no-op unless WithVRpcMetadata has seeded the context
 	// with a vrpcMetadata struct first — that's how the retrying interceptor
 	// uses it in production (the retry loop seeds attempt=1 on entry, then
@@ -100,7 +100,7 @@ func TestExecuteVRpc_AttemptNumberFromCtx(t *testing.T) {
 	}
 }
 
-func TestExecuteVRpc_AttemptNumberDefault(t *testing.T) {
+func TestInvoke_AttemptNumberDefault(t *testing.T) {
 	sent := runVRpcCapture(t, context.Background())
 	if sent.Metadata == nil {
 		t.Fatal("VirtualRpc.Metadata = nil")
@@ -110,7 +110,7 @@ func TestExecuteVRpc_AttemptNumberDefault(t *testing.T) {
 	}
 }
 
-func TestExecuteVRpc_AttemptStartIsRecent(t *testing.T) {
+func TestInvoke_AttemptStartIsRecent(t *testing.T) {
 	before := time.Now()
 	sent := runVRpcCapture(t, context.Background())
 	after := time.Now()
@@ -126,25 +126,25 @@ func TestExecuteVRpc_AttemptStartIsRecent(t *testing.T) {
 	}
 }
 
-// --- ExecuteVRpcEx: Stats, SentAt, RetryInfo plumbing ------------------------
+// --- Invoke: Stats, SentAt, RetryInfo plumbing ------------------------
 
-// execVRpcEx drives an ExecuteVRpcEx call to completion by waiting for the
+// runInvoke drives an Invoke call to completion by waiting for the
 // outbound frame, calling deliver(sent) to produce the server response, and
-// returning the populated ExecuteResult + err. It mirrors runVRpcCapture but
-// returns the full ExecuteResult so tests can assert on Stats / SentAt /
+// returning the populated InvokeResult + err. It mirrors runVRpcCapture but
+// returns the full InvokeResult so tests can assert on Stats / SentAt /
 // ClusterInfo without the back-compat triple stripping them.
-func execVRpcEx(t *testing.T, ctx context.Context, deliver func(s *Session, sent *spb.VirtualRpcRequest)) (ExecuteResult, error) {
+func runInvoke(t *testing.T, ctx context.Context, deliver func(s *Session, sent *spb.VirtualRpcRequest)) (InvokeResult, error) {
 	t.Helper()
 	s, stream := makeActive(t, SessionHooks{})
 	desc := newRoundTripDesc()
 
 	type outcome struct {
-		res ExecuteResult
+		res InvokeResult
 		err error
 	}
 	resCh := make(chan outcome, 1)
 	go func() {
-		r, err := s.ExecuteVRpcEx(ctx, desc, "hello")
+		r, err := s.Invoke(ctx, desc, "hello")
 		resCh <- outcome{res: r, err: err}
 	}()
 
@@ -158,16 +158,16 @@ func execVRpcEx(t *testing.T, ctx context.Context, deliver func(s *Session, sent
 	case out := <-resCh:
 		return out.res, out.err
 	case <-time.After(time.Second):
-		t.Fatal("ExecuteVRpcEx did not return after delivering response")
-		return ExecuteResult{}, nil
+		t.Fatal("Invoke did not return after delivering response")
+		return InvokeResult{}, nil
 	}
 }
 
-func TestExecuteVRpcEx_StatsExtractedFromResponse(t *testing.T) {
+func TestInvoke_StatsExtractedFromResponse(t *testing.T) {
 	const wantBackend = 123 * time.Millisecond
 
 	before := time.Now()
-	res, err := execVRpcEx(t, context.Background(), func(s *Session, sent *spb.VirtualRpcRequest) {
+	res, err := runInvoke(t, context.Background(), func(s *Session, sent *spb.VirtualRpcRequest) {
 		s.handleVRPCResponse(&spb.VirtualRpcResponse{
 			RpcId:   sent.RpcId,
 			Payload: []byte("ok"),
@@ -177,13 +177,13 @@ func TestExecuteVRpcEx_StatsExtractedFromResponse(t *testing.T) {
 		})
 	})
 	if err != nil {
-		t.Fatalf("ExecuteVRpcEx: unexpected err %v", err)
+		t.Fatalf("Invoke: unexpected err %v", err)
 	}
 	if res.Stats == nil {
-		t.Fatal("ExecuteResult.Stats = nil, want non-nil (server-supplied Stats must be propagated)")
+		t.Fatal("InvokeResult.Stats = nil, want non-nil (server-supplied Stats must be propagated)")
 	}
 	if got := res.Stats.GetBackendLatency().AsDuration(); got != wantBackend {
-		t.Errorf("ExecuteResult.Stats.BackendLatency = %v, want %v", got, wantBackend)
+		t.Errorf("InvokeResult.Stats.BackendLatency = %v, want %v", got, wantBackend)
 	}
 	// Sanity bookend on SentAt.
 	if res.SentAt.Before(before) {
@@ -191,8 +191,8 @@ func TestExecuteVRpcEx_StatsExtractedFromResponse(t *testing.T) {
 	}
 }
 
-func TestExecuteVRpcEx_StatsNilWhenServerOmits(t *testing.T) {
-	res, err := execVRpcEx(t, context.Background(), func(s *Session, sent *spb.VirtualRpcRequest) {
+func TestInvoke_StatsNilWhenServerOmits(t *testing.T) {
+	res, err := runInvoke(t, context.Background(), func(s *Session, sent *spb.VirtualRpcRequest) {
 		s.handleVRPCResponse(&spb.VirtualRpcResponse{
 			RpcId:   sent.RpcId,
 			Payload: []byte("ok"),
@@ -200,16 +200,16 @@ func TestExecuteVRpcEx_StatsNilWhenServerOmits(t *testing.T) {
 		})
 	})
 	if err != nil {
-		t.Fatalf("ExecuteVRpcEx: unexpected err %v", err)
+		t.Fatalf("Invoke: unexpected err %v", err)
 	}
 	if res.Stats != nil {
-		t.Errorf("ExecuteResult.Stats = %v, want nil when server omits Stats", res.Stats)
+		t.Errorf("InvokeResult.Stats = %v, want nil when server omits Stats", res.Stats)
 	}
 }
 
-func TestExecuteVRpcEx_SentAtIsNonZero(t *testing.T) {
+func TestInvoke_SentAtIsNonZero(t *testing.T) {
 	before := time.Now()
-	res, err := execVRpcEx(t, context.Background(), func(s *Session, sent *spb.VirtualRpcRequest) {
+	res, err := runInvoke(t, context.Background(), func(s *Session, sent *spb.VirtualRpcRequest) {
 		s.handleVRPCResponse(&spb.VirtualRpcResponse{
 			RpcId:   sent.RpcId,
 			Payload: []byte("ok"),
@@ -217,7 +217,7 @@ func TestExecuteVRpcEx_SentAtIsNonZero(t *testing.T) {
 	})
 	after := time.Now()
 	if err != nil {
-		t.Fatalf("ExecuteVRpcEx: unexpected err %v", err)
+		t.Fatalf("Invoke: unexpected err %v", err)
 	}
 	if res.SentAt.IsZero() {
 		t.Fatal("SentAt is zero after a successful send; want non-zero")
@@ -230,7 +230,7 @@ func TestExecuteVRpcEx_SentAtIsNonZero(t *testing.T) {
 	}
 }
 
-func TestExecuteVRpcEx_SentAtIsSetEvenOnSendFailure(t *testing.T) {
+func TestInvoke_SentAtIsSetEvenOnSendFailure(t *testing.T) {
 	// session_vrpc.go captures SentAt *before* calling Send. That is the
 	// contract callers rely on for client-blocking-latency math — we record
 	// when we attempted to hand the frame off, not whether the handoff
@@ -246,10 +246,10 @@ func TestExecuteVRpcEx_SentAtIsSetEvenOnSendFailure(t *testing.T) {
 	s.mu.Unlock()
 
 	before := time.Now()
-	res, err := s.ExecuteVRpcEx(context.Background(), newRoundTripDesc(), "hello")
+	res, err := s.Invoke(context.Background(), newRoundTripDesc(), "hello")
 	after := time.Now()
 	if err == nil {
-		t.Fatal("ExecuteVRpcEx: expected error from failing Send, got nil")
+		t.Fatal("Invoke: expected error from failing Send, got nil")
 	}
 	if res.SentAt.IsZero() {
 		t.Errorf("SentAt is zero after Send failure; want non-zero (session_vrpc.go captures SentAt before calling Send)")
@@ -260,8 +260,8 @@ func TestExecuteVRpcEx_SentAtIsSetEvenOnSendFailure(t *testing.T) {
 	}
 }
 
-func TestExecuteVRpcEx_ClusterInfoOnErrorPath(t *testing.T) {
-	res, err := execVRpcEx(t, context.Background(), func(s *Session, sent *spb.VirtualRpcRequest) {
+func TestInvoke_ClusterInfoOnErrorPath(t *testing.T) {
+	res, err := runInvoke(t, context.Background(), func(s *Session, sent *spb.VirtualRpcRequest) {
 		s.handleVRPCErrorResponse(&spb.ErrorResponse{
 			RpcId:       sent.RpcId,
 			Status:      &rpcstatus.Status{Code: int32(codes.FailedPrecondition), Message: "boom"},
@@ -269,10 +269,10 @@ func TestExecuteVRpcEx_ClusterInfoOnErrorPath(t *testing.T) {
 		})
 	})
 	if err == nil {
-		t.Fatal("ExecuteVRpcEx returned nil err on ErrorResponse path; want non-nil")
+		t.Fatal("Invoke returned nil err on ErrorResponse path; want non-nil")
 	}
 	if res.ClusterInfo == nil {
-		t.Fatal("ExecuteResult.ClusterInfo = nil on error path; want it preserved from ErrorResponse.ClusterInfo")
+		t.Fatal("InvokeResult.ClusterInfo = nil on error path; want it preserved from ErrorResponse.ClusterInfo")
 	}
 	if got := res.ClusterInfo.ClusterId; got != "c1" {
 		t.Errorf("ClusterInfo.ClusterId = %q, want %q", got, "c1")
@@ -282,14 +282,14 @@ func TestExecuteVRpcEx_ClusterInfoOnErrorPath(t *testing.T) {
 	}
 }
 
-func TestExecuteVRpcEx_RetryInfoPackedIntoStatus(t *testing.T) {
+func TestInvoke_RetryInfoPackedIntoStatus(t *testing.T) {
 	// Marquee test for the RetryInfo plumbing in handleVRPCErrorResponse:
 	// the server-supplied RetryInfo on ErrorResponse must be packed into the
 	// status details so downstream consumers can recover it via
 	// status.FromError(err).Details(). RetryingVRpc reads it from there.
 	const wantDelay = 250 * time.Millisecond
 
-	_, err := execVRpcEx(t, context.Background(), func(s *Session, sent *spb.VirtualRpcRequest) {
+	_, err := runInvoke(t, context.Background(), func(s *Session, sent *spb.VirtualRpcRequest) {
 		s.handleVRPCErrorResponse(&spb.ErrorResponse{
 			RpcId:     sent.RpcId,
 			Status:    &rpcstatus.Status{Code: int32(codes.Unavailable), Message: "boom"},
@@ -297,7 +297,7 @@ func TestExecuteVRpcEx_RetryInfoPackedIntoStatus(t *testing.T) {
 		})
 	})
 	if err == nil {
-		t.Fatal("ExecuteVRpcEx returned nil err on ErrorResponse path; want non-nil")
+		t.Fatal("Invoke returned nil err on ErrorResponse path; want non-nil")
 	}
 	st, ok := status.FromError(err)
 	if !ok {
@@ -318,49 +318,6 @@ func TestExecuteVRpcEx_RetryInfoPackedIntoStatus(t *testing.T) {
 	}
 	if got := found.GetRetryDelay().AsDuration(); got != wantDelay {
 		t.Errorf("RetryInfo.RetryDelay = %v, want %v", got, wantDelay)
-	}
-}
-
-func TestExecuteVRpc_BackCompatWrapperReturnsTriple(t *testing.T) {
-	// The back-compat wrapper must still return (resp, clusterInfo, err)
-	// drawn from the same ExecuteResult that ExecuteVRpcEx returns.
-	s, stream := makeActive(t, SessionHooks{})
-	desc := newRoundTripDesc()
-
-	type outcome struct {
-		resp    interface{}
-		cluster *spb.ClusterInformation
-		err     error
-	}
-	resCh := make(chan outcome, 1)
-	go func() {
-		r, c, err := s.ExecuteVRpc(context.Background(), desc, "hello")
-		resCh <- outcome{resp: r, cluster: c, err: err}
-	}()
-
-	waitFor(t, time.Second, func() bool { return len(stream.snapshotSent()) > 0 }, "Send called")
-	sent := stream.snapshotSent()[0].GetVirtualRpc()
-	s.handleVRPCResponse(&spb.VirtualRpcResponse{
-		RpcId:       sent.RpcId,
-		Payload:     []byte("world"),
-		ClusterInfo: &spb.ClusterInformation{ClusterId: "cwrap"},
-		Stats:       &spb.SessionRequestStats{BackendLatency: durationpb.New(time.Millisecond)},
-	})
-
-	var out outcome
-	select {
-	case out = <-resCh:
-	case <-time.After(time.Second):
-		t.Fatal("ExecuteVRpc did not return")
-	}
-	if out.err != nil {
-		t.Fatalf("ExecuteVRpc err = %v, want nil", out.err)
-	}
-	if got, _ := out.resp.(string); got != "world" {
-		t.Errorf("resp = %v, want %q", out.resp, "world")
-	}
-	if out.cluster == nil || out.cluster.ClusterId != "cwrap" {
-		t.Errorf("clusterInfo = %v, want ClusterId=cwrap", out.cluster)
 	}
 }
 

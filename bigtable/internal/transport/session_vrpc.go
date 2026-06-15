@@ -25,9 +25,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// ExecuteResult carries the full set of outputs from a vRPC execution.
-// Returned by ExecuteVRpcEx; the back-compat ExecuteVRpc wrapper exposes
-// the (Response, ClusterInfo, error) subset.
+// InvokeResult carries the full set of outputs from a single Invoke call.
 //
 // Fields:
 //   - Response: decoded vRPC payload (typed per VRpcDescriptor.Decode); nil on error.
@@ -43,33 +41,25 @@ import (
 // using gRPC status details — callers can extract it with
 // status.FromError(err).Details() and type-asserting to *errdetails.RetryInfo
 // (this is exactly how RetryingVRpc already consumes it).
-type ExecuteResult struct {
+type InvokeResult struct {
 	Response    interface{}
 	ClusterInfo *spb.ClusterInformation
 	Stats       *spb.SessionRequestStats
 	SentAt      time.Time
 }
 
-// ExecuteVRpc is a back-compat wrapper around ExecuteVRpcEx that returns the
-// historic (response, clusterInfo, error) triple. New callers that need Stats
-// or SentAt should use ExecuteVRpcEx directly.
-func (s *Session) ExecuteVRpc(ctx context.Context, desc VRpcDescriptor, req interface{}) (interface{}, *spb.ClusterInformation, error) {
-	res, err := s.ExecuteVRpcEx(ctx, desc, req)
-	return res.Response, res.ClusterInfo, err
-}
-
-// ExecuteVRpcEx is the full-fidelity vRPC execution path. It returns every
-// observable output of a single vRPC roundtrip — decoded response, cluster
-// info, server-reported Stats, and the local SentAt timestamp — so callers
-// can populate metrics (client_blocking_latency, server_backend_latency) and
+// Invoke executes a single virtual RPC on this session and returns every
+// observable output of the roundtrip — decoded response, cluster info,
+// server-reported Stats, and the local SentAt timestamp — so callers can
+// populate metrics (client_blocking_latency, server_backend_latency) and
 // respect server-supplied retry hints without losing data on the way out of
 // the transport.
 //
 // Calls are serialized by vrpcSem; concurrent callers queue behind the
 // in-flight RPC until the semaphore is released.
-func (s *Session) ExecuteVRpcEx(ctx context.Context, desc VRpcDescriptor, req interface{}) (result ExecuteResult, err error) {
+func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface{}) (result InvokeResult, err error) {
 	if err := s.vrpcSem.Acquire(ctx, multiPlexingLimit); err != nil {
-		return ExecuteResult{}, err
+		return InvokeResult{}, err
 	}
 	defer s.vrpcSem.Release(multiPlexingLimit)
 
@@ -82,13 +72,13 @@ func (s *Session) ExecuteVRpcEx(ctx context.Context, desc VRpcDescriptor, req in
 	if s.state != StateActive {
 		st := s.state
 		s.mu.Unlock()
-		return ExecuteResult{}, unavailable(ErrSessionNotActive, "session is not active (state: %v)", st)
+		return InvokeResult{}, unavailable(ErrSessionNotActive, "session is not active (state: %v)", st)
 	}
 	s.mu.Unlock()
 
 	reqBytes, err := desc.Encode(req)
 	if err != nil {
-		return ExecuteResult{}, fmt.Errorf("encode vRPC request: %w", err)
+		return InvokeResult{}, fmt.Errorf("encode vRPC request: %w", err)
 	}
 
 	rpcID := s.nextRPCID.Add(1)
@@ -170,7 +160,7 @@ func (s *Session) ExecuteVRpcEx(ctx context.Context, desc VRpcDescriptor, req in
 }
 
 // handleVRPCResponse delivers a server VirtualRpcResponse to the waiting
-// ExecuteVRpc caller, if any.
+// Invoke caller, if any.
 func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
 	s.mu.Lock()
 	rpc, ok := s.activeRPCs[resp.RpcId]

@@ -520,29 +520,21 @@ func (noDeadlineButCancellableContext) Deadline() (deadline time.Time, ok bool) 
 	return time.Time{}, false
 }
 
-// ExecuteVRpc checks out a session, executes a virtual RPC request, and
-// manages session outstanding counts. Back-compat wrapper around
-// ExecuteVRpcEx that drops Stats and SentAt; new callers should prefer
-// ExecuteVRpcEx so per-request metrics can be populated.
-func (p *SessionPoolImpl) ExecuteVRpc(ctx context.Context, desc VRpcDescriptor, req interface{}) (resp interface{}, clInfo *spb.ClusterInformation, err error) {
-	res, err := p.ExecuteVRpcEx(ctx, desc, req)
-	return res.Response, res.ClusterInfo, err
-}
-
-// ExecuteVRpcEx checks out a session, executes a virtual RPC, and returns
-// the full ExecuteResult (response, cluster info, server-reported Stats,
-// local SentAt timestamp). The checkout/outstanding bookkeeping mirrors
-// ExecuteVRpc; RetryInfo from server errors is plumbed through the returned
-// error via gRPC status details.
-func (p *SessionPoolImpl) ExecuteVRpcEx(ctx context.Context, desc VRpcDescriptor, req interface{}) (ExecuteResult, error) {
+// Invoke checks out a session from the pool, executes a single virtual RPC
+// on it, and returns the full InvokeResult (response, cluster info,
+// server-reported Stats, local SentAt timestamp). Outstanding-count
+// bookkeeping is managed automatically. RetryInfo from server errors is
+// plumbed through the returned error via gRPC status details so the retry
+// interceptor can honor it.
+func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req interface{}) (InvokeResult, error) {
 	sh, err := p.CheckoutSession(ctx)
 	if err != nil {
-		return ExecuteResult{}, err
+		return InvokeResult{}, err
 	}
 	start := time.Now()
 	defer func() {
 		sh.DecOutstanding(time.Since(start))
 	}()
 
-	return sh.session.ExecuteVRpcEx(ctx, desc, req)
+	return sh.session.Invoke(ctx, desc, req)
 }

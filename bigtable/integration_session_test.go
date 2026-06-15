@@ -515,7 +515,7 @@ func TestIntegration_SessionVRpc_RequestCarriesMetadata(t *testing.T) {
 		t.Fatal("AttemptStart = nil")
 	}
 	// Sanity: AttemptStart should be within a few seconds of now (it was
-	// captured immediately before Send by ExecuteVRpcEx).
+	// captured immediately before Send by Invoke).
 	now := time.Now()
 	got := v.Metadata.AttemptStart.AsTime()
 	if got.Before(now.Add(-30*time.Second)) || got.After(now.Add(30*time.Second)) {
@@ -561,7 +561,7 @@ func TestIntegration_SessionVRpc_RetriesOnUnavailable(t *testing.T) {
 	// AttemptNumber must strictly increment: attempt 1 = 1, attempt 2 = 2.
 	// SessionTable now seeds the ctx with WithVRpcMetadata before invoking
 	// RetryingVRpc, so retrying.go's WithAttempt(ctx, n) mutates the value
-	// that ExecuteVRpcEx subsequently reads via VRpcAttempt(ctx).
+	// that Invoke subsequently reads via VRpcAttempt(ctx).
 	wantAttempts := []int64{1, 2}
 	for i, want := range wantAttempts {
 		v := vrpcs[i]

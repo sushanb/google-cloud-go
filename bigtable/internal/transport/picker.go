@@ -15,13 +15,10 @@
 package internal
 
 import (
-	"context"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 )
 
 // RoundRobinPicker picks sessions in a round-robin sequence.
@@ -157,11 +154,6 @@ func (h *SessionHandle) GetLastActivity() time.Time {
 		return time.Time{}
 	}
 	return time.Unix(0, nano)
-}
-
-// ExecuteVRpc delegates the virtual RPC execution to the underlying session.
-func (h *SessionHandle) ExecuteVRpc(ctx context.Context, desc VRpcDescriptor, req interface{}) (interface{}, *spb.ClusterInformation, error) {
-	return h.session.ExecuteVRpc(ctx, desc, req)
 }
 
 // Picker defines the interface for picking a session from a pool.
