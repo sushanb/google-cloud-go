@@ -174,12 +174,12 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 		return nil, fmt.Errorf("failed to execute ReadRow vRPC: %w", err)
 	}
 
-	readResult, ok := res.(btransport.ReadRowResult)
+	readResp, ok := res.(*btpb.SessionReadRowResponse)
 	if !ok {
 		return nil, fmt.Errorf("unexpected response type from vRPC: %T", res)
 	}
 
-	return protoRowToRow(readResult.Row), nil
+	return protoRowToRow(readResp.GetRow()), nil
 }
 
 // Apply applies a single mutation via vRPC.

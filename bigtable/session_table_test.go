@@ -294,7 +294,7 @@ func TestSessionTable_ServerLatencyFromStats(t *testing.T) {
 	const wantBackend = 42 * time.Millisecond
 
 	readPool := &fakeInvoker{
-		resp:   btransport.ReadRowResult{Row: &btpb.Row{Key: []byte("row1")}},
+		resp:   &btpb.SessionReadRowResponse{Row: &btpb.Row{Key: []byte("row1")}},
 		stats:  &btpb.SessionRequestStats{BackendLatency: durationpb.New(wantBackend)},
 		sentAt: time.Now(),
 	}
@@ -348,7 +348,7 @@ func TestSessionTable_ClientBlockingLatencyFromSentAt(t *testing.T) {
 	// struct is built *after* hook returns). So if we set both in onCall,
 	// both land in the result correctly.
 	readPool := &fakeInvoker{
-		resp: btransport.ReadRowResult{Row: &btpb.Row{Key: []byte("row1")}},
+		resp: &btpb.SessionReadRowResponse{Row: &btpb.Row{Key: []byte("row1")}},
 	}
 	var capturedCtx context.Context
 	var captureMu sync.Mutex

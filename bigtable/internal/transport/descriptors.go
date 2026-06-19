@@ -110,17 +110,10 @@ type ReadRowArgs struct {
 	Filter *btpb.RowFilter
 }
 
-type ReadRowResult struct {
-	Row *btpb.Row
-}
-
 type MutateRowArgs struct {
 	RowKey    string
 	Mutations []*btpb.Mutation
 }
-
-// MutateRowResult holds the result of a MutateRow virtual RPC.
-type MutateRowResult struct{}
 
 func encodeReadRow(args ReadRowArgs) *spb.SessionReadRowRequest {
 	return &spb.SessionReadRowRequest{
@@ -129,29 +122,11 @@ func encodeReadRow(args ReadRowArgs) *spb.SessionReadRowRequest {
 	}
 }
 
-func decodeReadRow(payload []byte) (ReadRowResult, error) {
-	var resp spb.SessionReadRowResponse
-	if err := proto.Unmarshal(payload, &resp); err != nil {
-		return ReadRowResult{}, err
-	}
-	return ReadRowResult{
-		Row: resp.Row,
-	}, nil
-}
-
 func encodeMutateRow(args MutateRowArgs) *spb.SessionMutateRowRequest {
 	return &spb.SessionMutateRowRequest{
 		Key:       []byte(args.RowKey),
 		Mutations: args.Mutations,
 	}
-}
-
-func decodeMutateRow(payload []byte) (MutateRowResult, error) {
-	var resp spb.SessionMutateRowResponse
-	if err := proto.Unmarshal(payload, &resp); err != nil {
-		return MutateRowResult{}, err
-	}
-	return MutateRowResult{}, nil
 }
 
 var (
@@ -165,9 +140,7 @@ var (
 			}
 		}),
 		DecodeFn: createTableDecoder(func(env *spb.TableResponse) interface{} {
-			payload, _ := proto.Marshal(env.GetReadRow())
-			res, _ := decodeReadRow(payload)
-			return res
+			return env.GetReadRow()
 		}),
 	}
 
@@ -181,9 +154,7 @@ var (
 			}
 		}),
 		DecodeFn: createTableDecoder(func(env *spb.TableResponse) interface{} {
-			payload, _ := proto.Marshal(env.GetMutateRow())
-			res, _ := decodeMutateRow(payload)
-			return res
+			return env.GetMutateRow()
 		}),
 	}
 
@@ -197,9 +168,7 @@ var (
 			}
 		}),
 		DecodeFn: createAuthViewDecoder(func(env *spb.AuthorizedViewResponse) interface{} {
-			payload, _ := proto.Marshal(env.GetReadRow())
-			res, _ := decodeReadRow(payload)
-			return res
+			return env.GetReadRow()
 		}),
 	}
 
@@ -213,9 +182,7 @@ var (
 			}
 		}),
 		DecodeFn: createAuthViewDecoder(func(env *spb.AuthorizedViewResponse) interface{} {
-			payload, _ := proto.Marshal(env.GetMutateRow())
-			res, _ := decodeMutateRow(payload)
-			return res
+			return env.GetMutateRow()
 		}),
 	}
 
@@ -229,9 +196,7 @@ var (
 			}
 		}),
 		DecodeFn: createMatViewDecoder(func(env *spb.MaterializedViewResponse) interface{} {
-			payload, _ := proto.Marshal(env.GetReadRow())
-			res, _ := decodeReadRow(payload)
-			return res
+			return env.GetReadRow()
 		}),
 	}
 )
