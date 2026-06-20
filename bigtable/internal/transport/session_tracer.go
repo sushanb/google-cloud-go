@@ -97,6 +97,14 @@ func newSessionTracer(sessionType SessionType) *sessionTracer {
 	}
 }
 
+// openedAtSnapshot returns the cached open timestamp under the lock so
+// callers don't read a torn value.
+func (t *sessionTracer) openedAtSnapshot() time.Time {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.openedAt
+}
+
 func (t *sessionTracer) setPeerInfo(peerInfo *spb.PeerInfo, sessionName string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

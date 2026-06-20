@@ -46,6 +46,15 @@ type InvokeResult struct {
 	ClusterInfo *spb.ClusterInformation
 	Stats       *spb.SessionRequestStats
 	SentAt      time.Time
+	// SemWait is how long the call spent blocked in vrpcSem.Acquire — i.e.
+	// queue wait for the session's single in-flight slot. Useful for
+	// diagnosing whether a slow vRPC was server-slow vs head-of-line-
+	// blocked behind other queued callers.
+	SemWait time.Duration
+	// RpcIDOnSession is the per-session monotonic id of this call
+	// (1, 2, 3, …). Distinguishes warm-up vRPCs (small id) from
+	// established-session vRPCs.
+	RpcIDOnSession int64
 }
 
 // Invoke executes a single virtual RPC on this session and returns every
@@ -58,9 +67,11 @@ type InvokeResult struct {
 // Calls are serialized by vrpcSem; concurrent callers queue behind the
 // in-flight RPC until the semaphore is released.
 func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface{}) (result InvokeResult, err error) {
+	acquireStart := time.Now()
 	if err := s.vrpcSem.Acquire(ctx, multiPlexingLimit); err != nil {
 		return InvokeResult{}, err
 	}
+	result.SemWait = time.Since(acquireStart)
 	defer s.vrpcSem.Release(multiPlexingLimit)
 
 	startTime := time.Now()
@@ -82,6 +93,7 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 	}
 
 	rpcID := s.nextRPCID.Add(1)
+	result.RpcIDOnSession = rpcID
 	rpc := &vrpcImpl{
 		id:         rpcID,
 		method:     desc.Method(),

@@ -128,12 +128,24 @@ type ScalingEvent struct {
 
 // SlowVRpcEvent is one row in the pool's slow-vRPC log.
 type SlowVRpcEvent struct {
-	At       time.Time
-	Method   string
-	Latency  time.Duration
-	Session  string // log name of the session that handled the call
-	Success  bool
-	ErrCode  string // grpc status code on failure, empty on success
+	At      time.Time
+	Method  string
+	Latency time.Duration
+	Session string // log name of the session that handled the call
+	Success bool
+	ErrCode string // grpc status code on failure, empty on success
+	// SemWait is how long the call spent blocked in vrpcSem.Acquire
+	// — i.e. queue wait for the session's single in-flight slot.
+	SemWait time.Duration
+	// BackendLatency is the server-reported processing time
+	// (SessionRequestStats.BackendLatency); zero if not present.
+	BackendLatency time.Duration
+	// RpcIDOnSession is the per-session 1-indexed RPC id; very small
+	// values mean this was a freshly-opened session.
+	RpcIDOnSession int64
+	// SessionAge is time since the session entered StateActive — zero
+	// if the session never reached Active (rare error path).
+	SessionAge time.Duration
 }
 
 const (
@@ -1045,11 +1057,19 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 	latency := time.Since(start)
 	if latency > p.slowThreshold() {
 		ev := SlowVRpcEvent{
-			At:      start,
-			Method:  desc.Method(),
-			Latency: latency,
-			Session: sh.session.LogName(),
-			Success: invokeErr == nil,
+			At:             start,
+			Method:         desc.Method(),
+			Latency:        latency,
+			Session:        sh.session.LogName(),
+			Success:        invokeErr == nil,
+			SemWait:        result.SemWait,
+			RpcIDOnSession: result.RpcIDOnSession,
+		}
+		if result.Stats != nil && result.Stats.BackendLatency != nil {
+			ev.BackendLatency = result.Stats.BackendLatency.AsDuration()
+		}
+		if openedAt := sh.session.OpenedAt(); !openedAt.IsZero() {
+			ev.SessionAge = start.Sub(openedAt)
 		}
 		if invokeErr != nil {
 			ev.ErrCode = status.Code(invokeErr).String()

@@ -347,6 +347,12 @@ func (s *Session) CloseReason() string {
 // Retries returns the number of vRPCs Invoke processed with AttemptNumber > 1.
 func (s *Session) Retries() int64 { return s.retries.Load() }
 
+// OpenedAt returns when the session reached StateActive (zero until then).
+// Used by callers that want to compute a session's age for diagnostics.
+func (s *Session) OpenedAt() time.Time {
+	return s.tracer.openedAtSnapshot()
+}
+
 // SessionOption configures a Session at construction time.
 type SessionOption func(*Session)
 

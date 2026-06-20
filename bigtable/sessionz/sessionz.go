@@ -228,6 +228,28 @@ var funcs = template.FuncMap{
 	// clusterList renders a per-cluster response tally as a flat,
 	// sorted-by-count list: "[cluster-c1: 1350, cluster-c2: 412]". Order
 	// is stable (descending count, then alphabetical cluster id).
+	"reverseSlow": func(s []btransport.SlowVRpcEvent) []btransport.SlowVRpcEvent {
+		// Operators want newest-first in a slow log — the most recent
+		// incident is the one they care about. Return a reversed copy
+		// rather than mutating the source.
+		out := make([]btransport.SlowVRpcEvent, len(s))
+		for i := range s {
+			out[i] = s[len(s)-1-i]
+		}
+		return out
+	},
+	"latencyClass": func(d time.Duration) string {
+		// Color-code latency severity so spikes pop visually.
+		switch {
+		case d >= 5*time.Second:
+			return "lat-red"
+		case d >= 2*time.Second:
+			return "lat-orange"
+		case d >= time.Second:
+			return "lat-amber"
+		}
+		return ""
+	},
 	"clusterList": func(m map[string]int64) template.HTML {
 		if len(m) == 0 {
 			return template.HTML("—")
@@ -582,6 +604,9 @@ tr:hover td{background:#fafafa}
 .state-closed{color:#888}
 tr:target td{background:#fff4c2}
 tr:target td:first-child{border-left:3px solid #f0a000}
+.lat-amber{background:#fff7d6;color:#7a5a00;font-weight:600}
+.lat-orange{background:#ffe0c2;color:#a04500;font-weight:600}
+.lat-red{background:#ffd0d0;color:#922;font-weight:700}
 a{color:#1a5fb4;text-decoration:none}
 a:hover{text-decoration:underline}
 .summary{margin-bottom:1em;background:#fff;padding:.75em 1em;box-shadow:0 1px 2px rgba(0,0,0,.06)}
@@ -725,15 +750,35 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 {{end}}
 
 {{if .Pool.SlowVRpcs}}
-<h3 style="font-size:1em;margin:1.4em 0 .4em 0;color:#444">Slow vRPCs (last {{len .Pool.SlowVRpcs}})</h3>
+<h3 style="font-size:1em;margin:1.4em 0 .4em 0;color:#444">Slow vRPCs (last {{len .Pool.SlowVRpcs}}, newest first)</h3>
 <table>
-<thead><tr><th>When</th><th>Method</th><th class="num">Latency</th><th>Session</th><th>Status</th></tr></thead>
+<thead><tr>
+<th>When</th><th>Method</th><th class="num">Latency</th>
+<th class="num">SemWait</th><th class="num">Backend</th>
+<th>Session</th><th class="num">RpcID</th><th class="num">SessionAge</th>
+<th>Status</th>
+</tr></thead>
 <tbody>
-{{range .Pool.SlowVRpcs}}
-<tr><td>{{age .At}} ago</td><td class="mono">{{.Method}}</td><td class="num">{{dur .Latency}}</td><td class="mono">{{.Session}}</td><td>{{if .Success}}OK{{else}}<span style="color:#922">{{.ErrCode}}</span>{{end}}</td></tr>
+{{range reverseSlow .Pool.SlowVRpcs}}
+<tr>
+<td>{{age .At}} ago</td>
+<td class="mono">{{.Method}}</td>
+<td class="num {{latencyClass .Latency}}">{{dur .Latency}}</td>
+<td class="num" title="time spent in vrpcSem.Acquire — queue wait for the session's single in-flight slot">{{dur .SemWait}}</td>
+<td class="num" title="server-reported BackendLatency">{{dur .BackendLatency}}</td>
+<td class="mono">{{.Session}}</td>
+<td class="num" title="per-session 1-indexed RPC id; small values indicate a fresh session">{{.RpcIDOnSession}}</td>
+<td class="num" title="age of the session at the time of this call">{{dur .SessionAge}}</td>
+<td>{{if .Success}}OK{{else}}<span style="color:#922">{{.ErrCode}}</span>{{end}}</td>
+</tr>
 {{end}}
 </tbody>
 </table>
+<div style="font-size:.78em;color:#888;margin-top:.3em">
+<b>SemWait</b> ≈ <b>Latency</b> → call was queued on the session semaphore (head-of-line blocking).
+<b>Backend</b> close to <b>Latency</b> → server itself was slow.
+Low <b>RpcID</b> + small <b>SessionAge</b> → fresh session warm-up cost.
+</div>
 {{end}}
 
 {{if .Pool.ScalingHistory}}
