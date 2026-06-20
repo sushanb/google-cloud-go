@@ -79,12 +79,21 @@ func (s *Session) notifyClosed(streamErr error) {
 	})
 }
 
-// Close requests a graceful shutdown: it transitions to StateClosing, waits
-// for in-flight RPCs to drain (or for ctx to fire), then sends
-// CloseSessionRequest. The server's EOF eventually drives handleClose, which
-// moves to StateClosed.
+// Close requests a graceful shutdown:
+//  1. Transitions to StateClosing if currently New/Starting/Active. No-op
+//     when already past Closing — callers like handleGoAway advance the
+//     state upstream and then call Close to handle the drain + send dance.
+//  2. Waits for in-flight RPCs to drain (or for ctx to fire).
+//  3. Sends CloseSessionRequest to the server.
+//  4. Transitions to StateWaitServerClose.
+//  5. The server's EOF eventually drives handleClose → StateClosed. A
+//     pool-side monitor (SessionPoolImpl.sweepStuckSessions) force-closes
+//     sessions stuck in WaitServerClose past a grace period so an
+//     unresponsive server can't leak Closing sessions indefinitely.
 func (s *Session) Close(ctx context.Context, req *spb.CloseSessionRequest) error {
-	if _, ok := s.transitionTo(StateClosing, isState(StateNew, StateStarting, StateActive)); !ok {
+	s.transitionTo(StateClosing, isState(StateNew, StateStarting, StateActive))
+	if s.State() != StateClosing {
+		// Already past Closing (WaitServerClose / Closed) — nothing to do.
 		return nil
 	}
 
@@ -117,6 +126,10 @@ func (s *Session) Close(ctx context.Context, req *spb.CloseSessionRequest) error
 		s.ForceClose(nil)
 		return fmt.Errorf("send close session request: %w", err)
 	}
+	// Advance to WaitServerClose so the pool's stuck-session monitor can
+	// see we're parked waiting on the server. handleClose accepts the
+	// Closed transition from WaitServerClose as well.
+	s.transitionTo(StateWaitServerClose, isState(StateClosing))
 	return nil
 }
 
@@ -250,11 +263,21 @@ func (s *Session) handleSessionRefreshConfig(cfg *spb.SessionRefreshConfig) {
 		cfg.GetOptimizedOpenRequest() != nil, len(cfg.GetMetadata()))
 }
 
-// handleGoAway transitions to StateClosing and cancels every RPC with an id
-// greater than the last admitted one. A late-arriving GOAWAY from an already
-// terminal session is ignored — we do not move backwards.
+// handleGoAway processes a server-initiated GoAway:
+//  1. Transitions to StateClosing (no backwards motion from terminal states).
+//  2. Cancels every in-flight RPC whose id exceeds lastAdmitted — the server
+//     has promised never to ack those.
+//  3. Spawns a goroutine that runs s.Close to drive the session through
+//     Closing → WaitServerClose → Closed, so the lifecycle reliably
+//     completes even when the server forgets to follow up with a stream
+//     EOF after GoAway. The pool's stuck-session monitor then force-closes
+//     if it parks too long in WaitServerClose.
+//
+// A late-arriving GOAWAY from an already terminal session is ignored.
 func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
-	s.transitionTo(StateClosing, notState(StateClosing, StateClosed))
+	if _, ok := s.transitionTo(StateClosing, notState(StateClosing, StateWaitServerClose, StateClosed)); !ok {
+		return
+	}
 
 	lastAdmitted := goAway.GetLastRpcIdAdmitted()
 	s.debugf("received GOAWAY reason=%q description=%q last_rpc_id_admitted=%d",
@@ -263,6 +286,19 @@ func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
 	err := unavailable(ErrUnavailableGoAway,
 		"vRPC not admitted before GOAWAY (last_admitted=%d)", lastAdmitted)
 	s.cancelActiveRPCs(err, func(id int64) bool { return id > lastAdmitted })
+
+	// Drive the lifecycle to completion off the readLoop. s.Close drains
+	// remaining admitted RPCs, sends CloseSession, and transitions to
+	// WaitServerClose; the server's EOF or the pool monitor then advances
+	// to Closed.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = s.Close(ctx, &spb.CloseSessionRequest{
+			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_GOAWAY,
+			Description: "client teardown after server GOAWAY",
+		})
+	}()
 }
 
 // handleClose is invoked when Recv returns an error. It transitions to
