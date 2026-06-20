@@ -69,8 +69,12 @@ var (
 	port        = flag.Int("port", 6060, "HTTP port for the sessionz debug UI")
 	poolMin     = flag.Int("pool-min", 2, "minimum sessions in the pool")
 	poolMax     = flag.Int("pool-max", 10, "maximum sessions in the pool")
-	rps         = flag.Float64("rps", 50.0, "approximate ReadRow requests per second to generate")
+	rps         = flag.Float64("rps", 50.0, "approximate ReadRow requests per second to generate (interpreted as the BASE rate; modulated by -pattern)")
 	concurrency = flag.Int("concurrency", 4, "number of parallel ReadRow goroutines")
+	pattern     = flag.String("pattern", "constant", `load pattern: "constant" (steady -rps), "wave" (low/high square wave to exercise the sizer)`)
+	cycle       = flag.Duration("cycle", 60*time.Second, "wave-pattern full cycle period (one low + one high phase). Ignored for -pattern=constant.")
+	waveLow     = flag.Float64("wave-low", 0.1, "wave low-phase multiplier applied to -rps")
+	waveHigh    = flag.Float64("wave-high", 10.0, "wave high-phase multiplier applied to -rps")
 )
 
 func main() {
@@ -175,7 +179,7 @@ li .json{margin-left:.6em;font-size:.85em;color:#888}
 	// OpenTable (not Open) gives the session-routed TableAPI so the
 	// ReadRows below traverse the session pool we're trying to inspect.
 	tbl := client.OpenTable(*table)
-	go runLoad(ctx, tbl, *row, *rps, *concurrency)
+	go runLoad(ctx, tbl, *row, *rps, *concurrency, *pattern, *cycle, *waveLow, *waveHigh)
 
 	// Wait for SIGINT/SIGTERM, then shut everything down cleanly.
 	sigs := make(chan os.Signal, 1)
@@ -188,26 +192,55 @@ li .json{margin-left:.6em;font-size:.85em;color:#888}
 	_ = srv.Shutdown(shutdownCtx)
 }
 
-// runLoad spawns `concurrency` goroutines, each pacing itself to rps/concurrency
-// ReadRow calls per second. Counts and errors are logged every 5 seconds so you
-// can correlate what you see in the UI with what the load is actually doing.
-func runLoad(ctx context.Context, tbl bigtable.TableAPI, rowKey string, rps float64, concurrency int) {
+// runLoad spawns `concurrency` worker goroutines and a controller. The
+// workers each pace themselves to the SHARED per-op interval published by
+// the controller; that way changing the rate over time (e.g. for the
+// "wave" pattern) takes effect on every worker without restarting them.
+//
+// pattern semantics:
+//   - "constant": the controller publishes one interval (derived from rps)
+//     once and never changes it. Equivalent to the original fixed-rate load.
+//   - "wave": square wave — alternates a low and high target rate every
+//     cycle/2 so the pool sizer scales up during the high phase and prunes
+//     during the low phase. Multipliers applied to rps:
+//       low  = rps * waveLow      (default 0.1× — gentle, lets prune fire)
+//       high = rps * waveHigh     (default 10× — aggressive, forces scale-up)
+//     Each phase logs the transition so the sessionz timeline is readable.
+func runLoad(
+	ctx context.Context,
+	tbl bigtable.TableAPI,
+	rowKey string,
+	rps float64,
+	concurrency int,
+	pattern string,
+	cycle time.Duration,
+	waveLow, waveHigh float64,
+) {
 	if rps <= 0 || concurrency <= 0 {
 		return
 	}
-	perWorker := rps / float64(concurrency)
-	interval := time.Duration(float64(time.Second) / perWorker)
+
+	// currentIntervalNanos is the per-op delay each worker waits between
+	// requests. Updated atomically by the controller; workers read on
+	// every tick so a phase change takes effect immediately.
+	var currentIntervalNanos atomic.Int64
+	intervalFor := func(targetRps float64) time.Duration {
+		if targetRps <= 0 {
+			return time.Hour // park workers
+		}
+		perWorker := targetRps / float64(concurrency)
+		return time.Duration(float64(time.Second) / perWorker)
+	}
+	currentIntervalNanos.Store(int64(intervalFor(rps)))
 
 	var ok, errs atomic.Int64
 	for i := 0; i < concurrency; i++ {
 		go func() {
-			t := time.NewTicker(interval)
-			defer t.Stop()
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case <-t.C:
+				case <-time.After(time.Duration(currentIntervalNanos.Load())):
 				}
 				rctx, rcancel := context.WithTimeout(ctx, 5*time.Second)
 				_, err := tbl.ReadRow(rctx, rowKey)
@@ -221,6 +254,38 @@ func runLoad(ctx context.Context, tbl bigtable.TableAPI, rowKey string, rps floa
 		}()
 	}
 
+	// Controller goroutine: drives currentIntervalNanos for non-constant
+	// patterns. For "constant" we just leave the initial interval in place.
+	if pattern == "wave" && cycle > 0 {
+		go func() {
+			phase := time.Duration(0)
+			if cycle/2 > 0 {
+				phase = cycle / 2
+			}
+			high := false
+			ticker := time.NewTicker(phase)
+			defer ticker.Stop()
+			for {
+				high = !high
+				var target float64
+				if high {
+					target = rps * waveHigh
+				} else {
+					target = rps * waveLow
+				}
+				iv := intervalFor(target)
+				currentIntervalNanos.Store(int64(iv))
+				log.Printf("workload: phase=%s target=%.1f rps interval=%v",
+					phaseLabel(high), target, iv)
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	}
+
 	logTicker := time.NewTicker(5 * time.Second)
 	defer logTicker.Stop()
 	for {
@@ -228,7 +293,16 @@ func runLoad(ctx context.Context, tbl bigtable.TableAPI, rowKey string, rps floa
 		case <-ctx.Done():
 			return
 		case <-logTicker.C:
-			log.Printf("load so far: ok=%d errors=%d", ok.Load(), errs.Load())
+			log.Printf("load so far: ok=%d errors=%d (current interval %v)",
+				ok.Load(), errs.Load(),
+				time.Duration(currentIntervalNanos.Load()))
 		}
 	}
+}
+
+func phaseLabel(high bool) string {
+	if high {
+		return "HIGH"
+	}
+	return "LOW"
 }

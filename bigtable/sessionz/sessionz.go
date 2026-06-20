@@ -225,6 +225,41 @@ var funcs = template.FuncMap{
 		}
 		return strconv.Itoa(n)
 	},
+	// clusterList renders a per-cluster response tally as a flat,
+	// sorted-by-count list: "[cluster-c1: 1350, cluster-c2: 412]". Order
+	// is stable (descending count, then alphabetical cluster id).
+	"clusterList": func(m map[string]int64) template.HTML {
+		if len(m) == 0 {
+			return template.HTML("—")
+		}
+		type kv struct {
+			k string
+			v int64
+		}
+		pairs := make([]kv, 0, len(m))
+		for k, v := range m {
+			pairs = append(pairs, kv{k, v})
+		}
+		sort.Slice(pairs, func(i, j int) bool {
+			if pairs[i].v != pairs[j].v {
+				return pairs[i].v > pairs[j].v
+			}
+			return pairs[i].k < pairs[j].k
+		})
+		var b strings.Builder
+		b.WriteString("[")
+		for i, p := range pairs {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(`<span class="mono">`)
+			b.WriteString(template.HTMLEscapeString(p.k))
+			b.WriteString(`</span>: `)
+			b.WriteString(strconv.FormatInt(p.v, 10))
+		}
+		b.WriteString("]")
+		return template.HTML(b.String())
+	},
 	// opaqueID renders an int64 field that the server uses as an opaque
 	// uint64 identifier (GFE / AFE id) as hex. The proto field is signed
 	// so very large IDs come back negative ("-5686685877648862677") which
@@ -595,13 +630,18 @@ details.msgcell>summary:hover{color:#15498a}
 </div>
 <div class="summary">
 <span><b>BackendLatency</b> p50 {{dur .Pool.LatencyP50}} · p95 {{dur .Pool.LatencyP95}} · p99 {{dur .Pool.LatencyP99}} <span class="mono">(n={{.Pool.LatencyN}})</span></span>
-<span><b>Clusters</b> {{msgCell (sumMap .Pool.ClusterCounts) .Pool.ClusterCounts}}</span>
 {{if .Pool.TimeSeries}}
 <span><b>sessions</b> {{sparkline 120 28 "#1a5fb4" (sessionsSeries .Pool.TimeSeries)}}</span>
 <span><b>ok/s</b> {{sparkline 120 28 "#197a1f" (okSeries .Pool.TimeSeries)}}</span>
 <span><b>err/s</b> {{sparkline 120 28 "#a04500" (errSeries .Pool.TimeSeries)}}</span>
 {{end}}
 </div>
+
+{{if .Pool.ClusterCounts}}
+<div class="summary">
+<b>Clusters</b> ({{sumMap .Pool.ClusterCounts}} total responses) — {{clusterList .Pool.ClusterCounts}}
+</div>
+{{end}}
 
 {{if .Pool.OpenRequest}}
 <details class="openreq">
