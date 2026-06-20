@@ -17,10 +17,13 @@ package internal
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -322,17 +325,60 @@ func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
 // StateClosed (from any non-terminal state — including WaitServerClose
 // when the server's EOF arrives after a CloseSession we sent) and cancels
 // every remaining in-flight RPC.
+//
+// The close reason is derived from the Recv error if no more-specific
+// reason was recorded earlier — see streamEndReason. setCloseReason is
+// CompareAndSwap-once, so a GoAway / MissedHeartbeat / Error stamp from
+// upstream always wins; the categorized StreamEnd label only sticks when
+// the stream ended without any other path classifying it first.
 func (s *Session) handleClose(err error) {
 	if _, ok := s.transitionTo(StateClosed, notState(StateClosed)); !ok {
 		return
 	}
-	// "StreamEnd" is the catch-all label for server- or transport-driven
-	// closes — the actual reason is usually GOAWAY / heartbeat / etc and
-	// has already been recorded by the more specific path.
-	s.setCloseReason("StreamEnd")
+	s.setCloseReason(streamEndReason(err))
 	s.cancelActiveRPCs(unavailable(err, "session closed: %v", err), nil)
 	s.signalQuiescent()
 	s.notifyClosed(err)
+}
+
+// streamEndReason classifies the Recv error that ended the stream. The
+// returned label is what shows up in sessionz's Close-reasons breakdown
+// when no upstream path stamped a more specific reason (GoAway,
+// MissedHeartbeat, Error, etc.).
+//
+// Categories the operator typically cares about:
+//
+//	StreamEnd:EOF              — server closed the stream cleanly with
+//	                              io.EOF (graceful shutdown from server's
+//	                              side that didn't go through GoAway)
+//	StreamEnd:Canceled         — local ctx cancel (pool teardown,
+//	                              client app exit) or grpc CANCELED
+//	StreamEnd:DeadlineExceeded — ctx deadline or grpc DEADLINE_EXCEEDED
+//	StreamEnd:Unavailable      — transport-level break (TCP drop,
+//	                              connection recycler killed the channel,
+//	                              load balancer evicted the backend)
+//	StreamEnd:Internal         — server INTERNAL error
+//	StreamEnd:{Code}           — any other gRPC status code (verbatim)
+//	StreamEnd:Other            — no recognizable category (extremely rare)
+//	StreamEnd                  — err was nil (shouldn't happen since Recv
+//	                              only returns on error)
+func streamEndReason(err error) string {
+	if err == nil {
+		return "StreamEnd"
+	}
+	if errors.Is(err, io.EOF) {
+		return "StreamEnd:EOF"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "StreamEnd:Canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "StreamEnd:DeadlineExceeded"
+	}
+	if st, ok := status.FromError(err); ok {
+		return "StreamEnd:" + st.Code().String()
+	}
+	return "StreamEnd:Other"
 }
 
 // resetHeartbeatDeadline pushes out the watchdog to (3 * heartbeatInterval)
