@@ -240,6 +240,32 @@ var funcs = template.FuncMap{
 		}
 		return b.String()
 	},
+	// msgCell renders a count + a click-to-expand HTML5 <details> disclosure
+	// listing the per-type breakdown. Numbers stay tabular; the per-type rows
+	// only render after the user clicks the count.
+	"msgCell": func(total int64, m map[string]int64) template.HTML {
+		if len(m) == 0 {
+			return template.HTML(strconv.FormatInt(total, 10))
+		}
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var b strings.Builder
+		b.WriteString(`<details class="msgcell"><summary>`)
+		b.WriteString(strconv.FormatInt(total, 10))
+		b.WriteString(`</summary><div class="msgcell-body">`)
+		for _, k := range keys {
+			b.WriteString(`<div><span class="msgcell-k">`)
+			b.WriteString(template.HTMLEscapeString(k))
+			b.WriteString(`</span><span class="msgcell-v">`)
+			b.WriteString(strconv.FormatInt(m[k], 10))
+			b.WriteString(`</span></div>`)
+		}
+		b.WriteString(`</div></details>`)
+		return template.HTML(b.String())
+	},
 }
 
 func roundDuration(d time.Duration) time.Duration {
@@ -335,6 +361,14 @@ a:hover{text-decoration:underline}
 .summary b{color:#444}
 .empty{color:#888;font-style:italic;padding:.8em 0}
 .foot{margin-top:1.5em;color:#888;font-size:.8em}
+details.msgcell{display:inline-block}
+details.msgcell>summary{cursor:pointer;list-style:none;color:#1a5fb4;text-decoration:underline dotted}
+details.msgcell>summary::-webkit-details-marker{display:none}
+details.msgcell>summary:hover{color:#15498a}
+.msgcell-body{position:absolute;background:#fff;border:1px solid #ddd;box-shadow:0 4px 10px rgba(0,0,0,.12);padding:.5em .75em;margin-top:.25em;font-size:.85em;text-align:left;z-index:10;min-width:14em}
+.msgcell-body div{display:flex;justify-content:space-between;gap:1em;padding:.1em 0}
+.msgcell-k{color:#444;font-family:ui-monospace,Consolas,monospace}
+.msgcell-v{font-variant-numeric:tabular-nums;color:#222}
 </style>
 </head><body>
 <h1>Pool <span class="mono">{{.Pool.Name}}</span></h1>
@@ -381,8 +415,8 @@ a:hover{text-decoration:underline}
 <td class="num">{{.OkRpcs}}</td>
 <td class="num">{{.ErrorRpcs}}</td>
 <td class="num">{{.Retries}}</td>
-<td class="num" title="{{msgBreakdown .MsgsSentByType}}">{{.MsgsSent}}</td>
-<td class="num" title="{{msgBreakdown .MsgsRecvByType}}">{{.MsgsRecv}}</td>
+<td class="num">{{msgCell .MsgsSent .MsgsSentByType}}</td>
+<td class="num">{{msgCell .MsgsRecv .MsgsRecvByType}}</td>
 <td class="num">{{.ActiveRpcs}}</td>
 <td class="num">{{.Handle.Outstanding}}</td>
 <td class="num">{{.Handle.Picks}}</td>
