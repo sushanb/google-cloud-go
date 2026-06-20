@@ -187,8 +187,12 @@ type Session struct {
 	peerInfo      *spb.PeerInfo
 	refreshConfig *spb.SessionRefreshConfig
 
-	hasOkRpcs    bool
-	hasErrorRpcs bool
+	// okRpcs / errorRpcs are bumped lock-free from the vRPC dispatch paths so
+	// the debug UI can read a numeric total without locking. The booleans
+	// HasOkRpcs / HasErrorRpcs remain as thin wrappers over these counters
+	// for back-compat with existing callers.
+	okRpcs    atomic.Int64
+	errorRpcs atomic.Int64
 }
 
 // SessionOption configures a Session at construction time.
@@ -254,16 +258,24 @@ func (s *Session) RefreshConfig() *spb.SessionRefreshConfig {
 
 // HasOkRpcs reports whether the session served at least one successful vRPC.
 func (s *Session) HasOkRpcs() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.hasOkRpcs
+	return s.okRpcs.Load() > 0
 }
 
 // HasErrorRpcs reports whether the session served at least one failed vRPC.
 func (s *Session) HasErrorRpcs() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.hasErrorRpcs
+	return s.errorRpcs.Load() > 0
+}
+
+// OkRpcs returns the total number of successful vRPC responses delivered on
+// this session.
+func (s *Session) OkRpcs() int64 {
+	return s.okRpcs.Load()
+}
+
+// ErrorRpcs returns the total number of failed vRPC responses delivered on
+// this session.
+func (s *Session) ErrorRpcs() int64 {
+	return s.errorRpcs.Load()
 }
 
 // debugf logs at debug level if a logger has been attached.

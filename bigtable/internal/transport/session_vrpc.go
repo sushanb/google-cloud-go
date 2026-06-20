@@ -164,15 +164,13 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
 	s.mu.Lock()
 	rpc, ok := s.activeRPCs[resp.RpcId]
-	if ok {
-		s.hasOkRpcs = true
-	}
 	s.mu.Unlock()
 
 	if !ok {
 		s.debugf("dropping VirtualRpcResponse for unknown rpc_id=%d", resp.RpcId)
 		return
 	}
+	s.okRpcs.Add(1)
 	s.deliver(rpc, vrpcResult{resp: resp, clusterInfo: resp.ClusterInfo})
 }
 
@@ -181,15 +179,13 @@ func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
 func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 	s.mu.Lock()
 	rpc, ok := s.activeRPCs[errResp.RpcId]
-	if ok {
-		s.hasErrorRpcs = true
-	}
 	s.mu.Unlock()
 
 	if !ok {
 		s.debugf("dropping ErrorResponse for unknown rpc_id=%d", errResp.RpcId)
 		return
 	}
+	s.errorRpcs.Add(1)
 
 	var goErr error
 	if errResp.Status != nil {

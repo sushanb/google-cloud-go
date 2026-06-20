@@ -85,6 +85,34 @@ func NewSessionManager(
 	}
 }
 
+// ManagerSnapshot returns a snapshot of every pool the SessionManager
+// currently owns, ordered by pool key for stable rendering. The pool lock is
+// held only long enough to copy out the (key, *pool) pairs; the per-pool
+// snapshots are taken lock-free with respect to m.mu.
+func (m *SessionManager) ManagerSnapshot() []btransport.PoolSnapshot {
+	m.mu.Lock()
+	type entry struct {
+		key  string
+		pool *btransport.SessionPoolImpl
+	}
+	entries := make([]entry, 0, len(m.sessionPools))
+	for k, mp := range m.sessionPools {
+		entries = append(entries, entry{key: k, pool: mp.pool})
+	}
+	m.mu.Unlock()
+
+	sort.Slice(entries, func(i, j int) bool { return entries[i].key < entries[j].key })
+
+	out := make([]btransport.PoolSnapshot, 0, len(entries))
+	for _, e := range entries {
+		if e.pool == nil {
+			continue
+		}
+		out = append(out, e.pool.PoolSnapshot())
+	}
+	return out
+}
+
 // Close closes all session pools managed by the SessionManager.
 func (m *SessionManager) Close() error {
 	m.mu.Lock()
