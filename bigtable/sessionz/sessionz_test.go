@@ -30,6 +30,7 @@ type fakeProvider struct {
 }
 
 func (f fakeProvider) Snapshot() []btransport.PoolSnapshot { return f.pools }
+func (fakeProvider) Diverter() btransport.DiverterSnapshot { return btransport.DiverterSnapshot{} }
 
 func sampleSnapshot() []btransport.PoolSnapshot {
 	return []btransport.PoolSnapshot{
@@ -113,15 +114,18 @@ func TestIndex_JSON_RoundTrips(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", ct)
 	}
-	var got []btransport.PoolSnapshot
+	var got struct {
+		Pools    []btransport.PoolSnapshot   `json:"pools"`
+		Diverter btransport.DiverterSnapshot `json:"diverter"`
+	}
 	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
 		t.Fatalf("decode JSON: %v", err)
 	}
-	if len(got) != 1 || got[0].Name != pools[0].Name {
+	if len(got.Pools) != 1 || got.Pools[0].Name != pools[0].Name {
 		t.Errorf("JSON round-trip mismatch: %+v", got)
 	}
-	if len(got[0].Sessions) != 2 {
-		t.Errorf("Sessions len = %d, want 2", len(got[0].Sessions))
+	if len(got.Pools[0].Sessions) != 2 {
+		t.Errorf("Sessions len = %d, want 2", len(got.Pools[0].Sessions))
 	}
 }
 

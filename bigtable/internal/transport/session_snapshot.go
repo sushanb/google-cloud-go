@@ -16,6 +16,7 @@ package internal
 
 import (
 	"reflect"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -95,6 +96,20 @@ type SessionSnapshot struct {
 	MsgsRecvByType    map[string]int64
 	ActiveRpcs        int
 	CloseReason       string
+	// LatencyP50/95/99 are computed from the server-reported BackendLatency
+	// values cached on the session (last 256 samples). Zero when the session
+	// hasn't seen any responses with Stats populated yet.
+	LatencyP50  time.Duration
+	LatencyP95  time.Duration
+	LatencyP99  time.Duration
+	LatencyN    int // number of samples in the window
+	// ClusterCounts is the per-ClusterInformation.ClusterId response tally
+	// (e.g. {"cluster-c1": 412, "cluster-c2": 198}). Empty until the server
+	// has attached ClusterInformation to at least one response.
+	ClusterCounts map[string]int64
+	// ChannelIndex is the BigtableChannelPool connEntry index the session's
+	// bidi stream landed on, or -1 when unknown (non-Bigtable channel pool).
+	ChannelIndex int
 	HeartbeatInterval time.Duration
 	NextHeartbeat     time.Time
 	HasRefreshConfig  bool
@@ -150,6 +165,15 @@ type PoolSnapshot struct {
 	// OpenMaterializedView). All sessions in a given pool share this exact
 	// request, so it's surfaced per-pool rather than per-session.
 	OpenRequest *OpenRequestSnapshot
+	// Pool-level aggregates derived from the per-session snapshots and
+	// non-session pool state.
+	ClusterCounts  map[string]int64
+	LatencyP50     time.Duration
+	LatencyP95     time.Duration
+	LatencyP99     time.Duration
+	LatencyN       int
+	SlowVRpcs      []SlowVRpcEvent
+	TimeSeries     []TimeSeriesSample
 }
 
 // OpenRequestSnapshot is the JSON-friendly form of the OpenSessionRequest.
@@ -181,6 +205,7 @@ func (s *Session) Snapshot() SessionSnapshot {
 	sessionType := s.sessionType
 	s.mu.Unlock()
 
+	sortedLat := s.snapshotLatencies()
 	return SessionSnapshot{
 		LogName:           logName,
 		State:             state.String(),
@@ -195,6 +220,12 @@ func (s *Session) Snapshot() SessionSnapshot {
 		MsgsRecvByType:    recvByType(s),
 		ActiveRpcs:        activeRpcs,
 		CloseReason:       s.CloseReason(),
+		ClusterCounts:     s.snapshotClusters(),
+		ChannelIndex:      s.ChannelIndex(),
+		LatencyP50:        percentile(sortedLat, 50),
+		LatencyP95:        percentile(sortedLat, 95),
+		LatencyP99:        percentile(sortedLat, 99),
+		LatencyN:          len(sortedLat),
 		HeartbeatInterval: hbInterval,
 		NextHeartbeat:     nextHb,
 		HasRefreshConfig:  hasRefresh,
@@ -296,7 +327,15 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 		Throttler:      throttler,
 		ScalingHistory: p.snapshotScalingHistory(),
 		OpenRequest:    buildOpenRequestSnapshot(p.openSessionRequest, sessionType),
+		SlowVRpcs:      p.snapshotSlowVRpcs(),
+		TimeSeries:     p.snapshotTimeSeries(),
 	}
+
+	// Pool-level aggregates: combine cluster counts + latency samples
+	// across every session. Latency samples are merged from per-session
+	// ring buffers; pool percentiles are computed on the combined window.
+	aggregatedClusters := map[string]int64{}
+	var combinedLatencies []time.Duration
 
 	for _, sh := range handles {
 		if sh == nil || sh.session == nil {
@@ -313,6 +352,22 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 			snap.InUseCount++
 			snap.PendingCount += int(s.Handle.Outstanding)
 		}
+		for k, v := range s.ClusterCounts {
+			aggregatedClusters[k] += v
+		}
+		combinedLatencies = append(combinedLatencies, sh.session.snapshotLatencies()...)
+	}
+	if len(aggregatedClusters) > 0 {
+		snap.ClusterCounts = aggregatedClusters
+	}
+	if len(combinedLatencies) > 0 {
+		sort.Slice(combinedLatencies, func(i, j int) bool {
+			return combinedLatencies[i] < combinedLatencies[j]
+		})
+		snap.LatencyP50 = percentile(combinedLatencies, 50)
+		snap.LatencyP95 = percentile(combinedLatencies, 95)
+		snap.LatencyP99 = percentile(combinedLatencies, 99)
+		snap.LatencyN = len(combinedLatencies)
 	}
 	return snap
 }

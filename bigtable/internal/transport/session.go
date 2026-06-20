@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -222,6 +223,101 @@ type Session struct {
 	// (proactive prune, CheckoutSession dead-detect, or the eventual
 	// hooks.OnClose driven by the server EOF).
 	poolCloseRecorded atomic.Bool
+
+	// latencyMu guards latencySamples — a tiny ring buffer of the last
+	// latencyWindow server-reported BackendLatency values, used to compute
+	// p50/p95/p99 in the debug UI. Reservoir is sized so a snapshot copy
+	// is cheap (a few hundred floats).
+	latencyMu      sync.Mutex
+	latencySamples []time.Duration
+	latencyNext    int // next write index when ring is full
+
+	// clusterCounts tallies per-ClusterInformation.ClusterId responses.
+	// Lock-free reads via sync.Map; values are *atomic.Int64. The set of
+	// cluster ids is small (≤ pool cardinality) so iteration is cheap.
+	clusterCounts sync.Map
+
+	// channelIndex is set once at construction to the BigtableChannelPool
+	// connEntry index the session's bidi stream was placed on. -1 when
+	// the underlying pool isn't a BigtableChannelPool (e.g. test setups
+	// using option.WithGRPCConn) or when the pick wasn't observed.
+	channelIndex atomic.Int32
+}
+
+const latencyWindow = 256
+
+// recordLatency appends a server-reported BackendLatency sample to the ring
+// buffer. Called from Invoke whenever the response includes Stats. Cheap —
+// single mutex acquire over a fixed-size slice.
+func (s *Session) recordLatency(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	s.latencyMu.Lock()
+	if len(s.latencySamples) < latencyWindow {
+		s.latencySamples = append(s.latencySamples, d)
+	} else {
+		s.latencySamples[s.latencyNext] = d
+		s.latencyNext = (s.latencyNext + 1) % latencyWindow
+	}
+	s.latencyMu.Unlock()
+}
+
+// snapshotLatencies returns a sorted copy of the current samples so callers
+// can compute percentiles or iterate without holding the lock.
+func (s *Session) snapshotLatencies() []time.Duration {
+	s.latencyMu.Lock()
+	out := make([]time.Duration, len(s.latencySamples))
+	copy(out, s.latencySamples)
+	s.latencyMu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// percentile returns the p-th percentile (0-100) of the sorted slice. Uses
+// nearest-rank — small N, linear interpolation isn't worth the complexity.
+func percentile(sorted []time.Duration, p float64) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if p <= 0 {
+		return sorted[0]
+	}
+	if p >= 100 {
+		return sorted[len(sorted)-1]
+	}
+	idx := int(float64(len(sorted)-1) * p / 100)
+	return sorted[idx]
+}
+
+// recordCluster increments the per-cluster response counter.
+func (s *Session) recordCluster(id string) {
+	if id == "" {
+		return
+	}
+	c, _ := s.clusterCounts.LoadOrStore(id, new(atomic.Int64))
+	c.(*atomic.Int64).Add(1)
+}
+
+// snapshotClusters returns the per-cluster response counts as a flat map.
+func (s *Session) snapshotClusters() map[string]int64 {
+	out := map[string]int64{}
+	s.clusterCounts.Range(func(k, v interface{}) bool {
+		out[k.(string)] = v.(*atomic.Int64).Load()
+		return true
+	})
+	return out
+}
+
+// SetChannelIndex records the BigtableChannelPool connEntry index the
+// session's stream landed on. Called once at session construction.
+func (s *Session) SetChannelIndex(idx int) {
+	s.channelIndex.Store(int32(idx))
+}
+
+// ChannelIndex returns the per-pool channel index, or -1 if unset.
+func (s *Session) ChannelIndex() int {
+	return int(s.channelIndex.Load())
 }
 
 // setCloseReason records the reason for the session's terminal close. Only
@@ -271,6 +367,7 @@ func NewSession(logName string, stream Stream, hooks SessionHooks, sessionType S
 		sessionType:           sessionType,
 		vrpcSem:               semaphore.NewWeighted(multiPlexingLimit),
 	}
+	s.channelIndex.Store(-1)
 	for _, o := range opts {
 		o(s)
 	}

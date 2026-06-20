@@ -146,6 +146,9 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 		return result, ctx.Err()
 	case res := <-rpc.resultChan:
 		result.ClusterInfo = res.clusterInfo
+		if res.clusterInfo != nil {
+			s.recordCluster(res.clusterInfo.GetClusterId())
+		}
 		if res.err != nil {
 			return result, res.err
 		}
@@ -158,6 +161,9 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 		}
 		result.Response = respMsg
 		result.Stats = res.resp.Stats
+		if res.resp.Stats != nil && res.resp.Stats.BackendLatency != nil {
+			s.recordLatency(res.resp.Stats.BackendLatency.AsDuration())
+		}
 		return result, nil
 	}
 }

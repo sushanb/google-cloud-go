@@ -28,6 +28,8 @@ import (
 type SessionDebugProvider interface {
 	// Snapshot returns a snapshot of every session pool, ordered by pool key.
 	Snapshot() []btransport.PoolSnapshot
+	// Diverter returns the client-wide session/classic split state.
+	Diverter() btransport.DiverterSnapshot
 }
 
 // SessionDebug returns a SessionDebugProvider for this Client. Returns nil
@@ -37,15 +39,23 @@ func (c *Client) SessionDebug() SessionDebugProvider {
 	if !c.config.EnableSessionPool || c.sessionMgr == nil {
 		return nil
 	}
-	return sessionDebugAdapter{mgr: c.sessionMgr}
+	return sessionDebugAdapter{mgr: c.sessionMgr, diverter: c.diverter}
 }
 
 type sessionDebugAdapter struct {
-	mgr *SessionManager
+	mgr      *SessionManager
+	diverter *btransport.Diverter
 }
 
 func (a sessionDebugAdapter) Snapshot() []btransport.PoolSnapshot {
 	return a.mgr.ManagerSnapshot()
+}
+
+func (a sessionDebugAdapter) Diverter() btransport.DiverterSnapshot {
+	if a.diverter == nil {
+		return btransport.DiverterSnapshot{}
+	}
+	return a.diverter.Snapshot()
 }
 
 // ConfigDebugProvider exposes a snapshot of the most recent

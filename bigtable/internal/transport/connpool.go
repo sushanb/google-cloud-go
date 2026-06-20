@@ -348,6 +348,10 @@ type connEntry struct {
 	// Stamped on every successful Invoke / NewStream start so the UI can
 	// distinguish "idle and abandoned" from "actively used."
 	lastActivityNanos atomic.Int64
+	// index is the entry's position when added to the pool. Stable for the
+	// lifetime of the entry; used to stamp the channel-pick hint into
+	// caller-provided context values.
+	index int
 }
 
 // markPicked stamps a single selection by the pool's load-balancer onto this
@@ -355,6 +359,37 @@ type connEntry struct {
 func (e *connEntry) markPicked(now time.Time) {
 	e.picks.Add(1)
 	e.lastActivityNanos.Store(now.UnixNano())
+}
+
+// channelPickHintKey is the context-value key BigtableChannelPool.NewStream /
+// Invoke uses to optionally publish the picked connEntry index back to the
+// caller, so a Session can learn which gRPC channel its bidi stream landed
+// on. The hint is a *atomic.Int32 the caller pre-allocates and the pool
+// writes into; if absent, the pool is a no-op.
+type channelPickHintKey struct{}
+
+// ChannelPickHintInto returns a context that BigtableChannelPool will use to
+// publish the picked connEntry index into the supplied *atomic.Int32. The
+// caller can then read the value once the stream/invoke has returned.
+//
+// Used by Session creation to link sessions back to the channel they ride
+// on — surfaced in the sessionz / channelz debug UIs. Untouched by callers
+// that don't care: stamp() short-circuits when the context lacks the key.
+func ChannelPickHintInto(ctx context.Context, dst *atomic.Int32) context.Context {
+	if dst == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, channelPickHintKey{}, dst)
+}
+
+// stampChannelPickHint writes idx into the *atomic.Int32 the caller stashed
+// on ctx, if any. Cheap no-op on contexts that don't carry the key.
+func stampChannelPickHint(ctx context.Context, idx int) {
+	dst, ok := ctx.Value(channelPickHintKey{}).(*atomic.Int32)
+	if !ok || dst == nil {
+		return
+	}
+	dst.Store(int32(idx))
 }
 
 // isALTSUsed reports whether the connection is using ALTS aka Direct Access.
@@ -617,6 +652,7 @@ func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btop
 			exitSignal = err
 			break
 		}
+		entry.index = i
 		initialConns[i] = entry
 	}
 	if exitSignal != nil {
@@ -827,6 +863,7 @@ func (p *BigtableChannelPool) Invoke(ctx context.Context, method string, args in
 		return err
 	}
 	entry.markPicked(time.Now())
+	stampChannelPickHint(ctx, entry.index)
 	entry.unaryLoad.Add(1)
 	defer entry.unaryLoad.Add(-1)
 
@@ -866,6 +903,7 @@ func (p *BigtableChannelPool) NewStream(ctx context.Context, desc *grpc.StreamDe
 	}
 
 	entry.markPicked(time.Now())
+	stampChannelPickHint(ctx, entry.index)
 	entry.streamingLoad.Add(1)
 	stream, err := entry.conn.NewStream(ctx, desc, method, opts...)
 	if err != nil {
@@ -1083,10 +1121,15 @@ func (p *BigtableChannelPool) addConnections(increaseDelta, maxConns int) bool {
 
 	// LONG SECTION<END>
 
-	// add now
+	// add now — re-index every entry so its connEntry.index matches its
+	// position in the combined slice, keeping the channelz pick-hint
+	// indices stable per pool size.
 	combinedConns := make([]*connEntry, numCurrent+len(newEntries))
 	copy(combinedConns, currentConns)
 	copy(combinedConns[numCurrent:], newEntries)
+	for i, e := range combinedConns {
+		e.index = i
+	}
 	p.conns.Store(&combinedConns)
 
 	btopt.Debugf(p.logger, "bigtable_connpool: Added %d connections, new size: %d\n", numCurrent+len(newEntries), len(combinedConns))
@@ -1153,6 +1196,10 @@ func (p *BigtableChannelPool) removeConnections(decreaseDelta, minConns, maxRemo
 		if !entry.isDraining() {
 			connsToKeep = append(connsToKeep, entry)
 		}
+	}
+	// Re-index so connEntry.index stays aligned with slice position.
+	for i, e := range connsToKeep {
+		e.index = i
 	}
 
 	p.conns.Store(&connsToKeep) // new slice

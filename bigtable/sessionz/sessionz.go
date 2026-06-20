@@ -89,13 +89,21 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snaps := s.snapshot()
+	var diverter btransport.DiverterSnapshot
+	if s.provider != nil {
+		diverter = s.provider.Diverter()
+	}
 	if r.URL.Query().Get("format") == "json" {
-		writeJSON(w, snaps)
+		writeJSON(w, struct {
+			Pools    []btransport.PoolSnapshot `json:"pools"`
+			Diverter btransport.DiverterSnapshot `json:"diverter"`
+		}{snaps, diverter})
 		return
 	}
 	writeHTML(w, indexTpl, indexData{
-		Pools:      snaps,
-		Generated:  time.Now(),
+		Pools:       snaps,
+		Diverter:    diverter,
+		Generated:   time.Now(),
 		HasProvider: s.provider != nil,
 	})
 }
@@ -155,6 +163,7 @@ func writeHTML(w http.ResponseWriter, tpl *template.Template, data interface{}) 
 
 type indexData struct {
 	Pools       []btransport.PoolSnapshot
+	Diverter    btransport.DiverterSnapshot
 	Generated   time.Time
 	HasProvider bool
 }
@@ -209,6 +218,20 @@ var funcs = template.FuncMap{
 	"timestamp": func(t time.Time) string {
 		return t.Format(time.RFC3339)
 	},
+	"actualRatio": func(sess, classic int64) string {
+		total := sess + classic
+		if total == 0 {
+			return "—"
+		}
+		return strconv.FormatFloat(float64(sess)/float64(total), 'f', 2, 64)
+	},
+	"sumMap": func(m map[string]int64) int64 {
+		var total int64
+		for _, v := range m {
+			total += v
+		}
+		return total
+	},
 	"closeReasonsShort": func(m map[string]int64) string {
 		if len(m) == 0 {
 			return "—"
@@ -239,6 +262,71 @@ var funcs = template.FuncMap{
 			b.WriteString(strconv.FormatInt(m[k], 10))
 		}
 		return b.String()
+	},
+	// sparkline renders a tiny inline SVG line chart for a numeric series.
+	// width × height are pixels; the SVG auto-scales the Y axis to fit
+	// min/max of the data. Returns empty string if the series is too short.
+	"sparkline": func(width, height int, color string, values []float64) template.HTML {
+		if len(values) < 2 {
+			return ""
+		}
+		mn, mx := values[0], values[0]
+		for _, v := range values {
+			if v < mn {
+				mn = v
+			}
+			if v > mx {
+				mx = v
+			}
+		}
+		span := mx - mn
+		if span == 0 {
+			span = 1
+		}
+		var b strings.Builder
+		b.WriteString(`<svg width="`)
+		b.WriteString(strconv.Itoa(width))
+		b.WriteString(`" height="`)
+		b.WriteString(strconv.Itoa(height))
+		b.WriteString(`" style="vertical-align:middle"><polyline fill="none" stroke="`)
+		b.WriteString(color)
+		b.WriteString(`" stroke-width="1.2" points="`)
+		stepX := float64(width-2) / float64(len(values)-1)
+		for i, v := range values {
+			if i > 0 {
+				b.WriteString(" ")
+			}
+			x := 1 + float64(i)*stepX
+			y := float64(height-1) - (v-mn)/span*float64(height-2)
+			b.WriteString(strconv.FormatFloat(x, 'f', 1, 64))
+			b.WriteString(",")
+			b.WriteString(strconv.FormatFloat(y, 'f', 1, 64))
+		}
+		b.WriteString(`"/></svg>`)
+		return template.HTML(b.String())
+	},
+	// extractSeries pulls a single numeric series out of TimeSeries samples.
+	// Used by the template to feed sparkline().
+	"okSeries": func(ts []btransport.TimeSeriesSample) []float64 {
+		out := make([]float64, len(ts))
+		for i, s := range ts {
+			out[i] = s.OkPerSec
+		}
+		return out
+	},
+	"errSeries": func(ts []btransport.TimeSeriesSample) []float64 {
+		out := make([]float64, len(ts))
+		for i, s := range ts {
+			out[i] = s.ErrPerSec
+		}
+		return out
+	},
+	"sessionsSeries": func(ts []btransport.TimeSeriesSample) []float64 {
+		out := make([]float64, len(ts))
+		for i, s := range ts {
+			out[i] = float64(s.Sessions)
+		}
+		return out
 	},
 	// msgCell renders a count + a click-to-expand HTML5 <details> disclosure
 	// listing the per-type breakdown. Numbers stay tabular; the per-type rows
@@ -303,6 +391,16 @@ a:hover{text-decoration:underline}
 </head><body>
 <h1>Bigtable Session Pools</h1>
 <h2>generated {{timestamp .Generated}} · auto-refresh 5s</h2>
+{{if .HasProvider}}
+<div style="margin-bottom:1em;background:#fff;padding:.6em 1em;box-shadow:0 1px 2px rgba(0,0,0,.06)">
+<b>Diverter</b>
+target session load <b>{{printf "%.2f" .Diverter.SessionLoad}}</b> ·
+session picks {{.Diverter.SessionPicks}} · classic picks {{.Diverter.ClassicPicks}}
+{{if or .Diverter.SessionPicks .Diverter.ClassicPicks}}
+· actual ratio <b>{{actualRatio .Diverter.SessionPicks .Diverter.ClassicPicks}}</b>
+{{end}}
+</div>
+{{end}}
 {{if not .HasProvider}}
 <div class="empty">Session pooling is disabled on this client (ClientConfig.EnableSessionPool is false).</div>
 {{else if not .Pools}}
@@ -391,9 +489,18 @@ details.msgcell>summary:hover{color:#15498a}
 <div class="summary">
 <span><b>Sessions opened</b> {{.Pool.SessionsOpened}}</span>
 <span><b>Sessions closed</b> {{.Pool.SessionsClosed}}</span>
-<span title="{{msgBreakdown .Pool.CloseReasons}}"><b>Close reasons</b> {{closeReasonsShort .Pool.CloseReasons}}</span>
+<span><b>Close reasons</b> {{msgCell (sumMap .Pool.CloseReasons) .Pool.CloseReasons}}</span>
 <span><b>Config listener fires</b> {{.Pool.ListenerFires}}</span>
 <span><b>Creation budget</b> {{.Pool.Throttler.InUse}} / {{.Pool.Throttler.Capacity}} (penalty {{dur .Pool.Throttler.PenaltyDuration}})</span>
+</div>
+<div class="summary">
+<span><b>BackendLatency</b> p50 {{dur .Pool.LatencyP50}} · p95 {{dur .Pool.LatencyP95}} · p99 {{dur .Pool.LatencyP99}} <span class="mono">(n={{.Pool.LatencyN}})</span></span>
+<span><b>Clusters</b> {{msgCell (sumMap .Pool.ClusterCounts) .Pool.ClusterCounts}}</span>
+{{if .Pool.TimeSeries}}
+<span><b>sessions</b> {{sparkline 120 28 "#1a5fb4" (sessionsSeries .Pool.TimeSeries)}}</span>
+<span><b>ok/s</b> {{sparkline 120 28 "#197a1f" (okSeries .Pool.TimeSeries)}}</span>
+<span><b>err/s</b> {{sparkline 120 28 "#a04500" (errSeries .Pool.TimeSeries)}}</span>
+{{end}}
 </div>
 
 {{if .Pool.OpenRequest}}
@@ -418,9 +525,11 @@ details.msgcell>summary:hover{color:#15498a}
 <thead><tr>
 <th>Session</th><th>State</th><th>Transport</th><th>AFE region</th><th>AFE subzone</th>
 <th class="num">GFE&nbsp;id</th><th class="num">AFE&nbsp;id</th>
+<th class="num">Ch&nbsp;#</th>
 <th class="num">OK</th><th class="num">Err</th><th class="num">Retries</th>
 <th class="num">Msgs&nbsp;sent</th><th class="num">Msgs&nbsp;recv</th><th class="num">In&nbsp;flight</th>
-<th class="num">Outstanding</th><th class="num">Picks</th><th class="num">EWMA</th>
+<th class="num">Outstanding</th><th class="num">Picks</th>
+<th class="num">p50</th><th class="num">p95</th><th class="num">p99</th>
 <th>Last&nbsp;activity</th><th>Last&nbsp;state&nbsp;change</th><th>Next&nbsp;heartbeat</th>
 </tr></thead>
 <tbody>
@@ -433,6 +542,7 @@ details.msgcell>summary:hover{color:#15498a}
 <td>{{orDash .Peer.ApplicationFrontendSubzone}}</td>
 <td class="num">{{.Peer.GoogleFrontendID}}</td>
 <td class="num">{{.Peer.ApplicationFrontendID}}</td>
+<td class="num">{{if ge .ChannelIndex 0}}{{.ChannelIndex}}{{else}}—{{end}}</td>
 <td class="num">{{.OkRpcs}}</td>
 <td class="num">{{.ErrorRpcs}}</td>
 <td class="num">{{.Retries}}</td>
@@ -441,11 +551,25 @@ details.msgcell>summary:hover{color:#15498a}
 <td class="num">{{.ActiveRpcs}}</td>
 <td class="num">{{.Handle.Outstanding}}</td>
 <td class="num">{{.Handle.Picks}}</td>
-<td class="num">{{dur .Handle.EwmaLatency}}</td>
+<td class="num">{{dur .LatencyP50}}</td>
+<td class="num">{{dur .LatencyP95}}</td>
+<td class="num">{{dur .LatencyP99}}</td>
 <td>{{age .Handle.LastActivity}} ago</td>
 <td>{{age .LastStateChange}} ago</td>
 <td>{{untilNow .NextHeartbeat}}</td>
 </tr>
+{{end}}
+</tbody>
+</table>
+{{end}}
+
+{{if .Pool.SlowVRpcs}}
+<h3 style="font-size:1em;margin:1.4em 0 .4em 0;color:#444">Slow vRPCs (last {{len .Pool.SlowVRpcs}})</h3>
+<table>
+<thead><tr><th>When</th><th>Method</th><th class="num">Latency</th><th>Session</th><th>Status</th></tr></thead>
+<tbody>
+{{range .Pool.SlowVRpcs}}
+<tr><td>{{age .At}} ago</td><td class="mono">{{.Method}}</td><td class="num">{{dur .Latency}}</td><td class="mono">{{.Session}}</td><td>{{if .Success}}OK{{else}}<span style="color:#922">{{.ErrCode}}</span>{{end}}</td></tr>
 {{end}}
 </tbody>
 </table>

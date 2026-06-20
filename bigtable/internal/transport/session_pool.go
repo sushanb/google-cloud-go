@@ -25,6 +25,7 @@ import (
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // SessionPoolImpl implements a thread-safe session pool.
@@ -59,6 +60,21 @@ type SessionPoolImpl struct {
 	scalingHistoryMu sync.Mutex
 	scalingHistory   []ScalingEvent
 
+	// slowVRpcs is a ring buffer of the last N vRPCs that exceeded the
+	// slow-call threshold. Lets operators answer "which call was slow?"
+	// without trawling logs.
+	slowVRpcsMu       sync.Mutex
+	slowVRpcs         []SlowVRpcEvent
+	slowVRpcThreshold time.Duration
+
+	// timeSeriesMu / timeSeries is a 1-Hz ring buffer of pool-level
+	// observations driven by PerformScaling. Powers inline SVG sparklines
+	// in the sessionz UI. Capped at maxTimeSeries.
+	timeSeriesMu      sync.Mutex
+	timeSeries        []TimeSeriesSample
+	tsLastOkRpcs      int64
+	tsLastErrorRpcs   int64
+
 	// poolCtx is a cancellable context scoped to the lifetime of the pool. It
 	// is passed (wrapped to strip deadlines but preserve cancellation) to the
 	// underlying streamFactory, budget.Acquire, and Session.Start so that
@@ -75,6 +91,122 @@ type ScalingEvent struct {
 	ToCount   int
 	Delta     int
 	Reason    string
+}
+
+// SlowVRpcEvent is one row in the pool's slow-vRPC log.
+type SlowVRpcEvent struct {
+	At       time.Time
+	Method   string
+	Latency  time.Duration
+	Session  string // log name of the session that handled the call
+	Success  bool
+	ErrCode  string // grpc status code on failure, empty on success
+}
+
+const (
+	maxSlowVRpcs         = 100
+	defaultSlowThreshold = 1 * time.Second
+	// maxTimeSeries caps the per-pool sparkline ring. At the 1-Hz heartbeat
+	// sampling rate this covers the most recent 5 minutes — long enough to
+	// span a typical scaling event without ballooning memory.
+	maxTimeSeries = 300
+)
+
+// TimeSeriesSample is one point in a pool's sparkline ring buffer.
+// All counters are deltas since the previous sample so the chart shows
+// rate-per-second rather than running totals.
+type TimeSeriesSample struct {
+	At         time.Time
+	Sessions   int
+	OkPerSec   float64
+	ErrPerSec  float64
+	InUse      int
+	Pending    int
+}
+
+func (p *SessionPoolImpl) recordTimeSeries() {
+	p.mu.Lock()
+	totalSessions := len(p.sessions)
+	inUse, pending := 0, 0
+	var okTotal, errTotal int64
+	for _, sh := range p.sessions {
+		if sh == nil || sh.session == nil {
+			continue
+		}
+		ob := atomic.LoadInt64(&sh.outstanding)
+		if ob > 0 {
+			inUse++
+			pending += int(ob)
+		}
+		okTotal += sh.session.okRpcs.Load()
+		errTotal += sh.session.errorRpcs.Load()
+	}
+	p.mu.Unlock()
+
+	now := time.Now()
+	p.timeSeriesMu.Lock()
+	defer p.timeSeriesMu.Unlock()
+
+	var okRate, errRate float64
+	if len(p.timeSeries) > 0 {
+		prev := p.timeSeries[len(p.timeSeries)-1]
+		dt := now.Sub(prev.At).Seconds()
+		if dt > 0 {
+			okRate = float64(okTotal-p.tsLastOkRpcs) / dt
+			errRate = float64(errTotal-p.tsLastErrorRpcs) / dt
+		}
+	}
+	p.tsLastOkRpcs = okTotal
+	p.tsLastErrorRpcs = errTotal
+
+	sample := TimeSeriesSample{
+		At:        now,
+		Sessions:  totalSessions,
+		OkPerSec:  okRate,
+		ErrPerSec: errRate,
+		InUse:     inUse,
+		Pending:   pending,
+	}
+	if len(p.timeSeries) >= maxTimeSeries {
+		copy(p.timeSeries, p.timeSeries[1:])
+		p.timeSeries = p.timeSeries[:len(p.timeSeries)-1]
+	}
+	p.timeSeries = append(p.timeSeries, sample)
+}
+
+func (p *SessionPoolImpl) snapshotTimeSeries() []TimeSeriesSample {
+	p.timeSeriesMu.Lock()
+	defer p.timeSeriesMu.Unlock()
+	out := make([]TimeSeriesSample, len(p.timeSeries))
+	copy(out, p.timeSeries)
+	return out
+}
+
+// recordSlowVRpc appends to the slow-vRPC ring buffer. Only called from
+// SessionPoolImpl.Invoke after a call exceeds the threshold.
+func (p *SessionPoolImpl) recordSlowVRpc(ev SlowVRpcEvent) {
+	p.slowVRpcsMu.Lock()
+	defer p.slowVRpcsMu.Unlock()
+	if len(p.slowVRpcs) >= maxSlowVRpcs {
+		copy(p.slowVRpcs, p.slowVRpcs[1:])
+		p.slowVRpcs = p.slowVRpcs[:len(p.slowVRpcs)-1]
+	}
+	p.slowVRpcs = append(p.slowVRpcs, ev)
+}
+
+func (p *SessionPoolImpl) snapshotSlowVRpcs() []SlowVRpcEvent {
+	p.slowVRpcsMu.Lock()
+	defer p.slowVRpcsMu.Unlock()
+	out := make([]SlowVRpcEvent, len(p.slowVRpcs))
+	copy(out, p.slowVRpcs)
+	return out
+}
+
+func (p *SessionPoolImpl) slowThreshold() time.Duration {
+	if p.slowVRpcThreshold > 0 {
+		return p.slowVRpcThreshold
+	}
+	return defaultSlowThreshold
 }
 
 // maxScalingHistory caps the per-pool ring buffer length. Picked so that at
@@ -454,6 +586,11 @@ func (p *SessionPoolImpl) StartHeartbeat(ctx context.Context, interval time.Dura
 }
 
 func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
+	// Sample a time-series point on every heartbeat so the sparkline ring
+	// buffer fills at the heartbeat cadence regardless of whether scaling
+	// actually fires below.
+	p.recordTimeSeries()
+
 	p.mu.Lock()
 	if p.closed || p.scalingInProgress {
 		p.mu.Unlock()
@@ -539,7 +676,12 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 
 	// Inject the pre-computed target metadata headers context-safely E2E!
 	dialCtxOut := metadata.NewOutgoingContext(dialCtx, p.metadata)
-	stream, err := p.streamFactory(dialCtxOut)
+	// Pre-allocate a channel-pick hint so the underlying gRPC channel pool
+	// can publish which connEntry it placed this session's stream on.
+	// Defaults to -1 (no hint received).
+	var pickedChannel atomic.Int32
+	pickedChannel.Store(-1)
+	stream, err := p.streamFactory(ChannelPickHintInto(dialCtxOut, &pickedChannel))
 	if err != nil {
 		return err
 	}
@@ -570,6 +712,9 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 		OnActive: p.OnActive,
 		OnClose:  p.OnClose,
 	}, p.sessionType)
+	if hint := int(pickedChannel.Load()); hint >= 0 {
+		s.SetChannelIndex(hint)
+	}
 
 	p.mu.Lock()
 	p.startingSessions[s] = true
@@ -699,5 +844,20 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 		sh.DecOutstanding(time.Since(start))
 	}()
 
-	return sh.session.Invoke(ctx, desc, req)
+	result, invokeErr := sh.session.Invoke(ctx, desc, req)
+	latency := time.Since(start)
+	if latency > p.slowThreshold() {
+		ev := SlowVRpcEvent{
+			At:      start,
+			Method:  desc.Method(),
+			Latency: latency,
+			Session: sh.session.LogName(),
+			Success: invokeErr == nil,
+		}
+		if invokeErr != nil {
+			ev.ErrCode = status.Code(invokeErr).String()
+		}
+		p.recordSlowVRpc(ev)
+	}
+	return result, invokeErr
 }
