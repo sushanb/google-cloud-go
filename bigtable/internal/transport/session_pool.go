@@ -85,12 +85,29 @@ type SessionPoolImpl struct {
 }
 
 // ScalingEvent is one row in a pool's scaling history.
+//
+// Before is the pool's session count when the sizer decided to act.
+// Requested is the delta the sizer asked for (>0 scale up, <0 scale down).
+// Launched is the per-action outcome: createSession calls that returned nil
+// for scale-up (sessions handshaking but not yet active), or sessions
+// actually pruned for scale-down. Always sign-matches Requested.
+//
+// For scale-up the actual pool growth lags this event — handshakes complete
+// asynchronously via OnActive. Use the pool's live size for "what's
+// available right now"; use Launched + Requested to understand "what the
+// sizer tried to do."
 type ScalingEvent struct {
 	At        time.Time
+	Before    int
+	Requested int
+	Launched  int
+	Reason    string
+
+	// Deprecated: kept temporarily for JSON back-compat. FromCount mirrors
+	// Before; ToCount and Delta are no longer populated meaningfully.
 	FromCount int
 	ToCount   int
 	Delta     int
-	Reason    string
 }
 
 // SlowVRpcEvent is one row in the pool's slow-vRPC log.
@@ -622,16 +639,25 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 	fmt.Printf(">>> POOL %s PerformScaling starting evaluation: delta=%d, current_sessions=%d, starting_sessions=%d <<<\n", p.poolName, delta, currentSessions, startingSessions)
 
 	reason := scalingReason(stats, delta)
+	var launched atomic.Int64
 	defer func() {
-		p.mu.Lock()
-		newCount := len(p.sessions)
-		p.mu.Unlock()
+		actual := int(launched.Load())
+		if delta < 0 {
+			actual = -actual
+		}
 		p.recordScaling(ScalingEvent{
 			At:        time.Now(),
-			FromCount: currentSessions,
-			ToCount:   newCount,
-			Delta:     delta,
+			Before:    currentSessions,
+			Requested: delta,
+			Launched:  actual,
 			Reason:    reason,
+			// Back-compat: keep the legacy fields populated so JSON
+			// consumers that already parse FromCount/ToCount/Delta don't
+			// break. ToCount mirrors Before because scale-up genuinely
+			// hasn't grown the live pool by the time the defer fires.
+			FromCount: currentSessions,
+			ToCount:   currentSessions + actual,
+			Delta:     delta,
 		})
 	}()
 
@@ -645,6 +671,7 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 				if err := p.createSession(ctx); err != nil {
 					fmt.Printf(">>> POOL %s PerformScaling createSession failed: %v <<<\n", p.poolName, err)
 				} else {
+					launched.Add(1)
 					fmt.Printf(">>> POOL %s PerformScaling successfully provisioned a new session <<<\n", p.poolName)
 				}
 			}()
@@ -653,7 +680,7 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 	} else {
 		// Scale down: prune idle sessions gracefully
 		fmt.Printf(">>> POOL %s PerformScaling pruning %d idle sessions <<<\n", p.poolName, -delta)
-		p.pruneSessions(-delta)
+		launched.Store(int64(p.pruneSessions(-delta)))
 	}
 }
 
@@ -732,7 +759,10 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 	return nil
 }
 
-func (p *SessionPoolImpl) pruneSessions(count int) {
+// pruneSessions removes up to count idle sessions from the pool and kicks
+// off graceful close on each. Returns the number actually pruned so the
+// scaling-history event can report what happened.
+func (p *SessionPoolImpl) pruneSessions(count int) int {
 	// Phase 1: under lock, select prune candidates and remove them from
 	// p.sessions immediately so concurrent CheckoutSession callers don't
 	// pick them. Skip sessions younger than 5s so we don't churn through
@@ -740,7 +770,7 @@ func (p *SessionPoolImpl) pruneSessions(count int) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
-		return
+		return 0
 	}
 
 	now := time.Now()
@@ -769,7 +799,7 @@ func (p *SessionPoolImpl) pruneSessions(count int) {
 	p.mu.Unlock()
 
 	if len(toClose) == 0 {
-		return
+		return 0
 	}
 
 	// Phase 2: spawn graceful Close for every pruned session with a bounded
@@ -790,6 +820,7 @@ func (p *SessionPoolImpl) pruneSessions(count int) {
 		}(s)
 	}
 	wg.Wait()
+	return pruned
 }
 
 // scalingReason summarizes why the sizer requested a scale delta given the

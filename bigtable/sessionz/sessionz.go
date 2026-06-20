@@ -218,6 +218,26 @@ var funcs = template.FuncMap{
 	"timestamp": func(t time.Time) string {
 		return t.Format(time.RFC3339)
 	},
+	"signed": func(n int) string {
+		if n > 0 {
+			return "+" + strconv.Itoa(n)
+		}
+		return strconv.Itoa(n)
+	},
+	"scalingOutcome": func(ev btransport.ScalingEvent) string {
+		switch {
+		case ev.Requested > 0 && ev.Launched > 0:
+			return strconv.Itoa(ev.Launched) + " launched"
+		case ev.Requested > 0:
+			return "0 launched (failed)"
+		case ev.Requested < 0 && ev.Launched < 0:
+			return strconv.Itoa(-ev.Launched) + " pruned"
+		case ev.Requested < 0:
+			return "0 pruned (none eligible)"
+		default:
+			return "—"
+		}
+	},
 	"actualRatio": func(sess, classic int64) string {
 		total := sess + classic
 		if total == 0 {
@@ -578,13 +598,30 @@ details.msgcell>summary:hover{color:#15498a}
 {{if .Pool.ScalingHistory}}
 <h3 style="font-size:1em;margin:1.4em 0 .4em 0;color:#444">Scaling history (newest last, last {{len .Pool.ScalingHistory}})</h3>
 <table>
-<thead><tr><th>When</th><th class="num">From</th><th class="num">To</th><th class="num">Δ</th><th>Reason</th></tr></thead>
+<thead><tr>
+<th>When</th>
+<th class="num">Pool&nbsp;was</th>
+<th class="num">Sizer&nbsp;asked</th>
+<th class="num">Action&nbsp;result</th>
+<th>Reason</th>
+</tr></thead>
 <tbody>
 {{range .Pool.ScalingHistory}}
-<tr><td>{{age .At}} ago</td><td class="num">{{.FromCount}}</td><td class="num">{{.ToCount}}</td><td class="num">{{.Delta}}</td><td>{{.Reason}}</td></tr>
+<tr>
+<td>{{age .At}} ago</td>
+<td class="num">{{.Before}}</td>
+<td class="num">{{signed .Requested}}</td>
+<td class="num">{{scalingOutcome .}}</td>
+<td>{{.Reason}}</td>
+</tr>
 {{end}}
 </tbody>
 </table>
+<div style="font-size:.78em;color:#888;margin-top:.3em">
+<b>Pool&nbsp;was</b> = live pool size when the sizer decided.
+<b>Sizer&nbsp;asked</b> = delta requested (+ scale up, − scale down).
+<b>Action&nbsp;result</b> = sessions launched (scale up — these are handshaking and become Active shortly after) or sessions pruned (scale down).
+</div>
 {{end}}
 
 <div class="foot"><a href="?format=json">JSON</a> · <a href="../">all pools</a></div>
