@@ -47,6 +47,11 @@ type SessionPoolImpl struct {
 	nextSessionID      uint64                  // Monotonically increasing counter for unique session naming
 	sessionType        SessionType
 	poolName           string
+	// poolID is the SessionManager-assigned unique pool number used as a
+	// disambiguator when minting session log names — without it,
+	// `session-read-5` would collide across pools because each pool
+	// numbers its sessions from 1. 0 means "not assigned" (test setups).
+	poolID uint64
 
 	// Lifecycle counters surfaced via PoolSnapshot. All bumped lock-free.
 	sessionsOpened atomic.Int64
@@ -398,6 +403,13 @@ func (p *SessionPoolImpl) snapshotCloseReasons() map[string]int64 {
 		return true
 	})
 	return out
+}
+
+// SetPoolID stamps the pool with a SessionManager-assigned unique ID.
+// Used when minting session log names ("OpenTable3-read-5") so names
+// stay unique across pools. Call before any session is created.
+func (p *SessionPoolImpl) SetPoolID(id uint64) {
+	p.poolID = id
 }
 
 // NewSessionPoolImpl creates a new SessionPoolImpl.
@@ -841,15 +853,28 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 	id := atomic.AddUint64(&p.nextSessionID, 1)
 	// Derive a short role hint for the session log name from whatever
 	// permission marker the pool's name carries (the SessionManager adds
-	// "[READ]" / "[WRITE]" suffixes). Falls back to a generic "session".
-	role := "session"
+	// "[READ]" / "[WRITE]" suffixes). Falls back to a generic "s".
+	role := "s"
 	switch {
 	case strings.Contains(p.poolName, "[READ]"):
 		role = "read"
 	case strings.Contains(p.poolName, "[WRITE]"):
 		role = "write"
 	}
-	sessionName := fmt.Sprintf("session-%s-%d", role, id)
+	// Session log names must be globally unique within the client so the
+	// channelz → sessionz reverse link is unambiguous. Format encodes the
+	// proto type + pool ID so two pools of the same type can never collide:
+	//
+	//   OpenTable1-read-3   OpenTable2-write-5   OpenAuthorizedView7-read-1
+	//
+	// poolID==0 means no SessionManager assigned one (test setup); drop
+	// the ID segment in that case so the name stays readable.
+	var sessionName string
+	if p.poolID > 0 {
+		sessionName = fmt.Sprintf("%s%d-%s-%d", p.sessionType.ProtoName(), p.poolID, role, id)
+	} else {
+		sessionName = fmt.Sprintf("%s-%s-%d", p.sessionType.ProtoName(), role, id)
+	}
 	p.mu.Unlock()
 
 	// Create and start new session wrapper passing pool pointer as the lifecycle listener!
