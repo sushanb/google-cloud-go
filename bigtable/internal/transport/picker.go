@@ -15,6 +15,7 @@
 package internal
 
 import (
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -182,6 +183,43 @@ func (h *SessionHandle) GetLastActivity() time.Time {
 // Picker defines the interface for picking a session from a pool.
 type Picker interface {
 	PickSession() *SessionHandle
+}
+
+// LeastInFlightPicker picks the session with the lowest outstanding
+// vRPC count. With multiPlexingLimit=1 this collapses to "pick any
+// outstanding == 0 session" — the right semantic for the
+// LoadBalancingOptions_LeastInFlight_ config the server sends.
+type LeastInFlightPicker struct {
+	mu       sync.Mutex
+	sessions []*SessionHandle
+}
+
+// NewLeastInFlightPicker creates a new LeastInFlightPicker.
+func NewLeastInFlightPicker(sessions []*SessionHandle) *LeastInFlightPicker {
+	return &LeastInFlightPicker{sessions: sessions}
+}
+
+// PickSession scans for the session with the lowest outstanding count.
+// Returns immediately on the first outstanding == 0 it finds.
+func (p *LeastInFlightPicker) PickSession() *SessionHandle {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.sessions) == 0 {
+		return nil
+	}
+	var best *SessionHandle
+	bestLoad := int64(math.MaxInt64)
+	for _, sh := range p.sessions {
+		load := atomic.LoadInt64(&sh.outstanding)
+		if load == 0 {
+			return sh
+		}
+		if load < bestLoad {
+			best = sh
+			bestLoad = load
+		}
+	}
+	return best
 }
 
 // RandomPicker picks a session randomly from a list of sessions.

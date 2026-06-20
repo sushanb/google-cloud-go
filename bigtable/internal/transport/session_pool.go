@@ -113,7 +113,7 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 		return pool.Stats()
 	}
 	pool.sizer = NewPoolSizer(fetcher, min, max, 0.10)
-	pool.picker = NewRandomPicker(pool.sessions)
+	pool.picker = NewLeastInFlightPicker(pool.sessions)
 	pool.budget = NewAdaptiveSessionThrottler(10, 10*time.Second)
 
 	return pool
@@ -215,7 +215,7 @@ func pruneDead(p *SessionPoolImpl, dead []*SessionHandle) {
 			}
 		}
 	}
-	p.picker = NewRandomPicker(p.sessions)
+	p.picker = NewLeastInFlightPicker(p.sessions)
 	go p.PerformScaling(context.Background())
 }
 
@@ -347,7 +347,7 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 	p.sessionCreatedAt[sh] = time.Now()
 
 	// Re-initialize picker with updated sessions list
-	p.picker = NewRandomPicker(p.sessions)
+	p.picker = NewLeastInFlightPicker(p.sessions)
 
 	// New session is immediately idle (outstanding == 0). Post a wake-up
 	// so any worker parked on "no idle session" can grab it without
@@ -379,7 +379,7 @@ func (p *SessionPoolImpl) OnClose(s *Session, err error) {
 		delete(p.sessionCreatedAt, removed)
 		p.sessions = append(p.sessions[:idx], p.sessions[idx+1:]...)
 		// Re-initialize picker with updated active sessions
-		p.picker = NewRandomPicker(p.sessions)
+		p.picker = NewLeastInFlightPicker(p.sessions)
 		// Trigger scale up evaluation asynchronously immediately!
 		go p.PerformScaling(context.Background())
 	}
@@ -398,7 +398,7 @@ func (p *SessionPoolImpl) UpdateConfig(config *spb.SessionClientConfiguration_Se
 		case *spb.LoadBalancingOptions_Random_:
 			p.picker = NewRandomPicker(p.sessions)
 		case *spb.LoadBalancingOptions_LeastInFlight_:
-			p.picker = NewRoundRobinPicker(p.sessions)
+			p.picker = NewLeastInFlightPicker(p.sessions)
 		case *spb.LoadBalancingOptions_PeakEwma_:
 			subsetSize := 2
 			if opt.PeakEwma != nil {
@@ -617,7 +617,7 @@ func (p *SessionPoolImpl) pruneSessions(count int) {
 	}
 
 	p.sessions = active
-	p.picker = NewRandomPicker(p.sessions)
+	p.picker = NewLeastInFlightPicker(p.sessions)
 	p.mu.Unlock()
 
 	if len(toClose) == 0 {
