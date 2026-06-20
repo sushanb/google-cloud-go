@@ -195,6 +195,8 @@ tr:hover td{background:#fafafa}
 .state-starting{color:#a07000;font-weight:600}
 .state-closing{color:#a04500;font-weight:600}
 .state-closed{color:#888}
+tr:target td{background:#fff4c2}
+tr:target td:first-child{border-left:3px solid #f0a000}
 .foot{margin-top:1.5em;color:#888;font-size:.8em}
 a{color:#1a5fb4;text-decoration:none}
 a:hover{text-decoration:underline}
@@ -209,7 +211,8 @@ a:hover{text-decoration:underline}
 <div class="empty">No Bigtable channel pools — either the client uses an externally-supplied gRPC connection (option.WithGRPCConn) or no traffic has run yet.</div>
 {{else}}
 {{range .Pools}}
-<h3>{{.Role}} pool</h3>
+{{$role := .Role}}
+<h3 id="pool-{{.Role}}">{{.Role}} pool</h3>
 <div class="summary">
 <span><b>Instance</b> <span class="mono">{{orDash .Snapshot.InstanceName}}</span></span>
 <span><b>App&nbsp;profile</b> <span class="mono">{{orDash .Snapshot.AppProfile}}</span></span>
@@ -227,7 +230,7 @@ a:hover{text-decoration:underline}
 </tr></thead>
 <tbody>
 {{range .Snapshot.Channels}}
-<tr>
+<tr id="channel-{{$role}}-{{.Index}}">
 <td class="num">{{.Index}}</td>
 <td class="{{connStateClass .TargetState}}">{{orDash .TargetState}}</td>
 <td>{{boolMark .IsALTSUsed}}</td>

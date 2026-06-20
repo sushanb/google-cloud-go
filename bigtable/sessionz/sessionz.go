@@ -542,7 +542,7 @@ details.msgcell>summary:hover{color:#15498a}
 <td>{{orDash .Peer.ApplicationFrontendSubzone}}</td>
 <td class="num">{{.Peer.GoogleFrontendID}}</td>
 <td class="num">{{.Peer.ApplicationFrontendID}}</td>
-<td class="num">{{if ge .ChannelIndex 0}}{{.ChannelIndex}}{{else}}—{{end}}</td>
+<td class="num">{{if ge .ChannelIndex 0}}<a href="../../channelz/#channel-session-{{.ChannelIndex}}" title="jump to this channel in channelz">{{.ChannelIndex}}</a>{{else}}—{{end}}</td>
 <td class="num">{{.OkRpcs}}</td>
 <td class="num">{{.ErrorRpcs}}</td>
 <td class="num">{{.Retries}}</td>
