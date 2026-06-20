@@ -238,6 +238,45 @@ var funcs = template.FuncMap{
 			return "—"
 		}
 	},
+	// stateChips renders the per-state population summary as small colored
+	// inline chips ("5 Active · 1 Closing · 2 WaitServerClose"). Returns
+	// just the active count as plain text when the only state is Active.
+	"stateChips": func(m map[string]int) template.HTML {
+		if len(m) == 0 {
+			return template.HTML("—")
+		}
+		// Render in a stable canonical order so similar pools line up.
+		order := []string{"New", "Starting", "Active", "Closing", "WaitServerClose", "Closed"}
+		var b strings.Builder
+		for _, k := range order {
+			v, ok := m[k]
+			if !ok || v == 0 {
+				continue
+			}
+			cls := "chip"
+			switch k {
+			case "Active":
+				cls += " chip-active"
+			case "Starting", "New":
+				cls += " chip-starting"
+			case "Closing", "WaitServerClose":
+				cls += " chip-closing"
+			case "Closed":
+				cls += " chip-closed"
+			}
+			if b.Len() > 0 {
+				b.WriteString(" ")
+			}
+			b.WriteString(`<span class="`)
+			b.WriteString(cls)
+			b.WriteString(`">`)
+			b.WriteString(strconv.Itoa(v))
+			b.WriteString(`&nbsp;`)
+			b.WriteString(template.HTMLEscapeString(k))
+			b.WriteString(`</span>`)
+		}
+		return template.HTML(b.String())
+	},
 	"bucketMax": func(b []btransport.LifetimeBucketCount) int {
 		m := 0
 		for _, x := range b {
@@ -425,6 +464,11 @@ tr:hover td{background:#fafafa}
 a{color:#1a5fb4;text-decoration:none}
 a:hover{text-decoration:underline}
 .empty{color:#888;font-style:italic;padding:.8em 0}
+.chip{display:inline-block;padding:.05em .45em;border-radius:3px;font-size:.78em;background:#eee;color:#444;font-variant-numeric:tabular-nums;white-space:nowrap}
+.chip-active{background:#dff5d8;color:#197a1f}
+.chip-starting{background:#fff1c8;color:#a07000}
+.chip-closing{background:#ffe2cd;color:#a04500}
+.chip-closed{background:#e0e0e0;color:#666}
 .foot{margin-top:1.5em;color:#888;font-size:.8em}
 </style>
 </head><body>
@@ -448,7 +492,7 @@ session picks {{.Diverter.SessionPicks}} · classic picks {{.Diverter.ClassicPic
 <table>
 <thead><tr>
 <th>Pool</th><th>Type</th><th>Picker</th>
-<th class="num">Sessions</th><th class="num">Ready</th><th class="num">Starting</th>
+<th class="num">Sessions</th><th>States</th>
 <th class="num">In&nbsp;use</th><th class="num">Pending</th><th class="num">Min/Max</th>
 </tr></thead>
 <tbody>
@@ -458,8 +502,7 @@ session picks {{.Diverter.SessionPicks}} · classic picks {{.Diverter.ClassicPic
 <td>{{.SessionType}}</td>
 <td>{{.PickerType}}</td>
 <td class="num">{{.TotalSessions}}</td>
-<td class="num">{{.ReadyCount}}</td>
-<td class="num">{{.StartingCount}}</td>
+<td>{{stateChips .StateCounts}}</td>
 <td class="num">{{.InUseCount}}</td>
 <td class="num">{{.PendingCount}}</td>
 <td class="num">{{.MinSessions}} / {{.MaxSessions}}</td>
@@ -497,6 +540,11 @@ a:hover{text-decoration:underline}
 .summary span{display:inline-block;margin-right:1.4em}
 .summary b{color:#444}
 .empty{color:#888;font-style:italic;padding:.8em 0}
+.chip{display:inline-block;padding:.05em .45em;border-radius:3px;font-size:.78em;background:#eee;color:#444;font-variant-numeric:tabular-nums;white-space:nowrap}
+.chip-active{background:#dff5d8;color:#197a1f}
+.chip-starting{background:#fff1c8;color:#a07000}
+.chip-closing{background:#ffe2cd;color:#a04500}
+.chip-closed{background:#e0e0e0;color:#666}
 .foot{margin-top:1.5em;color:#888;font-size:.8em}
 details.openreq{margin-bottom:1em;background:#fff;padding:.5em 1em;box-shadow:0 1px 2px rgba(0,0,0,.06)}
 details.openreq>summary{cursor:pointer;color:#1a5fb4;padding:.25em 0}
@@ -519,11 +567,11 @@ details.msgcell>summary:hover{color:#15498a}
 <span><b>Type</b> {{.Pool.SessionType}}</span>
 <span><b>Picker</b> {{.Pool.PickerType}}</span>
 <span><b>Min / Max</b> {{.Pool.MinSessions}} / {{.Pool.MaxSessions}}</span>
-<span><b>Ready</b> {{.Pool.ReadyCount}}</span>
-<span><b>Starting</b> {{.Pool.StartingCount}}</span>
+<span><b>Total</b> {{.Pool.TotalSessions}}</span>
+<span><b>States</b> {{stateChips .Pool.StateCounts}}</span>
 <span><b>In&nbsp;use</b> {{.Pool.InUseCount}}</span>
 <span><b>Pending</b> {{.Pool.PendingCount}}</span>
-<span><b>Total</b> {{.Pool.TotalSessions}}</span>
+<span><b>Starting</b> {{.Pool.StartingCount}}</span>
 </div>
 <div class="summary">
 <span><b>Sessions opened</b> {{.Pool.SessionsOpened}}</span>

@@ -167,11 +167,17 @@ type PoolSnapshot struct {
 	OpenRequest *OpenRequestSnapshot
 	// Pool-level aggregates derived from the per-session snapshots and
 	// non-session pool state.
-	ClusterCounts  map[string]int64
-	LatencyP50     time.Duration
-	LatencyP95     time.Duration
-	LatencyP99     time.Duration
-	LatencyN       int
+	ClusterCounts map[string]int64
+	// StateCounts is the per-state population summary across every session
+	// currently in the pool: e.g. {"Active": 5, "Closing": 1,
+	// "WaitServerClose": 2}. Lets the debug UI render "how many are
+	// healthy right now" without rescanning each row. Keys come from
+	// State.String() so they line up with the per-session State column.
+	StateCounts map[string]int
+	LatencyP50  time.Duration
+	LatencyP95  time.Duration
+	LatencyP99  time.Duration
+	LatencyN    int
 	SlowVRpcs      []SlowVRpcEvent
 	TimeSeries     []TimeSeriesSample
 	// Session-lifetime distribution (built from the pool's lifetime ring
@@ -350,6 +356,7 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 	// across every session. Latency samples are merged from per-session
 	// ring buffers; pool percentiles are computed on the combined window.
 	aggregatedClusters := map[string]int64{}
+	stateCounts := map[string]int{}
 	var combinedLatencies []time.Duration
 
 	for _, sh := range handles {
@@ -360,6 +367,7 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 		s.Handle = sh.Snapshot()
 		snap.Sessions = append(snap.Sessions, s)
 
+		stateCounts[s.State]++
 		if s.State == StateActive.String() {
 			snap.ReadyCount++
 		}
@@ -371,6 +379,9 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 			aggregatedClusters[k] += v
 		}
 		combinedLatencies = append(combinedLatencies, sh.session.snapshotLatencies()...)
+	}
+	if len(stateCounts) > 0 {
+		snap.StateCounts = stateCounts
 	}
 	if len(aggregatedClusters) > 0 {
 		snap.ClusterCounts = aggregatedClusters
