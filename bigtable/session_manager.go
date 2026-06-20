@@ -246,6 +246,7 @@ func (m *SessionManager) GetOrCreateSessionPool(
 	}
 
 	pool := btransport.NewSessionPoolImpl(poolName, min, max, streamFactory, openSessionRequest, md, sessionType)
+	pool.SetPoolID(id)
 	mp = &managedPool{pool: pool}
 	m.sessionPools[key] = mp
 	configManager := m.configManager
