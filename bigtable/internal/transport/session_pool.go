@@ -421,10 +421,14 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 		return fmt.Errorf("session pool limit reached")
 	}
 	id := atomic.AddUint64(&p.nextSessionID, 1)
+	// Derive a short role hint for the session log name from whatever
+	// permission marker the pool's name carries (the SessionManager adds
+	// "[READ]" / "[WRITE]" suffixes). Falls back to a generic "session".
 	role := "session"
-	if strings.HasSuffix(p.poolName, ":read") {
+	switch {
+	case strings.Contains(p.poolName, "[READ]"):
 		role = "read"
-	} else if strings.HasSuffix(p.poolName, ":write") {
+	case strings.Contains(p.poolName, "[WRITE]"):
 		role = "write"
 	}
 	sessionName := fmt.Sprintf("session-%s-%d", role, id)
