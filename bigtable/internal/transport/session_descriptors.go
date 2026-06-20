@@ -16,10 +16,24 @@ package internal
 
 import (
 	"fmt"
+	"strings"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"google.golang.org/protobuf/proto"
 )
+
+// resourceLeaf returns the last segment of a slash-separated resource path
+// — e.g. "sushanb" from "projects/p/instances/i/tables/sushanb". Empty
+// string when the path is empty.
+func resourceLeaf(path string) string {
+	if path == "" {
+		return ""
+	}
+	if i := strings.LastIndex(path, "/"); i >= 0 && i < len(path)-1 {
+		return path[i+1:]
+	}
+	return path
+}
 
 // SessionType represents the protocol target session type.
 type SessionType int
@@ -69,6 +83,12 @@ type SessionDescriptor struct {
 	HeaderKeys []string
 	LogNameFn  func(req proto.Message) string
 	MetadataFn func(req proto.Message) map[string]string // Dynamically populates handshake metadata headers E2E!
+	// ShortNameFn returns a compact, human-readable identifier for the
+	// resource this descriptor opens — e.g. the table leaf "sushanb"
+	// from the full path. Used by SessionManager to bake the resource
+	// into the pool name ("OpenTablePool-1 (sushanb) [READ]") so
+	// operators can tell two pools of the same proto type apart.
+	ShortNameFn func(req proto.Message) string
 }
 
 var (
@@ -89,6 +109,10 @@ var (
 				"open_session.payload.permission":     r.Permission.String(),
 			}
 		},
+		ShortNameFn: func(req proto.Message) string {
+			r := req.(*spb.OpenTableRequest)
+			return resourceLeaf(r.TableName)
+		},
 	}
 
 	// AUTHORIZED_VIEW_SESSION manages authorized view scoped connection streams.
@@ -108,6 +132,18 @@ var (
 				"open_session.payload.permission":           r.Permission.String(),
 			}
 		},
+		ShortNameFn: func(req proto.Message) string {
+			r := req.(*spb.OpenAuthorizedViewRequest)
+			// Authorized views live under a table — surface both leafs
+			// joined by "/" so the pool name uniquely identifies the
+			// {table, view} pair.
+			parts := strings.Split(r.AuthorizedViewName, "/")
+			n := len(parts)
+			if n >= 3 && parts[n-2] == "authorizedViews" && parts[n-4] == "tables" {
+				return parts[n-3] + "/" + parts[n-1]
+			}
+			return resourceLeaf(r.AuthorizedViewName)
+		},
 	}
 
 	// MATERIALIZED_VIEW_SESSION manages materialized view scoped connection streams (Read-Only).
@@ -126,6 +162,10 @@ var (
 				"open_session.payload.app_profile_id":         r.AppProfileId,
 				"open_session.payload.permission":             r.Permission.String(),
 			}
+		},
+		ShortNameFn: func(req proto.Message) string {
+			r := req.(*spb.OpenMaterializedViewRequest)
+			return resourceLeaf(r.MaterializedViewName)
 		},
 	}
 )
