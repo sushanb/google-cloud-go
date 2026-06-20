@@ -174,6 +174,21 @@ type PoolSnapshot struct {
 	LatencyN       int
 	SlowVRpcs      []SlowVRpcEvent
 	TimeSeries     []TimeSeriesSample
+	// Session-lifetime distribution (built from the pool's lifetime ring
+	// buffer of completed sessions). LifetimeHistogram is the bucket-label
+	// → count list in the order defined by LifetimeBuckets; percentile
+	// fields are computed over the same window.
+	LifetimeHistogram []LifetimeBucketCount
+	LifetimeP50       time.Duration
+	LifetimeP95       time.Duration
+	LifetimeP99       time.Duration
+	LifetimeN         int
+}
+
+// LifetimeBucketCount is one bar in the session-lifetime histogram.
+type LifetimeBucketCount struct {
+	Label string
+	Count int
 }
 
 // OpenRequestSnapshot is the JSON-friendly form of the OpenSessionRequest.
@@ -368,6 +383,31 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 		snap.LatencyP95 = percentile(combinedLatencies, 95)
 		snap.LatencyP99 = percentile(combinedLatencies, 99)
 		snap.LatencyN = len(combinedLatencies)
+	}
+
+	// Lifetime distribution: render whichever buckets actually have data
+	// — but always emit them in canonical bucket order so the UI's bar
+	// labels line up across pools.
+	lifetimes := p.snapshotLifetimes()
+	if len(lifetimes) > 0 {
+		snap.LifetimeN = len(lifetimes)
+		buckets := make([]LifetimeBucketCount, len(LifetimeBuckets))
+		for i, b := range LifetimeBuckets {
+			buckets[i].Label = b.Label
+		}
+		for _, d := range lifetimes {
+			for i, b := range LifetimeBuckets {
+				if d < b.Max {
+					buckets[i].Count++
+					break
+				}
+			}
+		}
+		snap.LifetimeHistogram = buckets
+		sort.Slice(lifetimes, func(i, j int) bool { return lifetimes[i] < lifetimes[j] })
+		snap.LifetimeP50 = percentile(lifetimes, 50)
+		snap.LifetimeP95 = percentile(lifetimes, 95)
+		snap.LifetimeP99 = percentile(lifetimes, 99)
 	}
 	return snap
 }

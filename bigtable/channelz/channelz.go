@@ -41,6 +41,7 @@ import (
 	"encoding/json"
 	"html/template"
 	"net/http"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/bigtable"
@@ -143,6 +144,16 @@ var funcs = template.FuncMap{
 		}
 		return ""
 	},
+	"sessionsOn": func(m map[int][]string, idx int) string {
+		if m == nil {
+			return "—"
+		}
+		names, ok := m[idx]
+		if !ok || len(names) == 0 {
+			return "—"
+		}
+		return strings.Join(names, ", ")
+	},
 	"connStateClass": func(s string) string {
 		switch s {
 		case "READY":
@@ -212,6 +223,7 @@ a:hover{text-decoration:underline}
 {{else}}
 {{range .Pools}}
 {{$role := .Role}}
+{{$sessionsByChan := .SessionsByChannel}}
 <h3 id="pool-{{.Role}}">{{.Role}} pool</h3>
 <div class="summary">
 <span><b>Instance</b> <span class="mono">{{orDash .Snapshot.InstanceName}}</span></span>
@@ -226,7 +238,7 @@ a:hover{text-decoration:underline}
 <thead><tr>
 <th class="num">#</th><th>gRPC state</th><th>ALTS</th><th>IP</th><th>Draining</th>
 <th class="num">Unary&nbsp;in&nbsp;flight</th><th class="num">Streaming&nbsp;in&nbsp;flight</th><th class="num">Picks</th><th class="num">Errors</th>
-<th>Last&nbsp;activity</th><th>Age</th><th>Penalty</th>
+<th>Last&nbsp;activity</th><th>Age</th><th>Penalty</th><th>Sessions</th>
 </tr></thead>
 <tbody>
 {{range .Snapshot.Channels}}
@@ -243,6 +255,7 @@ a:hover{text-decoration:underline}
 <td>{{age .LastActivity}}</td>
 <td>{{age .CreatedAt}}</td>
 <td>{{until .PenaltyExpiresAt}}</td>
+<td class="mono" style="font-size:.78em;color:#444">{{sessionsOn $sessionsByChan .Index}}</td>
 </tr>
 {{end}}
 </tbody>

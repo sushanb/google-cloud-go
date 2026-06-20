@@ -75,6 +75,12 @@ type SessionPoolImpl struct {
 	tsLastOkRpcs      int64
 	tsLastErrorRpcs   int64
 
+	// lifetimesMu / lifetimes is a ring buffer of the last N completed
+	// session lifetimes (from pool admission to recordSessionClose). Lets
+	// the debug UI render a churn histogram + p50/p95 lifetime.
+	lifetimesMu sync.Mutex
+	lifetimes   []time.Duration
+
 	// poolCtx is a cancellable context scoped to the lifetime of the pool. It
 	// is passed (wrapped to strip deadlines but preserve cancellation) to the
 	// underlying streamFactory, budget.Acquire, and Session.Start so that
@@ -127,7 +133,51 @@ const (
 	// sampling rate this covers the most recent 5 minutes — long enough to
 	// span a typical scaling event without ballooning memory.
 	maxTimeSeries = 300
+	// maxLifetimes caps the per-pool lifetime ring. Enough to render a
+	// stable histogram for a busy pool without ballooning memory.
+	maxLifetimes = 512
 )
+
+// LifetimeBuckets are the time ranges the sessionz UI shows session
+// lifetimes against, smallest-first. Sized to span "churn" (sub-minute)
+// through "long-lived" (hours).
+var LifetimeBuckets = []struct {
+	Label string
+	Max   time.Duration
+}{
+	{"<10s", 10 * time.Second},
+	{"<1m", time.Minute},
+	{"<5m", 5 * time.Minute},
+	{"<30m", 30 * time.Minute},
+	{"<1h", time.Hour},
+	{"<6h", 6 * time.Hour},
+	{"<24h", 24 * time.Hour},
+	{"≥24h", time.Duration(1<<62 - 1)},
+}
+
+// recordLifetime appends a completed session lifetime to the ring buffer.
+// Called from each pool removal site that has a known createdAt for the
+// session being retired.
+func (p *SessionPoolImpl) recordLifetime(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	p.lifetimesMu.Lock()
+	defer p.lifetimesMu.Unlock()
+	if len(p.lifetimes) >= maxLifetimes {
+		copy(p.lifetimes, p.lifetimes[1:])
+		p.lifetimes = p.lifetimes[:len(p.lifetimes)-1]
+	}
+	p.lifetimes = append(p.lifetimes, d)
+}
+
+func (p *SessionPoolImpl) snapshotLifetimes() []time.Duration {
+	p.lifetimesMu.Lock()
+	out := make([]time.Duration, len(p.lifetimes))
+	copy(out, p.lifetimes)
+	p.lifetimesMu.Unlock()
+	return out
+}
 
 // TimeSeriesSample is one point in a pool's sparkline ring buffer.
 // All counters are deltas since the previous sample so the chart shows
@@ -414,6 +464,9 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 				}
 			}
 			if idx != -1 {
+				if created, ok := p.sessionCreatedAt[p.sessions[idx]]; ok {
+					p.recordLifetime(time.Since(created))
+				}
 				p.recordSessionClose(sh.session, "DeadOnPick")
 				delete(p.sessionCreatedAt, p.sessions[idx])
 				p.sessions = append(p.sessions[:idx], p.sessions[idx+1:]...)
@@ -476,6 +529,14 @@ func (p *SessionPoolImpl) Close() error {
 	}
 	p.closed = true
 	snapshot := p.sessions
+	// Capture per-handle createdAt so we can record lifetimes after the map
+	// is reset below.
+	createdAts := make(map[*SessionHandle]time.Time, len(snapshot))
+	for _, sh := range snapshot {
+		if t, ok := p.sessionCreatedAt[sh]; ok {
+			createdAts[sh] = t
+		}
+	}
 	p.sessions = nil
 	p.sessionCreatedAt = make(map[*SessionHandle]time.Time)
 	p.mu.Unlock()
@@ -485,6 +546,9 @@ func (p *SessionPoolImpl) Close() error {
 	// actual graceful Close on each session is still in flight.
 	for _, sh := range snapshot {
 		if sh != nil && sh.session != nil {
+			if t, ok := createdAts[sh]; ok {
+				p.recordLifetime(time.Since(t))
+			}
 			p.recordSessionClose(sh.session, "PoolClose")
 		}
 	}
@@ -582,6 +646,9 @@ func (p *SessionPoolImpl) OnClose(s *Session, err error) {
 
 	if idx != -1 {
 		removed := p.sessions[idx]
+		if created, ok := p.sessionCreatedAt[removed]; ok {
+			p.recordLifetime(time.Since(created))
+		}
 		p.recordSessionClose(s, "")
 		delete(p.sessionCreatedAt, removed)
 		p.sessions = append(p.sessions[:idx], p.sessions[idx+1:]...)
@@ -832,6 +899,9 @@ func (p *SessionPoolImpl) pruneSessions(count int) int {
 		tooYoung := !ok || now.Sub(createdAt) < minSessionAge
 		if pruned < count && atomic.LoadInt64(&sh.outstanding) == 0 && !tooYoung {
 			if sh.session != nil {
+				if ok {
+					p.recordLifetime(now.Sub(createdAt))
+				}
 				p.recordSessionClose(sh.session, "Downsize")
 				toClose = append(toClose, sh.session)
 			}

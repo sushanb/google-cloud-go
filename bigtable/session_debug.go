@@ -112,6 +112,12 @@ type ChannelPoolDebug struct {
 	// for the dedicated session pool created when EnableSessionPool is on.
 	Role     string
 	Snapshot btransport.ChannelPoolSnapshot
+	// SessionsByChannel maps a connEntry index to the session log names
+	// currently riding on it. Populated only for the "session" role —
+	// classic-path RPCs aren't associated with any session. nil when no
+	// sessions are linked (e.g. underlying pool isn't a
+	// BigtableChannelPool, so the pick-hint never fired).
+	SessionsByChannel map[int][]string
 }
 
 // ChannelDebug returns a ChannelDebugProvider for this Client. Always
@@ -135,7 +141,12 @@ func (a channelDebugAdapter) Snapshot() []ChannelPoolDebug {
 		// SessionManager owns its managedChannelPool. We can fetch it via
 		// the manager's accessor.
 		if sp := a.client.sessionMgr.channelChannelPool(); sp != nil {
-			out = append(out, ChannelPoolDebug{Role: "session", Snapshot: sp.ChannelPoolSnapshot()})
+			byChan := a.sessionsByChannelForSessionPool()
+			out = append(out, ChannelPoolDebug{
+				Role:              "session",
+				Snapshot:          sp.ChannelPoolSnapshot(),
+				SessionsByChannel: byChan,
+			})
 		}
 	}
 	return out
@@ -150,4 +161,28 @@ func bigtableChannelPool(p interface{}) *btransport.BigtableChannelPool {
 	}
 	bp, _ := p.(*btransport.BigtableChannelPool)
 	return bp
+}
+
+// sessionsByChannelForSessionPool walks every session pool the
+// SessionManager owns and groups the sessions' log names by their
+// ChannelIndex. Sessions without a valid index (sentinel -1) are skipped.
+// Returns nil if no sessions are linked.
+func (a channelDebugAdapter) sessionsByChannelForSessionPool() map[int][]string {
+	if a.client.sessionMgr == nil {
+		return nil
+	}
+	pools := a.client.sessionMgr.ManagerSnapshot()
+	var out map[int][]string
+	for _, pool := range pools {
+		for _, s := range pool.Sessions {
+			if s.ChannelIndex < 0 {
+				continue
+			}
+			if out == nil {
+				out = map[int][]string{}
+			}
+			out[s.ChannelIndex] = append(out[s.ChannelIndex], s.LogName)
+		}
+	}
+	return out
 }

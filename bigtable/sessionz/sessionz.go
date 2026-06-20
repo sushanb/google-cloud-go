@@ -238,6 +238,25 @@ var funcs = template.FuncMap{
 			return "—"
 		}
 	},
+	"bucketMax": func(b []btransport.LifetimeBucketCount) int {
+		m := 0
+		for _, x := range b {
+			if x.Count > m {
+				m = x.Count
+			}
+		}
+		return m
+	},
+	"barWidth": func(count, max int) int {
+		if max <= 0 {
+			return 0
+		}
+		w := count * 100 / max
+		if w == 0 && count > 0 {
+			return 2
+		}
+		return w
+	},
 	"actualRatio": func(sess, classic int64) string {
 		total := sess + classic
 		if total == 0 {
@@ -581,6 +600,27 @@ details.msgcell>summary:hover{color:#15498a}
 {{end}}
 </tbody>
 </table>
+{{end}}
+
+{{if .Pool.LifetimeHistogram}}
+<h3 style="font-size:1em;margin:1.4em 0 .4em 0;color:#444">Session lifetimes (n={{.Pool.LifetimeN}}) · p50 {{dur .Pool.LifetimeP50}} · p95 {{dur .Pool.LifetimeP95}} · p99 {{dur .Pool.LifetimeP99}}</h3>
+<table>
+<thead><tr><th>Bucket</th><th class="num">Count</th><th>Distribution</th></tr></thead>
+<tbody>
+{{$max := bucketMax .Pool.LifetimeHistogram}}
+{{range .Pool.LifetimeHistogram}}
+<tr>
+<td class="mono">{{.Label}}</td>
+<td class="num">{{.Count}}</td>
+<td><div style="display:inline-block;background:#1a5fb4;height:.9em;width:{{barWidth .Count $max}}%;min-width:1px"></div></td>
+</tr>
+{{end}}
+</tbody>
+</table>
+<div style="font-size:.78em;color:#888;margin-top:.3em">
+Captures the lifetime (admission → retirement) of the most recent {{.Pool.LifetimeN}} closed sessions.
+A spike in the &lt;1m bucket indicates churn (sessions dying young — usually GoAway / Heartbeat / Error).
+</div>
 {{end}}
 
 {{if .Pool.SlowVRpcs}}
