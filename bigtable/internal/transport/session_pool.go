@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -445,7 +446,6 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 		p.mu.Unlock()
 		return fmt.Errorf("session pool limit reached")
 	}
-	id := atomic.AddUint64(&p.nextSessionID, 1)
 	// Derive a short role hint for the session log name from whatever
 	// permission marker the pool's name carries (the SessionManager adds
 	// "[READ]" / "[WRITE]" suffixes). Falls back to a generic "s".
@@ -457,25 +457,32 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 		role = "write"
 	}
 	// Session log names must be globally unique within the client and
-	// self-describing so the name itself tells you what the session
-	// opens. Format:
+	// self-describing. Format:
 	//
-	//   {ProtoName}{poolID}-{shortName}-{role}-{seq}
+	//   {ProtoName}{poolID}-{shortName}-{role}-{uniqueHex}
 	//
-	// e.g. OpenTable1-sushanb-read-3, OpenTable3-users-write-5,
-	//      OpenAuthorizedView5-sushanb_myview-read-1.
+	// e.g. OpenTable1-sushanb-read-a3f2e891.
 	//
-	// Falls back to ProtoName-role-seq when no SessionManager IDs are
+	// The trailing segment is a random 32-bit hex id rather than a
+	// monotonic counter so a long-lived pool that churns sessions for
+	// years can't overflow. Collision odds with N live sessions in the
+	// 2^32 space are ≈ N²/2^33; under 1 in 8k at N = 1000.
+	//
+	// Falls back to ProtoName-role-hex when no SessionManager IDs are
 	// assigned (test setups).
+	hexID := fmt.Sprintf("%08x", rand.Uint32())
 	var sessionName string
 	switch {
 	case p.poolID > 0 && p.poolShortName != "":
-		sessionName = fmt.Sprintf("%s%d-%s-%s-%d", p.sessionType.ProtoName(), p.poolID, p.poolShortName, role, id)
+		sessionName = fmt.Sprintf("%s%d-%s-%s-%s", p.sessionType.ProtoName(), p.poolID, p.poolShortName, role, hexID)
 	case p.poolID > 0:
-		sessionName = fmt.Sprintf("%s%d-%s-%d", p.sessionType.ProtoName(), p.poolID, role, id)
+		sessionName = fmt.Sprintf("%s%d-%s-%s", p.sessionType.ProtoName(), p.poolID, role, hexID)
 	default:
-		sessionName = fmt.Sprintf("%s-%s-%d", p.sessionType.ProtoName(), role, id)
+		sessionName = fmt.Sprintf("%s-%s-%s", p.sessionType.ProtoName(), role, hexID)
 	}
+	// nextSessionID is still bumped so any caller relying on the
+	// monotonic count for stats stays correct; it's just not in the name.
+	atomic.AddUint64(&p.nextSessionID, 1)
 	p.mu.Unlock()
 
 	// Create and start new session wrapper passing pool pointer as the lifecycle listener!
