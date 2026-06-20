@@ -54,6 +54,7 @@ import (
 
 	"cloud.google.com/go/bigtable"
 	"cloud.google.com/go/bigtable/sessionz"
+	"google.golang.org/api/option"
 )
 
 var (
@@ -62,6 +63,7 @@ var (
 	table       = flag.String("table", "", "Bigtable table id (required)")
 	row         = flag.String("row", "", "row key to read (required)")
 	appProfile  = flag.String("app-profile", "", "app profile id (optional)")
+	endpoint    = flag.String("endpoint", "", "override Bigtable endpoint (e.g. test-bigtable.sandbox.googleapis.com:443)")
 	port        = flag.Int("port", 6060, "HTTP port for the sessionz debug UI")
 	poolMin     = flag.Int("pool-min", 2, "minimum sessions in the pool")
 	poolMax     = flag.Int("pool-max", 10, "maximum sessions in the pool")
@@ -85,7 +87,11 @@ func main() {
 		SessionPoolMin:    *poolMin,
 		SessionPoolMax:    *poolMax,
 	}
-	client, err := bigtable.NewClientWithConfig(ctx, *project, *instance, cfg)
+	var opts []option.ClientOption
+	if *endpoint != "" {
+		opts = append(opts, option.WithEndpoint(*endpoint))
+	}
+	client, err := bigtable.NewClientWithConfig(ctx, *project, *instance, cfg, opts...)
 	if err != nil {
 		log.Fatalf("bigtable.NewClientWithConfig: %v", err)
 	}
