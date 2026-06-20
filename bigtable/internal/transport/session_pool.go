@@ -58,6 +58,15 @@ type SessionPoolImpl struct {
 	// when no short name was provided.
 	poolShortName string
 
+	// freeSignal is the pool-level "a session became idle" wake-up
+	// channel. CheckoutSession parks here when every active session has
+	// outstanding > 0; DecOutstanding does a non-blocking send when it
+	// brings a session back to outstanding == 0; OnActive does the same
+	// when a freshly-handshaked session enters the ready set. Buffer 1
+	// so at most one wake-up is in flight; further waiters fall through
+	// to the timer fallback and re-scan.
+	freeSignal chan struct{}
+
 	// poolCtx is a cancellable context scoped to the lifetime of the pool. It
 	// is passed (wrapped to strip deadlines but preserve cancellation) to the
 	// underlying streamFactory, budget.Acquire, and Session.Start so that
@@ -95,6 +104,7 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 		startingSessions:   make(map[*Session]bool),
 		sessionCreatedAt:   make(map[*SessionHandle]time.Time),
 		sessionType:        sessionType,
+		freeSignal:         make(chan struct{}, 1),
 		poolCtx:            poolCtx,
 		poolCancel:         poolCancel,
 	}
@@ -109,18 +119,29 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 	return pool
 }
 
-// CheckoutSession retrieves a session from the pool for routing requests.
+// CheckoutSession returns a session ready to serve one vRPC. With
+// multiPlexingLimit=1, "ready" means the session is StateActive AND its
+// outstanding count is 0. This is the head-of-line-blocking fix:
+// instead of returning a busy session and letting the worker queue on
+// vrpcSem inside the session, we queue at the pool boundary so a single
+// idle session can serve the next waiter immediately. DecOutstanding
+// posts to p.freeSignal when a session returns to idle, OnActive does
+// the same for freshly-added sessions, and the ctx-aware select unblocks
+// the waiter without polling.
+//
+// Dead-session cleanup (session left StateActive while sitting in the
+// pool) still happens here — we scan, drop the bad handle, and trigger
+// a scale-up.
 func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, error) {
-	// Triggers scaling immediately if we might be short of sessions
+	// Short-circuit obvious "no sessions yet" — kick off scaling so the
+	// first caller doesn't burn the full timer waiting on PerformScaling's
+	// 1Hz heartbeat to fire.
 	p.mu.Lock()
 	if !p.closed && len(p.sessions) == 0 {
-		fmt.Printf(">>> POOL %s: all sessions busy, trying to create new session <<<\n", p.poolName)
+		fmt.Printf(">>> POOL %s: no sessions yet, kicking PerformScaling <<<\n", p.poolName)
 		go p.PerformScaling(ctx)
 	}
 	p.mu.Unlock()
-
-	ticker := time.NewTicker(15 * time.Millisecond)
-	defer ticker.Stop()
 
 	for {
 		p.mu.Lock()
@@ -129,37 +150,84 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 			return nil, errors.New("session pool is closed")
 		}
 
-		sh := p.picker.PickSession()
-		if sh != nil {
-			if sh.session.State() == StateActive {
-				sh.IncOutstanding()
-				p.mu.Unlock()
-				return sh, nil
+		// First pass: scan for an idle Active session and clean up dead
+		// ones in the same walk so the live set shrinks under our feet
+		// only when we're already iterating.
+		var idle *SessionHandle
+		var dead []*SessionHandle
+		for _, sh := range p.sessions {
+			if sh == nil || sh.session == nil {
+				continue
 			}
-			// Session is not active anymore. Remove it immediately from pool sessions
-			idx := -1
-			for i, sHandle := range p.sessions {
-				if sHandle == sh {
-					idx = i
-					break
-				}
+			if sh.session.State() != StateActive {
+				dead = append(dead, sh)
+				continue
 			}
-			if idx != -1 {
-				delete(p.sessionCreatedAt, p.sessions[idx])
-				p.sessions = append(p.sessions[:idx], p.sessions[idx+1:]...)
-				p.picker = NewRandomPicker(p.sessions)
+			if atomic.LoadInt64(&sh.outstanding) == 0 {
+				idle = sh
+				break
 			}
-			// Trigger scale up immediately to replace the dead session
-			go p.PerformScaling(ctx)
+		}
+		// Remove any dead handles we found, then re-init the picker so
+		// it stops trying to hand them out for tie-breaking.
+		if len(dead) > 0 {
+			pruneDead(p, dead)
 		}
 
+		if idle != nil {
+			idle.IncOutstanding()
+			p.mu.Unlock()
+			return idle, nil
+		}
+
+		// No idle session. Trigger scale-up if we're under max and the
+		// sizer hasn't already started one — better to ask too often
+		// than to leave a worker waiting on a sleeping pool.
+		if len(p.sessions) < p.maxSessions {
+			go p.PerformScaling(ctx)
+		}
 		p.mu.Unlock()
 
+		// Park on the wake-up signal. DecOutstanding posts here when a
+		// session returns to outstanding == 0 and OnActive posts when a
+		// fresh session lands. The short timer is a safety net — if we
+		// missed a wake-up (rare; the cap-1 buffer can drop concurrent
+		// posts), we'll re-scan after 50ms regardless.
 		select {
 		case <-ctx.Done():
 			return nil, fmt.Errorf("no active sessions available: %w", ctx.Err())
-		case <-ticker.C:
+		case <-p.freeSignal:
+		case <-time.After(50 * time.Millisecond):
 		}
+	}
+}
+
+// pruneDead removes the given handles from p.sessions (caller holds
+// p.mu). Triggers a background PerformScaling so the pool fills the
+// gap. Separate helper so CheckoutSession stays readable.
+func pruneDead(p *SessionPoolImpl, dead []*SessionHandle) {
+	for _, victim := range dead {
+		for i, sh := range p.sessions {
+			if sh == victim {
+				delete(p.sessionCreatedAt, victim)
+				p.sessions = append(p.sessions[:i], p.sessions[i+1:]...)
+				break
+			}
+		}
+	}
+	p.picker = NewRandomPicker(p.sessions)
+	go p.PerformScaling(context.Background())
+}
+
+// signalFree posts to p.freeSignal without blocking. The cap-1 buffer
+// is an oversimplification on purpose: any time a free session exists
+// or appears, at least one waiter wakes up and re-scans. Concurrent
+// signals collapse into one, which is fine because the woken waiter
+// re-checks everything under the lock anyway.
+func (p *SessionPoolImpl) signalFree() {
+	select {
+	case p.freeSignal <- struct{}{}:
+	default:
 	}
 }
 
@@ -271,11 +339,20 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 	}
 
 	sh := NewSessionHandle(s)
+	// Wire DecOutstanding's "I'm now idle" notifier to the pool's wake-up
+	// channel so workers parked in CheckoutSession on a full pool can be
+	// unblocked the moment any session returns to outstanding == 0.
+	sh.SetFreeSignal(p.freeSignal)
 	p.sessions = append(p.sessions, sh)
 	p.sessionCreatedAt[sh] = time.Now()
 
 	// Re-initialize picker with updated sessions list
 	p.picker = NewRandomPicker(p.sessions)
+
+	// New session is immediately idle (outstanding == 0). Post a wake-up
+	// so any worker parked on "no idle session" can grab it without
+	// waiting out the 50ms safety timer.
+	p.signalFree()
 }
 
 // OnClose removes the closed session from the active sessions list and updates the picker.

@@ -123,6 +123,11 @@ type SessionHandle struct {
 	outstanding  int64
 	ewma         *PeakEwma
 	lastActivity int64 // UnixNano timestamp of the last completed call
+	// freeSignal is the owning pool's "a session became idle" channel.
+	// DecOutstanding does a non-blocking send when outstanding drops
+	// to 0 so any worker parked on CheckoutSession wakes up and
+	// re-scans. nil when the handle isn't pool-owned (test setups).
+	freeSignal chan<- struct{}
 }
 
 // NewSessionHandle creates a new SessionHandle wrapping a Session.
@@ -133,18 +138,36 @@ func NewSessionHandle(session *Session) *SessionHandle {
 	}
 }
 
+// SetFreeSignal connects this handle's DecOutstanding to the pool's
+// "a session is now idle" wake-up channel. Called by SessionPoolImpl
+// when adding the handle in OnActive.
+func (h *SessionHandle) SetFreeSignal(c chan<- struct{}) {
+	h.freeSignal = c
+}
+
 // IncOutstanding increments outstanding calls.
 func (h *SessionHandle) IncOutstanding() {
 	atomic.AddInt64(&h.outstanding, 1)
 }
 
 // DecOutstanding decrements outstanding calls and updates EWMA latency + lastActivity timestamp.
+// When outstanding drops to 0, signals the pool that this session is
+// now idle so any worker waiting at CheckoutSession can grab it.
 func (h *SessionHandle) DecOutstanding(latency time.Duration) {
-	atomic.AddInt64(&h.outstanding, -1)
+	newCount := atomic.AddInt64(&h.outstanding, -1)
 	if h.ewma != nil && latency > 0 {
 		h.ewma.Update(latency)
 	}
 	atomic.StoreInt64(&h.lastActivity, time.Now().UnixNano())
+	if newCount == 0 && h.freeSignal != nil {
+		// Non-blocking send: the buffer is cap 1 so a single waiter
+		// will pick it up. If a previous signal is already queued
+		// it'll wake the next waiter without needing this one.
+		select {
+		case h.freeSignal <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // GetLastActivity returns the time of the last activity.
