@@ -215,6 +215,13 @@ type Session struct {
 	// category (Heartbeat / GoAway / Error / User / Downsize). Empty string
 	// when the close cause isn't classified.
 	closeReason atomic.Pointer[string]
+
+	// poolCloseRecorded is the once-flag the owning SessionPoolImpl
+	// consults so its sessionsClosed / CloseReasons counters bump exactly
+	// once per session — regardless of which removal path arrives first
+	// (proactive prune, CheckoutSession dead-detect, or the eventual
+	// hooks.OnClose driven by the server EOF).
+	poolCloseRecorded atomic.Bool
 }
 
 // setCloseReason records the reason for the session's terminal close. Only

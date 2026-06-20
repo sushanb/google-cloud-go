@@ -114,6 +114,40 @@ func (p *SessionPoolImpl) bumpCloseReason(label string) {
 	c.(*atomic.Int64).Add(1)
 }
 
+// recordSessionClose marks a session as retired exactly once and bumps
+// sessionsClosed + the close-reason histogram. Called from every removal
+// site (OnClose, CheckoutSession's dead-detect, pruneSessions, Pool.Close)
+// so the counter reflects pool-side retirements promptly even when the
+// underlying session's hooks.OnClose hasn't fired yet (e.g. the server
+// hasn't EOFed the stream). The once-flag lives on the Session so it
+// dedupes across paths.
+//
+// fallbackReason is used only when the session itself hasn't recorded a
+// reason yet — for example, pruneSessions hasn't sent CloseSession yet,
+// or CheckoutSession found a session in StateClosed via a race.
+func (p *SessionPoolImpl) recordSessionClose(s *Session, fallbackReason string) {
+	if s == nil {
+		return
+	}
+	if !s.poolCloseRecorded.CompareAndSwap(false, true) {
+		return
+	}
+	reason := s.CloseReason()
+	if reason == "" {
+		reason = fallbackReason
+	}
+	p.sessionsClosed.Add(1)
+	p.bumpCloseReason(reason)
+}
+
+// bumpStartingClose is the recordSessionClose variant for sessions that
+// died before reaching active state — they're held in startingSessions, not
+// p.sessions, so OnClose's idx-not-found branch is the only signal we get.
+// Wraps the same once-flag for consistency.
+func (p *SessionPoolImpl) bumpStartingClose(s *Session) {
+	p.recordSessionClose(s, "FailedToStart")
+}
+
 // snapshotCloseReasons returns the per-reason counts as a flat map.
 func (p *SessionPoolImpl) snapshotCloseReasons() map[string]int64 {
 	out := map[string]int64{}
@@ -188,6 +222,7 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 				}
 			}
 			if idx != -1 {
+				p.recordSessionClose(sh.session, "DeadOnPick")
 				delete(p.sessionCreatedAt, p.sessions[idx])
 				p.sessions = append(p.sessions[:idx], p.sessions[idx+1:]...)
 				p.picker = NewRandomPicker(p.sessions)
@@ -252,6 +287,15 @@ func (p *SessionPoolImpl) Close() error {
 	p.sessions = nil
 	p.sessionCreatedAt = make(map[*SessionHandle]time.Time)
 	p.mu.Unlock()
+
+	// Record the closes up-front (with PoolClose as the fallback reason)
+	// so the debug counters reflect retirement immediately, even though the
+	// actual graceful Close on each session is still in flight.
+	for _, sh := range snapshot {
+		if sh != nil && sh.session != nil {
+			p.recordSessionClose(sh.session, "PoolClose")
+		}
+	}
 
 	// Phase 2: kick off graceful Close for every session with a bounded ctx
 	// that is independent of poolCtx — so Session.Close can attempt to drain
@@ -324,14 +368,15 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 
 // OnClose removes the closed session from the active sessions list and updates the picker.
 func (p *SessionPoolImpl) OnClose(s *Session, err error) {
-	p.sessionsClosed.Add(1)
-	p.bumpCloseReason(s.CloseReason())
-
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if _, starting := p.startingSessions[s]; starting {
 		delete(p.startingSessions, s)
+		// A session that was never promoted to active still counts toward
+		// the close ledger — use a synthetic handle for the once-flag so
+		// duplicate OnClose calls don't double-count.
+		p.bumpStartingClose(s)
 		return
 	}
 
@@ -344,15 +389,22 @@ func (p *SessionPoolImpl) OnClose(s *Session, err error) {
 	}
 
 	if idx != -1 {
-		// Remove session handle from slice
 		removed := p.sessions[idx]
+		p.recordSessionClose(s, "")
 		delete(p.sessionCreatedAt, removed)
 		p.sessions = append(p.sessions[:idx], p.sessions[idx+1:]...)
 		// Re-initialize picker with updated active sessions
 		p.picker = NewRandomPicker(p.sessions)
 		// Trigger scale up evaluation asynchronously immediately!
 		go p.PerformScaling(context.Background())
+		return
 	}
+	// idx == -1: handle was already removed by a proactive path
+	// (CheckoutSession dead-detect, pruneSessions, Pool.Close). That path
+	// already recorded the close; this is a no-op thanks to the once-flag,
+	// but we still call it so a path that ever forgets to record doesn't
+	// silently leak counts.
+	p.recordSessionClose(s, "")
 }
 
 // UpdateConfig dynamically adjusts the pool size constraints and budget governor limits at runtime.
@@ -557,6 +609,7 @@ func (p *SessionPoolImpl) pruneSessions(count int) {
 		tooYoung := !ok || now.Sub(createdAt) < minSessionAge
 		if pruned < count && atomic.LoadInt64(&sh.outstanding) == 0 && !tooYoung {
 			if sh.session != nil {
+				p.recordSessionClose(sh.session, "Downsize")
 				toClose = append(toClose, sh.session)
 			}
 			delete(p.sessionCreatedAt, sh)

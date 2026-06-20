@@ -88,6 +88,10 @@ func (s *Session) Close(ctx context.Context, req *spb.CloseSessionRequest) error
 	if _, ok := s.transitionTo(StateClosing, isState(StateNew, StateStarting, StateActive)); !ok {
 		return nil
 	}
+	// Record the intended reason now — the eventual handleClose (driven by
+	// the server's EOF) would otherwise stamp "StreamEnd" over it and the
+	// downstream OnClose hook would see the wrong label.
+	s.setCloseReason(closeReasonLabel(req))
 
 	// Wait for active RPCs to drain. The quiescent channel is closed by the
 	// last RPC's cleanup defer when it sees state==Closing && empty, or by
@@ -263,6 +267,9 @@ func (s *Session) handleSessionRefreshConfig(cfg *spb.SessionRefreshConfig) {
 // terminal session is ignored — we do not move backwards.
 func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
 	s.transitionTo(StateClosing, notState(StateClosing, StateClosed))
+	// Stamp the close reason now so the eventual handleClose (when the
+	// server EOFs the stream) doesn't overwrite it with "StreamEnd".
+	s.setCloseReason("GoAway")
 
 	lastAdmitted := goAway.GetLastRpcIdAdmitted()
 	s.debugf("received GOAWAY reason=%q description=%q last_rpc_id_admitted=%d",
