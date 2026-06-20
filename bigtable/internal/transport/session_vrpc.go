@@ -111,6 +111,9 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 		// context; treat them as the first attempt.
 		attempt = 1
 	}
+	if attempt > 1 {
+		s.retries.Add(1)
+	}
 	virtRpc := &spb.VirtualRpcRequest{
 		RpcId:   rpcID,
 		Payload: reqBytes,

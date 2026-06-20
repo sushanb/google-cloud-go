@@ -25,6 +25,18 @@ type SessionThrottler interface {
 	Acquire(ctx context.Context) error
 	// Release returns a token back to the throttler, registering a penalty duration hold-off on failure.
 	Release(success bool)
+	// Snapshot exposes the throttler's current state for the debug UI:
+	// InUse is the number of tokens currently held by in-flight creations,
+	// Capacity is the total semaphore size, PenaltyDuration is the hold-off
+	// applied to a failed-creation token before it returns to the pool.
+	Snapshot() ThrottlerSnapshot
+}
+
+// ThrottlerSnapshot is the budget state surfaced to the debug UI.
+type ThrottlerSnapshot struct {
+	InUse           int
+	Capacity        int
+	PenaltyDuration time.Duration
 }
 
 // AdaptiveSessionThrottler implements a concurrency governor with adaptive failure penalties using a channel semaphore.
@@ -60,5 +72,15 @@ func (b *AdaptiveSessionThrottler) Release(success bool) {
 		time.AfterFunc(b.penaltyDuration, func() {
 			<-b.sem
 		})
+	}
+}
+
+// Snapshot returns the throttler's current state. len(sem) is the number of
+// in-flight creations holding a token; cap(sem) is the configured ceiling.
+func (b *AdaptiveSessionThrottler) Snapshot() ThrottlerSnapshot {
+	return ThrottlerSnapshot{
+		InUse:           len(b.sem),
+		Capacity:        cap(b.sem),
+		PenaltyDuration: b.penaltyDuration,
 	}
 }

@@ -123,6 +123,13 @@ type SessionHandle struct {
 	outstanding  int64
 	ewma         *PeakEwma
 	lastActivity int64 // UnixNano timestamp of the last completed call
+	picks        int64 // Number of times the picker has picked this handle.
+}
+
+// Picks returns the number of times this handle has been picked by the pool's
+// picker. Bumped exactly once per successful CheckoutSession.
+func (h *SessionHandle) Picks() int64 {
+	return atomic.LoadInt64(&h.picks)
 }
 
 // NewSessionHandle creates a new SessionHandle wrapping a Session.

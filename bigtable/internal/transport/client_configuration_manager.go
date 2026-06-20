@@ -127,10 +127,38 @@ type ClientConfigurationManager struct {
 	// recent poll() outcome — kept verbatim (cloned proto) so the configz
 	// debug UI can render the server's raw GetClientConfiguration response
 	// without re-deriving it from currentConfig.
-	lastResponse   *bigtablepb.ClientConfiguration
-	lastFetchedAt  time.Time
-	lastErr        error
-	lastErrAt      time.Time
+	lastResponse  *bigtablepb.ClientConfiguration
+	lastFetchedAt time.Time
+	lastErr       error
+	lastErrAt     time.Time
+	// pollHistory is a ring buffer of the last poll outcomes, capped at
+	// maxPollHistory so memory stays bounded over a long-lived client.
+	pollHistory []PollEvent
+}
+
+// PollEvent records one GetClientConfiguration poll outcome surfaced by
+// configz so an operator can see "polls stopped 4 minutes ago" or "the last
+// three polls failed" without trawling logs.
+type PollEvent struct {
+	At        time.Time
+	Duration  time.Duration
+	Err       string // empty on success
+	ConfigSeq int64  // post-poll seq; 0 if the poll didn't bump it
+}
+
+// maxPollHistory bounds the per-manager ring buffer. At the default polling
+// interval (5 min after the first server response, 1 min before) this covers
+// at least the last ~8 hours of activity.
+const maxPollHistory = 100
+
+// recordPoll appends a poll outcome to the ring buffer, evicting the oldest
+// when full. Caller must hold m.mu.
+func (m *ClientConfigurationManager) recordPoll(ev PollEvent) {
+	if len(m.pollHistory) >= maxPollHistory {
+		copy(m.pollHistory, m.pollHistory[1:])
+		m.pollHistory = m.pollHistory[:len(m.pollHistory)-1]
+	}
+	m.pollHistory = append(m.pollHistory, ev)
 }
 
 var defaultClientConfig = clientConfig{
@@ -247,15 +275,17 @@ func (m *ClientConfigurationManager) getConfig() clientConfig {
 // response (if any), Err the most recent failure (if any). The two timestamps
 // are zero if the corresponding event has never occurred.
 type ConfigSnapshot struct {
-	InstanceName  string
-	AppProfileID  string
-	ConfigSeq     int64
-	ValidUntil    time.Time
-	Response      *bigtablepb.ClientConfiguration
-	FetchedAt     time.Time
-	LastErr       error
-	LastErrAt     time.Time
-	CapturedAt    time.Time
+	InstanceName string
+	AppProfileID string
+	ConfigSeq    int64
+	ValidUntil   time.Time
+	Response     *bigtablepb.ClientConfiguration
+	FetchedAt    time.Time
+	LastErr      error
+	LastErrAt    time.Time
+	// PollHistory carries the last few poll outcomes (oldest first).
+	PollHistory []PollEvent
+	CapturedAt  time.Time
 }
 
 // Snapshot returns a ConfigSnapshot capturing the manager's most recent poll
@@ -268,6 +298,8 @@ func (m *ClientConfigurationManager) Snapshot() ConfigSnapshot {
 	if m.lastResponse != nil {
 		respClone = proto.Clone(m.lastResponse).(*bigtablepb.ClientConfiguration)
 	}
+	history := make([]PollEvent, len(m.pollHistory))
+	copy(history, m.pollHistory)
 	return ConfigSnapshot{
 		InstanceName: m.instanceName,
 		AppProfileID: m.appProfileId,
@@ -277,6 +309,7 @@ func (m *ClientConfigurationManager) Snapshot() ConfigSnapshot {
 		FetchedAt:    m.lastFetchedAt,
 		LastErr:      m.lastErr,
 		LastErrAt:    m.lastErrAt,
+		PollHistory:  history,
 		CapturedAt:   time.Now(),
 	}
 }
@@ -378,6 +411,7 @@ func (m *ClientConfigurationManager) pollingLoop(parentCtx context.Context) {
 // If the poll fails and the previous configuration's validity has expired, it falls back to the default config.
 func (m *ClientConfigurationManager) poll(ctx context.Context) {
 	btopt.Debugf(m.logger, "bigtable: polling client configuration...")
+	pollStart := time.Now()
 	req := &bigtablepb.GetClientConfigurationRequest{
 		InstanceName: m.instanceName,
 		AppProfileId: m.appProfileId,
@@ -418,6 +452,12 @@ func (m *ClientConfigurationManager) poll(ctx context.Context) {
 		m.mu.Lock()
 		m.lastErr = err
 		m.lastErrAt = time.Now()
+		m.recordPoll(PollEvent{
+			At:        pollStart,
+			Duration:  time.Since(pollStart),
+			Err:       err.Error(),
+			ConfigSeq: m.configSeq,
+		})
 		var listeners []configListener
 		var cfgToNotify clientConfig
 		var seq int64
@@ -461,6 +501,11 @@ func (m *ClientConfigurationManager) poll(ctx context.Context) {
 	m.lastFetchedAt = time.Now()
 	m.lastErr = nil
 	m.lastErrAt = time.Time{}
+	m.recordPoll(PollEvent{
+		At:        pollStart,
+		Duration:  time.Since(pollStart),
+		ConfigSeq: seq,
+	})
 
 	listeners := make([]configListener, 0, len(m.listeners))
 	for _, l := range m.listeners {

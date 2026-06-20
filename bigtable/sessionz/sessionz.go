@@ -209,6 +209,17 @@ var funcs = template.FuncMap{
 	"timestamp": func(t time.Time) string {
 		return t.Format(time.RFC3339)
 	},
+	"closeReasonsShort": func(m map[string]int64) string {
+		if len(m) == 0 {
+			return "—"
+		}
+		var total int64
+		for _, v := range m {
+			total += v
+		}
+		// Render as "N total" with the per-reason breakdown in the tooltip.
+		return strconv.FormatInt(total, 10) + " total"
+	},
 	"msgBreakdown": func(m map[string]int64) string {
 		if len(m) == 0 {
 			return ""
@@ -338,6 +349,13 @@ a:hover{text-decoration:underline}
 <span><b>Pending</b> {{.Pool.PendingCount}}</span>
 <span><b>Total</b> {{.Pool.TotalSessions}}</span>
 </div>
+<div class="summary">
+<span><b>Sessions opened</b> {{.Pool.SessionsOpened}}</span>
+<span><b>Sessions closed</b> {{.Pool.SessionsClosed}}</span>
+<span title="{{msgBreakdown .Pool.CloseReasons}}"><b>Close reasons</b> {{closeReasonsShort .Pool.CloseReasons}}</span>
+<span><b>Config listener fires</b> {{.Pool.ListenerFires}}</span>
+<span><b>Creation budget</b> {{.Pool.Throttler.InUse}} / {{.Pool.Throttler.Capacity}} (penalty {{dur .Pool.Throttler.PenaltyDuration}})</span>
+</div>
 {{if not .Pool.Sessions}}
 <div class="empty">No sessions registered in this pool right now.</div>
 {{else}}
@@ -345,8 +363,9 @@ a:hover{text-decoration:underline}
 <thead><tr>
 <th>Session</th><th>State</th><th>Transport</th><th>AFE region</th><th>AFE subzone</th>
 <th class="num">GFE&nbsp;id</th><th class="num">AFE&nbsp;id</th>
-<th class="num">OK</th><th class="num">Err</th><th class="num">Msgs&nbsp;sent</th><th class="num">Msgs&nbsp;recv</th><th class="num">In&nbsp;flight</th>
-<th class="num">Outstanding</th><th class="num">EWMA</th>
+<th class="num">OK</th><th class="num">Err</th><th class="num">Retries</th>
+<th class="num">Msgs&nbsp;sent</th><th class="num">Msgs&nbsp;recv</th><th class="num">In&nbsp;flight</th>
+<th class="num">Outstanding</th><th class="num">Picks</th><th class="num">EWMA</th>
 <th>Last&nbsp;activity</th><th>Last&nbsp;state&nbsp;change</th><th>Next&nbsp;heartbeat</th>
 </tr></thead>
 <tbody>
@@ -361,10 +380,12 @@ a:hover{text-decoration:underline}
 <td class="num">{{.Peer.ApplicationFrontendID}}</td>
 <td class="num">{{.OkRpcs}}</td>
 <td class="num">{{.ErrorRpcs}}</td>
+<td class="num">{{.Retries}}</td>
 <td class="num" title="{{msgBreakdown .MsgsSentByType}}">{{.MsgsSent}}</td>
 <td class="num" title="{{msgBreakdown .MsgsRecvByType}}">{{.MsgsRecv}}</td>
 <td class="num">{{.ActiveRpcs}}</td>
 <td class="num">{{.Handle.Outstanding}}</td>
+<td class="num">{{.Handle.Picks}}</td>
 <td class="num">{{dur .Handle.EwmaLatency}}</td>
 <td>{{age .Handle.LastActivity}} ago</td>
 <td>{{age .LastStateChange}} ago</td>
@@ -374,6 +395,19 @@ a:hover{text-decoration:underline}
 </tbody>
 </table>
 {{end}}
+
+{{if .Pool.ScalingHistory}}
+<h3 style="font-size:1em;margin:1.4em 0 .4em 0;color:#444">Scaling history (newest last, last {{len .Pool.ScalingHistory}})</h3>
+<table>
+<thead><tr><th>When</th><th class="num">From</th><th class="num">To</th><th class="num">Δ</th><th>Reason</th></tr></thead>
+<tbody>
+{{range .Pool.ScalingHistory}}
+<tr><td>{{age .At}} ago</td><td class="num">{{.FromCount}}</td><td class="num">{{.ToCount}}</td><td class="num">{{.Delta}}</td><td>{{.Reason}}</td></tr>
+{{end}}
+</tbody>
+</table>
+{{end}}
+
 <div class="foot"><a href="?format=json">JSON</a> · <a href="../">all pools</a></div>
 </body></html>
 `

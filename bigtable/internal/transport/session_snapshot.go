@@ -32,6 +32,7 @@ type SessionSnapshot struct {
 	LastStateChange   time.Time
 	OkRpcs            int64
 	ErrorRpcs         int64
+	Retries           int64
 	MsgsSent          int64
 	MsgsRecv          int64
 	// MsgsSentByType / MsgsRecvByType break the totals above down by the
@@ -41,6 +42,7 @@ type SessionSnapshot struct {
 	MsgsSentByType    map[string]int64
 	MsgsRecvByType    map[string]int64
 	ActiveRpcs        int
+	CloseReason       string
 	HeartbeatInterval time.Duration
 	NextHeartbeat     time.Time
 	HasRefreshConfig  bool
@@ -64,24 +66,32 @@ type SessionHandleSnapshot struct {
 	Outstanding  int64
 	EwmaLatency  time.Duration
 	LastActivity time.Time
+	Picks        int64
 }
 
 // PoolSnapshot is a snapshot of one SessionPoolImpl, including every session
 // currently in the pool. Sessions are listed in their pool order; callers may
 // re-sort as they wish.
 type PoolSnapshot struct {
-	Name          string
-	SessionType   string
-	MinSessions   int
-	MaxSessions   int
-	PickerType    string
-	ReadyCount    int
-	StartingCount int
-	InUseCount    int
-	PendingCount  int
-	TotalSessions int
-	Sessions      []SessionSnapshot
-	CapturedAt    time.Time
+	Name           string
+	SessionType    string
+	MinSessions    int
+	MaxSessions    int
+	PickerType     string
+	ReadyCount     int
+	StartingCount  int
+	InUseCount     int
+	PendingCount   int
+	TotalSessions  int
+	Sessions       []SessionSnapshot
+	CapturedAt     time.Time
+	// Lifecycle aggregates surfaced via PoolSnapshot.
+	SessionsOpened int64
+	SessionsClosed int64
+	CloseReasons   map[string]int64
+	ListenerFires  int64
+	Throttler      ThrottlerSnapshot
+	ScalingHistory []ScalingEvent
 }
 
 // Snapshot returns a debug-friendly snapshot of the session. It acquires
@@ -107,11 +117,13 @@ func (s *Session) Snapshot() SessionSnapshot {
 		LastStateChange:   lastChange,
 		OkRpcs:            s.okRpcs.Load(),
 		ErrorRpcs:         s.errorRpcs.Load(),
+		Retries:           s.retries.Load(),
 		MsgsSent:          s.msgsSent.Load(),
 		MsgsRecv:          s.msgsRecv.Load(),
 		MsgsSentByType:    sentByType(s),
 		MsgsRecvByType:    recvByType(s),
 		ActiveRpcs:        activeRpcs,
+		CloseReason:       s.CloseReason(),
 		HeartbeatInterval: hbInterval,
 		NextHeartbeat:     nextHb,
 		HasRefreshConfig:  hasRefresh,
@@ -169,6 +181,7 @@ func (h *SessionHandle) Snapshot() SessionHandleSnapshot {
 		Outstanding:  atomic.LoadInt64(&h.outstanding),
 		EwmaLatency:  ewma,
 		LastActivity: h.GetLastActivity(),
+		Picks:        atomic.LoadInt64(&h.picks),
 	}
 }
 
@@ -191,16 +204,26 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 	copy(handles, p.sessions)
 	p.mu.Unlock()
 
+	var throttler ThrottlerSnapshot
+	if p.budget != nil {
+		throttler = p.budget.Snapshot()
+	}
 	snap := PoolSnapshot{
-		Name:          name,
-		SessionType:   sessionType.String(),
-		MinSessions:   min,
-		MaxSessions:   max,
-		PickerType:    pickerType,
-		StartingCount: startingCount,
-		TotalSessions: len(handles),
-		Sessions:      make([]SessionSnapshot, 0, len(handles)),
-		CapturedAt:    time.Now(),
+		Name:           name,
+		SessionType:    sessionType.String(),
+		MinSessions:    min,
+		MaxSessions:    max,
+		PickerType:     pickerType,
+		StartingCount:  startingCount,
+		TotalSessions:  len(handles),
+		Sessions:       make([]SessionSnapshot, 0, len(handles)),
+		CapturedAt:     time.Now(),
+		SessionsOpened: p.sessionsOpened.Load(),
+		SessionsClosed: p.sessionsClosed.Load(),
+		CloseReasons:   p.snapshotCloseReasons(),
+		ListenerFires:  p.listenerFires.Load(),
+		Throttler:      throttler,
+		ScalingHistory: p.snapshotScalingHistory(),
 	}
 
 	for _, sh := range handles {

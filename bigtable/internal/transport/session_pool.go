@@ -47,6 +47,18 @@ type SessionPoolImpl struct {
 	sessionType        SessionType
 	poolName           string
 
+	// Lifecycle counters surfaced via PoolSnapshot. All bumped lock-free.
+	sessionsOpened atomic.Int64
+	sessionsClosed atomic.Int64
+	listenerFires  atomic.Int64
+	closesByReason sync.Map // close-reason label → *atomic.Int64
+
+	// scalingHistory is a ring buffer of the last N scaling decisions made
+	// by PerformScaling. Guarded by scalingHistoryMu so the snapshot reader
+	// gets a consistent slice copy without dropping events.
+	scalingHistoryMu sync.Mutex
+	scalingHistory   []ScalingEvent
+
 	// poolCtx is a cancellable context scoped to the lifetime of the pool. It
 	// is passed (wrapped to strip deadlines but preserve cancellation) to the
 	// underlying streamFactory, budget.Acquire, and Session.Start so that
@@ -54,6 +66,62 @@ type SessionPoolImpl struct {
 	// waiting on the budget semaphore.
 	poolCtx    context.Context
 	poolCancel context.CancelFunc
+}
+
+// ScalingEvent is one row in a pool's scaling history.
+type ScalingEvent struct {
+	At        time.Time
+	FromCount int
+	ToCount   int
+	Delta     int
+	Reason    string
+}
+
+// maxScalingHistory caps the per-pool ring buffer length. Picked so that at
+// the default 1-second heartbeat interval the buffer covers the last ~16
+// minutes of activity — long enough to see a full provisioning episode but
+// short enough to stay tiny.
+const maxScalingHistory = 1024
+
+// recordScaling appends an event to the ring buffer, dropping the oldest
+// entry when full.
+func (p *SessionPoolImpl) recordScaling(ev ScalingEvent) {
+	p.scalingHistoryMu.Lock()
+	defer p.scalingHistoryMu.Unlock()
+	if len(p.scalingHistory) >= maxScalingHistory {
+		copy(p.scalingHistory, p.scalingHistory[1:])
+		p.scalingHistory = p.scalingHistory[:len(p.scalingHistory)-1]
+	}
+	p.scalingHistory = append(p.scalingHistory, ev)
+}
+
+// snapshotScalingHistory returns a copy of the ring buffer, oldest first.
+func (p *SessionPoolImpl) snapshotScalingHistory() []ScalingEvent {
+	p.scalingHistoryMu.Lock()
+	defer p.scalingHistoryMu.Unlock()
+	out := make([]ScalingEvent, len(p.scalingHistory))
+	copy(out, p.scalingHistory)
+	return out
+}
+
+// bumpCloseReason atomically increments the close-reason counter; the map
+// is keyed by label so the set of reasons can grow without struct churn.
+func (p *SessionPoolImpl) bumpCloseReason(label string) {
+	if label == "" {
+		label = "Unspecified"
+	}
+	c, _ := p.closesByReason.LoadOrStore(label, new(atomic.Int64))
+	c.(*atomic.Int64).Add(1)
+}
+
+// snapshotCloseReasons returns the per-reason counts as a flat map.
+func (p *SessionPoolImpl) snapshotCloseReasons() map[string]int64 {
+	out := map[string]int64{}
+	p.closesByReason.Range(func(k, v interface{}) bool {
+		out[k.(string)] = v.(*atomic.Int64).Load()
+		return true
+	})
+	return out
 }
 
 // NewSessionPoolImpl creates a new SessionPoolImpl.
@@ -107,6 +175,7 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		if sh != nil {
 			if sh.session.State() == StateActive {
 				sh.IncOutstanding()
+				atomic.AddInt64(&sh.picks, 1)
 				p.mu.Unlock()
 				return sh, nil
 			}
@@ -247,6 +316,7 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 	sh := NewSessionHandle(s)
 	p.sessions = append(p.sessions, sh)
 	p.sessionCreatedAt[sh] = time.Now()
+	p.sessionsOpened.Add(1)
 
 	// Re-initialize picker with updated sessions list
 	p.picker = NewRandomPicker(p.sessions)
@@ -254,6 +324,9 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 
 // OnClose removes the closed session from the active sessions list and updates the picker.
 func (p *SessionPoolImpl) OnClose(s *Session, err error) {
+	p.sessionsClosed.Add(1)
+	p.bumpCloseReason(s.CloseReason())
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -284,6 +357,7 @@ func (p *SessionPoolImpl) OnClose(s *Session, err error) {
 
 // UpdateConfig dynamically adjusts the pool size constraints and budget governor limits at runtime.
 func (p *SessionPoolImpl) UpdateConfig(config *spb.SessionClientConfiguration_SessionPoolConfiguration) {
+	p.listenerFires.Add(1)
 	p.mu.Lock()
 	p.minSessions = int(config.MinSessionCount)
 	p.maxSessions = int(config.MaxSessionCount)
@@ -357,6 +431,20 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 	p.mu.Unlock()
 
 	fmt.Printf(">>> POOL %s PerformScaling starting evaluation: delta=%d, current_sessions=%d, starting_sessions=%d <<<\n", p.poolName, delta, currentSessions, startingSessions)
+
+	reason := scalingReason(stats, delta)
+	defer func() {
+		p.mu.Lock()
+		newCount := len(p.sessions)
+		p.mu.Unlock()
+		p.recordScaling(ScalingEvent{
+			At:        time.Now(),
+			FromCount: currentSessions,
+			ToCount:   newCount,
+			Delta:     delta,
+			Reason:    reason,
+		})
+	}()
 
 	if delta > 0 {
 		// Scale up: provision new sessions asynchronously and wait for completion to release the gate
@@ -504,6 +592,28 @@ func (p *SessionPoolImpl) pruneSessions(count int) {
 		}(s)
 	}
 	wg.Wait()
+}
+
+// scalingReason summarizes why the sizer requested a scale delta given the
+// pool's current stats. Pure helper — no side effects — so the snapshot
+// reader gets the same text the operator would derive from the log.
+func scalingReason(stats *PoolStats, delta int) string {
+	if delta > 0 {
+		switch {
+		case stats == nil:
+			return "scale up (no stats)"
+		case stats.PendingCount > 0:
+			return fmt.Sprintf("pending=%d", stats.PendingCount)
+		case stats.InUseCount > 0 && stats.ReadyCount-stats.InUseCount <= 0:
+			return fmt.Sprintf("ready=%d in_use=%d (headroom exhausted)", stats.ReadyCount, stats.InUseCount)
+		default:
+			return fmt.Sprintf("ready=%d in_use=%d (load>headroom)", stats.ReadyCount, stats.InUseCount)
+		}
+	}
+	if stats == nil {
+		return "scale down (no stats)"
+	}
+	return fmt.Sprintf("scale down: ready=%d in_use=%d", stats.ReadyCount, stats.InUseCount)
 }
 
 // noDeadlineButCancellableContext wraps a parent context to strip any

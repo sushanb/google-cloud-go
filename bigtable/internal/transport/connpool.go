@@ -246,16 +246,18 @@ func (p *BigtableChannelPool) connPoolStatsSupplier() []connPoolStats {
 // read non-destructively, so the debug UI can poll without disturbing the
 // metrics exporter (which itself swaps errorCount to 0 on each report).
 type ChannelSnapshot struct {
-	Index            int
-	OutstandingUnary int32
+	Index                int
+	OutstandingUnary     int32
 	OutstandingStreaming int32
-	ErrorCount       int64
-	IsALTSUsed       bool
-	IsDraining       bool
-	CreatedAt        time.Time
-	IPProtocol       string
-	TargetState      string
-	PenaltyExpiresAt time.Time
+	ErrorCount           int64
+	IsALTSUsed           bool
+	IsDraining           bool
+	CreatedAt            time.Time
+	IPProtocol           string
+	TargetState          string
+	PenaltyExpiresAt     time.Time
+	Picks                int64
+	LastActivity         time.Time
 }
 
 // ChannelPoolSnapshot is what bigtable/channelz renders. It captures pool-wide
@@ -295,6 +297,10 @@ func (p *BigtableChannelPool) ChannelPoolSnapshot() ChannelPoolSnapshot {
 			ErrorCount:           entry.errorCount.Load(),
 			IsALTSUsed:           entry.isALTSUsed(),
 			IsDraining:           entry.isDraining(),
+			Picks:                entry.picks.Load(),
+		}
+		if nanos := entry.lastActivityNanos.Load(); nanos > 0 {
+			cs.LastActivity = time.Unix(0, nanos)
 		}
 		if entry.conn != nil {
 			cs.IPProtocol = entry.conn.ipProtocol()
@@ -335,6 +341,20 @@ type connEntry struct {
 	drainingState atomic.Bool  // True if the connection is being gracefully drained.
 	penaltyExpiry atomic.Int64 // penaltyExpiry stores the UnixNano timestamp of when the penalty ends
 
+	// picks counts how many times the pool's selectFunc has returned this
+	// entry — used by the channelz debug UI to expose load-balancing skew.
+	picks atomic.Int64
+	// lastActivityNanos is the UnixNano timestamp of the most recent pick.
+	// Stamped on every successful Invoke / NewStream start so the UI can
+	// distinguish "idle and abandoned" from "actively used."
+	lastActivityNanos atomic.Int64
+}
+
+// markPicked stamps a single selection by the pool's load-balancer onto this
+// entry — used by the channelz UI to surface picker skew and idle channels.
+func (e *connEntry) markPicked(now time.Time) {
+	e.picks.Add(1)
+	e.lastActivityNanos.Store(now.UnixNano())
 }
 
 // isALTSUsed reports whether the connection is using ALTS aka Direct Access.
@@ -806,6 +826,7 @@ func (p *BigtableChannelPool) Invoke(ctx context.Context, method string, args in
 	if err != nil {
 		return err
 	}
+	entry.markPicked(time.Now())
 	entry.unaryLoad.Add(1)
 	defer entry.unaryLoad.Add(-1)
 
@@ -832,6 +853,7 @@ func (p *BigtableChannelPool) getBigtableConn() *BigtableConn {
 	if err != nil {
 		return nil
 	}
+	entry.markPicked(time.Now())
 	return entry.conn
 }
 
@@ -843,6 +865,7 @@ func (p *BigtableChannelPool) NewStream(ctx context.Context, desc *grpc.StreamDe
 		return nil, err
 	}
 
+	entry.markPicked(time.Now())
 	entry.streamingLoad.Add(1)
 	stream, err := entry.conn.NewStream(ctx, desc, method, opts...)
 	if err != nil {

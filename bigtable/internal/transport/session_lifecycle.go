@@ -61,6 +61,7 @@ func (s *Session) ForceClose(req *spb.CloseSessionRequest) {
 		return
 	}
 
+	s.setCloseReason(closeReasonLabel(req))
 	desc := "session force closed"
 	if req != nil && req.Description != "" {
 		desc = "session force closed: " + req.Description
@@ -278,6 +279,10 @@ func (s *Session) handleClose(err error) {
 	if _, ok := s.transitionTo(StateClosed, notState(StateClosed)); !ok {
 		return
 	}
+	// "StreamEnd" is the catch-all label for server- or transport-driven
+	// closes — the actual reason is usually GOAWAY / heartbeat / etc and
+	// has already been recorded by the more specific path.
+	s.setCloseReason("StreamEnd")
 	s.cancelActiveRPCs(unavailable(err, "session closed: %v", err), nil)
 	s.signalQuiescent()
 	s.notifyClosed(err)
@@ -378,6 +383,28 @@ func (s *Session) peerInfoExtracter(peerInfoData []string) {
 	s.tracer.setPeerInfo(&peerInfo, logName)
 	s.debugf("parsed PeerInfo: transport_type=%s afe=%s",
 		peerInfo.GetTransportType(), peerInfo.GetApplicationFrontendSubzone())
+}
+
+// closeReasonLabel maps a CloseSessionRequest reason to a short human-
+// readable category string for the debug UI. Empty when req is nil.
+func closeReasonLabel(req *spb.CloseSessionRequest) string {
+	if req == nil {
+		return ""
+	}
+	switch req.Reason {
+	case spb.CloseSessionRequest_CLOSE_SESSION_REASON_MISSED_HEARTBEAT:
+		return "MissedHeartbeat"
+	case spb.CloseSessionRequest_CLOSE_SESSION_REASON_GOAWAY:
+		return "GoAway"
+	case spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR:
+		return "Error"
+	case spb.CloseSessionRequest_CLOSE_SESSION_REASON_USER:
+		return "User"
+	case spb.CloseSessionRequest_CLOSE_SESSION_REASON_DOWNSIZE:
+		return "Downsize"
+	default:
+		return "Other"
+	}
 }
 
 // closeReasonToCause maps a CloseSessionRequest reason to a sentinel error,

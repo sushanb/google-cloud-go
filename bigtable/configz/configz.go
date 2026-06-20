@@ -226,6 +226,28 @@ a:hover{text-decoration:underline}
 {{else}}
 <div class="empty">No successful GetClientConfiguration poll has completed yet.</div>
 {{end}}
+
+{{if .Snapshot.PollHistory}}
+<h3 style="font-size:1em;margin:1.4em 0 .4em 0;color:#444">Poll history (oldest first, last {{len .Snapshot.PollHistory}})</h3>
+<table style="border-collapse:collapse;width:100%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.06)">
+<thead><tr style="background:#f3f3f3">
+<th style="padding:.4em .7em;text-align:left;font-size:.88em">When</th>
+<th style="padding:.4em .7em;text-align:right;font-size:.88em">Duration</th>
+<th style="padding:.4em .7em;text-align:right;font-size:.88em">Seq</th>
+<th style="padding:.4em .7em;text-align:left;font-size:.88em">Result</th>
+</tr></thead>
+<tbody>
+{{range .Snapshot.PollHistory}}
+<tr>
+<td style="padding:.35em .7em;border-bottom:1px solid #eee;font-size:.85em">{{ago .At}}</td>
+<td style="padding:.35em .7em;border-bottom:1px solid #eee;font-size:.85em;text-align:right;font-variant-numeric:tabular-nums">{{.Duration}}</td>
+<td style="padding:.35em .7em;border-bottom:1px solid #eee;font-size:.85em;text-align:right;font-variant-numeric:tabular-nums">{{.ConfigSeq}}</td>
+<td style="padding:.35em .7em;border-bottom:1px solid #eee;font-size:.85em">{{if .Err}}<span style="color:#922">{{.Err}}</span>{{else}}<span style="color:#197a1f">OK</span>{{end}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{end}}
 {{end}}
 
 <div class="foot"><a href="?format=json">JSON</a></div>

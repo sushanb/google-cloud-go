@@ -204,7 +204,39 @@ type Session struct {
 	// cache-resident.
 	msgsSentByType [numReqMsgTypes]atomic.Int64
 	msgsRecvByType [numRespMsgTypes]atomic.Int64
+
+	// retries counts vRPCs that arrived with VRpcAttempt>1 — i.e. the retry
+	// interceptor re-issued them on this session. Paired with errorRpcs it
+	// distinguishes "errored once and recovered" from "errored terminally."
+	retries atomic.Int64
+
+	// closeReason is set exactly once via setCloseReason() at session
+	// teardown so SessionPoolImpl.OnClose can attribute the close to a
+	// category (Heartbeat / GoAway / Error / User / Downsize). Empty string
+	// when the close cause isn't classified.
+	closeReason atomic.Pointer[string]
 }
+
+// setCloseReason records the reason for the session's terminal close. Only
+// the first call sticks; subsequent calls (which happen if multiple teardown
+// paths race) are ignored so the OnClose callback sees a stable value.
+func (s *Session) setCloseReason(reason string) {
+	if reason == "" {
+		return
+	}
+	s.closeReason.CompareAndSwap(nil, &reason)
+}
+
+// CloseReason returns the recorded close reason, or "" if none was set.
+func (s *Session) CloseReason() string {
+	if p := s.closeReason.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+// Retries returns the number of vRPCs Invoke processed with AttemptNumber > 1.
+func (s *Session) Retries() int64 { return s.retries.Load() }
 
 // SessionOption configures a Session at construction time.
 type SessionOption func(*Session)

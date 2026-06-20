@@ -222,8 +222,8 @@ a:hover{text-decoration:underline}
 <table>
 <thead><tr>
 <th class="num">#</th><th>gRPC state</th><th>ALTS</th><th>IP</th><th>Draining</th>
-<th class="num">Unary&nbsp;in&nbsp;flight</th><th class="num">Streaming&nbsp;in&nbsp;flight</th><th class="num">Errors</th>
-<th>Age</th><th>Penalty</th>
+<th class="num">Unary&nbsp;in&nbsp;flight</th><th class="num">Streaming&nbsp;in&nbsp;flight</th><th class="num">Picks</th><th class="num">Errors</th>
+<th>Last&nbsp;activity</th><th>Age</th><th>Penalty</th>
 </tr></thead>
 <tbody>
 {{range .Snapshot.Channels}}
@@ -235,7 +235,9 @@ a:hover{text-decoration:underline}
 <td>{{boolMark .IsDraining}}</td>
 <td class="num">{{.OutstandingUnary}}</td>
 <td class="num">{{.OutstandingStreaming}}</td>
+<td class="num">{{.Picks}}</td>
 <td class="num">{{.ErrorCount}}</td>
+<td>{{age .LastActivity}}</td>
 <td>{{age .CreatedAt}}</td>
 <td>{{until .PenaltyExpiresAt}}</td>
 </tr>
