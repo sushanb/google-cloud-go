@@ -105,15 +105,62 @@ func main() {
 	mux.Handle("/debug/sessionz/", http.StripPrefix("/debug/sessionz", sessionz.Handler(client)))
 	mux.Handle("/debug/configz/", http.StripPrefix("/debug/configz", configz.Handler(client)))
 	mux.Handle("/debug/channelz/", http.StripPrefix("/debug/channelz", channelz.Handler(client)))
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`<!doctype html><html><body style="font-family:sans-serif;margin:2em">
+
+	// Index page lists every debug surface. /debug, /debug/, and / all
+	// render the same listing so the operator can land on any of them.
+	debugIndex := func(w http.ResponseWriter, r *http.Request) {
+		// Only render the index for /debug and /debug/; anything else under
+		// /debug/ should 404 (specific debug surfaces have their own mounts).
+		if r.URL.Path != "/debug" && r.URL.Path != "/debug/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write([]byte(`<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<title>bigtable debug</title>
+<style>
+body{font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:2em;color:#222;background:#fafafa}
+h1{font-size:1.4em;margin:0 0 1em 0}
+ul{list-style:none;padding:0;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.06)}
+li{padding:.8em 1em;border-bottom:1px solid #eee}
+li:last-child{border-bottom:none}
+li a{color:#1a5fb4;text-decoration:none;font-weight:600;font-size:1.05em}
+li a:hover{text-decoration:underline}
+li .desc{display:block;color:#666;font-size:.9em;margin-top:.2em}
+li .json{margin-left:.6em;font-size:.85em;color:#888}
+</style>
+</head><body>
 <h1>Bigtable debug</h1>
 <ul>
-  <li><a href="/debug/sessionz/">sessionz</a> — live session pools, PeerInfo, per-session OK/err/msgs</li>
-  <li><a href="/debug/channelz/">channelz</a> — gRPC channel pools, LB policy, unary/streaming load</li>
-  <li><a href="/debug/configz/">configz</a> — last GetClientConfiguration response (JSON)</li>
+  <li>
+    <a href="/debug/sessionz/">sessionz</a>
+    <a class="json" href="/debug/sessionz/?format=json">JSON</a>
+    <span class="desc">Live session pools — per-session state, PeerInfo (transport / AFE / GFE), OK/error/retry counts, msg sent/recv with per-type breakdown, picks, EWMA, heartbeat, plus pool-level lifecycle (open/close + reasons), config-listener fires, throttler budget, and scaling history.</span>
+  </li>
+  <li>
+    <a href="/debug/channelz/">channelz</a>
+    <a class="json" href="/debug/channelz/?format=json">JSON</a>
+    <span class="desc">gRPC channel pools (classic + session) — LB policy, per-channel ALTS/IP, in-flight unary/streaming load, picks, last activity, draining flag, and error counts.</span>
+  </li>
+  <li>
+    <a href="/debug/configz/">configz</a>
+    <a class="json" href="/debug/configz/?format=json">JSON</a>
+    <span class="desc">Latest GetClientConfiguration response from the server — full proto rendered as JSON — plus poll history (timestamp, duration, result) so you can spot stuck or failing polls.</span>
+  </li>
 </ul>
 </body></html>`))
+	}
+	mux.HandleFunc("/debug/", debugIndex)
+	mux.HandleFunc("/debug", debugIndex)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.Redirect(w, r, "/debug/", http.StatusFound)
+			return
+		}
+		http.NotFound(w, r)
 	})
 
 	addr := fmt.Sprintf(":%d", *port)
