@@ -51,6 +51,11 @@ type SessionPoolImpl struct {
 	// `session-read-5` would collide across pools because each pool
 	// numbers its sessions from 1. 0 means "not assigned" (test setups).
 	poolID uint64
+	// poolShortName is the resource leaf (e.g. "sushanb" for an
+	// OpenTable pool) baked into the session log name so the name
+	// identifies WHAT the session opens, not just which pool. Empty
+	// when no short name was provided.
+	poolShortName string
 
 	// poolCtx is a cancellable context scoped to the lifetime of the pool. It
 	// is passed (wrapped to strip deadlines but preserve cancellation) to the
@@ -66,6 +71,14 @@ type SessionPoolImpl struct {
 // stay unique across pools. Call before any session is created.
 func (p *SessionPoolImpl) SetPoolID(id uint64) {
 	p.poolID = id
+}
+
+// SetPoolShortName stamps the pool with a resource short name (e.g.
+// "sushanb") so session log names identify what they're opening
+// ("OpenTable3-sushanb-read-5"). Slashes are flattened to underscores
+// so the name stays URL-safe.
+func (p *SessionPoolImpl) SetPoolShortName(name string) {
+	p.poolShortName = strings.ReplaceAll(name, "/", "_")
 }
 
 // NewSessionPoolImpl creates a new SessionPoolImpl.
@@ -443,18 +456,24 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 	case strings.Contains(p.poolName, "[WRITE]"):
 		role = "write"
 	}
-	// Session log names must be globally unique within the client.
-	// Format encodes proto type + pool ID so two pools of the same type
-	// can never collide:
+	// Session log names must be globally unique within the client and
+	// self-describing so the name itself tells you what the session
+	// opens. Format:
 	//
-	//   OpenTable1-read-3   OpenTable2-write-5   OpenAuthorizedView7-read-1
+	//   {ProtoName}{poolID}-{shortName}-{role}-{seq}
 	//
-	// poolID==0 means no SessionManager assigned one (test setup); drop
-	// the ID segment in that case so the name stays readable.
+	// e.g. OpenTable1-sushanb-read-3, OpenTable3-users-write-5,
+	//      OpenAuthorizedView5-sushanb_myview-read-1.
+	//
+	// Falls back to ProtoName-role-seq when no SessionManager IDs are
+	// assigned (test setups).
 	var sessionName string
-	if p.poolID > 0 {
+	switch {
+	case p.poolID > 0 && p.poolShortName != "":
+		sessionName = fmt.Sprintf("%s%d-%s-%s-%d", p.sessionType.ProtoName(), p.poolID, p.poolShortName, role, id)
+	case p.poolID > 0:
 		sessionName = fmt.Sprintf("%s%d-%s-%d", p.sessionType.ProtoName(), p.poolID, role, id)
-	} else {
+	default:
 		sessionName = fmt.Sprintf("%s-%s-%d", p.sessionType.ProtoName(), role, id)
 	}
 	p.mu.Unlock()
