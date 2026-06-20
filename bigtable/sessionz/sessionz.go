@@ -623,7 +623,7 @@ details.msgcell>summary:hover{color:#15498a}
 </tr></thead>
 <tbody>
 {{range .Pool.Sessions}}
-<tr id="session-{{.LogName}}">
+<tr id="{{.LogName}}">
 <td class="mono">{{.LogName}}</td>
 <td class="{{stateClass .State}}">{{.State}}</td>
 <td>{{orDash .Peer.TransportType}}</td>

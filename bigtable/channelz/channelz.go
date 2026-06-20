@@ -161,7 +161,7 @@ var funcs = template.FuncMap{
 			nameEsc := template.HTMLEscapeString(r.LogName)
 			b.WriteString(`<a href="../sessionz/pool/`)
 			b.WriteString(poolEsc)
-			b.WriteString(`#session-`)
+			b.WriteString(`#`)
 			b.WriteString(nameEsc)
 			b.WriteString(`" title="jump to `)
 			b.WriteString(nameEsc)
