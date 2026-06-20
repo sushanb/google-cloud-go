@@ -35,6 +35,8 @@ import (
 	"encoding/json"
 	"html/template"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -207,6 +209,26 @@ var funcs = template.FuncMap{
 	"timestamp": func(t time.Time) string {
 		return t.Format(time.RFC3339)
 	},
+	"msgBreakdown": func(m map[string]int64) string {
+		if len(m) == 0 {
+			return ""
+		}
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var b strings.Builder
+		for i, k := range keys {
+			if i > 0 {
+				b.WriteString("\n")
+			}
+			b.WriteString(k)
+			b.WriteString(": ")
+			b.WriteString(strconv.FormatInt(m[k], 10))
+		}
+		return b.String()
+	},
 }
 
 func roundDuration(d time.Duration) time.Duration {
@@ -323,7 +345,7 @@ a:hover{text-decoration:underline}
 <thead><tr>
 <th>Session</th><th>State</th><th>Transport</th><th>AFE region</th><th>AFE subzone</th>
 <th class="num">GFE&nbsp;id</th><th class="num">AFE&nbsp;id</th>
-<th class="num">OK</th><th class="num">Err</th><th class="num">In&nbsp;flight</th>
+<th class="num">OK</th><th class="num">Err</th><th class="num">Msgs&nbsp;sent</th><th class="num">Msgs&nbsp;recv</th><th class="num">In&nbsp;flight</th>
 <th class="num">Outstanding</th><th class="num">EWMA</th>
 <th>Last&nbsp;activity</th><th>Last&nbsp;state&nbsp;change</th><th>Next&nbsp;heartbeat</th>
 </tr></thead>
@@ -339,6 +361,8 @@ a:hover{text-decoration:underline}
 <td class="num">{{.Peer.ApplicationFrontendID}}</td>
 <td class="num">{{.OkRpcs}}</td>
 <td class="num">{{.ErrorRpcs}}</td>
+<td class="num" title="{{msgBreakdown .MsgsSentByType}}">{{.MsgsSent}}</td>
+<td class="num" title="{{msgBreakdown .MsgsRecvByType}}">{{.MsgsRecv}}</td>
 <td class="num">{{.ActiveRpcs}}</td>
 <td class="num">{{.Handle.Outstanding}}</td>
 <td class="num">{{dur .Handle.EwmaLatency}}</td>

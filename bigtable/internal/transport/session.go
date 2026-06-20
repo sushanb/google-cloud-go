@@ -193,6 +193,17 @@ type Session struct {
 	// for back-compat with existing callers.
 	okRpcs    atomic.Int64
 	errorRpcs atomic.Int64
+	// msgsSent / msgsRecv count every Send / Recv frame on the bidi stream.
+	// They cover every session-level frame type — OpenSession, vRPC,
+	// CloseSession, Heartbeat — not just successful vRPCs.
+	msgsSent atomic.Int64
+	msgsRecv atomic.Int64
+	// Per-frame-type breakdown of the above. Indexed by reqMsgType /
+	// respMsgType (see session_msgtype.go). Lock-free reads and writes via
+	// the array of atomics; total length is small (≤ 8) so the field stays
+	// cache-resident.
+	msgsSentByType [numReqMsgTypes]atomic.Int64
+	msgsRecvByType [numRespMsgTypes]atomic.Int64
 }
 
 // SessionOption configures a Session at construction time.
@@ -276,6 +287,18 @@ func (s *Session) OkRpcs() int64 {
 // this session.
 func (s *Session) ErrorRpcs() int64 {
 	return s.errorRpcs.Load()
+}
+
+// MsgsSent returns the total number of frames sent on this session's bidi
+// stream (every Send, regardless of payload type).
+func (s *Session) MsgsSent() int64 {
+	return s.msgsSent.Load()
+}
+
+// MsgsRecv returns the total number of frames received on this session's
+// bidi stream (every successful Recv).
+func (s *Session) MsgsRecv() int64 {
+	return s.msgsRecv.Load()
 }
 
 // debugf logs at debug level if a logger has been attached.

@@ -1,0 +1,253 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package channelz provides an HTTP debug page for a *bigtable.Client's
+// underlying gRPC channel pools — sister to sessionz and configz.
+//
+// What it shows, per BigtableChannelPool ("classic" and, when enabled,
+// "session"): the LB policy, total channel count, and one row per channel
+// with outstanding unary load, outstanding streaming load, error count,
+// ALTS/DirectAccess flag, IP protocol, gRPC connectivity state, age, and
+// draining flag.
+//
+// Mount it under any path:
+//
+//	http.Handle("/debug/channelz/", http.StripPrefix("/debug/channelz",
+//	    channelz.Handler(c)))
+//
+// Routes (relative to the mount point):
+//
+//	GET /              → HTML table of every channel pool + its channels.
+//	GET /?format=json  → same data as JSON.
+//
+// The handler does no work until a request lands on it. The snapshot reads
+// the existing atomics non-destructively (unlike the metrics exporter, which
+// swaps errorCount to 0 on each report) so polling the debug UI does not
+// disturb metric counts.
+package channelz
+
+import (
+	"encoding/json"
+	"html/template"
+	"net/http"
+	"time"
+
+	"cloud.google.com/go/bigtable"
+)
+
+// Handler returns an http.Handler that renders a debug page for the
+// channel pools owned by c.
+func Handler(c *bigtable.Client) http.Handler {
+	return HandlerFromProvider(providerForClient(c))
+}
+
+// HandlerFromProvider is the same as Handler but accepts an arbitrary
+// ChannelDebugProvider — useful for tests.
+func HandlerFromProvider(p bigtable.ChannelDebugProvider) http.Handler {
+	mux := http.NewServeMux()
+	srv := &server{provider: p}
+	mux.HandleFunc("/", srv.handle)
+	return mux
+}
+
+func providerForClient(c *bigtable.Client) bigtable.ChannelDebugProvider {
+	if c == nil {
+		return nil
+	}
+	return c.ChannelDebug()
+}
+
+type server struct {
+	provider bigtable.ChannelDebugProvider
+}
+
+func (s *server) handle(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" && r.URL.Path != "" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+
+	var pools []bigtable.ChannelPoolDebug
+	if s.provider != nil {
+		pools = s.provider.Snapshot()
+	}
+
+	if r.URL.Query().Get("format") == "json" {
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(pools)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := pageTpl.Execute(w, pageData{
+		Pools:       pools,
+		Generated:   time.Now(),
+		HasProvider: s.provider != nil,
+	}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+type pageData struct {
+	Pools       []bigtable.ChannelPoolDebug
+	Generated   time.Time
+	HasProvider bool
+}
+
+var funcs = template.FuncMap{
+	"age": func(t time.Time) string {
+		if t.IsZero() {
+			return "—"
+		}
+		return roundDuration(time.Since(t)).String() + " ago"
+	},
+	"until": func(t time.Time) string {
+		if t.IsZero() {
+			return "—"
+		}
+		d := time.Until(t)
+		if d < 0 {
+			return "expired " + roundDuration(-d).String() + " ago"
+		}
+		return "in " + roundDuration(d).String()
+	},
+	"orDash": func(s string) string {
+		if s == "" {
+			return "—"
+		}
+		return s
+	},
+	"timestamp": func(t time.Time) string {
+		if t.IsZero() {
+			return "—"
+		}
+		return t.Format(time.RFC3339)
+	},
+	"boolMark": func(b bool) string {
+		if b {
+			return "✓"
+		}
+		return ""
+	},
+	"connStateClass": func(s string) string {
+		switch s {
+		case "READY":
+			return "state-active"
+		case "CONNECTING":
+			return "state-starting"
+		case "TRANSIENT_FAILURE":
+			return "state-closing"
+		case "SHUTDOWN":
+			return "state-closed"
+		}
+		return ""
+	},
+}
+
+func roundDuration(d time.Duration) time.Duration {
+	switch {
+	case d > time.Hour:
+		return d.Round(time.Minute)
+	case d > time.Minute:
+		return d.Round(time.Second)
+	case d > time.Second:
+		return d.Round(10 * time.Millisecond)
+	default:
+		return d.Round(time.Microsecond)
+	}
+}
+
+const pageTplSrc = `<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<title>bigtable channelz</title>
+<meta http-equiv="refresh" content="5">
+<style>
+body{font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:1.5em;color:#222;background:#fafafa}
+h1{font-size:1.3em;margin:0 0 .25em 0}
+h2{font-size:1em;color:#666;font-weight:normal;margin:.6em 0 .8em 0}
+h3{font-size:1.05em;margin:1.4em 0 .5em 0}
+.summary{margin-bottom:1em;background:#fff;padding:.6em 1em;box-shadow:0 1px 2px rgba(0,0,0,.06)}
+.summary span{display:inline-block;margin-right:1.4em}
+.summary b{color:#444}
+table{border-collapse:collapse;width:100%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.06);margin-bottom:1em}
+th,td{padding:.4em .7em;text-align:left;border-bottom:1px solid #eee;font-size:.88em;vertical-align:top}
+th{background:#f3f3f3;font-weight:600}
+tr:hover td{background:#fafafa}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.mono{font-family:ui-monospace,Consolas,monospace;font-size:.85em}
+.empty{color:#888;font-style:italic;padding:.8em 0}
+.state-active{color:#197a1f;font-weight:600}
+.state-starting{color:#a07000;font-weight:600}
+.state-closing{color:#a04500;font-weight:600}
+.state-closed{color:#888}
+.foot{margin-top:1.5em;color:#888;font-size:.8em}
+a{color:#1a5fb4;text-decoration:none}
+a:hover{text-decoration:underline}
+</style>
+</head><body>
+<h1>Bigtable gRPC Channel Pools</h1>
+<h2>generated {{timestamp .Generated}} · auto-refresh 5s</h2>
+
+{{if not .HasProvider}}
+<div class="empty">No channel debug provider attached.</div>
+{{else if not .Pools}}
+<div class="empty">No Bigtable channel pools — either the client uses an externally-supplied gRPC connection (option.WithGRPCConn) or no traffic has run yet.</div>
+{{else}}
+{{range .Pools}}
+<h3>{{.Role}} pool</h3>
+<div class="summary">
+<span><b>Instance</b> <span class="mono">{{orDash .Snapshot.InstanceName}}</span></span>
+<span><b>App&nbsp;profile</b> <span class="mono">{{orDash .Snapshot.AppProfile}}</span></span>
+<span><b>LB&nbsp;policy</b> {{orDash .Snapshot.LBPolicy}}</span>
+<span><b>Channels</b> {{.Snapshot.TotalConns}}</span>
+</div>
+{{if not .Snapshot.Channels}}
+<div class="empty">No live channels.</div>
+{{else}}
+<table>
+<thead><tr>
+<th class="num">#</th><th>gRPC state</th><th>ALTS</th><th>IP</th><th>Draining</th>
+<th class="num">Unary&nbsp;in&nbsp;flight</th><th class="num">Streaming&nbsp;in&nbsp;flight</th><th class="num">Errors</th>
+<th>Age</th><th>Penalty</th>
+</tr></thead>
+<tbody>
+{{range .Snapshot.Channels}}
+<tr>
+<td class="num">{{.Index}}</td>
+<td class="{{connStateClass .TargetState}}">{{orDash .TargetState}}</td>
+<td>{{boolMark .IsALTSUsed}}</td>
+<td>{{orDash .IPProtocol}}</td>
+<td>{{boolMark .IsDraining}}</td>
+<td class="num">{{.OutstandingUnary}}</td>
+<td class="num">{{.OutstandingStreaming}}</td>
+<td class="num">{{.ErrorCount}}</td>
+<td>{{age .CreatedAt}}</td>
+<td>{{until .PenaltyExpiresAt}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{end}}
+{{end}}
+{{end}}
+
+<div class="foot"><a href="?format=json">JSON</a></div>
+</body></html>
+`
+
+var pageTpl = template.Must(template.New("channelz").Funcs(funcs).Parse(pageTplSrc))

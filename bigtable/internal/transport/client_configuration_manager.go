@@ -26,6 +26,7 @@ import (
 	btopt "cloud.google.com/go/bigtable/internal/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
 )
 
 const MinPollingInterval = 1 * time.Minute
@@ -121,6 +122,15 @@ type ClientConfigurationManager struct {
 	validUntil     time.Time
 	listeners      map[int]configListener
 	nextListenerID int
+
+	// lastResponse / lastFetchedAt / lastErr / lastErrAt mirror the most
+	// recent poll() outcome — kept verbatim (cloned proto) so the configz
+	// debug UI can render the server's raw GetClientConfiguration response
+	// without re-deriving it from currentConfig.
+	lastResponse   *bigtablepb.ClientConfiguration
+	lastFetchedAt  time.Time
+	lastErr        error
+	lastErrAt      time.Time
 }
 
 var defaultClientConfig = clientConfig{
@@ -228,6 +238,47 @@ func (m *ClientConfigurationManager) getConfig() clientConfig {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.currentConfig.Clone()
+}
+
+// ConfigSnapshot is an immutable view of the most recent
+// GetClientConfiguration poll outcome — what the configz debug UI renders.
+//
+// Both Response and Err can be set: Response holds the last successful
+// response (if any), Err the most recent failure (if any). The two timestamps
+// are zero if the corresponding event has never occurred.
+type ConfigSnapshot struct {
+	InstanceName  string
+	AppProfileID  string
+	ConfigSeq     int64
+	ValidUntil    time.Time
+	Response      *bigtablepb.ClientConfiguration
+	FetchedAt     time.Time
+	LastErr       error
+	LastErrAt     time.Time
+	CapturedAt    time.Time
+}
+
+// Snapshot returns a ConfigSnapshot capturing the manager's most recent poll
+// outcome. The returned ClientConfiguration proto is a clone — safe for the
+// caller to marshal without racing with subsequent polls.
+func (m *ClientConfigurationManager) Snapshot() ConfigSnapshot {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var respClone *bigtablepb.ClientConfiguration
+	if m.lastResponse != nil {
+		respClone = proto.Clone(m.lastResponse).(*bigtablepb.ClientConfiguration)
+	}
+	return ConfigSnapshot{
+		InstanceName: m.instanceName,
+		AppProfileID: m.appProfileId,
+		ConfigSeq:    m.configSeq,
+		ValidUntil:   m.validUntil,
+		Response:     respClone,
+		FetchedAt:    m.lastFetchedAt,
+		LastErr:      m.lastErr,
+		LastErrAt:    m.lastErrAt,
+		CapturedAt:   time.Now(),
+	}
 }
 
 // addListener adds a listener for configuration changes.
@@ -365,6 +416,8 @@ func (m *ClientConfigurationManager) poll(ctx context.Context) {
 	if err != nil {
 		btopt.Debugf(m.logger, "bigtable: failed to poll client configuration: %v", err)
 		m.mu.Lock()
+		m.lastErr = err
+		m.lastErrAt = time.Now()
 		var listeners []configListener
 		var cfgToNotify clientConfig
 		var seq int64
@@ -400,6 +453,14 @@ func (m *ClientConfigurationManager) poll(ctx context.Context) {
 	m.configSeq++
 	seq := m.configSeq
 	m.validUntil = time.Now().Add(parsedResp.Polling.ValidityDuration)
+	// Clone the proto so subsequent server-side mutations cannot reach
+	// debug readers that are inspecting the snapshot.
+	if resp != nil {
+		m.lastResponse = proto.Clone(resp).(*bigtablepb.ClientConfiguration)
+	}
+	m.lastFetchedAt = time.Now()
+	m.lastErr = nil
+	m.lastErrAt = time.Time{}
 
 	listeners := make([]configListener, 0, len(m.listeners))
 	for _, l := range m.listeners {

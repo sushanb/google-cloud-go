@@ -32,6 +32,14 @@ type SessionSnapshot struct {
 	LastStateChange   time.Time
 	OkRpcs            int64
 	ErrorRpcs         int64
+	MsgsSent          int64
+	MsgsRecv          int64
+	// MsgsSentByType / MsgsRecvByType break the totals above down by the
+	// SessionRequest / SessionResponse oneof payload type. Keys come from the
+	// reqMsgType / respMsgType String() methods (e.g. "VirtualRpc", "Heartbeat").
+	// Buckets with a zero count are omitted to keep the rendered cell short.
+	MsgsSentByType    map[string]int64
+	MsgsRecvByType    map[string]int64
 	ActiveRpcs        int
 	HeartbeatInterval time.Duration
 	NextHeartbeat     time.Time
@@ -99,12 +107,42 @@ func (s *Session) Snapshot() SessionSnapshot {
 		LastStateChange:   lastChange,
 		OkRpcs:            s.okRpcs.Load(),
 		ErrorRpcs:         s.errorRpcs.Load(),
+		MsgsSent:          s.msgsSent.Load(),
+		MsgsRecv:          s.msgsRecv.Load(),
+		MsgsSentByType:    sentByType(s),
+		MsgsRecvByType:    recvByType(s),
 		ActiveRpcs:        activeRpcs,
 		HeartbeatInterval: hbInterval,
 		NextHeartbeat:     nextHb,
 		HasRefreshConfig:  hasRefresh,
 		Peer:              peerInfoToSnapshot(peer),
 	}
+}
+
+func sentByType(s *Session) map[string]int64 {
+	var out map[string]int64
+	for i := reqMsgType(0); i < numReqMsgTypes; i++ {
+		if v := s.msgsSentByType[i].Load(); v > 0 {
+			if out == nil {
+				out = make(map[string]int64, 2)
+			}
+			out[i.String()] = v
+		}
+	}
+	return out
+}
+
+func recvByType(s *Session) map[string]int64 {
+	var out map[string]int64
+	for i := respMsgType(0); i < numRespMsgTypes; i++ {
+		if v := s.msgsRecvByType[i].Load(); v > 0 {
+			if out == nil {
+				out = make(map[string]int64, 2)
+			}
+			out[i.String()] = v
+		}
+	}
+	return out
 }
 
 func peerInfoToSnapshot(p *spb.PeerInfo) PeerInfoSnapshot {

@@ -44,6 +44,11 @@ import (
 // Set SESSIONZ_PORT=0 (or unset) to pick a random free port; the URL is
 // logged on startup either way.
 func TestHighQpsSessionSandboxWithDebugUI(t *testing.T) {
+	// Sandbox tests require live GCP credentials and take 10+ minutes. Gate
+	// them so the default `go test ./...` doesn't try to run them.
+	if os.Getenv("BIGTABLE_SANDBOX") != "1" {
+		t.Skip("set BIGTABLE_SANDBOX=1 to run the sandbox load test against autonomous-mote-782")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 11*time.Minute)
 	defer cancel()
 

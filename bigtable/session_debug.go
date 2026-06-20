@@ -47,3 +47,97 @@ type sessionDebugAdapter struct {
 func (a sessionDebugAdapter) Snapshot() []btransport.PoolSnapshot {
 	return a.mgr.ManagerSnapshot()
 }
+
+// ConfigDebugProvider exposes a snapshot of the most recent
+// GetClientConfiguration poll outcome. The bigtable/configz package consumes
+// this to render an HTTP debug page; callers can also use it programmatically.
+//
+// Snapshot is safe to call concurrently with other Client operations. It
+// adds no overhead to the polling loop — the manager already keeps the last
+// response under its existing mutex.
+type ConfigDebugProvider interface {
+	// Snapshot returns the most recent GetClientConfiguration response (or
+	// the most recent error if no poll has succeeded yet).
+	Snapshot() btransport.ConfigSnapshot
+}
+
+// ConfigDebug returns a ConfigDebugProvider for this Client. Returns nil
+// when the client was constructed without a configuration manager (i.e.
+// before NewClientWithConfig wired one up).
+func (c *Client) ConfigDebug() ConfigDebugProvider {
+	if c.configManager == nil {
+		return nil
+	}
+	return configDebugAdapter{mgr: c.configManager}
+}
+
+type configDebugAdapter struct {
+	mgr *btransport.ClientConfigurationManager
+}
+
+func (a configDebugAdapter) Snapshot() btransport.ConfigSnapshot {
+	return a.mgr.Snapshot()
+}
+
+// ChannelDebugProvider exposes a snapshot of every gRPC channel pool the
+// Client currently owns — the classic data-plane pool and (when session
+// pooling is enabled) the dedicated session pool. The bigtable/channelz
+// package consumes this to render a per-channel debug view.
+//
+// Each entry in the returned slice corresponds to one BigtableChannelPool.
+// Snapshot is safe to call concurrently with other Client operations and
+// adds no overhead to the request path — it reads the existing atomics
+// non-destructively.
+type ChannelDebugProvider interface {
+	// Snapshot returns one ChannelPoolSnapshot per BigtableChannelPool the
+	// client holds, labeled by Role ("classic" / "session"). The slice is
+	// empty when the client uses a non-Bigtable connection pool (e.g. the
+	// caller passed option.WithGRPCConn).
+	Snapshot() []ChannelPoolDebug
+}
+
+// ChannelPoolDebug names a single channel pool and carries its snapshot.
+type ChannelPoolDebug struct {
+	// Role labels the pool — "classic" for the data-plane pool, "session"
+	// for the dedicated session pool created when EnableSessionPool is on.
+	Role     string
+	Snapshot btransport.ChannelPoolSnapshot
+}
+
+// ChannelDebug returns a ChannelDebugProvider for this Client. Always
+// non-nil; if the Client uses a non-Bigtable pool (caller passed
+// option.WithGRPCConn) the snapshot will be empty.
+func (c *Client) ChannelDebug() ChannelDebugProvider {
+	return channelDebugAdapter{client: c}
+}
+
+type channelDebugAdapter struct {
+	client *Client
+}
+
+func (a channelDebugAdapter) Snapshot() []ChannelPoolDebug {
+	out := make([]ChannelPoolDebug, 0, 2)
+	if p := bigtableChannelPool(a.client.classicPool.pool); p != nil {
+		out = append(out, ChannelPoolDebug{Role: "classic", Snapshot: p.ChannelPoolSnapshot()})
+	}
+	if a.client.config.EnableSessionPool {
+		// The session channel pool lives on the SessionManager because the
+		// SessionManager owns its managedChannelPool. We can fetch it via
+		// the manager's accessor.
+		if sp := a.client.sessionMgr.channelChannelPool(); sp != nil {
+			out = append(out, ChannelPoolDebug{Role: "session", Snapshot: sp.ChannelPoolSnapshot()})
+		}
+	}
+	return out
+}
+
+// bigtableChannelPool extracts the *btransport.BigtableChannelPool from a
+// gtransport.ConnPool, returning nil if the pool isn't a BigtableChannelPool
+// (e.g. the caller built the client with option.WithGRPCConn).
+func bigtableChannelPool(p interface{}) *btransport.BigtableChannelPool {
+	if p == nil {
+		return nil
+	}
+	bp, _ := p.(*btransport.BigtableChannelPool)
+	return bp
+}

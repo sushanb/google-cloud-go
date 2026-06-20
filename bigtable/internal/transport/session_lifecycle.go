@@ -124,8 +124,13 @@ func (s *Session) Close(ctx context.Context, req *spb.CloseSessionRequest) error
 // corrupt the underlying stream.
 func (s *Session) Send(req *spb.SessionRequest) error {
 	s.sendMu.Lock()
-	defer s.sendMu.Unlock()
-	return s.stream.Send(req)
+	err := s.stream.Send(req)
+	s.sendMu.Unlock()
+	if err == nil {
+		s.msgsSent.Add(1)
+		s.msgsSentByType[classifyReq(req)].Add(1)
+	}
+	return err
 }
 
 // readLoop drives the inbound side of the stream until Recv returns an error.
@@ -163,6 +168,8 @@ func (s *Session) readLoop(ctx context.Context) {
 			s.handleClose(err)
 			return
 		}
+		s.msgsRecv.Add(1)
+		s.msgsRecvByType[classifyResp(resp)].Add(1)
 		s.handleSessionResponse(resp)
 	}
 }

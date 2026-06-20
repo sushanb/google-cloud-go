@@ -53,6 +53,8 @@ import (
 	"time"
 
 	"cloud.google.com/go/bigtable"
+	"cloud.google.com/go/bigtable/channelz"
+	"cloud.google.com/go/bigtable/configz"
 	"cloud.google.com/go/bigtable/sessionz"
 	"google.golang.org/api/option"
 )
@@ -97,12 +99,21 @@ func main() {
 	}
 	defer client.Close()
 
-	// Mount the sessionz handler under /debug/sessionz/. http.StripPrefix
-	// lets the handler use root-relative routes (/, /pool/{key}).
+	// Mount the three debug UIs under /debug/. http.StripPrefix lets each
+	// handler use root-relative routes (/, /pool/{key}, etc).
 	mux := http.NewServeMux()
 	mux.Handle("/debug/sessionz/", http.StripPrefix("/debug/sessionz", sessionz.Handler(client)))
+	mux.Handle("/debug/configz/", http.StripPrefix("/debug/configz", configz.Handler(client)))
+	mux.Handle("/debug/channelz/", http.StripPrefix("/debug/channelz", channelz.Handler(client)))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/debug/sessionz/", http.StatusFound)
+		_, _ = w.Write([]byte(`<!doctype html><html><body style="font-family:sans-serif;margin:2em">
+<h1>Bigtable debug</h1>
+<ul>
+  <li><a href="/debug/sessionz/">sessionz</a> — live session pools, PeerInfo, per-session OK/err/msgs</li>
+  <li><a href="/debug/channelz/">channelz</a> — gRPC channel pools, LB policy, unary/streaming load</li>
+  <li><a href="/debug/configz/">configz</a> — last GetClientConfiguration response (JSON)</li>
+</ul>
+</body></html>`))
 	})
 
 	addr := fmt.Sprintf(":%d", *port)

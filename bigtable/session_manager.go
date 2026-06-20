@@ -85,6 +85,18 @@ func NewSessionManager(
 	}
 }
 
+// channelChannelPool returns the SessionManager's underlying
+// BigtableChannelPool if it has one, or nil. Used by Client.ChannelDebug to
+// surface session-pool channel stats without leaking managedChannelPool to
+// the public API.
+func (m *SessionManager) channelChannelPool() *btransport.BigtableChannelPool {
+	if m.channelPool.pool == nil {
+		return nil
+	}
+	bp, _ := m.channelPool.pool.(*btransport.BigtableChannelPool)
+	return bp
+}
+
 // ManagerSnapshot returns a snapshot of every pool the SessionManager
 // currently owns, ordered by pool key for stable rendering. The pool lock is
 // held only long enough to copy out the (key, *pool) pairs; the per-pool
