@@ -33,6 +33,7 @@ package sessionz
 
 import (
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"net/http"
 	"sort"
@@ -223,6 +224,16 @@ var funcs = template.FuncMap{
 			return "+" + strconv.Itoa(n)
 		}
 		return strconv.Itoa(n)
+	},
+	// opaqueID renders an int64 field that the server uses as an opaque
+	// uint64 identifier (GFE / AFE id) as hex. The proto field is signed
+	// so very large IDs come back negative ("-5686685877648862677") which
+	// is technically the correct bit pattern but looks like a bug.
+	"opaqueID": func(n int64) string {
+		if n == 0 {
+			return "—"
+		}
+		return fmt.Sprintf("0x%016x", uint64(n))
 	},
 	"scalingOutcome": func(ev btransport.ScalingEvent) string {
 		switch {
@@ -629,8 +640,8 @@ details.msgcell>summary:hover{color:#15498a}
 <td>{{orDash .Peer.TransportType}}</td>
 <td>{{orDash .Peer.ApplicationFrontendRegion}}</td>
 <td>{{orDash .Peer.ApplicationFrontendSubzone}}</td>
-<td class="num">{{.Peer.GoogleFrontendID}}</td>
-<td class="num">{{.Peer.ApplicationFrontendID}}</td>
+<td class="mono num" title="opaque int64; rendered as hex of the uint64 bit pattern">{{opaqueID .Peer.GoogleFrontendID}}</td>
+<td class="mono num" title="opaque int64; rendered as hex of the uint64 bit pattern">{{opaqueID .Peer.ApplicationFrontendID}}</td>
 <td class="num">{{if ge .ChannelIndex 0}}<a href="../../channelz/#channel-session-{{.ChannelIndex}}" title="jump to this channel in channelz">{{.ChannelIndex}}</a>{{else}}—{{end}}</td>
 <td class="num">{{.OkRpcs}}</td>
 <td class="num">{{.ErrorRpcs}}</td>
