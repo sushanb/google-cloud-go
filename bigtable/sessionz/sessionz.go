@@ -755,7 +755,7 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 <table>
 <thead><tr>
 <th>When</th><th>Method</th><th class="num">Latency</th>
-<th class="num">SemWait</th><th class="num">Backend</th>
+<th class="num">PoolWait</th><th class="num">SemWait</th><th class="num">Backend</th>
 <th>Session</th><th class="num">RpcID</th><th class="num">SessionAge</th>
 <th>Status</th>
 </tr></thead>
@@ -765,6 +765,7 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 <td>{{age .At}} ago</td>
 <td class="mono">{{.Method}}</td>
 <td class="num {{latencyClass .Latency}}">{{dur .Latency}}</td>
+<td class="num" title="time inside CheckoutSession — waiting for an idle session at the pool boundary">{{dur .PoolWait}}</td>
 <td class="num" title="time spent in vrpcSem.Acquire — queue wait for the session's single in-flight slot">{{dur .SemWait}}</td>
 <td class="num" title="server-reported BackendLatency">{{dur .BackendLatency}}</td>
 <td class="mono">{{.Session}}</td>
@@ -776,7 +777,8 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 </tbody>
 </table>
 <div style="font-size:.78em;color:#888;margin-top:.3em">
-<b>SemWait</b> ≈ <b>Latency</b> → call was queued on the session semaphore (head-of-line blocking).
+<b>PoolWait</b> ≈ <b>Latency</b> → workers exceeded pool capacity; queued at the pool boundary waiting for an idle session.
+<b>SemWait</b> ≈ <b>Latency</b> → call was queued on the per-session semaphore (would indicate the pool-level checkout missed a busy session — should be rare with pool-queue checkout).
 <b>Backend</b> close to <b>Latency</b> → server itself was slow.
 Low <b>RpcID</b> + small <b>SessionAge</b> → fresh session warm-up cost.
 </div>

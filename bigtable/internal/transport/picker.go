@@ -15,6 +15,7 @@
 package internal
 
 import (
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -124,6 +125,11 @@ type SessionHandle struct {
 	ewma         *PeakEwma
 	lastActivity int64 // UnixNano timestamp of the last completed call
 	picks        int64 // Number of times the picker has picked this handle.
+	// freeSignal is the owning pool's "a session became idle" channel.
+	// DecOutstanding does a non-blocking send when outstanding drops
+	// to 0 so any worker parked on CheckoutSession wakes up and
+	// re-scans. nil when the handle isn't pool-owned (test setups).
+	freeSignal chan<- struct{}
 }
 
 // Picks returns the number of times this handle has been picked by the pool's
@@ -140,18 +146,33 @@ func NewSessionHandle(session *Session) *SessionHandle {
 	}
 }
 
+// SetFreeSignal connects this handle's DecOutstanding to the pool's
+// "a session is now idle" wake-up channel. Called by SessionPoolImpl
+// when adding the handle in OnActive.
+func (h *SessionHandle) SetFreeSignal(c chan<- struct{}) {
+	h.freeSignal = c
+}
+
 // IncOutstanding increments outstanding calls.
 func (h *SessionHandle) IncOutstanding() {
 	atomic.AddInt64(&h.outstanding, 1)
 }
 
 // DecOutstanding decrements outstanding calls and updates EWMA latency + lastActivity timestamp.
+// When outstanding drops to 0, signals the pool that this session is
+// now idle so any worker waiting at CheckoutSession can grab it.
 func (h *SessionHandle) DecOutstanding(latency time.Duration) {
-	atomic.AddInt64(&h.outstanding, -1)
+	newCount := atomic.AddInt64(&h.outstanding, -1)
 	if h.ewma != nil && latency > 0 {
 		h.ewma.Update(latency)
 	}
 	atomic.StoreInt64(&h.lastActivity, time.Now().UnixNano())
+	if newCount == 0 && h.freeSignal != nil {
+		select {
+		case h.freeSignal <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // GetLastActivity returns the time of the last activity.
@@ -166,6 +187,44 @@ func (h *SessionHandle) GetLastActivity() time.Time {
 // Picker defines the interface for picking a session from a pool.
 type Picker interface {
 	PickSession() *SessionHandle
+}
+
+// LeastInFlightPicker picks the session with the lowest outstanding
+// vRPC count, breaking ties by lower last-activity (oldest first so
+// load spreads). With multiPlexingLimit=1 this collapses to "pick any
+// outstanding == 0 session" — the right semantic for the
+// LoadBalancingOptions_LeastInFlight_ config the server sends.
+type LeastInFlightPicker struct {
+	mu       sync.Mutex
+	sessions []*SessionHandle
+}
+
+// NewLeastInFlightPicker creates a new LeastInFlightPicker.
+func NewLeastInFlightPicker(sessions []*SessionHandle) *LeastInFlightPicker {
+	return &LeastInFlightPicker{sessions: sessions}
+}
+
+// PickSession scans for the session with the lowest outstanding count.
+// Returns immediately on the first outstanding == 0 it finds.
+func (p *LeastInFlightPicker) PickSession() *SessionHandle {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.sessions) == 0 {
+		return nil
+	}
+	var best *SessionHandle
+	bestLoad := int64(math.MaxInt64)
+	for _, sh := range p.sessions {
+		load := atomic.LoadInt64(&sh.outstanding)
+		if load == 0 {
+			return sh
+		}
+		if load < bestLoad {
+			best = sh
+			bestLoad = load
+		}
+	}
+	return best
 }
 
 // RandomPicker picks a session randomly from a list of sessions.
