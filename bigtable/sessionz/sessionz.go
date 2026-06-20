@@ -361,6 +361,11 @@ a:hover{text-decoration:underline}
 .summary b{color:#444}
 .empty{color:#888;font-style:italic;padding:.8em 0}
 .foot{margin-top:1.5em;color:#888;font-size:.8em}
+details.openreq{margin-bottom:1em;background:#fff;padding:.5em 1em;box-shadow:0 1px 2px rgba(0,0,0,.06)}
+details.openreq>summary{cursor:pointer;color:#1a5fb4;padding:.25em 0}
+details.openreq>summary:hover{color:#15498a}
+.openreq-body h4{font-size:.9em;margin:.8em 0 .25em 0;color:#444}
+.openreq-body pre{background:#f7f7f7;padding:.6em .8em;border-left:3px solid #1a5fb4;font-family:ui-monospace,Consolas,monospace;font-size:.82em;line-height:1.4;margin:0;overflow-x:auto}
 details.msgcell{display:inline-block}
 details.msgcell>summary{cursor:pointer;list-style:none;color:#1a5fb4;text-decoration:underline dotted}
 details.msgcell>summary::-webkit-details-marker{display:none}
@@ -390,6 +395,22 @@ details.msgcell>summary:hover{color:#15498a}
 <span><b>Config listener fires</b> {{.Pool.ListenerFires}}</span>
 <span><b>Creation budget</b> {{.Pool.Throttler.InUse}} / {{.Pool.Throttler.Capacity}} (penalty {{dur .Pool.Throttler.PenaltyDuration}})</span>
 </div>
+
+{{if .Pool.OpenRequest}}
+<details class="openreq">
+<summary><b>OpenSessionRequest</b> <span class="mono">{{.Pool.OpenRequest.PayloadType}}</span> (protocol v{{.Pool.OpenRequest.ProtocolVersion}}) — click to expand</summary>
+<div class="openreq-body">
+{{if .Pool.OpenRequest.PayloadJSON}}
+<h4>Payload</h4>
+<pre>{{.Pool.OpenRequest.PayloadJSON}}</pre>
+{{end}}
+{{if .Pool.OpenRequest.FlagsJSON}}
+<h4>FeatureFlags</h4>
+<pre>{{.Pool.OpenRequest.FlagsJSON}}</pre>
+{{end}}
+</div>
+</details>
+{{end}}
 {{if not .Pool.Sessions}}
 <div class="empty">No sessions registered in this pool right now.</div>
 {{else}}

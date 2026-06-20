@@ -20,7 +20,59 @@ import (
 	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
+
+// openRequestMarshaler formats decoded OpenSessionRequest payloads for the
+// debug UI: multiline JSON, snake_case names, omit empties.
+var openRequestMarshaler = protojson.MarshalOptions{
+	Multiline:       true,
+	Indent:          "  ",
+	UseProtoNames:   true,
+	EmitUnpopulated: false,
+}
+
+// buildOpenRequestSnapshot decodes the OpenSessionRequest's Payload into
+// the message type indicated by sessionType and renders it (plus the
+// feature-flags wrapper) as protojson for the debug UI. Returns nil when
+// the pool has no template request (rare — only happens in tests that
+// inject a session directly).
+func buildOpenRequestSnapshot(req *spb.OpenSessionRequest, sessionType SessionType) *OpenRequestSnapshot {
+	if req == nil {
+		return nil
+	}
+	out := &OpenRequestSnapshot{ProtocolVersion: req.ProtocolVersion}
+
+	var inner proto.Message
+	switch sessionType {
+	case SessionTypeTable:
+		out.PayloadType = "OpenTableRequest"
+		inner = &spb.OpenTableRequest{}
+	case SessionTypeAuthorizedView:
+		out.PayloadType = "OpenAuthorizedViewRequest"
+		inner = &spb.OpenAuthorizedViewRequest{}
+	case SessionTypeMaterializedView:
+		out.PayloadType = "OpenMaterializedViewRequest"
+		inner = &spb.OpenMaterializedViewRequest{}
+	default:
+		out.PayloadType = "unknown"
+	}
+
+	if inner != nil && len(req.Payload) > 0 {
+		if err := proto.Unmarshal(req.Payload, inner); err == nil {
+			if b, mErr := openRequestMarshaler.Marshal(inner); mErr == nil {
+				out.PayloadJSON = string(b)
+			}
+		}
+	}
+	if req.Flags != nil {
+		if b, err := openRequestMarshaler.Marshal(req.Flags); err == nil {
+			out.FlagsJSON = string(b)
+		}
+	}
+	return out
+}
 
 // SessionSnapshot is an immutable, allocation-friendly snapshot of one
 // Session's debugging state. All fields are value types so the snapshot can
@@ -92,6 +144,25 @@ type PoolSnapshot struct {
 	ListenerFires  int64
 	Throttler      ThrottlerSnapshot
 	ScalingHistory []ScalingEvent
+	// OpenRequest captures the OpenSessionRequest template used to handshake
+	// every session in this pool — protocol version, feature flags, and the
+	// decoded inner payload (OpenTable / OpenAuthorizedView /
+	// OpenMaterializedView). All sessions in a given pool share this exact
+	// request, so it's surfaced per-pool rather than per-session.
+	OpenRequest *OpenRequestSnapshot
+}
+
+// OpenRequestSnapshot is the JSON-friendly form of the OpenSessionRequest.
+// PayloadType names the inner-message kind ("OpenTable",
+// "OpenAuthorizedView", "OpenMaterializedView", or "unknown"); PayloadJSON
+// is the inner message rendered via protojson — that's the field that
+// answers "what was this session opened for?". FlagsJSON renders the
+// FeatureFlags proto so operators can see what the client asked for.
+type OpenRequestSnapshot struct {
+	ProtocolVersion int64
+	PayloadType     string
+	PayloadJSON     string
+	FlagsJSON       string
 }
 
 // Snapshot returns a debug-friendly snapshot of the session. It acquires
@@ -224,6 +295,7 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 		ListenerFires:  p.listenerFires.Load(),
 		Throttler:      throttler,
 		ScalingHistory: p.snapshotScalingHistory(),
+		OpenRequest:    buildOpenRequestSnapshot(p.openSessionRequest, sessionType),
 	}
 
 	for _, sh := range handles {
