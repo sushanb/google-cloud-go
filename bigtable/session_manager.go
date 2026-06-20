@@ -246,10 +246,17 @@ func (m *SessionManager) createPoolForPayload(
 	if m.maxSessions > 0 {
 		max = m.maxSessions
 	}
-	return m.GetOrCreateSessionPool(key, min, max, streamFactory, handshake, md, sessionDesc.Type), nil
+	shortName := ""
+	if sessionDesc.ShortNameFn != nil {
+		shortName = sessionDesc.ShortNameFn(payload)
+	}
+	return m.GetOrCreateSessionPool(key, min, max, streamFactory, handshake, md, sessionDesc.Type, shortName), nil
 }
 
 // GetOrCreateSessionPool gets or creates a session pool for a specific key.
+// shortName is an optional resource identifier (e.g. table leaf name) that
+// gets embedded in the pool's display name so operators can distinguish
+// pools of the same proto type at a glance.
 func (m *SessionManager) GetOrCreateSessionPool(
 	key string,
 	min, max int,
@@ -257,6 +264,7 @@ func (m *SessionManager) GetOrCreateSessionPool(
 	openSessionRequest *btpb.OpenSessionRequest,
 	md metadata.MD,
 	sessionType btransport.SessionType,
+	shortName string,
 ) *btransport.SessionPoolImpl {
 	fmt.Printf(">>> getOrCreateSessionPool: key=%s, min=%d, max=%d <<<\n", key, min, max)
 
@@ -267,12 +275,13 @@ func (m *SessionManager) GetOrCreateSessionPool(
 		return mp.pool
 	}
 
-	// Mint a unique, human-readable pool name from the proto type the
-	// session is opened with plus a monotonic ID. The map key (passed in
-	// as `key`, e.g. "table:sushanb:read") stays the dedup key so repeat
-	// OpenTable calls return the same pool; the pool's surfaced name is
-	// what the debug UI shows. Permission hint comes from the key's
-	// :read / :write suffix when present.
+	// Mint a unique, human-readable pool name from the proto type +
+	// monotonic ID + (optional) resource short name + permission hint.
+	// The map key stays the dedup key so repeat OpenTable calls return
+	// the same pool; the pool's surfaced name is what the debug UI shows.
+	//
+	//   OpenTablePool-1 (sushanb) [READ]
+	//   OpenAuthorizedViewPool-3 (sushanb/myview) [WRITE]
 	id := m.nextPoolID.Add(1)
 	permission := ""
 	if strings.HasSuffix(key, ":read") {
@@ -281,6 +290,9 @@ func (m *SessionManager) GetOrCreateSessionPool(
 		permission = "WRITE"
 	}
 	poolName := fmt.Sprintf("%sPool-%d", sessionType.ProtoName(), id)
+	if shortName != "" {
+		poolName += " (" + shortName + ")"
+	}
 	if permission != "" {
 		poolName += " [" + permission + "]"
 	}
