@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
@@ -48,6 +49,11 @@ type SessionManager struct {
 	configManager     *btransport.ClientConfigurationManager
 	backgroundCtx     context.Context
 	sessionPools      map[string]*managedPool
+	// nextPoolID is the monotonic counter used to mint unique pool names
+	// like "OpenTablePool-3". Distinct from the keyed sessionPools map
+	// (which uses the table+permission key for dedup); the pool name is
+	// purely the human-facing identifier surfaced in the debug UI.
+	nextPoolID        atomic.Uint64
 	minSessions       int
 	maxSessions       int
 	channelPool       managedChannelPool
@@ -261,7 +267,25 @@ func (m *SessionManager) GetOrCreateSessionPool(
 		return mp.pool
 	}
 
-	pool := btransport.NewSessionPoolImpl(key, min, max, streamFactory, openSessionRequest, md, sessionType)
+	// Mint a unique, human-readable pool name from the proto type the
+	// session is opened with plus a monotonic ID. The map key (passed in
+	// as `key`, e.g. "table:sushanb:read") stays the dedup key so repeat
+	// OpenTable calls return the same pool; the pool's surfaced name is
+	// what the debug UI shows. Permission hint comes from the key's
+	// :read / :write suffix when present.
+	id := m.nextPoolID.Add(1)
+	permission := ""
+	if strings.HasSuffix(key, ":read") {
+		permission = "READ"
+	} else if strings.HasSuffix(key, ":write") {
+		permission = "WRITE"
+	}
+	poolName := fmt.Sprintf("%sPool-%d", sessionType.ProtoName(), id)
+	if permission != "" {
+		poolName += " [" + permission + "]"
+	}
+
+	pool := btransport.NewSessionPoolImpl(poolName, min, max, streamFactory, openSessionRequest, md, sessionType)
 	mp = &managedPool{pool: pool}
 	m.sessionPools[key] = mp
 	configManager := m.configManager
