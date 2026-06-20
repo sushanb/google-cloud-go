@@ -80,17 +80,31 @@ func (s *Session) notifyClosed(streamErr error) {
 	})
 }
 
-// Close requests a graceful shutdown: it transitions to StateClosing, waits
-// for in-flight RPCs to drain (or for ctx to fire), then sends
-// CloseSessionRequest. The server's EOF eventually drives handleClose, which
-// moves to StateClosed.
+// Close requests a graceful shutdown:
+//  1. Transitions to StateClosing (no-op if already Closing — callers like
+//     handleGoAway invoke this after the state was advanced upstream).
+//  2. Waits for in-flight RPCs to drain (or for ctx to fire).
+//  3. Sends CloseSessionRequest to the server.
+//  4. Transitions to StateWaitServerClose.
+//  5. The server's EOF eventually drives handleClose → StateClosed.
+//
+// A pool-side monitor (see SessionPoolImpl.startStuckSessionMonitor)
+// force-closes sessions stuck in StateWaitServerClose past a grace period
+// so an unresponsive server can't leak Closing sessions indefinitely.
 func (s *Session) Close(ctx context.Context, req *spb.CloseSessionRequest) error {
-	if _, ok := s.transitionTo(StateClosing, isState(StateNew, StateStarting, StateActive)); !ok {
+	// Allow being called from Closing too — handleGoAway already
+	// transitioned and now wants the drain + send + WaitServerClose dance.
+	s.transitionTo(StateClosing, isState(StateNew, StateStarting, StateActive))
+	st := s.State()
+	if st != StateClosing {
+		// Already past Closing (WaitServerClose / Closed); nothing to do.
 		return nil
 	}
 	// Record the intended reason now — the eventual handleClose (driven by
 	// the server's EOF) would otherwise stamp "StreamEnd" over it and the
-	// downstream OnClose hook would see the wrong label.
+	// downstream OnClose hook would see the wrong label. setCloseReason is
+	// CompareAndSwap-once so callers like handleGoAway that stamped earlier
+	// win over this one.
 	s.setCloseReason(closeReasonLabel(req))
 
 	// Wait for active RPCs to drain. The quiescent channel is closed by the
@@ -122,6 +136,9 @@ func (s *Session) Close(ctx context.Context, req *spb.CloseSessionRequest) error
 		s.ForceClose(nil)
 		return fmt.Errorf("send close session request: %w", err)
 	}
+	// Advance to WaitServerClose so the pool monitor can see we're waiting
+	// on the server. handleClose accepts StateWaitServerClose → Closed.
+	s.transitionTo(StateWaitServerClose, isState(StateClosing))
 	return nil
 }
 
@@ -262,20 +279,21 @@ func (s *Session) handleSessionRefreshConfig(cfg *spb.SessionRefreshConfig) {
 		cfg.GetOptimizedOpenRequest() != nil, len(cfg.GetMetadata()))
 }
 
-// handleGoAway transitions to StateClosing and cancels every RPC with an id
-// greater than the last admitted one. A late-arriving GOAWAY from an already
-// terminal session is ignored — we do not move backwards.
+// handleGoAway processes a server-initiated GoAway:
+//  1. Transitions to StateClosing (no backwards motion from terminal states).
+//  2. Stamps "GoAway" as the close reason so it survives the eventual
+//     handleClose stamp.
+//  3. Cancels every in-flight RPC whose id exceeds lastAdmitted — the server
+//     has promised never to ack those.
+//  4. Spawns a goroutine that drives the session through Closing →
+//     WaitServerClose → Closed via s.Close, so the lifecycle completes even
+//     when the server forgets to follow up with a stream EOF.
 //
-// After cancellation, schedules a deferred teardown: waits for in-flight
-// RPCs to drain (or for a 30s grace period to expire), then ForceCloses.
-// Without this the session can linger in Closing forever — GoAway is a
-// promise the server will admit no more vRPCs, but the server does not
-// always follow up with a stream EOF. Lingering Closing sessions accumulate
-// in the pool, never trigger OnClose, and never increment sessionsClosed.
+// A late-arriving GOAWAY from an already terminal session is ignored.
 func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
-	s.transitionTo(StateClosing, notState(StateClosing, StateClosed))
-	// Stamp the close reason now so the eventual handleClose (when the
-	// server EOFs the stream) doesn't overwrite it with "StreamEnd".
+	if _, ok := s.transitionTo(StateClosing, notState(StateClosing, StateWaitServerClose, StateClosed)); !ok {
+		return
+	}
 	s.setCloseReason("GoAway")
 
 	lastAdmitted := goAway.GetLastRpcIdAdmitted()
@@ -286,29 +304,14 @@ func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
 		"vRPC not admitted before GOAWAY (last_admitted=%d)", lastAdmitted)
 	s.cancelActiveRPCs(err, func(id int64) bool { return id > lastAdmitted })
 
-	// Safety net: ensure the session reaches StateClosed and OnClose fires
-	// within a bounded grace period. ForceClose is a no-op if handleClose
-	// (server EOF) gets there first, so this only kicks in when the server
-	// stops talking to us.
-	//
-	// If there are no admitted RPCs still in flight, signal quiescent now
-	// so the wait below short-circuits. (signalQuiescent is normally fired
-	// by the last RPC's cleanup defer; with no RPCs that defer never runs,
-	// and an idle GoAway'd session would otherwise wait the full grace
-	// period for no reason.)
-	s.mu.Lock()
-	idle := len(s.activeRPCs) == 0
-	s.mu.Unlock()
-	if idle {
-		s.signalQuiescent()
-	}
+	// Drive the lifecycle to completion off the readLoop. s.Close drains
+	// the remaining admitted RPCs (or returns on ctx-timeout via ForceClose),
+	// sends CloseSession, transitions to WaitServerClose, and then the
+	// pool's stuck-session monitor or the server's EOF moves us to Closed.
 	go func() {
-		const goAwayGrace = 30 * time.Second
-		select {
-		case <-s.quiescent:
-		case <-time.After(goAwayGrace):
-		}
-		s.ForceClose(&spb.CloseSessionRequest{
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = s.Close(ctx, &spb.CloseSessionRequest{
 			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_GOAWAY,
 			Description: "client teardown after server GOAWAY",
 		})
@@ -316,7 +319,9 @@ func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
 }
 
 // handleClose is invoked when Recv returns an error. It transitions to
-// StateClosed and cancels every remaining in-flight RPC.
+// StateClosed (from any non-terminal state — including WaitServerClose
+// when the server's EOF arrives after a CloseSession we sent) and cancels
+// every remaining in-flight RPC.
 func (s *Session) handleClose(err error) {
 	if _, ok := s.transitionTo(StateClosed, notState(StateClosed)); !ok {
 		return

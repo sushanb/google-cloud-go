@@ -208,7 +208,7 @@ var funcs = template.FuncMap{
 			return "state-active"
 		case "Starting", "New":
 			return "state-starting"
-		case "Closing":
+		case "Closing", "WaitServerClose":
 			return "state-closing"
 		case "Closed":
 			return "state-closed"

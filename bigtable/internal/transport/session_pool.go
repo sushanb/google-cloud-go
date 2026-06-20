@@ -191,6 +191,49 @@ func (p *SessionPoolImpl) recordTimeSeries() {
 	p.timeSeries = append(p.timeSeries, sample)
 }
 
+// waitServerCloseGrace bounds how long a session may sit in
+// StateWaitServerClose before the pool force-closes it. The server should
+// EOF the stream promptly after acknowledging CloseSession; if it doesn't,
+// this gives us a deterministic teardown so OnClose fires and counters move.
+const waitServerCloseGrace = 30 * time.Second
+
+// sweepStuckSessions scans the pool for sessions parked in
+// StateWaitServerClose beyond waitServerCloseGrace and force-closes them.
+// Runs from PerformScaling at the heartbeat cadence; takes p.mu only long
+// enough to snapshot the (handle, last-state-change) tuples then issues
+// ForceClose calls outside the lock.
+func (p *SessionPoolImpl) sweepStuckSessions() {
+	type victim struct {
+		sess     *Session
+		stuckFor time.Duration
+	}
+	var victims []victim
+
+	p.mu.Lock()
+	for _, sh := range p.sessions {
+		if sh == nil || sh.session == nil {
+			continue
+		}
+		sh.session.mu.Lock()
+		stuck := sh.session.state == StateWaitServerClose
+		since := time.Since(sh.session.lastStateChange)
+		sh.session.mu.Unlock()
+		if stuck && since > waitServerCloseGrace {
+			victims = append(victims, victim{sess: sh.session, stuckFor: since})
+		}
+	}
+	p.mu.Unlock()
+
+	for _, v := range victims {
+		fmt.Printf(">>> POOL %s sweepStuckSessions: force-closing %s stuck in WaitServerClose for %v <<<\n",
+			p.poolName, v.sess.LogName(), v.stuckFor.Round(time.Second))
+		v.sess.ForceClose(&spb.CloseSessionRequest{
+			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR,
+			Description: "stuck in WaitServerClose past grace",
+		})
+	}
+}
+
 func (p *SessionPoolImpl) snapshotTimeSeries() []TimeSeriesSample {
 	p.timeSeriesMu.Lock()
 	defer p.timeSeriesMu.Unlock()
@@ -607,6 +650,11 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 	// buffer fills at the heartbeat cadence regardless of whether scaling
 	// actually fires below.
 	p.recordTimeSeries()
+	// Sweep for sessions stuck in WaitServerClose past the grace window —
+	// happens when a server sent GoAway / accepted CloseSession but never
+	// followed up with a stream EOF. ForceClose drives them to Closed so
+	// OnClose fires and the pool retires them.
+	p.sweepStuckSessions()
 
 	p.mu.Lock()
 	if p.closed || p.scalingInProgress {

@@ -74,10 +74,14 @@ const (
 	StateStarting
 	// StateActive indicates the session is active and ready for RPCs.
 	StateActive
-	// StateClosing indicates the session is draining and shutting down. It
-	// covers both the pre-CloseSession drain and the post-CloseSession wait
-	// for the server's EOF.
+	// StateClosing indicates the client has decided to close the session
+	// and is draining outstanding vRPCs before sending CloseSession.
 	StateClosing
+	// StateWaitServerClose indicates the client has sent CloseSession and
+	// is waiting for the server's EOF/trailers to confirm teardown. The
+	// pool's stuck-session monitor force-closes sessions parked here too
+	// long (server lost / silent).
+	StateWaitServerClose
 	// StateClosed indicates the session is closed.
 	StateClosed
 )
@@ -93,6 +97,8 @@ func (s State) String() string {
 		return "Active"
 	case StateClosing:
 		return "Closing"
+	case StateWaitServerClose:
+		return "WaitServerClose"
 	case StateClosed:
 		return "Closed"
 	default:

@@ -170,6 +170,7 @@ func TestState_String(t *testing.T) {
 		{StateStarting, "Starting"},
 		{StateActive, "Active"},
 		{StateClosing, "Closing"},
+		{StateWaitServerClose, "WaitServerClose"},
 		{StateClosed, "Closed"},
 		{State(99), "Unknown"},
 	}
@@ -647,8 +648,12 @@ func TestClose_Graceful_NoInflightSendsCloseRequest(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Close returned error: %v", err)
 	}
-	if got := s.State(); got != StateClosing {
-		t.Errorf("state = %v, want StateClosing", got)
+	// After draining (no in-flight RPCs) and sending CloseSession, the
+	// session advances to WaitServerClose. handleClose (server EOF) would
+	// then move it to Closed; the pool's stuck-session monitor force-closes
+	// it otherwise.
+	if got := s.State(); got != StateWaitServerClose {
+		t.Errorf("state = %v, want StateWaitServerClose", got)
 	}
 	sent := stream.snapshotSent()
 	if len(sent) != 1 || sent[0].GetCloseSession() == nil {
