@@ -265,6 +265,13 @@ func (s *Session) handleSessionRefreshConfig(cfg *spb.SessionRefreshConfig) {
 // handleGoAway transitions to StateClosing and cancels every RPC with an id
 // greater than the last admitted one. A late-arriving GOAWAY from an already
 // terminal session is ignored — we do not move backwards.
+//
+// After cancellation, schedules a deferred teardown: waits for in-flight
+// RPCs to drain (or for a 30s grace period to expire), then ForceCloses.
+// Without this the session can linger in Closing forever — GoAway is a
+// promise the server will admit no more vRPCs, but the server does not
+// always follow up with a stream EOF. Lingering Closing sessions accumulate
+// in the pool, never trigger OnClose, and never increment sessionsClosed.
 func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
 	s.transitionTo(StateClosing, notState(StateClosing, StateClosed))
 	// Stamp the close reason now so the eventual handleClose (when the
@@ -278,6 +285,34 @@ func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
 	err := unavailable(ErrUnavailableGoAway,
 		"vRPC not admitted before GOAWAY (last_admitted=%d)", lastAdmitted)
 	s.cancelActiveRPCs(err, func(id int64) bool { return id > lastAdmitted })
+
+	// Safety net: ensure the session reaches StateClosed and OnClose fires
+	// within a bounded grace period. ForceClose is a no-op if handleClose
+	// (server EOF) gets there first, so this only kicks in when the server
+	// stops talking to us.
+	//
+	// If there are no admitted RPCs still in flight, signal quiescent now
+	// so the wait below short-circuits. (signalQuiescent is normally fired
+	// by the last RPC's cleanup defer; with no RPCs that defer never runs,
+	// and an idle GoAway'd session would otherwise wait the full grace
+	// period for no reason.)
+	s.mu.Lock()
+	idle := len(s.activeRPCs) == 0
+	s.mu.Unlock()
+	if idle {
+		s.signalQuiescent()
+	}
+	go func() {
+		const goAwayGrace = 30 * time.Second
+		select {
+		case <-s.quiescent:
+		case <-time.After(goAwayGrace):
+		}
+		s.ForceClose(&spb.CloseSessionRequest{
+			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_GOAWAY,
+			Description: "client teardown after server GOAWAY",
+		})
+	}()
 }
 
 // handleClose is invoked when Recv returns an error. It transitions to
