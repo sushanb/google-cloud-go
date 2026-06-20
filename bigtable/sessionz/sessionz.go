@@ -534,6 +534,8 @@ tr:hover td{background:#fafafa}
 .state-starting{color:#a07000;font-weight:600}
 .state-closing{color:#a04500;font-weight:600}
 .state-closed{color:#888}
+tr:target td{background:#fff4c2}
+tr:target td:first-child{border-left:3px solid #f0a000}
 a{color:#1a5fb4;text-decoration:none}
 a:hover{text-decoration:underline}
 .summary{margin-bottom:1em;background:#fff;padding:.75em 1em;box-shadow:0 1px 2px rgba(0,0,0,.06)}
@@ -621,7 +623,7 @@ details.msgcell>summary:hover{color:#15498a}
 </tr></thead>
 <tbody>
 {{range .Pool.Sessions}}
-<tr>
+<tr id="session-{{.LogName}}">
 <td class="mono">{{.LogName}}</td>
 <td class="{{stateClass .State}}">{{.State}}</td>
 <td>{{orDash .Peer.TransportType}}</td>

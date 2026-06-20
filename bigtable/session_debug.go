@@ -112,12 +112,21 @@ type ChannelPoolDebug struct {
 	// for the dedicated session pool created when EnableSessionPool is on.
 	Role     string
 	Snapshot btransport.ChannelPoolSnapshot
-	// SessionsByChannel maps a connEntry index to the session log names
-	// currently riding on it. Populated only for the "session" role —
-	// classic-path RPCs aren't associated with any session. nil when no
-	// sessions are linked (e.g. underlying pool isn't a
-	// BigtableChannelPool, so the pick-hint never fired).
-	SessionsByChannel map[int][]string
+	// SessionsByChannel maps a connEntry index to the sessions riding on
+	// it. Populated only for the "session" role — classic-path RPCs aren't
+	// associated with any session. nil when no sessions are linked (e.g.
+	// the underlying pool isn't a BigtableChannelPool, so the pick-hint
+	// never fired). Each SessionRef carries enough identity to deep-link
+	// back into sessionz's pool-detail anchor.
+	SessionsByChannel map[int][]SessionRef
+}
+
+// SessionRef identifies one session for the channelz → sessionz reverse
+// link. PoolName matches the sessionz /pool/{name} URL segment; LogName
+// is the per-session row anchor (id="session-{LogName}") in sessionz.
+type SessionRef struct {
+	PoolName string
+	LogName  string
 }
 
 // ChannelDebug returns a ChannelDebugProvider for this Client. Always
@@ -164,24 +173,29 @@ func bigtableChannelPool(p interface{}) *btransport.BigtableChannelPool {
 }
 
 // sessionsByChannelForSessionPool walks every session pool the
-// SessionManager owns and groups the sessions' log names by their
-// ChannelIndex. Sessions without a valid index (sentinel -1) are skipped.
+// SessionManager owns and groups the sessions by their ChannelIndex.
+// Each entry carries the owning pool name so the channelz template can
+// emit links straight into the matching sessionz pool detail page.
+// Sessions without a valid channel index (sentinel -1) are skipped.
 // Returns nil if no sessions are linked.
-func (a channelDebugAdapter) sessionsByChannelForSessionPool() map[int][]string {
+func (a channelDebugAdapter) sessionsByChannelForSessionPool() map[int][]SessionRef {
 	if a.client.sessionMgr == nil {
 		return nil
 	}
 	pools := a.client.sessionMgr.ManagerSnapshot()
-	var out map[int][]string
+	var out map[int][]SessionRef
 	for _, pool := range pools {
 		for _, s := range pool.Sessions {
 			if s.ChannelIndex < 0 {
 				continue
 			}
 			if out == nil {
-				out = map[int][]string{}
+				out = map[int][]SessionRef{}
 			}
-			out[s.ChannelIndex] = append(out[s.ChannelIndex], s.LogName)
+			out[s.ChannelIndex] = append(out[s.ChannelIndex], SessionRef{
+				PoolName: pool.Name,
+				LogName:  s.LogName,
+			})
 		}
 	}
 	return out

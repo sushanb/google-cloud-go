@@ -144,15 +144,34 @@ var funcs = template.FuncMap{
 		}
 		return ""
 	},
-	"sessionsOn": func(m map[int][]string, idx int) string {
+	"sessionsOn": func(m map[int][]bigtable.SessionRef, idx int) template.HTML {
 		if m == nil {
-			return "—"
+			return template.HTML("—")
 		}
-		names, ok := m[idx]
-		if !ok || len(names) == 0 {
-			return "—"
+		refs, ok := m[idx]
+		if !ok || len(refs) == 0 {
+			return template.HTML("—")
 		}
-		return strings.Join(names, ", ")
+		var b strings.Builder
+		for i, r := range refs {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			poolEsc := template.HTMLEscapeString(r.PoolName)
+			nameEsc := template.HTMLEscapeString(r.LogName)
+			b.WriteString(`<a href="../sessionz/pool/`)
+			b.WriteString(poolEsc)
+			b.WriteString(`#session-`)
+			b.WriteString(nameEsc)
+			b.WriteString(`" title="jump to `)
+			b.WriteString(nameEsc)
+			b.WriteString(` in `)
+			b.WriteString(poolEsc)
+			b.WriteString(`">`)
+			b.WriteString(nameEsc)
+			b.WriteString(`</a>`)
+		}
+		return template.HTML(b.String())
 	},
 	"connStateClass": func(s string) string {
 		switch s {
