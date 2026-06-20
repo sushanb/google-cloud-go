@@ -48,6 +48,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -75,6 +77,7 @@ var (
 	cycle       = flag.Duration("cycle", 60*time.Second, "wave-pattern full cycle period (one low + one high phase). Ignored for -pattern=constant.")
 	waveLow     = flag.Float64("wave-low", 0.1, "wave low-phase multiplier applied to -rps")
 	waveHigh    = flag.Float64("wave-high", 10.0, "wave high-phase multiplier applied to -rps")
+	sessionPool = flag.Bool("session-pool", true, "enable the session-based vRPC transport (true=session path, false=classic ReadRows path)")
 )
 
 func main() {
@@ -89,7 +92,7 @@ func main() {
 
 	cfg := bigtable.ClientConfig{
 		AppProfile:        *appProfile,
-		EnableSessionPool: true,
+		EnableSessionPool: *sessionPool,
 		SessionPoolMin:    *poolMin,
 		SessionPoolMax:    *poolMax,
 	}
@@ -233,6 +236,27 @@ func runLoad(
 	}
 	currentIntervalNanos.Store(int64(intervalFor(rps)))
 
+	// latency ring buffer for client-observed end-to-end latency. Every
+	// worker appends after each call; the periodic logger snapshots the
+	// buffer to compute p50/p95/p99 across both session and classic
+	// paths uniformly.
+	const latencyWindow = 2048
+	var (
+		latMu  sync.Mutex
+		latBuf = make([]time.Duration, 0, latencyWindow)
+		latNxt int
+	)
+	recordLat := func(d time.Duration) {
+		latMu.Lock()
+		if len(latBuf) < latencyWindow {
+			latBuf = append(latBuf, d)
+		} else {
+			latBuf[latNxt] = d
+			latNxt = (latNxt + 1) % latencyWindow
+		}
+		latMu.Unlock()
+	}
+
 	var ok, errs atomic.Int64
 	for i := 0; i < concurrency; i++ {
 		go func() {
@@ -243,8 +267,11 @@ func runLoad(
 				case <-time.After(time.Duration(currentIntervalNanos.Load())):
 				}
 				rctx, rcancel := context.WithTimeout(ctx, 5*time.Second)
+				start := time.Now()
 				_, err := tbl.ReadRow(rctx, rowKey)
+				lat := time.Since(start)
 				rcancel()
+				recordLat(lat)
 				if err != nil {
 					errs.Add(1)
 				} else {
@@ -293,11 +320,30 @@ func runLoad(
 		case <-ctx.Done():
 			return
 		case <-logTicker.C:
-			log.Printf("load so far: ok=%d errors=%d (current interval %v)",
-				ok.Load(), errs.Load(),
-				time.Duration(currentIntervalNanos.Load()))
+			p50, p95, p99, n := latPercentiles(&latMu, &latBuf)
+			log.Printf("load so far: ok=%d errors=%d (interval %v) — p50=%v p95=%v p99=%v (n=%d)",
+				ok.Load(), errs.Load(), time.Duration(currentIntervalNanos.Load()),
+				p50, p95, p99, n)
 		}
 	}
+}
+
+// latPercentiles snapshots and sorts the latency ring buffer, then
+// returns nearest-rank p50/p95/p99 and the sample count.
+func latPercentiles(mu *sync.Mutex, buf *[]time.Duration) (p50, p95, p99 time.Duration, n int) {
+	mu.Lock()
+	snap := make([]time.Duration, len(*buf))
+	copy(snap, *buf)
+	mu.Unlock()
+	if len(snap) == 0 {
+		return 0, 0, 0, 0
+	}
+	sort.Slice(snap, func(i, j int) bool { return snap[i] < snap[j] })
+	idx := func(p float64) time.Duration {
+		i := int(float64(len(snap)-1) * p / 100)
+		return snap[i]
+	}
+	return idx(50), idx(95), idx(99), len(snap)
 }
 
 func phaseLabel(high bool) string {
