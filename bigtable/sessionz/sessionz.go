@@ -654,7 +654,8 @@ details.msgcell>summary:hover{color:#15498a}
 <span><b>Creation budget</b> {{.Pool.Throttler.InUse}} / {{.Pool.Throttler.Capacity}} (penalty {{dur .Pool.Throttler.PenaltyDuration}})</span>
 </div>
 <div class="summary">
-<span><b>BackendLatency</b> p50 {{dur .Pool.LatencyP50}} · p95 {{dur .Pool.LatencyP95}} · p99 {{dur .Pool.LatencyP99}} <span class="mono">(n={{.Pool.LatencyN}})</span></span>
+<span title="end-to-end wall-clock observed by SessionPoolImpl.Invoke — includes vrpcSem queue wait + network + decode + Backend"><b>TotalLatency</b> p50 {{dur .Pool.TotalLatencyP50}} · p95 {{dur .Pool.TotalLatencyP95}} · p99 {{dur .Pool.TotalLatencyP99}} <span class="mono">(n={{.Pool.TotalLatencyN}})</span></span>
+<span title="server-reported SessionRequestStats.BackendLatency — pure server processing time"><b>BackendLatency</b> p50 {{dur .Pool.LatencyP50}} · p95 {{dur .Pool.LatencyP95}} · p99 {{dur .Pool.LatencyP99}} <span class="mono">(n={{.Pool.LatencyN}})</span></span>
 {{if .Pool.TimeSeries}}
 <span><b>sessions</b> {{sparkline 120 28 "#1a5fb4" (sessionsSeries .Pool.TimeSeries)}}</span>
 <span><b>ok/s</b> {{sparkline 120 28 "#197a1f" (okSeries .Pool.TimeSeries)}}</span>

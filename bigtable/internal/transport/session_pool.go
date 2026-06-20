@@ -1064,6 +1064,10 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 
 	result, invokeErr := sh.session.Invoke(ctx, desc, req)
 	latency := time.Since(start)
+	// Record end-to-end wall-clock latency on the session's ring buffer
+	// so the pool snapshot can render p50/p95/p99 next to the
+	// server-reported BackendLatency percentiles.
+	sh.session.recordTotalLatency(latency)
 	if latency > p.slowThreshold() {
 		ev := SlowVRpcEvent{
 			At:             start,

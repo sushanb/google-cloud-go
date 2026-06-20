@@ -237,6 +237,14 @@ type Session struct {
 	latencyMu      sync.Mutex
 	latencySamples []time.Duration
 	latencyNext    int // next write index when ring is full
+	// totalLatencyMu / totalLatencySamples mirror the above but for the
+	// END-TO-END wall-clock latency a caller observes from SessionPoolImpl.
+	// Invoke — i.e. includes vrpcSem queue wait, network, decode. Lets
+	// the debug UI show client-observed p50/p95/p99 next to the
+	// server-reported BackendLatency for direct comparison.
+	totalLatencyMu      sync.Mutex
+	totalLatencySamples []time.Duration
+	totalLatencyNext    int
 
 	// clusterCounts tallies per-ClusterInformation.ClusterId responses.
 	// Lock-free reads via sync.Map; values are *atomic.Int64. The set of
@@ -276,6 +284,33 @@ func (s *Session) snapshotLatencies() []time.Duration {
 	out := make([]time.Duration, len(s.latencySamples))
 	copy(out, s.latencySamples)
 	s.latencyMu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// recordTotalLatency appends an end-to-end wall-clock sample (as observed
+// by the caller of SessionPoolImpl.Invoke) to the per-session ring buffer.
+// Same shape as recordLatency — single mutex acquire, fixed-size slice.
+func (s *Session) recordTotalLatency(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	s.totalLatencyMu.Lock()
+	if len(s.totalLatencySamples) < latencyWindow {
+		s.totalLatencySamples = append(s.totalLatencySamples, d)
+	} else {
+		s.totalLatencySamples[s.totalLatencyNext] = d
+		s.totalLatencyNext = (s.totalLatencyNext + 1) % latencyWindow
+	}
+	s.totalLatencyMu.Unlock()
+}
+
+// snapshotTotalLatencies returns a sorted copy of the total-latency ring.
+func (s *Session) snapshotTotalLatencies() []time.Duration {
+	s.totalLatencyMu.Lock()
+	out := make([]time.Duration, len(s.totalLatencySamples))
+	copy(out, s.totalLatencySamples)
+	s.totalLatencyMu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
 }
