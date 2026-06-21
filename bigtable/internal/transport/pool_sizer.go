@@ -57,10 +57,21 @@ type PoolSizer struct {
 	// (i.e. asked to grow the pool). Scale-down is suppressed for
 	// downscaleCooldown after this — the just-launched sessions need a
 	// chance to land and absorb the next wave before we kill them.
-	// Without this, instantaneous in-use dips between heartbeats let
-	// the sizer prune sessions whose handshake is still in flight,
-	// driving the per-second 5↔9 oscillation we observed.
 	lastScaleUp time.Time
+
+	// inUseHist is a ring of recent (timestamp, in_use+effectivePending)
+	// samples used to compute the peak working set over peakInUseWindow.
+	// Scale-DOWN reads the peak instead of the snapshot — without it,
+	// a single momentary dip between bursts is enough to prune a pile
+	// of sessions that would be needed again 300ms later. Scale-UP
+	// continues to read the snapshot so we react fast to genuine
+	// shortages. Net: "fast up, slow down" hysteresis.
+	inUseHist []inUseSample
+}
+
+type inUseSample struct {
+	at    time.Time
+	value int // InUseCount + EffectivePending — the "active work" the sizer cares about
 }
 
 const (
@@ -71,6 +82,15 @@ const (
 	// sessions get to serve at least one wave before being eligible
 	// for pruning.
 	downscaleCooldown = 5 * time.Second
+	// peakInUseWindow is how far back the sizer looks when computing the
+	// "peak working set" used for scale-down decisions. Set wide enough
+	// to span a typical wave-shaped traffic cycle (LOW + HIGH phases),
+	// so transient troughs inside a cycle don't trigger pruning.
+	peakInUseWindow = 30 * time.Second
+	// maxInUseSamples caps the in-use history ring. At the 1-Hz heartbeat
+	// plus event-driven CheckoutSession kicks, ~120 samples is plenty
+	// to cover peakInUseWindow even when load is bursty.
+	maxInUseSamples = 128
 )
 
 // NewPoolSizer creates a new PoolSizer.
@@ -121,20 +141,28 @@ type ScaleDecision struct {
 	MinIdleSessions int
 
 	// Intermediates
-	EffectivePending  int     // ceil(PendingCount / NewSessionQLen)
-	SessionsInUse     int     // InUseCount + EffectivePending
-	IdleHeadroom      int     // max(MinIdleSessions, ceil(SessionsInUse * HeadroomPct))
-	DesiredRaw        int     // SessionsInUse + IdleHeadroom (pre-clamp)
-	DesiredCapacity   int     // clamped to [MinSessions, MaxSessions]
-	ImmediateCapacity int     // ReadyCount
-	EventualCapacity  int     // ReadyCount + StartingCount
+	EffectivePending  int // ceil(PendingCount / NewSessionQLen)
+	SessionsInUse     int // InUseCount + EffectivePending
+	IdleHeadroom      int // max(MinIdleSessions, ceil(SessionsInUse * HeadroomPct))
+	DesiredRaw        int // SessionsInUse + IdleHeadroom (pre-clamp)
+	DesiredCapacity   int // clamped to [MinSessions, MaxSessions] — used for SCALE-UP
+	ImmediateCapacity int // ReadyCount
+	EventualCapacity  int // ReadyCount + StartingCount
+
+	// Scale-down inputs — derived from peak-over-window, not snapshot.
+	// PeakWorkingSet is max(InUseCount + EffectivePending) over
+	// peakInUseWindow. DesiredCapacityDown is the corresponding desired
+	// pool size. Only used by the scale-down branch — keeps that
+	// decision smoothed across wave troughs.
+	PeakWorkingSet      int
+	DesiredCapacityDown int
 
 	// Final decision
-	Delta              int           // what GetScaleDelta returns
-	WouldDelta         int           // what Delta would have been without cooldown
-	CooldownActive     bool          // true iff downscale was suppressed
-	CooldownRemaining  time.Duration // time left in the cooldown window
-	Branch             string        // "scale-up" | "scale-down" | "suppressed" | "dead-band" | "no-stats"
+	Delta             int           // what GetScaleDelta returns
+	WouldDelta        int           // what Delta would have been without cooldown
+	CooldownActive    bool          // true iff downscale was suppressed
+	CooldownRemaining time.Duration // time left in the cooldown window
+	Branch            string        // "scale-up" | "scale-down" | "suppressed" | "dead-band" | "no-stats"
 }
 
 // GetScaleDelta evaluates the current statistics and calculates the required scaling delta.
@@ -180,6 +208,12 @@ func (s *PoolSizer) Decide() ScaleDecision {
 	d.EffectivePending = int(math.Ceil(float64(stats.PendingCount) / float64(divisor)))
 	d.SessionsInUse = stats.InUseCount + d.EffectivePending
 
+	// Sample the current working set into the sliding-window ring and
+	// compute the peak we'll use for scale-DOWN decisions.
+	now := time.Now()
+	s.recordInUseLocked(d.SessionsInUse, now)
+	d.PeakWorkingSet = s.peakInUseLocked(now)
+
 	// Idle headroom as a fraction of in-use, FLOORED so a brief in-use
 	// dip can't collapse the cushion to zero.
 	d.IdleHeadroom = int(math.Ceil(float64(d.SessionsInUse) * s.headroomPct))
@@ -188,13 +222,17 @@ func (s *PoolSizer) Decide() ScaleDecision {
 	}
 	d.DesiredRaw = d.SessionsInUse + d.IdleHeadroom
 
-	d.DesiredCapacity = d.DesiredRaw
-	if d.DesiredCapacity < s.minSessions {
-		d.DesiredCapacity = s.minSessions
+	// Scale-UP desired uses the current snapshot — keeps reaction fast.
+	d.DesiredCapacity = clamp(d.DesiredRaw, s.minSessions, s.maxSessions)
+
+	// Scale-DOWN desired uses the windowed peak — keeps reaction slow.
+	// Headroom rides on the peak too, so the dead band tracks the
+	// actual wave amplitude rather than the trough.
+	downIdle := int(math.Ceil(float64(d.PeakWorkingSet) * s.headroomPct))
+	if downIdle < s.minIdleSessions {
+		downIdle = s.minIdleSessions
 	}
-	if d.DesiredCapacity > s.maxSessions {
-		d.DesiredCapacity = s.maxSessions
-	}
+	d.DesiredCapacityDown = clamp(d.PeakWorkingSet+downIdle, s.minSessions, s.maxSessions)
 
 	d.ImmediateCapacity = stats.ReadyCount
 	d.EventualCapacity = stats.ReadyCount + stats.StartingCount
@@ -203,14 +241,14 @@ func (s *PoolSizer) Decide() ScaleDecision {
 		d.Delta = d.DesiredCapacity - d.EventualCapacity
 		d.WouldDelta = d.Delta
 		d.Branch = "scale-up"
-		s.lastScaleUp = time.Now()
+		s.lastScaleUp = now
 		return d
 	}
-	if d.DesiredCapacity < d.ImmediateCapacity {
-		raw := d.DesiredCapacity - d.ImmediateCapacity
+	if d.DesiredCapacityDown < d.ImmediateCapacity {
+		raw := d.DesiredCapacityDown - d.ImmediateCapacity
 		d.WouldDelta = raw
 		if !s.lastScaleUp.IsZero() {
-			elapsed := time.Since(s.lastScaleUp)
+			elapsed := now.Sub(s.lastScaleUp)
 			if elapsed < downscaleCooldown {
 				d.CooldownActive = true
 				d.CooldownRemaining = downscaleCooldown - elapsed
@@ -225,4 +263,48 @@ func (s *PoolSizer) Decide() ScaleDecision {
 	}
 	d.Branch = "dead-band"
 	return d
+}
+
+// recordInUseLocked appends a sample, drops any older than peakInUseWindow,
+// and caps the ring at maxInUseSamples. Caller holds s.mu.
+func (s *PoolSizer) recordInUseLocked(value int, now time.Time) {
+	cutoff := now.Add(-peakInUseWindow)
+	// Drop expired prefix.
+	i := 0
+	for i < len(s.inUseHist) && s.inUseHist[i].at.Before(cutoff) {
+		i++
+	}
+	if i > 0 {
+		s.inUseHist = s.inUseHist[i:]
+	}
+	s.inUseHist = append(s.inUseHist, inUseSample{at: now, value: value})
+	if len(s.inUseHist) > maxInUseSamples {
+		s.inUseHist = s.inUseHist[len(s.inUseHist)-maxInUseSamples:]
+	}
+}
+
+// peakInUseLocked returns max(value) across samples within peakInUseWindow.
+// Caller holds s.mu.
+func (s *PoolSizer) peakInUseLocked(now time.Time) int {
+	cutoff := now.Add(-peakInUseWindow)
+	peak := 0
+	for _, sm := range s.inUseHist {
+		if sm.at.Before(cutoff) {
+			continue
+		}
+		if sm.value > peak {
+			peak = sm.value
+		}
+	}
+	return peak
+}
+
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }

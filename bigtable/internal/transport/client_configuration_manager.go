@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 const MinPollingInterval = 1 * time.Minute
@@ -339,14 +340,61 @@ func (m *ClientConfigurationManager) addListener(listener configListener) func()
 }
 
 // AddSessionPoolListener registers a callback that receives raw SessionPoolConfiguration updates.
+//
+// Forwards EVERY field of the parsed sessionPoolConfig — not just the size
+// bounds. Before this, Headroom, NewSessionQueueLength, and the entire
+// LoadBalancingOptions oneof were silently dropped, so the pool ran with
+// the constructor defaults (headroomPct=0 after UpdateConfig overwrote the
+// 0.10 default; picker locked to whatever NewSessionPoolImpl chose) no matter
+// what the control plane sent.
 func (m *ClientConfigurationManager) AddSessionPoolListener(listener func(*bigtablepb.SessionClientConfiguration_SessionPoolConfiguration)) func() {
 	return m.addListener(func(cfg clientConfig, seq int64) {
+		sp := cfg.Session.SessionPool
 		spCfg := &bigtablepb.SessionClientConfiguration_SessionPoolConfiguration{
-			MinSessionCount: int32(cfg.Session.SessionPool.MinSessionCount),
-			MaxSessionCount: int32(cfg.Session.SessionPool.MaxSessionCount),
+			Headroom:                           sp.Headroom,
+			MinSessionCount:                    int32(sp.MinSessionCount),
+			MaxSessionCount:                    int32(sp.MaxSessionCount),
+			NewSessionCreationBudget:           int32(sp.NewSessionCreationBudget),
+			ConsecutiveSessionFailureThreshold: int32(sp.ConsecutiveSessionFailureThreshold),
+			NewSessionQueueLength:              int32(sp.NewSessionQueueLength),
 		}
+		if sp.NewSessionCreationPenalty > 0 {
+			spCfg.NewSessionCreationPenalty = durationpb.New(sp.NewSessionCreationPenalty)
+		}
+		spCfg.LoadBalancingOptions = encodeLoadBalancing(sp.LoadBalancing)
 		listener(spCfg)
 	})
+}
+
+// encodeLoadBalancing converts the parsed loadBalancingOptions back into the
+// proto LoadBalancingOptions oneof so downstream consumers (PoolSizer,
+// SessionPoolImpl.UpdateConfig) see the same value the control plane sent.
+func encodeLoadBalancing(lb loadBalancingOptions) *bigtablepb.LoadBalancingOptions {
+	switch lb.Strategy {
+	case StrategyRandom:
+		return &bigtablepb.LoadBalancingOptions{
+			LoadBalancingStrategy: &bigtablepb.LoadBalancingOptions_Random_{
+				Random: &bigtablepb.LoadBalancingOptions_Random{},
+			},
+		}
+	case StrategyLeastInFlight:
+		return &bigtablepb.LoadBalancingOptions{
+			LoadBalancingStrategy: &bigtablepb.LoadBalancingOptions_LeastInFlight_{
+				LeastInFlight: &bigtablepb.LoadBalancingOptions_LeastInFlight{
+					RandomSubsetSize: int64(lb.RandomSubsetSize),
+				},
+			},
+		}
+	case StrategyPeakEwma:
+		return &bigtablepb.LoadBalancingOptions{
+			LoadBalancingStrategy: &bigtablepb.LoadBalancingOptions_PeakEwma_{
+				PeakEwma: &bigtablepb.LoadBalancingOptions_PeakEwma{
+					RandomSubsetSize: int64(lb.RandomSubsetSize),
+				},
+			},
+		}
+	}
+	return nil
 }
 
 // AddSessionLoadListener registers a callback that receives the server-driven

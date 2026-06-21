@@ -795,6 +795,7 @@ Low <b>RpcID</b> + small <b>SessionAge</b> → fresh session warm-up cost.
 <th>Branch</th>
 <th class="num" title="Stats at decision time: ready/starting/in-use/pending(waiters)">R/S/U/P</th>
 <th class="num" title="Sizer intermediates: effective-pending / sessions-in-use / idle-cushion / desired-capacity">eP/sU/idle/desired</th>
+<th class="num" title="Scale-down inputs: peak working set over 30s window / desired-capacity-down. Scale-down only fires when desiredDown < immediate.">peak/desiredDown</th>
 <th class="num" title="Immediate vs eventual capacity (ready vs ready+starting)">imm/evt</th>
 <th>Cooldown</th>
 <th>Reason</th>
@@ -808,8 +809,9 @@ Low <b>RpcID</b> + small <b>SessionAge</b> → fresh session warm-up cost.
 <td class="num">{{scalingOutcome .}}</td>
 <td class="mono" title="scale-up | scale-down | suppressed | dead-band | no-stats">{{.Decision.Branch}}</td>
 <td class="num mono" title="ready={{.Decision.ReadyCount}}&#10;starting={{.Decision.StartingCount}}&#10;in_use={{.Decision.InUseCount}}&#10;pending(waiters)={{.Decision.PendingCount}}">{{.Decision.ReadyCount}}/{{.Decision.StartingCount}}/{{.Decision.InUseCount}}/{{.Decision.PendingCount}}</td>
-<td class="num mono" title="effectivePending = ceil(pending/{{.Decision.NewSessionQLen}}) = {{.Decision.EffectivePending}}&#10;sessionsInUse = inUse + effPending = {{.Decision.SessionsInUse}}&#10;idle = max(minIdle={{.Decision.MinIdleSessions}}, ceil(sessionsInUse*{{.Decision.HeadroomPct}})) = {{.Decision.IdleHeadroom}}&#10;desired = clamp(sessionsInUse+idle, min={{.Decision.MinSessions}}, max={{.Decision.MaxSessions}}) = {{.Decision.DesiredCapacity}}">{{.Decision.EffectivePending}}/{{.Decision.SessionsInUse}}/{{.Decision.IdleHeadroom}}/{{.Decision.DesiredCapacity}}</td>
-<td class="num mono" title="immediate = ready ({{.Decision.ImmediateCapacity}})&#10;eventual = ready + starting ({{.Decision.EventualCapacity}})&#10;Scale up if desired>eventual; scale down if desired<immediate; dead-band otherwise.">{{.Decision.ImmediateCapacity}}/{{.Decision.EventualCapacity}}</td>
+<td class="num mono" title="effectivePending = ceil(pending/{{.Decision.NewSessionQLen}}) = {{.Decision.EffectivePending}}&#10;sessionsInUse = inUse + effPending = {{.Decision.SessionsInUse}}&#10;idle = max(minIdle={{.Decision.MinIdleSessions}}, ceil(sessionsInUse*{{.Decision.HeadroomPct}})) = {{.Decision.IdleHeadroom}}&#10;desiredUp = clamp(sessionsInUse+idle, min={{.Decision.MinSessions}}, max={{.Decision.MaxSessions}}) = {{.Decision.DesiredCapacity}}">{{.Decision.EffectivePending}}/{{.Decision.SessionsInUse}}/{{.Decision.IdleHeadroom}}/{{.Decision.DesiredCapacity}}</td>
+<td class="num mono" title="peakWorkingSet = max(sessionsInUse) over last 30s = {{.Decision.PeakWorkingSet}}&#10;desiredDown = clamp(peak + ceil(peak*headroom), min, max) = {{.Decision.DesiredCapacityDown}}&#10;Scale-down only fires when desiredDown < immediate ({{.Decision.ImmediateCapacity}}).">{{.Decision.PeakWorkingSet}}/{{.Decision.DesiredCapacityDown}}</td>
+<td class="num mono" title="immediate = ready ({{.Decision.ImmediateCapacity}})&#10;eventual = ready + starting ({{.Decision.EventualCapacity}})&#10;Scale up if desiredUp>eventual; scale down if desiredDown<immediate; dead-band otherwise.">{{.Decision.ImmediateCapacity}}/{{.Decision.EventualCapacity}}</td>
 <td class="mono" title="When active, downscale is suppressed for the remaining duration. wouldDelta is what the sizer would have returned without the cooldown.">{{if .Decision.CooldownActive}}<span style="color:#a60">{{dur .Decision.CooldownRemaining}} (would={{signed .Decision.WouldDelta}})</span>{{else}}—{{end}}</td>
 <td>{{.Reason}}</td>
 </tr>

@@ -892,7 +892,8 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 	// in the log.
 	fmt.Printf(">>> POOL %s SIZER branch=%s delta=%d would=%d "+
 		"ready=%d starting=%d in_use=%d pending=%d "+
-		"effPending=%d sessionsInUse=%d idle=%d desired=%d "+
+		"effPending=%d sessionsInUse=%d idle=%d desiredUp=%d "+
+		"peak30s=%d desiredDown=%d "+
 		"immediate=%d eventual=%d "+
 		"cfg{min=%d max=%d head=%.2f nsql=%d minIdle=%d} "+
 		"cooldown=%v(remain=%v) "+
@@ -900,6 +901,7 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 		p.poolName, decision.Branch, decision.Delta, decision.WouldDelta,
 		decision.ReadyCount, decision.StartingCount, decision.InUseCount, decision.PendingCount,
 		decision.EffectivePending, decision.SessionsInUse, decision.IdleHeadroom, decision.DesiredCapacity,
+		decision.PeakWorkingSet, decision.DesiredCapacityDown,
 		decision.ImmediateCapacity, decision.EventualCapacity,
 		decision.MinSessions, decision.MaxSessions, decision.HeadroomPct, decision.NewSessionQLen, decision.MinIdleSessions,
 		decision.CooldownActive, decision.CooldownRemaining,
