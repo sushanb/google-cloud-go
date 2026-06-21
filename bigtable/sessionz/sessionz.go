@@ -238,6 +238,21 @@ var funcs = template.FuncMap{
 		}
 		return out
 	},
+	"eventKindClass": func(k string) string {
+		// Color-code event severity so close/missed pop visually amongst
+		// the (usually less alarming) hb-alive / ctx-done entries.
+		switch k {
+		case "close":
+			return "evt-close"
+		case "hb-missed":
+			return "evt-missed"
+		case "ctx-done":
+			return "evt-ctxdone"
+		case "hb-alive":
+			return "evt-alive"
+		}
+		return ""
+	},
 	"latencyClass": func(d time.Duration) string {
 		// Color-code latency severity so spikes pop visually.
 		switch {
@@ -607,6 +622,10 @@ tr:target td:first-child{border-left:3px solid #f0a000}
 .lat-amber{background:#fff7d6;color:#7a5a00;font-weight:600}
 .lat-orange{background:#ffe0c2;color:#a04500;font-weight:600}
 .lat-red{background:#ffd0d0;color:#922;font-weight:700}
+.evt-close{background:#ffd0d0;color:#922;font-weight:700}
+.evt-missed{background:#ffe0c2;color:#a04500;font-weight:600}
+.evt-ctxdone{background:#fff7d6;color:#7a5a00;font-weight:600}
+.evt-alive{background:#eaf3ff;color:#1a5fb4;font-weight:600}
 a{color:#1a5fb4;text-decoration:none}
 a:hover{text-decoration:underline}
 .summary{margin-bottom:1em;background:#fff;padding:.75em 1em;box-shadow:0 1px 2px rgba(0,0,0,.06)}
@@ -747,6 +766,31 @@ details.msgcell>summary:hover{color:#15498a}
 <div style="font-size:.78em;color:#888;margin-top:.3em">
 Captures the lifetime (admission → retirement) of the most recent {{.Pool.LifetimeN}} closed sessions.
 A spike in the &lt;1m bucket indicates churn (sessions dying young — usually GoAway / Heartbeat / Error).
+</div>
+{{end}}
+
+{{if .Pool.RecentEvents}}
+<h3 style="font-size:1em;margin:1.4em 0 .4em 0;color:#444">Recent session events (last {{len .Pool.RecentEvents}}, newest first)</h3>
+<table>
+<thead><tr>
+<th>When</th><th>Kind</th><th>Session</th><th>Detail</th>
+</tr></thead>
+<tbody>
+{{range .Pool.RecentEvents}}
+<tr>
+<td>{{age .At}} ago</td>
+<td class="mono {{eventKindClass .Kind}}">{{.Kind}}</td>
+<td class="mono">{{.Session}}</td>
+<td class="mono" style="white-space:pre-wrap;word-break:break-all">{{.Message}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+<div style="font-size:.78em;color:#888;margin-top:.3em">
+<b>close</b> — stream tear-down handled by readLoop's Recv error path (raw_err shows the gRPC status).
+<b>hb-missed</b> — heartbeat watchdog fired ForceClose; "case 2" half-dead Recv.
+<b>hb-alive</b> — timer tick saw in-flight RPCs AND a recent frame had already pushed the deadline (≥1 interval); "case 1" server kept stream alive but specific vRPC response may be stalled.
+<b>ctx-done</b> — Session.Invoke's per-attempt wait was killed by caller ctx (deadline or cancel); often paired with a 5s row in the slow-vRPC table.
 </div>
 {{end}}
 

@@ -115,6 +115,11 @@ type SessionSnapshot struct {
 	HasRefreshConfig  bool
 	Peer              PeerInfoSnapshot
 	Handle            SessionHandleSnapshot
+	// RecentEvents is the per-session debug-event ring buffer (close,
+	// heartbeat-missed, heartbeat-alive while in-flight, ctx-done). Capped
+	// at maxSessionEvents and ordered oldest-first. Empty for healthy
+	// long-lived sessions.
+	RecentEvents []SessionEvent
 }
 
 // PeerInfoSnapshot is a JSON-friendly mirror of the relevant fields of
@@ -190,7 +195,13 @@ type PoolSnapshot struct {
 	TotalLatencyP99 time.Duration
 	TotalLatencyN   int
 	SlowVRpcs       []SlowVRpcEvent
-	TimeSeries      []TimeSeriesSample
+	// RecentEvents is the pool-wide merge of every session's RecentEvents,
+	// sorted newest-first and capped at maxPoolRecentEvents. Lets the
+	// sessionz UI render a single timeline of session-lifecycle anomalies
+	// (closes, missed heartbeats, ctx-done stalls) without scrolling
+	// through every session row.
+	RecentEvents []PoolSessionEvent
+	TimeSeries   []TimeSeriesSample
 	// Session-lifetime distribution (built from the pool's lifetime ring
 	// buffer of completed sessions). LifetimeHistogram is the bucket-label
 	// → count list in the order defined by LifetimeBuckets; percentile
@@ -207,6 +218,21 @@ type LifetimeBucketCount struct {
 	Label string
 	Count int
 }
+
+// PoolSessionEvent is a SessionEvent tagged with the originating session's
+// LogName so the pool-level merged timeline in sessionz can attribute each
+// entry without nesting.
+type PoolSessionEvent struct {
+	At      time.Time
+	Kind    string
+	Session string
+	Message string
+}
+
+// maxPoolRecentEvents caps the merged pool-level event timeline so the
+// sessionz render stays bounded under high churn. Roughly ~2x the per-
+// session cap times a small handful of misbehaving sessions.
+const maxPoolRecentEvents = 200
 
 // OpenRequestSnapshot is the JSON-friendly form of the OpenSessionRequest.
 // PayloadType names the inner-message kind ("OpenTable",
@@ -262,6 +288,7 @@ func (s *Session) Snapshot() SessionSnapshot {
 		NextHeartbeat:     nextHb,
 		HasRefreshConfig:  hasRefresh,
 		Peer:              peerInfoToSnapshot(peer),
+		RecentEvents:      s.snapshotEvents(),
 	}
 }
 
@@ -392,6 +419,25 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 		}
 		combinedLatencies = append(combinedLatencies, sh.session.snapshotLatencies()...)
 		combinedTotalLatencies = append(combinedTotalLatencies, sh.session.snapshotTotalLatencies()...)
+		// Merge per-session debug events into the pool-wide timeline,
+		// tagging each with the originating session log name so the UI
+		// can attribute them without nesting per-session rows.
+		for _, ev := range s.RecentEvents {
+			snap.RecentEvents = append(snap.RecentEvents, PoolSessionEvent{
+				At:      ev.At,
+				Kind:    ev.Kind,
+				Session: s.LogName,
+				Message: ev.Message,
+			})
+		}
+	}
+	// Newest-first, then cap to maxPoolRecentEvents. Stable sort so events
+	// recorded in the same instant keep their per-session ordering.
+	sort.SliceStable(snap.RecentEvents, func(i, j int) bool {
+		return snap.RecentEvents[i].At.After(snap.RecentEvents[j].At)
+	})
+	if len(snap.RecentEvents) > maxPoolRecentEvents {
+		snap.RecentEvents = snap.RecentEvents[:maxPoolRecentEvents]
 	}
 	if len(stateCounts) > 0 {
 		snap.StateCounts = stateCounts

@@ -17,6 +17,7 @@ package internal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sort"
 	"sync"
@@ -256,6 +257,67 @@ type Session struct {
 	// the underlying pool isn't a BigtableChannelPool (e.g. test setups
 	// using option.WithGRPCConn) or when the pick wasn't observed.
 	channelIndex atomic.Int32
+
+	// eventsMu guards the per-session debug-event ring buffer surfaced in
+	// sessionz. Sized small (maxSessionEvents) so the snapshot copy stays
+	// cheap and the UI render isn't drowned by a runaway session.
+	eventsMu sync.Mutex
+	events   []SessionEvent
+}
+
+// SessionEvent is one entry in a session's per-session debug ring buffer.
+// Surfaced through SessionSnapshot.RecentEvents and merged across all
+// sessions into PoolSnapshot.RecentEvents for the sessionz UI.
+//
+// Kinds in use:
+//
+//	"close"     — stream tear-down handled by handleClose; Message carries
+//	              reason, age, in-flight count, last rpc id, raw err.
+//	"hb-missed" — heartbeat watchdog fired ForceClose; Message carries
+//	              in-flight count and last-frame age.
+//	"hb-alive"  — heartbeat tick observed in-flight RPC(s) while a recent
+//	              frame had already pushed the deadline; useful for spotting
+//	              "server kept stream alive but lost specific vRPC response"
+//	              stalls. Suppressed (not recorded) unless lastFrameAge is
+//	              at least one heartbeat interval to avoid log noise.
+//	"ctx-done"  — Session.Invoke's per-attempt wait was killed by the
+//	              caller's context (deadline or cancel); Message carries
+//	              method, rpc id, time waited, ctx err, session state.
+type SessionEvent struct {
+	At      time.Time
+	Kind    string
+	Message string
+}
+
+const maxSessionEvents = 32
+
+// recordEvent appends a SessionEvent to the per-session ring buffer. Cheap
+// (single mutex + bounded slice); safe to call from any goroutine including
+// readLoop and heartBeatLoop.
+func (s *Session) recordEvent(kind, format string, args ...interface{}) {
+	ev := SessionEvent{
+		At:      time.Now(),
+		Kind:    kind,
+		Message: fmt.Sprintf(format, args...),
+	}
+	s.eventsMu.Lock()
+	if len(s.events) >= maxSessionEvents {
+		copy(s.events, s.events[1:])
+		s.events = s.events[:len(s.events)-1]
+	}
+	s.events = append(s.events, ev)
+	s.eventsMu.Unlock()
+}
+
+// snapshotEvents returns a copy of the session's debug-event ring buffer
+// (oldest first). Allocation-friendly: single mutex acquire over a
+// bounded-size slice.
+func (s *Session) snapshotEvents() []SessionEvent {
+	s.eventsMu.Lock()
+	out := make([]SessionEvent, len(s.events))
+	copy(out, s.events)
+	s.eventsMu.Unlock()
+	return out
 }
 
 const latencyWindow = 256

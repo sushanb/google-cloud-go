@@ -1235,7 +1235,20 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 			ev.SessionAge = start.Sub(openedAt)
 		}
 		if invokeErr != nil {
-			ev.ErrCode = status.Code(invokeErr).String()
+			// Standard library context errors don't implement GRPCStatus(),
+			// so status.Code falls through to Unknown — which mislabels
+			// deadline-fire rows in the slow-vRPC table. Classify them
+			// explicitly so the operator sees the real reason.
+			switch {
+			case errors.Is(invokeErr, context.DeadlineExceeded):
+				ev.ErrCode = "DeadlineExceeded"
+			case errors.Is(invokeErr, context.Canceled):
+				ev.ErrCode = "Canceled"
+			default:
+				ev.ErrCode = status.Code(invokeErr).String()
+			}
+			fmt.Printf(">>> POOL %s slow vRPC failed method=%s session=%s rpc_id=%d code=%s latency=%v session_age=%v backend=%v raw_err=%v <<<\n",
+				p.poolName, ev.Method, ev.Session, ev.RpcIDOnSession, ev.ErrCode, ev.Latency, ev.SessionAge, ev.BackendLatency, invokeErr)
 		}
 		p.recordSlowVRpc(ev)
 	}

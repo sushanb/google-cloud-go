@@ -335,7 +335,20 @@ func (s *Session) handleClose(err error) {
 	if _, ok := s.transitionTo(StateClosed, notState(StateClosed)); !ok {
 		return
 	}
-	s.setCloseReason(streamEndReason(err))
+	reason := streamEndReason(err)
+	s.setCloseReason(reason)
+	s.mu.Lock()
+	inFlight := len(s.activeRPCs)
+	s.mu.Unlock()
+	age := time.Duration(0)
+	if openedAt := s.OpenedAt(); !openedAt.IsZero() {
+		age = time.Since(openedAt)
+	}
+	lastRPC := s.nextRPCID.Load()
+	fmt.Printf(">>> SESSION %s handleClose reason=%s age=%v in_flight=%d last_rpc_id=%d raw_err=%v <<<\n",
+		s.logName, reason, age, inFlight, lastRPC, err)
+	s.recordEvent("close", "reason=%s age=%v in_flight=%d last_rpc_id=%d raw_err=%v",
+		reason, age, inFlight, lastRPC, err)
 	s.cancelActiveRPCs(unavailable(err, "session closed: %v", err), nil)
 	s.signalQuiescent()
 	s.notifyClosed(err)
@@ -416,6 +429,9 @@ func (s *Session) heartBeatLoop(ctx context.Context) {
 			active := len(s.activeRPCs)
 			remaining := time.Until(s.nextHeartbeatDeadline)
 			interval := s.heartbeatInterval
+			// last-frame age = (deadline - now) inverted into "how long
+			// since the last frame extended us" = 3*interval - remaining.
+			lastFrameAge := 3*interval - remaining
 			s.mu.Unlock()
 
 			if active == 0 {
@@ -426,9 +442,28 @@ func (s *Session) heartBeatLoop(ctx context.Context) {
 			}
 			if remaining > 0 {
 				// Deadline was pushed out while we were sleeping; re-arm.
+				// Log so we can see heartbeats (or other frames) keeping
+				// the session alive while specific in-flight vRPCs stall —
+				// that's the "case 1" signal vs. half-dead Recv (case 2).
+				fmt.Printf(">>> SESSION %s heartbeat tick alive in_flight=%d last_frame_age=%v remaining=%v interval=%v <<<\n",
+					s.logName, active, lastFrameAge, remaining, interval)
+				// Only record when last_frame_age has crossed one interval —
+				// otherwise every healthy session would spam the UI ring
+				// buffer ~3x/second and drown out close/missed events.
+				if lastFrameAge >= interval {
+					s.recordEvent("hb-alive", "in_flight=%d last_frame_age=%v remaining=%v interval=%v",
+						active, lastFrameAge, remaining, interval)
+				}
 				timer.Reset(remaining)
 				continue
 			}
+			// active > 0 and deadline elapsed — half-dead stream (no frames
+			// arriving while we have in-flight work). Log before ForceClose
+			// so we have a definitive marker even if downstream cancel races.
+			fmt.Printf(">>> SESSION %s heartbeat MISSED — forcing close in_flight=%d last_frame_age=%v interval=%v <<<\n",
+				s.logName, active, lastFrameAge, interval)
+			s.recordEvent("hb-missed", "in_flight=%d last_frame_age=%v interval=%v",
+				active, lastFrameAge, interval)
 			s.ForceClose(&spb.CloseSessionRequest{
 				Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_MISSED_HEARTBEAT,
 				Description: "client terminated session due to missed server heartbeats",
