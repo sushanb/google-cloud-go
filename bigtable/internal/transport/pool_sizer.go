@@ -101,16 +101,75 @@ func (s *PoolSizer) UpdateConfig(config *spb.SessionClientConfiguration_SessionP
 	}
 }
 
-// GetScaleDelta evaluates the current statistics and calculates the required scaling delta
-// to maintain the desired headroom cushion and satisfy pending calls.
+// ScaleDecision is the full decision trace from one evaluation of the
+// sizer. Every input, every intermediate value, plus the final delta
+// and the reason it landed where it did. Surfaced in ScalingEvent so
+// operators can answer "WHY did the sizer choose this?" without
+// re-running the math by hand.
+type ScaleDecision struct {
+	// Inputs (copy of PoolStats at the moment of decision)
+	ReadyCount    int
+	StartingCount int
+	InUseCount    int
+	PendingCount  int // pool-boundary waiters
+
+	// Sizer config snapshot
+	MinSessions     int
+	MaxSessions     int
+	HeadroomPct     float64
+	NewSessionQLen  int
+	MinIdleSessions int
+
+	// Intermediates
+	EffectivePending  int     // ceil(PendingCount / NewSessionQLen)
+	SessionsInUse     int     // InUseCount + EffectivePending
+	IdleHeadroom      int     // max(MinIdleSessions, ceil(SessionsInUse * HeadroomPct))
+	DesiredRaw        int     // SessionsInUse + IdleHeadroom (pre-clamp)
+	DesiredCapacity   int     // clamped to [MinSessions, MaxSessions]
+	ImmediateCapacity int     // ReadyCount
+	EventualCapacity  int     // ReadyCount + StartingCount
+
+	// Final decision
+	Delta              int           // what GetScaleDelta returns
+	WouldDelta         int           // what Delta would have been without cooldown
+	CooldownActive     bool          // true iff downscale was suppressed
+	CooldownRemaining  time.Duration // time left in the cooldown window
+	Branch             string        // "scale-up" | "scale-down" | "suppressed" | "dead-band" | "no-stats"
+}
+
+// GetScaleDelta evaluates the current statistics and calculates the required scaling delta.
+// Thin wrapper around Decide() that returns only the final delta — kept for callers
+// that don't need the trace.
 func (s *PoolSizer) GetScaleDelta() int {
+	return s.Decide().Delta
+}
+
+// Decide computes a full ScaleDecision: every input, every intermediate,
+// and the reasoning behind the final delta. Use this in PerformScaling
+// so each ScalingEvent in the ring buffer carries the decision's
+// provenance. As a side effect, stamps lastScaleUp when Delta > 0 so
+// the cooldown applies to subsequent calls.
+func (s *PoolSizer) Decide() ScaleDecision {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	d := ScaleDecision{
+		MinSessions:     s.minSessions,
+		MaxSessions:     s.maxSessions,
+		HeadroomPct:     s.headroomPct,
+		NewSessionQLen:  s.newSessionQLen,
+		MinIdleSessions: s.minIdleSessions,
+	}
+
 	stats := s.fetcher()
 	if stats == nil {
-		return 0
+		d.Branch = "no-stats"
+		return d
 	}
+	d.ReadyCount = stats.ReadyCount
+	d.StartingCount = stats.StartingCount
+	d.InUseCount = stats.InUseCount
+	d.PendingCount = stats.PendingCount
 
 	// effectivePending = ceil(PendingCount / NewSessionQueueLength)
 	// Java: int effectivePending = (int) Math.ceil((double) pendingRpcs.getSize() / pendingVRpcsPerSession);
@@ -118,46 +177,52 @@ func (s *PoolSizer) GetScaleDelta() int {
 	if divisor <= 0 {
 		divisor = defaultNewSessionQueueLength
 	}
-	effectivePending := int(math.Ceil(float64(stats.PendingCount) / float64(divisor)))
-	sessionsInUse := stats.InUseCount + effectivePending
+	d.EffectivePending = int(math.Ceil(float64(stats.PendingCount) / float64(divisor)))
+	d.SessionsInUse = stats.InUseCount + d.EffectivePending
 
 	// Idle headroom as a fraction of in-use, FLOORED so a brief in-use
-	// dip can't collapse the cushion to zero (the cause of the per-second
-	// shrink-then-grow we saw in scaling history).
-	idle := int(math.Ceil(float64(sessionsInUse) * s.headroomPct))
-	if idle < s.minIdleSessions {
-		idle = s.minIdleSessions
+	// dip can't collapse the cushion to zero.
+	d.IdleHeadroom = int(math.Ceil(float64(d.SessionsInUse) * s.headroomPct))
+	if d.IdleHeadroom < s.minIdleSessions {
+		d.IdleHeadroom = s.minIdleSessions
 	}
-	desiredCapacity := sessionsInUse + idle
+	d.DesiredRaw = d.SessionsInUse + d.IdleHeadroom
 
-	if desiredCapacity < s.minSessions {
-		desiredCapacity = s.minSessions
+	d.DesiredCapacity = d.DesiredRaw
+	if d.DesiredCapacity < s.minSessions {
+		d.DesiredCapacity = s.minSessions
 	}
-	if desiredCapacity > s.maxSessions {
-		desiredCapacity = s.maxSessions
+	if d.DesiredCapacity > s.maxSessions {
+		d.DesiredCapacity = s.maxSessions
 	}
 
-	// Split capacity into immediate (ready right now) and eventual
-	// (includes in-flight handshakes). A dead band between the two
-	// prevents pruning sessions whose handshake is still landing.
-	immediateCapacity := stats.ReadyCount
-	eventualCapacity := stats.ReadyCount + stats.StartingCount
+	d.ImmediateCapacity = stats.ReadyCount
+	d.EventualCapacity = stats.ReadyCount + stats.StartingCount
 
-	if desiredCapacity > eventualCapacity {
-		// Genuine shortage: even counting in-flight starts, not enough.
+	if d.DesiredCapacity > d.EventualCapacity {
+		d.Delta = d.DesiredCapacity - d.EventualCapacity
+		d.WouldDelta = d.Delta
+		d.Branch = "scale-up"
 		s.lastScaleUp = time.Now()
-		return desiredCapacity - eventualCapacity
+		return d
 	}
-	if desiredCapacity < immediateCapacity {
-		// Truly overprovisioned in the snapshot — but suppress the
-		// shrink if we just scaled up. In Go the handshake budget is
-		// short enough that StartingCount is often 0 by the time the
-		// next heartbeat fires, so the capacity-split dead band
-		// doesn't catch this case on its own.
-		if !s.lastScaleUp.IsZero() && time.Since(s.lastScaleUp) < downscaleCooldown {
-			return 0
+	if d.DesiredCapacity < d.ImmediateCapacity {
+		raw := d.DesiredCapacity - d.ImmediateCapacity
+		d.WouldDelta = raw
+		if !s.lastScaleUp.IsZero() {
+			elapsed := time.Since(s.lastScaleUp)
+			if elapsed < downscaleCooldown {
+				d.CooldownActive = true
+				d.CooldownRemaining = downscaleCooldown - elapsed
+				d.Delta = 0
+				d.Branch = "suppressed"
+				return d
+			}
 		}
-		return desiredCapacity - immediateCapacity
+		d.Delta = raw
+		d.Branch = "scale-down"
+		return d
 	}
-	return 0
+	d.Branch = "dead-band"
+	return d
 }

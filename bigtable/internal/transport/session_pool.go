@@ -136,6 +136,15 @@ type ScalingEvent struct {
 	Launched  int
 	Reason    string
 
+	// Decision is the full sizer trace that produced Requested — every
+	// input, every intermediate, plus the branch taken
+	// ("scale-up" | "scale-down" | "suppressed" | "dead-band").
+	// Lets the operator answer "why did the sizer pick THIS?" without
+	// re-running the math. Suppressed events (Requested == 0,
+	// Decision.WouldDelta != 0) are also recorded so cooldown activity
+	// is visible.
+	Decision ScaleDecision
+
 	// Deprecated: kept temporarily for JSON back-compat. FromCount mirrors
 	// Before; ToCount and Delta are no longer populated meaningfully.
 	FromCount int
@@ -864,21 +873,63 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 		p.mu.Unlock()
 	}()
 
-	stats := p.Stats()
-	fmt.Printf(">>> POOL %s STATS: Ready=%d, Starting=%d, InUse=%d, PendingOutstanding=%d <<<\n",
-		p.poolName, stats.ReadyCount, stats.StartingCount, stats.InUseCount, stats.PendingCount)
-
-	delta := p.sizer.GetScaleDelta()
-	if delta == 0 {
-		return
+	decision := p.sizer.Decide()
+	stats := &PoolStats{
+		ReadyCount:    decision.ReadyCount,
+		StartingCount: decision.StartingCount,
+		InUseCount:    decision.InUseCount,
+		PendingCount:  decision.PendingCount,
 	}
+	delta := decision.Delta
 
 	p.mu.Lock()
 	currentSessions := len(p.sessions)
 	startingSessions := len(p.startingSessions)
 	p.mu.Unlock()
 
-	fmt.Printf(">>> POOL %s PerformScaling starting evaluation: delta=%d, current_sessions=%d, starting_sessions=%d <<<\n", p.poolName, delta, currentSessions, startingSessions)
+	// One-line decision trace: every input + intermediate the sizer used.
+	// Grep for ">>> POOL <name> SIZER" to follow a single pool's decisions
+	// in the log.
+	fmt.Printf(">>> POOL %s SIZER branch=%s delta=%d would=%d "+
+		"ready=%d starting=%d in_use=%d pending=%d "+
+		"effPending=%d sessionsInUse=%d idle=%d desired=%d "+
+		"immediate=%d eventual=%d "+
+		"cfg{min=%d max=%d head=%.2f nsql=%d minIdle=%d} "+
+		"cooldown=%v(remain=%v) "+
+		"live{sessions=%d starting=%d}\n",
+		p.poolName, decision.Branch, decision.Delta, decision.WouldDelta,
+		decision.ReadyCount, decision.StartingCount, decision.InUseCount, decision.PendingCount,
+		decision.EffectivePending, decision.SessionsInUse, decision.IdleHeadroom, decision.DesiredCapacity,
+		decision.ImmediateCapacity, decision.EventualCapacity,
+		decision.MinSessions, decision.MaxSessions, decision.HeadroomPct, decision.NewSessionQLen, decision.MinIdleSessions,
+		decision.CooldownActive, decision.CooldownRemaining,
+		currentSessions, startingSessions,
+	)
+
+	// Record SUPPRESSED scale-downs even though they don't change the
+	// pool — otherwise cooldown activity is invisible in the ring
+	// buffer and the operator can't see "the sizer wanted to shrink
+	// but I held it back".
+	if delta == 0 && decision.WouldDelta != 0 {
+		p.recordScaling(ScalingEvent{
+			At:        time.Now(),
+			Before:    currentSessions,
+			Requested: 0,
+			Launched:  0,
+			Reason: fmt.Sprintf("suppressed: would=%d (cooldown %v remaining; desired=%d immediate=%d)",
+				decision.WouldDelta, decision.CooldownRemaining,
+				decision.DesiredCapacity, decision.ImmediateCapacity),
+			Decision:  decision,
+			FromCount: currentSessions,
+			ToCount:   currentSessions,
+			Delta:     0,
+		})
+		return
+	}
+	if delta == 0 {
+		// dead-band or no-stats — nothing to record.
+		return
+	}
 
 	reason := scalingReason(stats, delta)
 	var launched atomic.Int64
@@ -893,6 +944,7 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 			Requested: delta,
 			Launched:  actual,
 			Reason:    reason,
+			Decision:  decision,
 			// Back-compat: keep the legacy fields populated so JSON
 			// consumers that already parse FromCount/ToCount/Delta don't
 			// break. ToCount mirrors Before because scale-up genuinely
