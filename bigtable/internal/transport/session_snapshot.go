@@ -230,9 +230,10 @@ type PoolSessionEvent struct {
 }
 
 // maxPoolRecentEvents caps the merged pool-level event timeline so the
-// sessionz render stays bounded under high churn. Roughly ~2x the per-
-// session cap times a small handful of misbehaving sessions.
-const maxPoolRecentEvents = 200
+// sessionz render stays bounded under high churn. Sized to comfortably
+// hold a multi-minute incident across a busy pool (≈8× the per-session
+// cap × a handful of misbehaving sessions).
+const maxPoolRecentEvents = 500
 
 // OpenRequestSnapshot is the JSON-friendly form of the OpenSessionRequest.
 // PayloadType names the inner-message kind ("OpenTable",

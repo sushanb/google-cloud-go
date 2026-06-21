@@ -289,7 +289,7 @@ type SessionEvent struct {
 	Message string
 }
 
-const maxSessionEvents = 32
+const maxSessionEvents = 64
 
 // recordEvent appends a SessionEvent to the per-session ring buffer. Cheap
 // (single mutex + bounded slice); safe to call from any goroutine including
