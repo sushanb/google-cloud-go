@@ -65,6 +65,14 @@ type SessionPoolImpl struct {
 	listenerFires  atomic.Int64
 	closesByReason sync.Map // close-reason label → *atomic.Int64
 
+	// waitersCount is the live count of callers parked inside
+	// CheckoutSession waiting for an idle session at the pool boundary.
+	// This is the "pending vRPCs" signal the sizer needs — Java tracks
+	// it via a dedicated Sized input. Before this field, Stats() was
+	// (mis)reporting sum(outstanding) as PendingCount, which equaled
+	// InUseCount and made the sizer oscillate.
+	waitersCount atomic.Int32
+
 	// scalingHistory is a ring buffer of the last N scaling decisions made
 	// by PerformScaling. Guarded by scalingHistoryMu so the snapshot reader
 	// gets a consistent slice copy without dropping events.
@@ -545,12 +553,19 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		// fresh session lands. The 50ms timer is a safety net in case
 		// a wake-up was dropped (cap-1 buffer; concurrent posts
 		// collapse). ctx.Done unblocks immediately.
+		//
+		// Bracket the wait with waitersCount so the sizer (via Stats())
+		// sees the real queue depth at the pool boundary. Java tracks
+		// the same signal through its Sized pendingRpcs input.
+		p.waitersCount.Add(1)
 		select {
 		case <-ctx.Done():
+			p.waitersCount.Add(-1)
 			return nil, fmt.Errorf("no active sessions available: %w", ctx.Err())
 		case <-p.freeSignal:
 		case <-time.After(50 * time.Millisecond):
 		}
+		p.waitersCount.Add(-1)
 	}
 }
 
@@ -593,15 +608,12 @@ func (p *SessionPoolImpl) Stats() *PoolStats {
 
 	ready := 0
 	inUse := 0
-	totalOutstanding := 0
 	for _, sh := range p.sessions {
 		if sh.session.State() == StateActive {
 			ready++
 		}
-		outstanding := atomic.LoadInt64(&sh.outstanding)
-		if outstanding > 0 {
+		if atomic.LoadInt64(&sh.outstanding) > 0 {
 			inUse++
-			totalOutstanding += int(outstanding)
 		}
 	}
 
@@ -609,7 +621,11 @@ func (p *SessionPoolImpl) Stats() *PoolStats {
 		ReadyCount:    ready,
 		InUseCount:    inUse,
 		StartingCount: len(p.startingSessions),
-		PendingCount:  totalOutstanding,
+		// PendingCount is the true pool-boundary queue depth —
+		// callers parked inside CheckoutSession waiting on
+		// freeSignal. Matches Java's pendingRpcs.getSize() input
+		// to the sizer.
+		PendingCount: int(p.waitersCount.Load()),
 	}
 }
 
