@@ -36,16 +36,36 @@ func NewRoundRobinPicker(sessions []*SessionHandle) *RoundRobinPicker {
 	}
 }
 
-// PickSession selects the next session sequentially.
+// PickSession selects the next idle Active session in round-robin order.
+// Returns nil when every session is busy or non-Active — callers (e.g.
+// CheckoutSession) treat nil as "park on freeSignal". Skipping busy
+// sessions instead of returning them keeps the multiPlexingLimit=1
+// invariant downstream and prevents head-of-slice starvation when one
+// cohort of sessions handles all traffic.
 func (p *RoundRobinPicker) PickSession() *SessionHandle {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.sessions) == 0 {
+	n := uint32(len(p.sessions))
+	if n == 0 {
 		return nil
 	}
-	sh := p.sessions[p.next%uint32(len(p.sessions))]
-	p.next++
-	return sh
+	start := p.next
+	for i := uint32(0); i < n; i++ {
+		idx := (start + i) % n
+		sh := p.sessions[idx]
+		if sh == nil || sh.session == nil {
+			continue
+		}
+		if sh.session.State() != StateActive {
+			continue
+		}
+		if atomic.LoadInt64(&sh.outstanding) != 0 {
+			continue
+		}
+		p.next = idx + 1
+		return sh
+	}
+	return nil
 }
 
 // PeakEwmaPicker picks sessions based on outstanding request count and EWMA latency.
@@ -68,7 +88,11 @@ func NewPeakEwmaPicker(sessions []*SessionHandle, randomSubsetSize int) *PeakEwm
 	}
 }
 
-// PickSession selects a session using the Peak EWMA least-cost algorithm.
+// PickSession selects an idle Active session via Peak EWMA least-cost over
+// a randomized K-choice subset. Returns nil when no idle Active session
+// exists. Filtering to idle here keeps multiPlexingLimit=1 enforced at the
+// pool boundary and prevents the picker from returning a busy session
+// that the caller would have to reject anyway.
 func (p *PeakEwmaPicker) PickSession() *SessionHandle {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -76,19 +100,33 @@ func (p *PeakEwmaPicker) PickSession() *SessionHandle {
 		return nil
 	}
 
-	// If the subset size is larger than the number of sessions, scan all sessions
-	subsetSize := p.randomSubsetSize
-	if subsetSize >= len(p.sessions) {
-		return p.pickMinCost(p.sessions)
+	// Build the idle-Active set first; K-choice draws come from this
+	// pool so a busy/closing session can never win the cost comparison.
+	idle := make([]*SessionHandle, 0, len(p.sessions))
+	for _, sh := range p.sessions {
+		if sh == nil || sh.session == nil {
+			continue
+		}
+		if sh.session.State() != StateActive {
+			continue
+		}
+		if atomic.LoadInt64(&sh.outstanding) != 0 {
+			continue
+		}
+		idle = append(idle, sh)
+	}
+	if len(idle) == 0 {
+		return nil
 	}
 
-	// Randomized K-choice selection
+	subsetSize := p.randomSubsetSize
+	if subsetSize >= len(idle) {
+		return p.pickMinCost(idle)
+	}
 	choices := make([]*SessionHandle, subsetSize)
 	for i := 0; i < subsetSize; i++ {
-		idx := p.rng.Intn(len(p.sessions))
-		choices[i] = p.sessions[idx]
+		choices[i] = idle[p.rng.Intn(len(idle))]
 	}
-
 	return p.pickMinCost(choices)
 }
 
@@ -204,8 +242,23 @@ func NewLeastInFlightPicker(sessions []*SessionHandle) *LeastInFlightPicker {
 	return &LeastInFlightPicker{sessions: sessions}
 }
 
-// PickSession scans for the session with the lowest outstanding count.
-// Returns immediately on the first outstanding == 0 it finds.
+// PickSession scans for an idle Active session, tie-breaking on
+// lastActivity so the longest-idle session wins. Returns nil when no
+// idle Active session exists. Two important properties:
+//
+//  1. We do NOT break on the first outstanding==0 we find. Returning the
+//     first match starves later slots in p.sessions — the wake-up
+//     pattern (cap-1 freeSignal → ONE waiter wakes → scans → finds the
+//     just-freed session in the first cohort → returns) means later-
+//     activated sessions can sit at Picks=0 indefinitely while
+//     PendingCount stays high.
+//  2. The lastActivity tie-break favors NEVER-PICKED sessions (whose
+//     lastActivity is zero) and sessions idle for longer, distributing
+//     traffic across every member of the pool rather than letting one
+//     cohort handle everything.
+//
+// All non-Active and busy sessions are filtered out, keeping the
+// multiPlexingLimit=1 invariant at the picker boundary.
 func (p *LeastInFlightPicker) PickSession() *SessionHandle {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -213,15 +266,21 @@ func (p *LeastInFlightPicker) PickSession() *SessionHandle {
 		return nil
 	}
 	var best *SessionHandle
-	bestLoad := int64(math.MaxInt64)
+	bestActivity := int64(math.MaxInt64)
 	for _, sh := range p.sessions {
-		load := atomic.LoadInt64(&sh.outstanding)
-		if load == 0 {
-			return sh
+		if sh == nil || sh.session == nil {
+			continue
 		}
-		if load < bestLoad {
+		if sh.session.State() != StateActive {
+			continue
+		}
+		if atomic.LoadInt64(&sh.outstanding) != 0 {
+			continue
+		}
+		activity := atomic.LoadInt64(&sh.lastActivity)
+		if activity < bestActivity {
 			best = sh
-			bestLoad = load
+			bestActivity = activity
 		}
 	}
 	return best
@@ -242,13 +301,27 @@ func NewRandomPicker(sessions []*SessionHandle) *RandomPicker {
 	}
 }
 
-// PickSession selects a session randomly.
+// PickSession selects an idle Active session uniformly at random.
+// Returns nil when no idle Active session exists. Filtering to idle
+// keeps multiPlexingLimit=1 enforced at the picker boundary.
 func (p *RandomPicker) PickSession() *SessionHandle {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.sessions) == 0 {
+	idle := make([]*SessionHandle, 0, len(p.sessions))
+	for _, sh := range p.sessions {
+		if sh == nil || sh.session == nil {
+			continue
+		}
+		if sh.session.State() != StateActive {
+			continue
+		}
+		if atomic.LoadInt64(&sh.outstanding) != 0 {
+			continue
+		}
+		idle = append(idle, sh)
+	}
+	if len(idle) == 0 {
 		return nil
 	}
-	idx := p.rng.Intn(len(p.sessions))
-	return p.sessions[idx]
+	return idle[p.rng.Intn(len(idle))]
 }

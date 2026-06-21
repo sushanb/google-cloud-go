@@ -530,10 +530,13 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 			return nil, errors.New("session pool is closed")
 		}
 
-		// Scan for an idle Active session and collect any dead handles
-		// in the same pass so the live set shrinks under our feet only
-		// while we're already iterating.
-		var idle *SessionHandle
+		// Dead-sweep first so the picker scans only live handles. The
+		// inline scan that lived here previously had a "first idle
+		// wins" break that combined with cap-1 freeSignal to starve
+		// later-activated cohorts (their Picks stayed 0 indefinitely
+		// while PendingCount held above 0). Routing selection through
+		// p.picker (which now applies a lastActivity tie-break) fixes
+		// that.
 		var dead []*SessionHandle
 		for _, sh := range p.sessions {
 			if sh == nil || sh.session == nil {
@@ -541,18 +544,13 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 			}
 			if sh.session.State() != StateActive {
 				dead = append(dead, sh)
-				continue
-			}
-			if atomic.LoadInt64(&sh.outstanding) == 0 {
-				idle = sh
-				break
 			}
 		}
 		if len(dead) > 0 {
 			p.pruneDeadLocked(dead)
 		}
 
-		if idle != nil {
+		if idle := p.picker.PickSession(); idle != nil {
 			idle.IncOutstanding()
 			atomic.AddInt64(&idle.picks, 1)
 			p.mu.Unlock()
