@@ -67,6 +67,14 @@ type SessionPoolImpl struct {
 	// to the timer fallback and re-scan.
 	freeSignal chan struct{}
 
+	// waitersCount is the live count of callers parked inside
+	// CheckoutSession waiting for an idle session at the pool boundary.
+	// This is the "pending vRPCs" signal the sizer needs. Before this
+	// field, Stats() was (mis)reporting sum(outstanding) as
+	// PendingCount, which equaled InUseCount with multiPlexingLimit=1
+	// and made the sizer oscillate.
+	waitersCount atomic.Int32
+
 	// poolCtx is a cancellable context scoped to the lifetime of the pool. It
 	// is passed (wrapped to strip deadlines but preserve cancellation) to the
 	// underlying streamFactory, budget.Acquire, and Session.Start so that
@@ -193,12 +201,18 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		// fresh session lands. The short timer is a safety net — if we
 		// missed a wake-up (rare; the cap-1 buffer can drop concurrent
 		// posts), we'll re-scan after 50ms regardless.
+		//
+		// Bracket the wait with waitersCount so the sizer (via Stats())
+		// sees the real queue depth at the pool boundary.
+		p.waitersCount.Add(1)
 		select {
 		case <-ctx.Done():
+			p.waitersCount.Add(-1)
 			return nil, fmt.Errorf("no active sessions available: %w", ctx.Err())
 		case <-p.freeSignal:
 		case <-time.After(50 * time.Millisecond):
 		}
+		p.waitersCount.Add(-1)
 	}
 }
 
@@ -238,17 +252,20 @@ func (p *SessionPoolImpl) Stats() *PoolStats {
 
 	ready := 0
 	inUse := 0
-	totalOutstanding := 0
 	for _, sh := range p.sessions {
 		if sh.session.State() == StateActive {
 			ready++
 		}
-		outstanding := atomic.LoadInt64(&sh.outstanding)
-		if outstanding > 0 {
+		if atomic.LoadInt64(&sh.outstanding) > 0 {
 			inUse++
-			totalOutstanding += int(outstanding)
 		}
 	}
+	// PendingCount is the true pool-boundary queue depth (callers
+	// parked inside CheckoutSession waiting on freeSignal). The
+	// previous implementation summed outstanding across sessions,
+	// which with multiPlexingLimit=1 equaled InUseCount and made the
+	// sizer oscillate.
+	totalOutstanding := int(p.waitersCount.Load())
 
 	return &PoolStats{
 		ReadyCount:    ready,
