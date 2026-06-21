@@ -125,6 +125,18 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 	}
 	if attempt > 1 {
 		s.retries.Add(1)
+		// Capture WHY this is a retry — the previous attempt's error
+		// was stashed in ctx by RetryingVRpc. Without this the
+		// per-session Retries counter is opaque ("we retried, but
+		// why?"); with it sessionz surfaces a "retry" event tagged
+		// with the prior gRPC code + message.
+		if prev := PrevAttemptErr(ctx); prev != nil {
+			prevCode := status.Code(prev).String()
+			fmt.Printf(">>> SESSION %s retry attempt=%d method=%s prev_code=%s prev_err=%v <<<\n",
+				s.logName, attempt, desc.Method(), prevCode, prev)
+			s.recordEvent("retry", "attempt=%d method=%s prev_code=%s prev_err=%v",
+				attempt, desc.Method(), prevCode, prev)
+		}
 	}
 	virtRpc := &spb.VirtualRpcRequest{
 		RpcId:   rpcID,

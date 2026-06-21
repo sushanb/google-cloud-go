@@ -75,6 +75,13 @@ func RetryingVRpc(opts RetryingOptions) Interceptor {
 			}
 
 			attemptCtx := WithAttempt(ctx, int(currentAttempt))
+			// Tag the next attempt's context with the prior attempt's
+			// error so the downstream Session.Invoke can record a
+			// "retry" SessionEvent carrying the original gRPC code +
+			// message. lastErr is nil on the very first attempt.
+			if lastErr != nil {
+				attemptCtx = WithPrevAttemptErr(attemptCtx, lastErr)
+			}
 
 			if shieldedListener != nil {
 				shieldedListener.OnAttemptStart(attemptCtx)

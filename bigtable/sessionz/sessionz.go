@@ -268,6 +268,8 @@ var funcs = template.FuncMap{
 			return "evt-ctxdone"
 		case "hb-alive":
 			return "evt-alive"
+		case "retry":
+			return "evt-retry"
 		}
 		return ""
 	},
@@ -644,6 +646,7 @@ tr:target td:first-child{border-left:3px solid #f0a000}
 .evt-missed{background:#ffe0c2;color:#a04500;font-weight:600}
 .evt-ctxdone{background:#fff7d6;color:#7a5a00;font-weight:600}
 .evt-alive{background:#eaf3ff;color:#1a5fb4;font-weight:600}
+.evt-retry{background:#f3e6ff;color:#5a1a8a;font-weight:600}
 a{color:#1a5fb4;text-decoration:none}
 a:hover{text-decoration:underline}
 .summary{margin-bottom:1em;background:#fff;padding:.75em 1em;box-shadow:0 1px 2px rgba(0,0,0,.06)}
@@ -809,6 +812,7 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 <b>hb-missed</b> — heartbeat watchdog fired ForceClose; "case 2" half-dead Recv.
 <b>hb-alive</b> — timer tick saw in-flight RPCs AND a recent frame had already pushed the deadline (≥1 interval); "case 1" server kept stream alive but specific vRPC response may be stalled.
 <b>ctx-done</b> — Session.Invoke's per-attempt wait was killed by caller ctx (deadline or cancel); often paired with a 5s row in the slow-vRPC table.
+<b>retry</b> — this session received attempt N (N>1); detail carries the previous attempt's gRPC code + message that triggered the retry (paired with the per-session Retries counter).
 </div>
 {{end}}
 
