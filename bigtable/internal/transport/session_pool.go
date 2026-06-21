@@ -180,6 +180,12 @@ type SlowVRpcEvent struct {
 	// SessionAge is time since the session entered StateActive — zero
 	// if the session never reached Active (rare error path).
 	SessionAge time.Duration
+	// Peer captures the AFE/GFE the session was bound to at the time
+	// of the call. Empty when the bidi-stream header hasn't been
+	// parsed yet (very young sessions). Lets the sessionz UI surface
+	// "Unavailable cohort tied to one AFE" without manually cross-
+	// referencing every per-session Peer block.
+	Peer PeerInfoSnapshot
 }
 
 const (
@@ -1234,6 +1240,13 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 		if openedAt := sh.session.OpenedAt(); !openedAt.IsZero() {
 			ev.SessionAge = start.Sub(openedAt)
 		}
+		// Capture the session's PeerInfo so cohort patterns (e.g. every
+		// Unavailable failure on AFE X) are visible directly in the
+		// slow-vRPC table instead of requiring a per-session cross-ref.
+		sh.session.mu.Lock()
+		peerProto := sh.session.peerInfo
+		sh.session.mu.Unlock()
+		ev.Peer = peerInfoToSnapshot(peerProto)
 		if invokeErr != nil {
 			// Standard library context errors don't implement GRPCStatus(),
 			// so status.Code falls through to Unknown — which mislabels

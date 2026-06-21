@@ -238,6 +238,24 @@ var funcs = template.FuncMap{
 		}
 		return out
 	},
+	"peerShort": func(p btransport.PeerInfoSnapshot) string {
+		// Compact one-cell render for the slow-vRPC table: AFE id (hex)
+		// + region/subzone is what an operator needs to spot a cohort
+		// of failures pinned to a single AFE. Returns "—" when the
+		// stream header hadn't been parsed at slow-vRPC capture time.
+		if p.ApplicationFrontendID == 0 && p.GoogleFrontendID == 0 {
+			return "—"
+		}
+		region := p.ApplicationFrontendRegion
+		if region == "" {
+			region = "?"
+		}
+		subzone := p.ApplicationFrontendSubzone
+		if subzone == "" {
+			subzone = "?"
+		}
+		return fmt.Sprintf("%x/%s/%s", p.ApplicationFrontendID, region, subzone)
+	},
 	"eventKindClass": func(k string) string {
 		// Color-code event severity so close/missed pop visually amongst
 		// the (usually less alarming) hb-alive / ctx-done entries.
@@ -801,6 +819,7 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 <th>When</th><th>Method</th><th class="num">Latency</th>
 <th class="num">PoolWait</th><th class="num">SemWait</th><th class="num">Backend</th>
 <th>Session</th><th class="num">RpcID</th><th class="num">SessionAge</th>
+<th>Peer (afe/region/subzone)</th>
 <th>Status</th>
 </tr></thead>
 <tbody>
@@ -815,6 +834,7 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 <td class="mono">{{.Session}}</td>
 <td class="num" title="per-session 1-indexed RPC id; small values indicate a fresh session">{{.RpcIDOnSession}}</td>
 <td class="num" title="age of the session at the time of this call">{{dur .SessionAge}}</td>
+<td class="mono" title="ApplicationFrontendId (hex) / region / subzone of the AFE this session was bound to at call time">{{peerShort .Peer}}</td>
 <td>{{if .Success}}OK{{else}}<span style="color:#922">{{.ErrCode}}</span>{{end}}</td>
 </tr>
 {{end}}
