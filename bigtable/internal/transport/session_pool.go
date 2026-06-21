@@ -241,21 +241,24 @@ type TimeSeriesSample struct {
 func (p *SessionPoolImpl) recordTimeSeries() {
 	p.mu.Lock()
 	totalSessions := len(p.sessions)
-	inUse, pending := 0, 0
+	inUse := 0
 	var okTotal, errTotal int64
 	for _, sh := range p.sessions {
 		if sh == nil || sh.session == nil {
 			continue
 		}
-		ob := atomic.LoadInt64(&sh.outstanding)
-		if ob > 0 {
+		if atomic.LoadInt64(&sh.outstanding) > 0 {
 			inUse++
-			pending += int(ob)
 		}
 		okTotal += sh.session.okRpcs.Load()
 		errTotal += sh.session.errorRpcs.Load()
 	}
 	p.mu.Unlock()
+	// Pending = pool-boundary queue depth (waiters parked in
+	// CheckoutSession), same source as Stats().PendingCount. The previous
+	// implementation summed outstanding across sessions, which with
+	// multiPlexingLimit=1 just equaled inUse and made the UI lie.
+	pending := int(p.waitersCount.Load())
 
 	now := time.Now()
 	p.timeSeriesMu.Lock()

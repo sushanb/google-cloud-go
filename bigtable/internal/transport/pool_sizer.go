@@ -17,6 +17,7 @@ package internal
 import (
 	"math"
 	"sync"
+	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 )
@@ -52,11 +53,24 @@ type PoolSizer struct {
 	headroomPct     float64 // Idle headroom as a fraction of sessions in use (e.g., 0.10 = 10%)
 	newSessionQLen  int     // server-driven per-session pending queue length; divides PendingCount
 	minIdleSessions int     // floor on the idle cushion so headroom never collapses to 0
+	// lastScaleUp is the time we most recently returned a positive delta
+	// (i.e. asked to grow the pool). Scale-down is suppressed for
+	// downscaleCooldown after this — the just-launched sessions need a
+	// chance to land and absorb the next wave before we kill them.
+	// Without this, instantaneous in-use dips between heartbeats let
+	// the sizer prune sessions whose handshake is still in flight,
+	// driving the per-second 5↔9 oscillation we observed.
+	lastScaleUp time.Time
 }
 
 const (
 	defaultNewSessionQueueLength = 10
 	defaultMinIdleSessions       = 1
+	// downscaleCooldown is how long after a scale-up the sizer refuses
+	// to scale down. ~3× the typical handshake budget so freshly-grown
+	// sessions get to serve at least one wave before being eligible
+	// for pruning.
+	downscaleCooldown = 5 * time.Second
 )
 
 // NewPoolSizer creates a new PoolSizer.
@@ -131,10 +145,18 @@ func (s *PoolSizer) GetScaleDelta() int {
 
 	if desiredCapacity > eventualCapacity {
 		// Genuine shortage: even counting in-flight starts, not enough.
+		s.lastScaleUp = time.Now()
 		return desiredCapacity - eventualCapacity
 	}
 	if desiredCapacity < immediateCapacity {
-		// Truly overprovisioned: more idle right now than desired.
+		// Truly overprovisioned in the snapshot — but suppress the
+		// shrink if we just scaled up. In Go the handshake budget is
+		// short enough that StartingCount is often 0 by the time the
+		// next heartbeat fires, so the capacity-split dead band
+		// doesn't catch this case on its own.
+		if !s.lastScaleUp.IsZero() && time.Since(s.lastScaleUp) < downscaleCooldown {
+			return 0
+		}
 		return desiredCapacity - immediateCapacity
 	}
 	return 0
