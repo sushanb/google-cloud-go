@@ -345,10 +345,11 @@ func (s *Session) handleClose(err error) {
 		age = time.Since(openedAt)
 	}
 	lastRPC := s.nextRPCID.Load()
-	fmt.Printf(">>> SESSION %s handleClose reason=%s age=%v in_flight=%d last_rpc_id=%d raw_err=%v <<<\n",
-		s.logName, reason, age, inFlight, lastRPC, err)
-	s.recordEvent("close", "reason=%s age=%v in_flight=%d last_rpc_id=%d raw_err=%v",
-		reason, age, inFlight, lastRPC, err)
+	peer := s.peerInfoSummary()
+	fmt.Printf(">>> SESSION %s handleClose reason=%s age=%v in_flight=%d last_rpc_id=%d %s raw_err=%v <<<\n",
+		s.logName, reason, age, inFlight, lastRPC, peer, err)
+	s.recordEvent("close", "reason=%s age=%v in_flight=%d last_rpc_id=%d %s raw_err=%v",
+		reason, age, inFlight, lastRPC, peer, err)
 	s.cancelActiveRPCs(unavailable(err, "session closed: %v", err), nil)
 	s.signalQuiescent()
 	s.notifyClosed(err)

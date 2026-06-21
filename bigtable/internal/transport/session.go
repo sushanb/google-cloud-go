@@ -320,6 +320,26 @@ func (s *Session) snapshotEvents() []SessionEvent {
 	return out
 }
 
+// peerInfoSummary renders the session's PeerInfo as a compact single line
+// suitable for inclusion in log messages and debug events. Returns
+// "peer=unknown" when the bidi stream header hasn't been parsed yet (the
+// session has not received the asynchronous PeerInfo metadata). Format
+// keeps the ids in hex so they line up with what sessionz renders.
+func (s *Session) peerInfoSummary() string {
+	s.mu.Lock()
+	p := s.peerInfo
+	s.mu.Unlock()
+	if p == nil {
+		return "peer=unknown"
+	}
+	return fmt.Sprintf("peer={afe=%x/%s/%s gfe=%x transport=%s}",
+		p.GetApplicationFrontendId(),
+		p.GetApplicationFrontendRegion(),
+		p.GetApplicationFrontendSubzone(),
+		p.GetGoogleFrontendId(),
+		p.GetTransportType())
+}
+
 const latencyWindow = 256
 
 // recordLatency appends a server-reported BackendLatency sample to the ring

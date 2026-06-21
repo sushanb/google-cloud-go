@@ -160,10 +160,11 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 		sessState := s.state
 		s.mu.Unlock()
 		waited := time.Since(sentAt)
-		fmt.Printf(">>> SESSION %s vRPC %s rpc_id=%d ctx.Done waited=%v err=%v session_state=%v still_in_flight=%v <<<\n",
-			s.logName, desc.Method(), rpcID, waited, ctx.Err(), sessState, stillActive)
-		s.recordEvent("ctx-done", "method=%s rpc_id=%d waited=%v err=%v session_state=%v still_in_flight=%v",
-			desc.Method(), rpcID, waited, ctx.Err(), sessState, stillActive)
+		peer := s.peerInfoSummary()
+		fmt.Printf(">>> SESSION %s vRPC %s rpc_id=%d ctx.Done waited=%v err=%v session_state=%v still_in_flight=%v %s <<<\n",
+			s.logName, desc.Method(), rpcID, waited, ctx.Err(), sessState, stillActive, peer)
+		s.recordEvent("ctx-done", "method=%s rpc_id=%d waited=%v err=%v session_state=%v still_in_flight=%v %s",
+			desc.Method(), rpcID, waited, ctx.Err(), sessState, stillActive, peer)
 		return result, ctx.Err()
 	case res := <-rpc.resultChan:
 		result.ClusterInfo = res.clusterInfo
