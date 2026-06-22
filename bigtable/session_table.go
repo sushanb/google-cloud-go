@@ -119,8 +119,6 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 		opt.set(&settings)
 	}
 
-	fmt.Printf(">>> SessionTable ReadRow: row=%s via readPool=%p <<<\n", row, t.readPool)
-
 	retryInterceptor := btransport.RetryingVRpc(btransport.RetryingOptions{
 		MaxAttempts:       10, // Up to 10 attempts (initial attempt + 9 retries)
 		InitialBackoff:    10 * time.Millisecond,
@@ -153,9 +151,6 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 			if result.Stats != nil && result.Stats.BackendLatency != nil {
 				mt.currOp.currAttempt.setServerLatency(convertToMs(result.Stats.GetBackendLatency().AsDuration()))
 			}
-		}
-		if result.ClusterInfo != nil {
-			fmt.Printf(">>> SessionTable ReadRow attempt served by Cluster: Id=%s, Zone=%s <<<\n", result.ClusterInfo.ClusterId, result.ClusterInfo.ZoneId)
 		}
 		if err != nil {
 			return nil, err
@@ -202,8 +197,6 @@ func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts 
 		statusCode, _ := convertToGrpcStatusErr(err)
 		mt.setCurrOpStatus(statusCode)
 	}()
-
-	fmt.Printf(">>> SessionTable Apply: row=%s via writePool=%p <<<\n", row, t.writePool)
 
 	// Non-idempotent mutations (SetCell with ServerTime) cannot blindly retry —
 	// a retry of an already-applied mutation would create duplicate cells with
@@ -252,9 +245,6 @@ func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts 
 			if result.Stats != nil && result.Stats.BackendLatency != nil {
 				mt.currOp.currAttempt.setServerLatency(convertToMs(result.Stats.GetBackendLatency().AsDuration()))
 			}
-		}
-		if result.ClusterInfo != nil {
-			fmt.Printf(">>> SessionTable Apply attempt served by Cluster: Id=%s, Zone=%s <<<\n", result.ClusterInfo.ClusterId, result.ClusterInfo.ZoneId)
 		}
 		if err != nil {
 			return nil, err

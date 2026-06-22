@@ -25,6 +25,7 @@ import (
 	"time"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+	btopt "cloud.google.com/go/bigtable/internal/option"
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/metadata"
@@ -180,14 +181,14 @@ func (m *SessionManager) GetOrCreateSessionTable(
 	readKey := fmt.Sprintf("%s:read", keyPrefix)
 	readPool, err := m.createPoolForPayload(resourceName, sessionDesc, readStreamFactory, readPayload, flags, readKey)
 	if err != nil {
-		fmt.Printf(">>> SessionManager: failed to create read pool for key=%s: %v; falling back to classic <<<\n", readKey, err)
+		btopt.Debugf(nil, "SessionManager: failed to create read pool for key=%s: %v; falling back to classic", readKey, err)
 		return &tableImpl{*classic}
 	}
 
 	writeKey := fmt.Sprintf("%s:write", keyPrefix)
 	writePool, err := m.createPoolForPayload(resourceName, sessionDesc, writeStreamFactory, writePayload, flags, writeKey)
 	if err != nil {
-		fmt.Printf(">>> SessionManager: failed to create write pool for key=%s: %v; falling back to classic <<<\n", writeKey, err)
+		btopt.Debugf(nil, "SessionManager: failed to create write pool for key=%s: %v; falling back to classic", writeKey, err)
 		return &tableImpl{*classic}
 	}
 
@@ -266,8 +267,6 @@ func (m *SessionManager) GetOrCreateSessionPool(
 	sessionType btransport.SessionType,
 	shortName string,
 ) *btransport.SessionPoolImpl {
-	fmt.Printf(">>> getOrCreateSessionPool: key=%s, min=%d, max=%d <<<\n", key, min, max)
-
 	m.mu.Lock()
 	mp, ok := m.sessionPools[key]
 	if ok {

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+	btopt "cloud.google.com/go/bigtable/internal/option"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
@@ -340,7 +341,7 @@ func (p *SessionPoolImpl) sweepStuckSessions() {
 	p.mu.Unlock()
 
 	for _, v := range victims {
-		fmt.Printf(">>> POOL %s sweepStuckSessions: force-closing %s stuck in WaitServerClose for %v <<<\n",
+		btopt.Debugf(nil, "POOL %s sweepStuckSessions: force-closing %s stuck in WaitServerClose for %v",
 			p.poolName, v.sess.LogName(), v.stuckFor.Round(time.Second))
 		v.sess.ForceClose(&spb.CloseSessionRequest{
 			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR,
@@ -518,7 +519,6 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, error) {
 	p.mu.Lock()
 	if !p.closed && len(p.sessions) == 0 {
-		fmt.Printf(">>> POOL %s: no sessions yet, kicking PerformScaling <<<\n", p.poolName)
 		go p.PerformScaling(ctx)
 	}
 	p.mu.Unlock()
@@ -812,7 +812,6 @@ func (p *SessionPoolImpl) UpdateConfig(config *spb.SessionClientConfiguration_Se
 	p.mu.Lock()
 	p.minSessions = int(config.MinSessionCount)
 	p.maxSessions = int(config.MaxSessionCount)
-	fmt.Printf(">>> SessionPool %p UpdateConfig: minSessions=%d, maxSessions=%d <<<\n", p, p.minSessions, p.maxSessions)
 
 	if config.LoadBalancingOptions != nil {
 		lbo := config.LoadBalancingOptions
@@ -888,29 +887,7 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 
 	p.mu.Lock()
 	currentSessions := len(p.sessions)
-	startingSessions := len(p.startingSessions)
 	p.mu.Unlock()
-
-	// One-line decision trace: every input + intermediate the sizer used.
-	// Grep for ">>> POOL <name> SIZER" to follow a single pool's decisions
-	// in the log.
-	fmt.Printf(">>> POOL %s SIZER branch=%s delta=%d would=%d "+
-		"ready=%d starting=%d in_use=%d pending=%d "+
-		"effPending=%d sessionsInUse=%d idle=%d desiredUp=%d "+
-		"peak30s=%d desiredDown=%d "+
-		"immediate=%d eventual=%d "+
-		"cfg{min=%d max=%d head=%.2f nsql=%d minIdle=%d} "+
-		"cooldown=%v(remain=%v) "+
-		"live{sessions=%d starting=%d}\n",
-		p.poolName, decision.Branch, decision.Delta, decision.WouldDelta,
-		decision.ReadyCount, decision.StartingCount, decision.InUseCount, decision.PendingCount,
-		decision.EffectivePending, decision.SessionsInUse, decision.IdleHeadroom, decision.DesiredCapacity,
-		decision.PeakWorkingSet, decision.DesiredCapacityDown,
-		decision.ImmediateCapacity, decision.EventualCapacity,
-		decision.MinSessions, decision.MaxSessions, decision.HeadroomPct, decision.NewSessionQLen, decision.MinIdleSessions,
-		decision.CooldownActive, decision.CooldownRemaining,
-		currentSessions, startingSessions,
-	)
 
 	// Record SUPPRESSED scale-downs even though they don't change the
 	// pool — otherwise cooldown activity is invisible in the ring
@@ -969,17 +946,15 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 			go func() {
 				defer wg.Done()
 				if err := p.createSession(ctx); err != nil {
-					fmt.Printf(">>> POOL %s PerformScaling createSession failed: %v <<<\n", p.poolName, err)
+					btopt.Debugf(nil, "POOL %s PerformScaling createSession failed: %v", p.poolName, err)
 				} else {
 					launched.Add(1)
-					fmt.Printf(">>> POOL %s PerformScaling successfully provisioned a new session <<<\n", p.poolName)
 				}
 			}()
 		}
 		wg.Wait()
 	} else {
 		// Scale down: prune idle sessions gracefully
-		fmt.Printf(">>> POOL %s PerformScaling pruning %d idle sessions <<<\n", p.poolName, -delta)
 		launched.Store(int64(p.pruneSessions(-delta)))
 	}
 }
@@ -1082,7 +1057,7 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 		p.mu.Lock()
 		delete(p.startingSessions, s)
 		p.mu.Unlock()
-		fmt.Printf(">>> POOL %p createSession Start failed for %s: %v <<<\n", p, sessionName, err)
+		btopt.Debugf(nil, "POOL %p createSession Start failed for %s: %v", p, sessionName, err)
 		return fmt.Errorf("failed to start session: %w", err)
 	}
 
@@ -1258,7 +1233,7 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 			default:
 				ev.ErrCode = status.Code(invokeErr).String()
 			}
-			fmt.Printf(">>> POOL %s slow vRPC failed method=%s session=%s rpc_id=%d code=%s latency=%v session_age=%v backend=%v raw_err=%v <<<\n",
+			btopt.Debugf(nil, "POOL %s slow vRPC failed method=%s session=%s rpc_id=%d code=%s latency=%v session_age=%v backend=%v raw_err=%v",
 				p.poolName, ev.Method, ev.Session, ev.RpcIDOnSession, ev.ErrCode, ev.Latency, ev.SessionAge, ev.BackendLatency, invokeErr)
 		}
 		p.recordSlowVRpc(ev)

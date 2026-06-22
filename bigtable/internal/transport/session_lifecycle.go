@@ -346,8 +346,6 @@ func (s *Session) handleClose(err error) {
 	}
 	lastRPC := s.nextRPCID.Load()
 	peer := s.peerInfoSummary()
-	fmt.Printf(">>> SESSION %s handleClose reason=%s age=%v in_flight=%d last_rpc_id=%d %s raw_err=%v <<<\n",
-		s.logName, reason, age, inFlight, lastRPC, peer, err)
 	s.recordEvent("close", "reason=%s age=%v in_flight=%d last_rpc_id=%d %s raw_err=%v",
 		reason, age, inFlight, lastRPC, peer, err)
 	s.cancelActiveRPCs(unavailable(err, "session closed: %v", err), nil)
@@ -443,11 +441,6 @@ func (s *Session) heartBeatLoop(ctx context.Context) {
 			}
 			if remaining > 0 {
 				// Deadline was pushed out while we were sleeping; re-arm.
-				// Log so we can see heartbeats (or other frames) keeping
-				// the session alive while specific in-flight vRPCs stall —
-				// that's the "case 1" signal vs. half-dead Recv (case 2).
-				fmt.Printf(">>> SESSION %s heartbeat tick alive in_flight=%d last_frame_age=%v remaining=%v interval=%v <<<\n",
-					s.logName, active, lastFrameAge, remaining, interval)
 				// Only record when last_frame_age has crossed one interval —
 				// otherwise every healthy session would spam the UI ring
 				// buffer ~3x/second and drown out close/missed events.
@@ -461,8 +454,8 @@ func (s *Session) heartBeatLoop(ctx context.Context) {
 			// active > 0 and deadline elapsed — half-dead stream (no frames
 			// arriving while we have in-flight work). Log before ForceClose
 			// so we have a definitive marker even if downstream cancel races.
-			fmt.Printf(">>> SESSION %s heartbeat MISSED — forcing close in_flight=%d last_frame_age=%v interval=%v <<<\n",
-				s.logName, active, lastFrameAge, interval)
+			s.debugf("heartbeat MISSED — forcing close in_flight=%d last_frame_age=%v interval=%v",
+				active, lastFrameAge, interval)
 			s.recordEvent("hb-missed", "in_flight=%d last_frame_age=%v interval=%v",
 				active, lastFrameAge, interval)
 			s.ForceClose(&spb.CloseSessionRequest{
