@@ -25,6 +25,7 @@ import (
 	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+	btopt "cloud.google.com/go/bigtable/internal/option"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -146,7 +147,6 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 	// 1Hz heartbeat to fire.
 	p.mu.Lock()
 	if !p.closed && len(p.sessions) == 0 {
-		fmt.Printf(">>> POOL %s: no sessions yet, kicking PerformScaling <<<\n", p.poolName)
 		go p.PerformScaling(ctx)
 	}
 	p.mu.Unlock()
@@ -405,7 +405,6 @@ func (p *SessionPoolImpl) UpdateConfig(config *spb.SessionClientConfiguration_Se
 	p.mu.Lock()
 	p.minSessions = int(config.MinSessionCount)
 	p.maxSessions = int(config.MaxSessionCount)
-	fmt.Printf(">>> SessionPool %p UpdateConfig: minSessions=%d, maxSessions=%d <<<\n", p, p.minSessions, p.maxSessions)
 
 	if config.LoadBalancingOptions != nil {
 		lbo := config.LoadBalancingOptions
@@ -466,21 +465,12 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 		p.mu.Unlock()
 	}()
 
-	stats := p.Stats()
-	fmt.Printf(">>> POOL %s STATS: Ready=%d, Starting=%d, InUse=%d, PendingOutstanding=%d <<<\n",
-		p.poolName, stats.ReadyCount, stats.StartingCount, stats.InUseCount, stats.PendingCount)
+	p.Stats()
 
 	delta := p.sizer.GetScaleDelta()
 	if delta == 0 {
 		return
 	}
-
-	p.mu.Lock()
-	currentSessions := len(p.sessions)
-	startingSessions := len(p.startingSessions)
-	p.mu.Unlock()
-
-	fmt.Printf(">>> POOL %s PerformScaling starting evaluation: delta=%d, current_sessions=%d, starting_sessions=%d <<<\n", p.poolName, delta, currentSessions, startingSessions)
 
 	if delta > 0 {
 		// Scale up: provision new sessions asynchronously and wait for completion to release the gate
@@ -490,16 +480,13 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 			go func() {
 				defer wg.Done()
 				if err := p.createSession(ctx); err != nil {
-					fmt.Printf(">>> POOL %s PerformScaling createSession failed: %v <<<\n", p.poolName, err)
-				} else {
-					fmt.Printf(">>> POOL %s PerformScaling successfully provisioned a new session <<<\n", p.poolName)
+					btopt.Debugf(nil, "POOL %s PerformScaling createSession failed: %v", p.poolName, err)
 				}
 			}()
 		}
 		wg.Wait()
 	} else {
 		// Scale down: prune idle sessions gracefully
-		fmt.Printf(">>> POOL %s PerformScaling pruning %d idle sessions <<<\n", p.poolName, -delta)
 		p.pruneSessions(-delta)
 	}
 }
@@ -592,7 +579,7 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 		p.mu.Lock()
 		delete(p.startingSessions, s)
 		p.mu.Unlock()
-		fmt.Printf(">>> POOL %p createSession Start failed for %s: %v <<<\n", p, sessionName, err)
+		btopt.Debugf(nil, "POOL %p createSession Start failed for %s: %v", p, sessionName, err)
 		return fmt.Errorf("failed to start session: %w", err)
 	}
 
@@ -694,7 +681,7 @@ func (p *SessionPoolImpl) sweepStuckSessions() {
 	p.mu.Unlock()
 
 	for _, v := range victims {
-		fmt.Printf(">>> POOL %s sweepStuckSessions: force-closing %s stuck in WaitServerClose for %v <<<\n",
+		btopt.Debugf(nil, "POOL %s sweepStuckSessions: force-closing %s stuck in WaitServerClose for %v",
 			p.poolName, v.sess.LogName(), v.stuckFor.Round(time.Second))
 		v.sess.ForceClose(&spb.CloseSessionRequest{
 			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR,

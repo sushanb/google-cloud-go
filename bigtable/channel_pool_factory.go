@@ -105,7 +105,6 @@ func createBigtableChannelPool(
 	directAccessMD metadata.MD,
 	clientCreationTimestamp time.Time,
 ) (*btransport.BigtableChannelPool, error) {
-	fmt.Printf(">>> createBigtableChannelPool called for project=%s, instance=%s <<<\n", project, instance)
 	uResolver, err := internaloption.NewUnsafeResolver(o...)
 	var connPoolSize int
 	if err != nil {
