@@ -77,21 +77,19 @@ func (f *fakeInvoker) callCount() int32 {
 // path stays exercised but doesn't try to emit OTel metrics.
 func newSessionTestTable(t *testing.T, readPool, writePool Invoker) *SessionTable {
 	t.Helper()
-	classic := &Table{
-		c: &Client{
-			project:              "P",
-			instance:             "I",
-			metricsTracerFactory: &builtinMetricsTracerFactory{enabled: false, shutdown: func() {}},
-		},
-		table: "t",
+	factory := &builtinMetricsTracerFactory{enabled: false, shutdown: func() {}}
+	metricsFactory := func(ctx context.Context, isStreaming bool) *builtinMetricsTracer {
+		mt := factory.createBuiltinMetricsTracer(ctx, "t", isStreaming)
+		return &mt
 	}
 	st := &SessionTable{
-		tableName:     "projects/P/instances/I/tables/t",
-		classic:       classic,
-		readPool:      readPool,
-		writePool:     writePool,
-		readVRpcDesc:  btransport.READ_ROW,
-		writeVRpcDesc: btransport.MUTATE_ROW,
+		tableName:      "projects/P/instances/I/tables/t",
+		md:             nil,
+		metricsFactory: metricsFactory,
+		readPool:       readPool,
+		writePool:      writePool,
+		readVRpcDesc:   btransport.READ_ROW,
+		writeVRpcDesc:  btransport.MUTATE_ROW,
 	}
 	return st
 }

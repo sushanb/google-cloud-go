@@ -153,7 +153,10 @@ func (m *SessionManager) GetOrCreateSessionTable(
 	}
 
 	if readPool != nil && m.diverter != nil {
-		sessionTable := NewSessionTable(classic.table, classic, readPool, writePool, readVRpcDesc, writeVRpcDesc)
+		metricsFactory := func(ctx context.Context, isStreaming bool) *builtinMetricsTracer {
+			return classic.newBuiltinMetricsTracer(ctx, isStreaming)
+		}
+		sessionTable := NewSessionTable(classic.table, classic.md, metricsFactory, readPool, writePool, readVRpcDesc, writeVRpcDesc)
 		return NewTableShim(&tableImpl{*classic}, sessionTable, m.diverter)
 	}
 

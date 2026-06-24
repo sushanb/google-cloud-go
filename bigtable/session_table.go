@@ -22,6 +22,7 @@ import (
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	btransport "cloud.google.com/go/bigtable/internal/transport"
+	"google.golang.org/grpc/metadata"
 )
 
 // Invoker is the narrow surface SessionTable needs from a session pool:
@@ -39,30 +40,41 @@ type Invoker interface {
 	Invoke(ctx context.Context, desc btransport.VRpcDescriptor, req interface{}) (btransport.InvokeResult, error)
 }
 
-// SessionTable implements TableAPI by routing calls via virtual RPCs through dedicated session pools.
+// SessionTable routes ReadRow and Apply calls via virtual RPCs through
+// dedicated session pools. It has no dependency on the classic *Table or
+// *Client — callers supply request metadata and an optional metrics factory
+// directly, enabling construction without a full bigtable.Client (e.g. from
+// the accelerator).
 type SessionTable struct {
-	tableName     string
-	classic       *Table
-	readPool      Invoker
-	writePool     Invoker
-	readVRpcDesc  btransport.VRpcDescriptor
-	writeVRpcDesc btransport.VRpcDescriptor
+	tableName      string
+	md             metadata.MD
+	metricsFactory func(ctx context.Context, isStreaming bool) *builtinMetricsTracer // nil = noop
+	readPool       Invoker
+	writePool      Invoker
+	readVRpcDesc   btransport.VRpcDescriptor
+	writeVRpcDesc  btransport.VRpcDescriptor
 }
 
-// NewSessionTable creates a new SessionTable instance.
+// NewSessionTable creates a SessionTable.
+//
+// md is the outgoing gRPC metadata to attach to every vRPC request (resource
+// prefix header, feature flags, etc.). metricsFactory may be nil, in which
+// case a no-op tracer is used and no metrics are emitted.
 func NewSessionTable(
 	tableName string,
-	classic *Table,
+	md metadata.MD,
+	metricsFactory func(ctx context.Context, isStreaming bool) *builtinMetricsTracer,
 	readPool *btransport.SessionPoolImpl,
 	writePool *btransport.SessionPoolImpl,
 	readVRpcDesc btransport.VRpcDescriptor,
 	writeVRpcDesc btransport.VRpcDescriptor,
 ) *SessionTable {
 	st := &SessionTable{
-		tableName:     tableName,
-		classic:       classic,
-		readVRpcDesc:  readVRpcDesc,
-		writeVRpcDesc: writeVRpcDesc,
+		tableName:      tableName,
+		md:             md,
+		metricsFactory: metricsFactory,
+		readVRpcDesc:   readVRpcDesc,
+		writeVRpcDesc:  writeVRpcDesc,
 	}
 	// Avoid storing a typed-nil *SessionPoolImpl in the interface field: the
 	// nil-pool checks in ReadRow/Apply use a plain `pool == nil` comparison,
@@ -74,6 +86,16 @@ func NewSessionTable(
 		st.writePool = writePool
 	}
 	return st
+}
+
+// newTracer returns a metrics tracer for a single operation. If metricsFactory
+// is nil a zero-value (no-op) tracer is returned — all builtinMetricsTracer
+// recording methods gate on builtInEnabled, so the zero value is safe.
+func (t *SessionTable) newTracer(ctx context.Context, isStreaming bool) *builtinMetricsTracer {
+	if t.metricsFactory == nil {
+		return &builtinMetricsTracer{}
+	}
+	return t.metricsFactory(ctx, isStreaming)
 }
 
 type sessionMetricsListener struct{}
@@ -90,15 +112,27 @@ func (l sessionMetricsListener) OnAttemptComplete(ctx context.Context, err error
 	}
 }
 
-// ReadRow reads a single row via vRPC.
+// ReadRow reads a single row via vRPC and returns the result as a bigtable.Row.
+// Returns (nil, nil) for a missing row. Returns an error if the read pool is
+// not available — callers (TableShim) should route to the classic path instead.
 func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOption) (rowVal Row, err error) {
+	pr, err := t.ReadRowProto(ctx, row, nil)
+	if err != nil {
+		return nil, err
+	}
+	return protoRowToRow(pr), nil
+}
+
+// ReadRowProto reads a single row via vRPC and returns the raw *btpb.Row proto,
+// bypassing the bigtable.Row conversion. Returns (nil, nil) for a missing row.
+func (t *SessionTable) ReadRowProto(ctx context.Context, row string, filter *btpb.RowFilter) (pr *btpb.Row, err error) {
 	if t.readPool == nil {
-		return t.classic.ReadRow(ctx, row, opts...)
+		return nil, errors.New("bigtable: read pool not available")
 	}
 
-	ctx = mergeOutgoingMetadata(ctx, t.classic.md)
+	ctx = mergeOutgoingMetadata(ctx, t.md)
 
-	mt := t.classic.newBuiltinMetricsTracer(ctx, false)
+	mt := t.newTracer(ctx, false)
 	defer mt.recordOperationCompletion()
 	mt.setMethod("ReadRows")
 	ctx = contextWithMetricsTracer(ctx, mt)
@@ -108,19 +142,19 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 		mt.setCurrOpStatus(statusCode)
 	}()
 
-	req := &btpb.ReadRowsRequest{
-		TableName: t.tableName,
-		Rows: &btpb.RowSet{
-			RowKeys: [][]byte{[]byte(row)},
-		},
-	}
-	settings := makeReadSettings(req, 0)
-	for _, opt := range opts {
-		opt.set(&settings)
+	// Apply any ReadOptions that set a filter.
+	if filter == nil {
+		req := &btpb.ReadRowsRequest{
+			TableName: t.tableName,
+			Rows:      &btpb.RowSet{RowKeys: [][]byte{[]byte(row)}},
+		}
+		settings := makeReadSettings(req, 0)
+		filter = req.Filter
+		_ = settings
 	}
 
 	retryInterceptor := btransport.RetryingVRpc(btransport.RetryingOptions{
-		MaxAttempts:       10, // Up to 10 attempts (initial attempt + 9 retries)
+		MaxAttempts:       10,
 		InitialBackoff:    10 * time.Millisecond,
 		MaxBackoff:        32 * time.Second,
 		BackoffMultiplier: 1.5,
@@ -129,7 +163,7 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 
 	args := btransport.ReadRowArgs{
 		RowKey: row,
-		Filter: req.Filter,
+		Filter: filter,
 	}
 
 	baseHandler := func(attemptCtx context.Context, request interface{}) (interface{}, error) {
@@ -139,15 +173,9 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 				mt.currOp.currAttempt.setClusterID(result.ClusterInfo.ClusterId)
 				mt.currOp.currAttempt.setZoneID(result.ClusterInfo.ZoneId)
 			}
-			// Stamp client-blocking latency as (SentAt - attemptStart). The
-			// gRPC stats handler never fires for vRPC frames, so without
-			// this assignment clientBlockingLatency would stay at 0 on
-			// the session path.
 			if !result.SentAt.IsZero() && !mt.currOp.currAttempt.startTime.IsZero() {
 				mt.currOp.currAttempt.clientBlockingLatency = convertToMs(result.SentAt.Sub(mt.currOp.currAttempt.startTime))
 			}
-			// Pull server-reported backend latency out of the Stats
-			// payload when the server populated it on the success frame.
 			if result.Stats != nil && result.Stats.BackendLatency != nil {
 				mt.currOp.currAttempt.setServerLatency(convertToMs(result.Stats.GetBackendLatency().AsDuration()))
 			}
@@ -158,10 +186,6 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 		return result.Response, nil
 	}
 
-	// Seed vRPC metadata so RetryingVRpc's WithAttempt(ctx, n) actually
-	// increments the per-attempt counter that Invoke reads via
-	// VRpcAttempt(ctx). Without this seed, WithAttempt is a no-op and every
-	// retry wire-frame carries AttemptNumber=1.
 	ctx = btransport.WithVRpcMetadata(ctx, t.readVRpcDesc.Method(), 0)
 	chained := btransport.ChainInterceptors(retryInterceptor)
 	res, err := chained(ctx, args, baseHandler)
@@ -173,22 +197,19 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 	if !ok {
 		return nil, fmt.Errorf("unexpected response type from vRPC: %T", res)
 	}
-
-	return protoRowToRow(readResp.GetRow()), nil
+	return readResp.GetRow(), nil
 }
 
-// Apply applies a single mutation via vRPC.
+// Apply applies a single mutation via vRPC. Conditional mutations must be
+// routed to the classic path by the caller (TableShim) before reaching here.
 func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts ...ApplyOption) (err error) {
-	if m.isConditional {
-		return t.classic.Apply(ctx, row, m, opts...)
-	}
 	if t.writePool == nil {
 		return errors.New("bigtable: write operations not supported on this resource")
 	}
 
-	ctx = mergeOutgoingMetadata(ctx, t.classic.md)
+	ctx = mergeOutgoingMetadata(ctx, t.md)
 
-	mt := t.classic.newBuiltinMetricsTracer(ctx, false)
+	mt := t.newTracer(ctx, false)
 	defer mt.recordOperationCompletion()
 	mt.setMethod("MutateRow")
 	ctx = contextWithMetricsTracer(ctx, mt)
@@ -233,15 +254,9 @@ func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts 
 				mt.currOp.currAttempt.setClusterID(result.ClusterInfo.ClusterId)
 				mt.currOp.currAttempt.setZoneID(result.ClusterInfo.ZoneId)
 			}
-			// Stamp client-blocking latency as (SentAt - attemptStart). The
-			// gRPC stats handler never fires for vRPC frames, so without
-			// this assignment clientBlockingLatency would stay at 0 on
-			// the session path.
 			if !result.SentAt.IsZero() && !mt.currOp.currAttempt.startTime.IsZero() {
 				mt.currOp.currAttempt.clientBlockingLatency = convertToMs(result.SentAt.Sub(mt.currOp.currAttempt.startTime))
 			}
-			// Pull server-reported backend latency out of the Stats
-			// payload when the server populated it on the success frame.
 			if result.Stats != nil && result.Stats.BackendLatency != nil {
 				mt.currOp.currAttempt.setServerLatency(convertToMs(result.Stats.GetBackendLatency().AsDuration()))
 			}
@@ -252,10 +267,6 @@ func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts 
 		return result.Response, nil
 	}
 
-	// Seed vRPC metadata so RetryingVRpc's WithAttempt(ctx, n) actually
-	// increments the per-attempt counter that Invoke reads via
-	// VRpcAttempt(ctx). Without this seed, WithAttempt is a no-op and every
-	// retry wire-frame carries AttemptNumber=1.
 	ctx = btransport.WithVRpcMetadata(ctx, t.writeVRpcDesc.Method(), 0)
 	chained := btransport.ChainInterceptors(retryInterceptor)
 	_, err = chained(ctx, args, baseHandler)
@@ -266,24 +277,30 @@ func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts 
 	return nil
 }
 
-// ReadRows delegates to classic TableAPI.
+// MutateRowProto applies proto mutations directly without bigtable.Mutation boxing.
+// ops are passed directly to the vRPC layer.
+func (t *SessionTable) MutateRowProto(ctx context.Context, row string, mutations []*btpb.Mutation) error {
+	return t.Apply(ctx, row, &Mutation{ops: mutations})
+}
+
+// ReadRows, SampleRowKeys, ApplyBulk, and ApplyReadModifyWrite are always
+// routed to the classic path by TableShim and will never be called on a
+// SessionTable. They exist only to satisfy the TableAPI interface.
+
 func (t *SessionTable) ReadRows(ctx context.Context, arg RowSet, f func(Row) bool, opts ...ReadOption) error {
-	return t.classic.ReadRows(ctx, arg, f, opts...)
+	return errors.New("bigtable: ReadRows not supported on session table")
 }
 
-// SampleRowKeys delegates to classic TableAPI.
 func (t *SessionTable) SampleRowKeys(ctx context.Context) ([]string, error) {
-	return t.classic.SampleRowKeys(ctx)
+	return nil, errors.New("bigtable: SampleRowKeys not supported on session table")
 }
 
-// ApplyBulk delegates to classic TableAPI.
 func (t *SessionTable) ApplyBulk(ctx context.Context, rowKeys []string, muts []*Mutation, opts ...ApplyOption) ([]error, error) {
-	return t.classic.ApplyBulk(ctx, rowKeys, muts, opts...)
+	return nil, errors.New("bigtable: ApplyBulk not supported on session table")
 }
 
-// ApplyReadModifyWrite delegates to classic TableAPI.
 func (t *SessionTable) ApplyReadModifyWrite(ctx context.Context, row string, m *ReadModifyWrite) (Row, error) {
-	return t.classic.ApplyReadModifyWrite(ctx, row, m)
+	return nil, errors.New("bigtable: ApplyReadModifyWrite not supported on session table")
 }
 
 func protoRowToRow(pr *btpb.Row) Row {
