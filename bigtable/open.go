@@ -15,13 +15,8 @@
 package bigtable
 
 import (
-	"context"
-	"fmt"
-
+	"cloud.google.com/go/bigtable/internal/session"
 	"google.golang.org/grpc/metadata"
-
-	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
-	btransport "cloud.google.com/go/bigtable/internal/transport"
 )
 
 // Open opens a table.
@@ -36,48 +31,27 @@ func (c *Client) Open(table string) *Table {
 	}
 }
 
-// OpenTable opens a table.
+// OpenTable opens a table. When EnableSessionPool is set on the client config,
+// session-routable operations (ReadRow, Apply) dispatch through the vRPC
+// session transport via internal/session; everything else delegates to the
+// classic *Table.
 func (c *Client) OpenTable(table string) TableAPI {
 	classic := c.Open(table)
-	readStreamFactory := func(ctx context.Context) (btransport.Stream, error) {
-		if c.sessionClient != nil {
-			return c.sessionClient.OpenTable(ctx)
-		}
-		return c.client.OpenTable(ctx)
-	}
-	writeStreamFactory := func(ctx context.Context) (btransport.Stream, error) {
-		if c.sessionClient != nil {
-			return c.sessionClient.OpenTable(ctx)
-		}
-		return c.client.OpenTable(ctx)
+	classicAPI := &tableImpl{*classic}
+
+	if c.sessionImpl == nil || c.diverter == nil {
+		return classicAPI
 	}
 
-	readTableReq := &btpb.OpenTableRequest{
-		TableName:    c.fullTableName(table),
-		AppProfileId: c.appProfile,
-		Permission:   btpb.OpenTableRequest_PERMISSION_READ,
-	}
-	writeTableReq := &btpb.OpenTableRequest{
-		TableName:    c.fullTableName(table),
-		AppProfileId: c.appProfile,
-		Permission:   btpb.OpenTableRequest_PERMISSION_WRITE,
-	}
-
-	return c.sessionMgr.GetOrCreateSessionTable(
-		c.fullTableName(table),
-		classic,
-		btransport.TABLE_SESSION,
-		readStreamFactory,
-		writeStreamFactory,
-		readTableReq,
-		writeTableReq,
-		btransport.READ_ROW,
-		btransport.MUTATE_ROW,
-		fmt.Sprintf("table:%s", table),
-	)
+	return NewTableShim(classicAPI, c.getOrCreateSessionTable(table), c.diverter)
 }
 
-// OpenAuthorizedView opens an authorized view.
+// OpenAuthorizedView opens an authorized view. Session-transport routing for
+// authorized views is not yet implemented in internal/session; all operations
+// go through the classic path.
+//
+// TODO: add SessionTableApi support for authorized views (separate VRpc
+// descriptors and OpenSessionRequest payload type).
 func (c *Client) OpenAuthorizedView(table, authorizedView string) TableAPI {
 	classic := &Table{
 		c:     c,
@@ -88,46 +62,15 @@ func (c *Client) OpenAuthorizedView(table, authorizedView string) TableAPI {
 		), c.featureFlagsMD),
 		authorizedView: authorizedView,
 	}
-
-	readStreamFactory := func(ctx context.Context) (btransport.Stream, error) {
-		if c.sessionClient != nil {
-			return c.sessionClient.OpenAuthorizedView(ctx)
-		}
-		return c.client.OpenAuthorizedView(ctx)
-	}
-	writeStreamFactory := func(ctx context.Context) (btransport.Stream, error) {
-		if c.sessionClient != nil {
-			return c.sessionClient.OpenAuthorizedView(ctx)
-		}
-		return c.client.OpenAuthorizedView(ctx)
-	}
-
-	readTableReq := &btpb.OpenAuthorizedViewRequest{
-		AuthorizedViewName: c.fullAuthorizedViewName(table, authorizedView),
-		AppProfileId:       c.appProfile,
-		Permission:         btpb.OpenAuthorizedViewRequest_PERMISSION_READ,
-	}
-	writeTableReq := &btpb.OpenAuthorizedViewRequest{
-		AuthorizedViewName: c.fullAuthorizedViewName(table, authorizedView),
-		AppProfileId:       c.appProfile,
-		Permission:         btpb.OpenAuthorizedViewRequest_PERMISSION_WRITE,
-	}
-
-	return c.sessionMgr.GetOrCreateSessionTable(
-		c.fullAuthorizedViewName(table, authorizedView),
-		classic,
-		btransport.AUTHORIZED_VIEW_SESSION,
-		readStreamFactory,
-		writeStreamFactory,
-		readTableReq,
-		writeTableReq,
-		btransport.READ_ROW_AUTH_VIEW,
-		btransport.MUTATE_ROW_AUTH_VIEW,
-		fmt.Sprintf("auth_view:%s:%s", table, authorizedView),
-	)
+	return &tableImpl{*classic}
 }
 
-// OpenMaterializedView opens a materialized view.
+// OpenMaterializedView opens a materialized view. Session-transport routing
+// for materialized views is not yet implemented in internal/session; reads go
+// through the classic path.
+//
+// TODO: add SessionTableApi support for materialized views (read-only, with
+// the READ_ROW_MAT_VIEW descriptor).
 func (c *Client) OpenMaterializedView(materializedView string) TableAPI {
 	classic := &Table{
 		c: c,
@@ -137,29 +80,21 @@ func (c *Client) OpenMaterializedView(materializedView string) TableAPI {
 		), c.featureFlagsMD),
 		materializedView: materializedView,
 	}
+	return &tableImpl{*classic}
+}
 
-	readStreamFactory := func(ctx context.Context) (btransport.Stream, error) {
-		if c.sessionClient != nil {
-			return c.sessionClient.OpenMaterializedView(ctx)
-		}
-		return c.client.OpenMaterializedView(ctx)
+// getOrCreateSessionTable returns the cached SessionTableApi for table,
+// creating one on miss. The cache lives on the Client because internal/session
+// is intentionally cache-free.
+func (c *Client) getOrCreateSessionTable(table string) session.SessionTableApi {
+	// Lookup / create under one lock so concurrent OpenTable calls for the
+	// same table do not stand up duplicate session pools.
+	c.sessionTablesMu.Lock()
+	defer c.sessionTablesMu.Unlock()
+	if st, ok := c.sessionTables[table]; ok {
+		return st
 	}
-
-	readTableReq := &btpb.OpenMaterializedViewRequest{
-		MaterializedViewName: c.fullMaterializedViewName(materializedView),
-		AppProfileId:         c.appProfile,
-	}
-
-	return c.sessionMgr.GetOrCreateSessionTable(
-		c.fullMaterializedViewName(materializedView),
-		classic,
-		btransport.MATERIALIZED_VIEW_SESSION,
-		readStreamFactory,
-		nil,
-		readTableReq,
-		nil,
-		btransport.READ_ROW_MAT_VIEW,
-		nil,
-		fmt.Sprintf("mat_view:%s", materializedView),
-	)
+	st := c.sessionImpl.NewSessionTable(table)
+	c.sessionTables[table] = st
+	return st
 }

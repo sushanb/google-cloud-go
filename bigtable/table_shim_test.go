@@ -19,9 +19,11 @@ import (
 	"errors"
 	"testing"
 
+	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	internal "cloud.google.com/go/bigtable/internal/transport"
 )
 
+// mockTableAPI is the classic-side mock — implements the public TableAPI.
 type mockTableAPI struct {
 	readRowFunc              func(ctx context.Context, row string, opts ...ReadOption) (Row, error)
 	applyFunc                func(ctx context.Context, row string, m *Mutation, opts ...ApplyOption) error
@@ -73,7 +75,41 @@ func (m *mockTableAPI) ApplyReadModifyWrite(ctx context.Context, row string, rmw
 	return nil, nil
 }
 
+// mockSessionTableApi is the session-side mock — implements session.SessionTableApi.
+type mockSessionTableApi struct {
+	readRowFunc   func(ctx context.Context, req *btpb.SessionReadRowRequest) (*btpb.SessionReadRowResponse, error)
+	mutateRowFunc func(ctx context.Context, req *btpb.SessionMutateRowRequest) (*btpb.SessionMutateRowResponse, error)
+}
+
+func (m *mockSessionTableApi) ReadRow(ctx context.Context, req *btpb.SessionReadRowRequest) (*btpb.SessionReadRowResponse, error) {
+	if m.readRowFunc != nil {
+		return m.readRowFunc(ctx, req)
+	}
+	return &btpb.SessionReadRowResponse{}, nil
+}
+
+func (m *mockSessionTableApi) MutateRow(ctx context.Context, req *btpb.SessionMutateRowRequest) (*btpb.SessionMutateRowResponse, error) {
+	if m.mutateRowFunc != nil {
+		return m.mutateRowFunc(ctx, req)
+	}
+	return &btpb.SessionMutateRowResponse{}, nil
+}
+
+func (m *mockSessionTableApi) Close() error { return nil }
+
 func TestTableShim_ReadRow(t *testing.T) {
+	// Session-side: a row with one family, one column, one cell. TableShim
+	// converts the proto into a bigtable.Row keyed by "row1".
+	sessionRow := &btpb.Row{
+		Key: []byte("row1"),
+		Families: []*btpb.Family{{
+			Name: "fam",
+			Columns: []*btpb.Column{{
+				Qualifier: []byte("q"),
+				Cells:     []*btpb.Cell{{Value: []byte("v")}},
+			}},
+		}},
+	}
 	dummyRow := Row{"fam": []ReadItem{{Row: "row1"}}}
 	dummyErr := errors.New("dummy error")
 
@@ -87,15 +123,15 @@ func TestTableShim_ReadRow(t *testing.T) {
 				return dummyRow, nil
 			},
 		}
-		session := &mockTableAPI{
-			readRowFunc: func(ctx context.Context, row string, opts ...ReadOption) (Row, error) {
+		sessionAPI := &mockSessionTableApi{
+			readRowFunc: func(ctx context.Context, req *btpb.SessionReadRowRequest) (*btpb.SessionReadRowResponse, error) {
 				sessionCalled = true
 				return nil, dummyErr
 			},
 		}
 
 		diverter := internal.NewDiverter(0.0) // 0% load
-		shim := NewTableShim(classic, session, diverter)
+		shim := NewTableShim(classic, sessionAPI, diverter)
 
 		res, err := shim.ReadRow(context.Background(), "row1")
 		if err != nil {
@@ -122,15 +158,15 @@ func TestTableShim_ReadRow(t *testing.T) {
 				return nil, dummyErr
 			},
 		}
-		session := &mockTableAPI{
-			readRowFunc: func(ctx context.Context, row string, opts ...ReadOption) (Row, error) {
+		sessionAPI := &mockSessionTableApi{
+			readRowFunc: func(ctx context.Context, req *btpb.SessionReadRowRequest) (*btpb.SessionReadRowResponse, error) {
 				sessionCalled = true
-				return dummyRow, nil
+				return &btpb.SessionReadRowResponse{Row: sessionRow}, nil
 			},
 		}
 
 		diverter := internal.NewDiverter(1.0) // 100% load
-		shim := NewTableShim(classic, session, diverter)
+		shim := NewTableShim(classic, sessionAPI, diverter)
 
 		res, err := shim.ReadRow(context.Background(), "row1")
 		if err != nil {
@@ -157,15 +193,15 @@ func TestTableShim_ReadRow(t *testing.T) {
 				return dummyRow, nil
 			},
 		}
-		session := &mockTableAPI{
-			readRowFunc: func(ctx context.Context, row string, opts ...ReadOption) (Row, error) {
+		sessionAPI := &mockSessionTableApi{
+			readRowFunc: func(ctx context.Context, req *btpb.SessionReadRowRequest) (*btpb.SessionReadRowResponse, error) {
 				sessionCalled = true
 				return nil, dummyErr
 			},
 		}
 
 		diverter := internal.NewDiverter(1.0)
-		shim := NewTableShim(classic, session, diverter)
+		shim := NewTableShim(classic, sessionAPI, diverter)
 
 		_, err := shim.ReadRow(context.Background(), "row1")
 		if err != dummyErr {
@@ -193,15 +229,15 @@ func TestTableShim_Apply(t *testing.T) {
 				return nil
 			},
 		}
-		session := &mockTableAPI{
-			applyFunc: func(ctx context.Context, row string, m *Mutation, opts ...ApplyOption) error {
+		sessionAPI := &mockSessionTableApi{
+			mutateRowFunc: func(ctx context.Context, req *btpb.SessionMutateRowRequest) (*btpb.SessionMutateRowResponse, error) {
 				sessionCalled = true
-				return dummyErr
+				return nil, dummyErr
 			},
 		}
 
 		diverter := internal.NewDiverter(0.0)
-		shim := NewTableShim(classic, session, diverter)
+		shim := NewTableShim(classic, sessionAPI, diverter)
 
 		err := shim.Apply(context.Background(), "row1", NewMutation())
 		if err != nil {
@@ -225,15 +261,15 @@ func TestTableShim_Apply(t *testing.T) {
 				return dummyErr
 			},
 		}
-		session := &mockTableAPI{
-			applyFunc: func(ctx context.Context, row string, m *Mutation, opts ...ApplyOption) error {
+		sessionAPI := &mockSessionTableApi{
+			mutateRowFunc: func(ctx context.Context, req *btpb.SessionMutateRowRequest) (*btpb.SessionMutateRowResponse, error) {
 				sessionCalled = true
-				return nil
+				return &btpb.SessionMutateRowResponse{}, nil
 			},
 		}
 
 		diverter := internal.NewDiverter(1.0)
-		shim := NewTableShim(classic, session, diverter)
+		shim := NewTableShim(classic, sessionAPI, diverter)
 
 		err := shim.Apply(context.Background(), "row1", NewMutation())
 		if err != nil {
@@ -257,15 +293,15 @@ func TestTableShim_Apply(t *testing.T) {
 				return nil
 			},
 		}
-		session := &mockTableAPI{
-			applyFunc: func(ctx context.Context, row string, m *Mutation, opts ...ApplyOption) error {
+		sessionAPI := &mockSessionTableApi{
+			mutateRowFunc: func(ctx context.Context, req *btpb.SessionMutateRowRequest) (*btpb.SessionMutateRowResponse, error) {
 				sessionCalled = true
-				return dummyErr
+				return nil, dummyErr
 			},
 		}
 
 		diverter := internal.NewDiverter(1.0)
-		shim := NewTableShim(classic, session, diverter)
+		shim := NewTableShim(classic, sessionAPI, diverter)
 
 		err := shim.Apply(context.Background(), "row1", NewMutation())
 		if err != dummyErr {
@@ -282,7 +318,6 @@ func TestTableShim_Apply(t *testing.T) {
 
 func TestTableShim_DelegatedMethods(t *testing.T) {
 	classicCalled := false
-	sessionCalled := false
 
 	classic := &mockTableAPI{
 		readRowsFunc: func(ctx context.Context, arg RowSet, f func(Row) bool, opts ...ReadOption) error {
@@ -302,56 +337,36 @@ func TestTableShim_DelegatedMethods(t *testing.T) {
 			return nil, nil
 		},
 	}
-	session := &mockTableAPI{
-		readRowsFunc: func(ctx context.Context, arg RowSet, f func(Row) bool, opts ...ReadOption) error {
-			sessionCalled = true
-			return nil
-		},
-		sampleRowKeysFunc: func(ctx context.Context) ([]string, error) {
-			sessionCalled = true
-			return nil, nil
-		},
-		applyBulkFunc: func(ctx context.Context, rowKeys []string, muts []*Mutation, opts ...ApplyOption) ([]error, error) {
-			sessionCalled = true
-			return nil, nil
-		},
-		applyReadModifyWriteFunc: func(ctx context.Context, row string, m *ReadModifyWrite) (Row, error) {
-			sessionCalled = true
-			return nil, nil
-		},
-	}
+	sessionAPI := &mockSessionTableApi{}
 
 	diverter := internal.NewDiverter(1.0) // Even with 100% session load, these delegate to classic
-	shim := NewTableShim(classic, session, diverter)
+	shim := NewTableShim(classic, sessionAPI, diverter)
 
 	// ReadRows
 	classicCalled = false
 	_ = shim.ReadRows(context.Background(), RowRange{}, func(r Row) bool { return true })
-	if !classicCalled || sessionCalled {
-		t.Errorf("ReadRows: expected classic called: %v, session called: %v", classicCalled, sessionCalled)
+	if !classicCalled {
+		t.Error("ReadRows: expected classic to be called")
 	}
 
 	// SampleRowKeys
 	classicCalled = false
-	sessionCalled = false
 	_, _ = shim.SampleRowKeys(context.Background())
-	if !classicCalled || sessionCalled {
-		t.Errorf("SampleRowKeys: expected classic called: %v, session called: %v", classicCalled, sessionCalled)
+	if !classicCalled {
+		t.Error("SampleRowKeys: expected classic to be called")
 	}
 
 	// ApplyBulk
 	classicCalled = false
-	sessionCalled = false
 	_, _ = shim.ApplyBulk(context.Background(), nil, nil)
-	if !classicCalled || sessionCalled {
-		t.Errorf("ApplyBulk: expected classic called: %v, session called: %v", classicCalled, sessionCalled)
+	if !classicCalled {
+		t.Error("ApplyBulk: expected classic to be called")
 	}
 
 	// ApplyReadModifyWrite
 	classicCalled = false
-	sessionCalled = false
 	_, _ = shim.ApplyReadModifyWrite(context.Background(), "row1", nil)
-	if !classicCalled || sessionCalled {
-		t.Errorf("ApplyReadModifyWrite: expected classic called: %v, session called: %v", classicCalled, sessionCalled)
+	if !classicCalled {
+		t.Error("ApplyReadModifyWrite: expected classic to be called")
 	}
 }

@@ -21,10 +21,12 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"sync"
 	"time"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	btopt "cloud.google.com/go/bigtable/internal/option"
+	"cloud.google.com/go/bigtable/internal/session"
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 	"cloud.google.com/go/internal/trace"
 	gax "github.com/googleapis/gax-go/v2"
@@ -49,11 +51,21 @@ type Client struct {
 	executeQueryRetryOption    gax.CallOption
 	featureFlagsMD             metadata.MD // Pre-computed feature flags metadata to be sent with each request.
 	configManager              *btransport.ClientConfigurationManager
-	sessionMgr                 *SessionManager
 	diverter                   *btransport.Diverter
 	config                     ClientConfig
 	backgroundCtx              context.Context
 	backgroundCancel           context.CancelFunc
+
+	// sessionImpl is the session-transport connectivity tier. nil when
+	// EnableSessionPool is false (or when initial dial failed) — OpenTable
+	// then returns the classic-only TableAPI.
+	sessionImpl session.SessionClient
+
+	// sessionTables caches per-table SessionTableApi instances so OpenTable
+	// does not re-open read+write pools on every call. session.SessionClient
+	// is intentionally cache-free; the cache lives here.
+	sessionTablesMu sync.Mutex
+	sessionTables   map[string]session.SessionTableApi
 }
 
 // ClientConfig has configurations for the client.
@@ -233,19 +245,20 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		c.diverter.SetSessionLoad(load)
 	})
 
-	c.sessionMgr = NewSessionManager(
-		config.EnableSessionPool,
-		metricsTracerFactory.enabled,
-		disableRetryInfo,
-		directAccessMD,
-		c.diverter,
-		configManager,
-		c.backgroundCtx,
-		config.SessionPoolMin,
-		config.SessionPoolMax,
-		metricsTracerFactory.otelMeterProvider,
-		sessionManaged,
-	)
+	// Construct the session-transport connectivity tier. internal/session
+	// dials its own connection — the per-AFE / CCM-driven pool is a documented
+	// TODO inside that package. If EnableSessionPool is false or the dial
+	// fails, sessionImpl is left nil and OpenTable returns the classic-only
+	// TableAPI.
+	if config.EnableSessionPool {
+		sc, err := session.NewSessionClient(ctx, project, instance, config.AppProfile, configManager, opts...)
+		if err != nil {
+			btopt.Debugf(nil, "bigtable: session.NewSessionClient failed: %v; OpenTable will fall back to classic", err)
+		} else {
+			c.sessionImpl = sc
+			c.sessionTables = make(map[string]session.SessionTableApi)
+		}
+	}
 
 	return c, nil
 }
@@ -253,17 +266,25 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 // Close closes the Client.
 //
 // Shutdown order:
-//  1. SessionManager.Close — drain in-flight session work and stop new acquisitions.
+//  1. Cached SessionTableApi instances + sessionImpl — drain in-flight session
+//     work and tear down per-table pools before the connection goes.
 //  2. ClientConfigurationManager.Close — stop polling so it cannot fire UpdateConfig
 //     against pools that are about to be torn down.
 //  3. backgroundCancel — release any goroutines tied to the client's background ctx.
 //  4. metricsTracerFactory.shutdown — flush metrics now that no further RPCs will run.
 //  5. classicPool.Close — finally tear down the underlying connection pool.
 func (c *Client) Close() error {
-	fmt.Printf("Closing the client for project %s and instance %s\n", c.project, c.instance)
 	var errs []error
-	if c.sessionMgr != nil {
-		if err := c.sessionMgr.Close(); err != nil {
+	c.sessionTablesMu.Lock()
+	for _, st := range c.sessionTables {
+		if err := st.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	c.sessionTables = nil
+	c.sessionTablesMu.Unlock()
+	if c.sessionImpl != nil {
+		if err := c.sessionImpl.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
