@@ -261,9 +261,30 @@ func (m *ClientConfigurationManager) addListener(listener configListener) func()
 // bounds. Before this, Headroom, NewSessionQueueLength, and the entire
 // LoadBalancingOptions oneof were silently dropped, so the pool ran with
 // the constructor defaults no matter what the control plane sent.
+//
+// Fires once at registration with the manager's current sessionPoolConfig
+// (delivers CCM defaults before any successful poll has landed). On every
+// subsequent poll, fires ONLY when the parsed sessionPoolConfig differs from
+// the value last delivered to this listener — mirroring Java's
+// ListenerEntry.maybeNotify(oldValue, newValue) per-extractor equality
+// check. sessionPoolConfig is a plain comparable struct, so == suffices.
 func (m *ClientConfigurationManager) AddSessionPoolListener(listener func(*bigtablepb.SessionClientConfiguration_SessionPoolConfiguration)) func() {
+	var (
+		mu       sync.Mutex
+		haveLast bool
+		last     sessionPoolConfig
+	)
 	return m.addListener(func(cfg clientConfig, seq int64) {
 		sp := cfg.Session.SessionPool
+		mu.Lock()
+		if haveLast && last == sp {
+			mu.Unlock()
+			return
+		}
+		last = sp
+		haveLast = true
+		mu.Unlock()
+
 		spCfg := &bigtablepb.SessionClientConfiguration_SessionPoolConfiguration{
 			Headroom:                           sp.Headroom,
 			MinSessionCount:                    int32(sp.MinSessionCount),
@@ -311,21 +332,33 @@ func encodeLoadBalancing(lb loadBalancingOptions) *bigtablepb.LoadBalancingOptio
 	return nil
 }
 
-// AddSessionLoadListener registers a callback that receives the server-driven
-// SessionLoad value (0.0 = all-classic, 1.0 = all-session) on every
-// configuration update from a successful poll. Returns an unregister thunk.
-//
-// Unlike AddSessionPoolListener, this skips the immediate registration-time
-// fire that would otherwise deliver the default config (seq=0). Callers rely
-// on the bootstrap value they passed to NewDiverter remaining in effect until
-// the control plane actually responds — firing with seq=0's default
-// SessionLoad=0 would silently clobber that bootstrap.
+// AddSessionLoadListener registers a callback that receives the SessionLoad
+// value (0.0 = all-classic, 1.0 = all-session). Fires once at registration
+// with the manager's current SessionLoad — defaultClientConfig.Session.SessionLoad
+// is 0, so absent a successful poll the listener sees 0 and the diverter
+// safely routes to classic. On every subsequent poll, fires ONLY when the
+// new SessionLoad differs from the value last delivered to this listener,
+// mirroring Java's ListenerEntry.maybeNotify(oldValue, newValue) per-extractor
+// equality check. This makes the listener callback the single source of truth
+// for SessionLoad on the consumer side; callers should not seed their own
+// bootstrap. Returns an unregister thunk.
 func (m *ClientConfigurationManager) AddSessionLoadListener(listener func(load float64)) func() {
+	var (
+		mu       sync.Mutex
+		haveLast bool
+		last     float64
+	)
 	return m.addListener(func(cfg clientConfig, seq int64) {
-		if seq == 0 {
+		load := cfg.Session.SessionLoad
+		mu.Lock()
+		if haveLast && last == load {
+			mu.Unlock()
 			return
 		}
-		listener(cfg.Session.SessionLoad)
+		last = load
+		haveLast = true
+		mu.Unlock()
+		listener(load)
 	})
 }
 

@@ -41,9 +41,10 @@ const (
 
 // sessionClient is the private SessionClient implementation. It holds one gRPC
 // connection (placeholder for a future per-AFE pool) and uses it to construct
-// session pools on demand for each SessionTableApi it vends.
+// session pools on demand for each SessionTableApi it vends. It also owns the
+// per-instance ClientConfigurationManager built by NewSessionClient.
 //
-// Lifted from bigtable.SessionManager: pool naming with monotonic ID, optional
+// Lifted from bigtable.SessionManager: pool naming with monotonic ID,
 // ClientConfigurationManager listener registration. Metrics integration is
 // deferred to Phase 4 — meterProvider is a no-op and dispatch code skips the
 // per-attempt tracer work.
@@ -55,8 +56,9 @@ type sessionClient struct {
 	featureFlagsMD metadata.MD
 	meterProvider  metric.MeterProvider
 
-	// configManager pushes pool sizing / channel selection configuration from
-	// the server. Optional — when nil, pools run with their default config.
+	// configManager pushes pool sizing / channel selection configuration and
+	// SessionLoad updates from the server. Owned by this sessionClient —
+	// Close closes it before tearing down the gRPC connection.
 	configManager *btransport.ClientConfigurationManager
 
 	// nextPoolID mints unique pool IDs for human-readable pool names, mirroring
@@ -114,8 +116,23 @@ func (c *sessionClient) MeterProvider() metric.MeterProvider {
 	return c.meterProvider
 }
 
-// Close closes the underlying gRPC connection.
+// OnSessionLoad registers a listener for server-driven SessionLoad updates.
+// Returns a no-op unregister thunk if no configManager is wired.
+func (c *sessionClient) OnSessionLoad(listener func(load float64)) func() {
+	if c.configManager == nil {
+		return func() {}
+	}
+	return c.configManager.AddSessionLoadListener(listener)
+}
+
+// Close closes the embedded ClientConfigurationManager first — its barrier
+// blocks until any in-flight poll's listener callbacks have returned, so no
+// SessionPool.UpdateConfig fires against a pool that is about to tear down —
+// then closes the underlying gRPC connection.
 func (c *sessionClient) Close() error {
+	if c.configManager != nil {
+		c.configManager.Close()
+	}
 	if c.conn == nil {
 		return nil
 	}
@@ -123,7 +140,7 @@ func (c *sessionClient) Close() error {
 }
 
 // makePool constructs a SessionPoolImpl for a single (table, permission) pair
-// and wires up CCM listener registration when configManager is set.
+// and wires up CCM listener registration.
 //
 // The pool's stream factory closes over c.btClient.OpenTable, so all pools
 // share the same underlying connection.
