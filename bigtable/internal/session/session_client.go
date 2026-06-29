@@ -13,48 +13,60 @@
 // limitations under the License.
 
 // Package session provides the internal vRPC-session connectivity tier used
-// by both the classic bigtable.Client and the accelerator. A SessionClient is
-// per (project, instance, appProfile). It owns a channel pool and vends
-// per-table SessionTableApi instances.
+// by the classic bigtable.Client. A SessionClient is per (project, instance,
+// appProfile). It owns a channel pool, a ClientConfigurationManager for
+// server-driven pool sizing / traffic-split updates, and vends per-table
+// SessionTableApi instances.
 //
-// Callers (bigtable.Client, accelerator.AcceleratorChannel) are responsible
-// for caching per-table SessionTableApi instances — NewSessionTable does not
-// cache.
+// Callers (bigtable.Client) are responsible for caching per-table
+// SessionTableApi instances — NewSessionTable does not cache.
 package session
 
 import (
 	"context"
+	"fmt"
+	"net/url"
 
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc/metadata"
 )
 
 // SessionClient is the per-instance connectivity tier for the vRPC session
 // transport.
 type SessionClient interface {
 	// NewSessionTable constructs a fresh SessionTableApi for tableName.
-	// Does NOT cache — the consumer (bigtable.Client / AcceleratorChannel) is
-	// responsible for caching per-table instances to amortize pool creation.
+	// Does NOT cache — the consumer (bigtable.Client) is responsible for
+	// caching per-table instances to amortize pool creation.
 	NewSessionTable(tableName string) SessionTableApi
 
 	// MeterProvider returns the OTel meter provider derived from the metrics
 	// factory injected at construction time. Callers can register additional
-	// instruments on it (for example, the accelerator's python-to-wire hop
-	// histograms). Returns a no-op provider when no metrics factory was
+	// instruments on it. Returns a no-op provider when no metrics factory was
 	// injected — registrations are silently dropped.
 	MeterProvider() metric.MeterProvider
 
-	// Close closes the underlying channel pool. SessionTableApi instances
-	// previously vended become unusable.
+	// OnSessionLoad registers a listener for SessionLoad updates (0.0 =
+	// all-classic, 1.0 = all-session) pushed by the embedded
+	// ClientConfigurationManager. Fires once at registration with the CCM's
+	// current value (defaults to 0 before any successful poll) and again on
+	// each subsequent poll where the new value differs from the previous
+	// fire — a poll that returns an unchanged SessionLoad does not refire.
+	// Returns an unregister thunk.
+	OnSessionLoad(listener func(load float64)) (unregister func())
+
+	// Close closes the embedded ClientConfigurationManager (stopping further
+	// listener callbacks) and the underlying channel pool. SessionTableApi
+	// instances previously vended become unusable.
 	Close() error
 }
 
-// NewSessionClient dials Bigtable and constructs a SessionClient bound to the
-// given resource scope. configManager is optional — when non-nil, each
-// SessionPoolImpl created by this client registers a listener so the server
-// can push pool sizing / channel-selection configuration.
+// NewSessionClient dials Bigtable, constructs a ClientConfigurationManager
+// bound to the dialed connection, and returns a SessionClient that owns
+// both. Close cascades: CCM is closed first (so no late listener callbacks
+// fire against pools that are about to tear down), then the gRPC connection.
 //
 // TODO: Replace the simple single-connection dial with a per-AFE channel pool
 // driven by ClientConfigurationManager — see SESSION_CLIENT_REFACTOR.md
@@ -68,20 +80,30 @@ type SessionClient interface {
 func NewSessionClient(
 	ctx context.Context,
 	project, instance, appProfile string,
-	configManager *btransport.ClientConfigurationManager,
 	opts ...option.ClientOption,
 ) (SessionClient, error) {
 	conn, btClient, err := dialBigtable(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
+
+	featureFlagsMD := buildFeatureFlagsMD()
+	instanceName := fmt.Sprintf("projects/%s/instances/%s", project, instance)
+	configMD := metadata.Join(metadata.Pairs(
+		resourcePrefixHeader, instanceName,
+		requestParamsHeader, fmt.Sprintf("name=%s&app_profile_id=%s",
+			url.QueryEscape(instanceName), url.QueryEscape(appProfile)),
+	), featureFlagsMD)
+	configManager := btransport.NewClientConfigurationManager(btClient, instanceName, appProfile, configMD, nil)
+	configManager.Start(ctx)
+
 	return &sessionClient{
 		project:        project,
 		instance:       instance,
 		appProfile:     appProfile,
 		conn:           conn,
 		btClient:       btClient,
-		featureFlagsMD: buildFeatureFlagsMD(),
+		featureFlagsMD: featureFlagsMD,
 		meterProvider:  noop.NewMeterProvider(),
 		configManager:  configManager,
 	}, nil

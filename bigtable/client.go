@@ -50,7 +50,6 @@ type Client struct {
 	retryOption                gax.CallOption
 	executeQueryRetryOption    gax.CallOption
 	featureFlagsMD             metadata.MD // Pre-computed feature flags metadata to be sent with each request.
-	configManager              *btransport.ClientConfigurationManager
 	diverter                   *btransport.Diverter
 	config                     ClientConfig
 	backgroundCtx              context.Context
@@ -225,38 +224,34 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		executeQueryRetryOption: executeQueryRetryOption,
 		featureFlagsMD:          directAccessMD,
 		config:                  config,
-		diverter:                btransport.NewDiverter(1.0),
+		// Bootstrap the diverter at 0.0 (all-classic). The OnSessionLoad
+		// listener registered below — only when EnableSessionPool=true and the
+		// session dial succeeded — is the single writer that raises it. When
+		// EnableSessionPool=false, no listener is registered and the diverter
+		// stays at 0 so every call routes through the classic transport.
+		diverter: btransport.NewDiverter(0.0),
 	}
 	c.backgroundCtx, c.backgroundCancel = context.WithCancel(context.Background())
 
-	configMD := metadata.Join(metadata.Pairs(
-		resourcePrefixHeader, c.fullInstanceName(),
-		requestParamsHeader, c.reqParamsHeaderValInstance(),
-	), c.featureFlagsMD)
-
-	configManager := btransport.NewClientConfigurationManager(btClient, c.fullInstanceName(), config.AppProfile, configMD, nil)
-	configManager.Start(ctx)
-	c.configManager = configManager
-
-	// Pump server-driven SessionLoad into the Diverter so the classic/session
-	// traffic split honors the control plane's choice. NewDiverter(1.0) above
-	// is the bootstrap default; the first successful poll replaces it.
-	configManager.AddSessionLoadListener(func(load float64) {
-		c.diverter.SetSessionLoad(load)
-	})
-
 	// Construct the session-transport connectivity tier. internal/session
-	// dials its own connection — the per-AFE / CCM-driven pool is a documented
-	// TODO inside that package. If EnableSessionPool is false or the dial
-	// fails, sessionImpl is left nil and OpenTable returns the classic-only
-	// TableAPI.
+	// dials its own connection AND owns its ClientConfigurationManager — the
+	// per-AFE / CCM-driven pool is a documented TODO inside that package. If
+	// EnableSessionPool is false or the dial fails, sessionImpl is left nil
+	// and OpenTable returns the classic-only TableAPI; with no SessionLoad
+	// listener registered, the diverter stays at its 0.0 bootstrap and every
+	// call routes through the classic transport.
 	if config.EnableSessionPool {
-		sc, err := session.NewSessionClient(ctx, project, instance, config.AppProfile, configManager, opts...)
+		sc, err := session.NewSessionClient(ctx, project, instance, config.AppProfile, opts...)
 		if err != nil {
 			btopt.Debugf(nil, "bigtable: session.NewSessionClient failed: %v; OpenTable will fall back to classic", err)
 		} else {
 			c.sessionImpl = sc
 			c.sessionTables = make(map[string]session.SessionTableApi)
+			// OnSessionLoad fires immediately at registration with the
+			// CCM's default SessionLoad (0.0) and again on every successful
+			// poll thereafter, making the listener callback the single
+			// writer of the diverter's session-load ratio.
+			sc.OnSessionLoad(c.diverter.SetSessionLoad)
 		}
 	}
 
@@ -268,11 +263,11 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 // Shutdown order:
 //  1. Cached SessionTableApi instances + sessionImpl — drain in-flight session
 //     work and tear down per-table pools before the connection goes.
-//  2. ClientConfigurationManager.Close — stop polling so it cannot fire UpdateConfig
-//     against pools that are about to be torn down.
-//  3. backgroundCancel — release any goroutines tied to the client's background ctx.
-//  4. metricsTracerFactory.shutdown — flush metrics now that no further RPCs will run.
-//  5. classicPool.Close — finally tear down the underlying connection pool.
+//     sessionImpl.Close internally closes its ClientConfigurationManager
+//     before tearing down the session connection.
+//  2. backgroundCancel — release any goroutines tied to the client's background ctx.
+//  3. metricsTracerFactory.shutdown — flush metrics now that no further RPCs will run.
+//  4. classicPool.Close — finally tear down the underlying connection pool.
 func (c *Client) Close() error {
 	var errs []error
 	c.sessionTablesMu.Lock()
@@ -287,9 +282,6 @@ func (c *Client) Close() error {
 		if err := c.sessionImpl.Close(); err != nil {
 			errs = append(errs, err)
 		}
-	}
-	if c.configManager != nil {
-		c.configManager.Close()
 	}
 	if c.backgroundCancel != nil {
 		c.backgroundCancel()

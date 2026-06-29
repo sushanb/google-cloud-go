@@ -283,10 +283,12 @@ func TestClose_WaitsForInFlightPolls(t *testing.T) {
 	}
 }
 
-func TestAddSessionLoadListener_SkipsImmediateDefaultFire(t *testing.T) {
-	// AddSessionLoadListener intentionally suppresses the seq=0 registration-
-	// time fire so the Diverter's bootstrap value (e.g. NewDiverter(1.0)) is
-	// not silently overwritten by the default config's SessionLoad=0.
+func TestAddSessionLoadListener_FiresImmediatelyWithDefault(t *testing.T) {
+	// AddSessionLoadListener fires at registration with the manager's current
+	// SessionLoad. Before any successful poll, that is the default config's
+	// SessionLoad=0 — pinning consumers to the safe all-classic route until
+	// the control plane responds. This makes the listener callback the single
+	// source of truth for SessionLoad on the consumer side.
 	client := &mockBigtableClient{}
 	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
 
@@ -301,15 +303,18 @@ func TestAddSessionLoadListener_SkipsImmediateDefaultFire(t *testing.T) {
 
 	select {
 	case load := <-got:
-		t.Fatalf("listener fired with load=%v at registration time; want no fire (seq=0 suppression)", load)
+		if load != 0 {
+			t.Fatalf("registration-time fire = %v, want 0 (default config)", load)
+		}
 	case <-time.After(100 * time.Millisecond):
-		// Expected: no fire.
+		t.Fatal("listener did not fire at registration time; want one fire with load=0")
 	}
 }
 
 func TestAddSessionLoadListener_FiresOnFirstPoll(t *testing.T) {
 	// After the first successful poll, AddSessionLoadListener fires with the
-	// server-reported SessionLoad.
+	// server-reported SessionLoad — separate from the registration-time fire
+	// that delivers the default config's SessionLoad=0.
 	client := &mockBigtableClient{
 		getConfigFunc: func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
 			return &bigtablepb.ClientConfiguration{
@@ -321,14 +326,21 @@ func TestAddSessionLoadListener_FiresOnFirstPoll(t *testing.T) {
 	}
 	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
 
-	got := make(chan float64, 1)
+	got := make(chan float64, 2)
 	unregister := manager.AddSessionLoadListener(func(load float64) {
-		select {
-		case got <- load:
-		default:
-		}
+		got <- load
 	})
 	defer unregister()
+
+	// Drain the registration-time default fire.
+	select {
+	case load := <-got:
+		if load != 0 {
+			t.Fatalf("registration-time fire = %v, want 0 (default config)", load)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AddSessionLoadListener did not fire at registration time")
+	}
 
 	manager.poll(context.Background())
 
@@ -339,6 +351,75 @@ func TestAddSessionLoadListener_FiresOnFirstPoll(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("AddSessionLoadListener did not fire after first poll")
+	}
+}
+
+func TestAddSessionLoadListener_SkipsUnchangedPoll(t *testing.T) {
+	// A poll that returns the same SessionLoad as the previous fire must NOT
+	// re-invoke the listener — mirroring Java's ListenerEntry.maybeNotify
+	// (Objects.equals(oldValue, newValue) → return).
+	client := &mockBigtableClient{
+		getConfigFunc: func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
+			return &bigtablepb.ClientConfiguration{
+				SessionConfiguration: &bigtablepb.SessionClientConfiguration{
+					SessionLoad: 0.75,
+				},
+			}, nil
+		},
+	}
+	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
+
+	var mu sync.Mutex
+	var totalCalls int
+	var lastLoad float64
+	unregister := manager.AddSessionLoadListener(func(load float64) {
+		mu.Lock()
+		defer mu.Unlock()
+		totalCalls++
+		lastLoad = load
+	})
+	defer unregister()
+
+	// Registration-time fire delivers default SessionLoad=0.
+	mu.Lock()
+	if totalCalls != 1 || lastLoad != 0 {
+		mu.Unlock()
+		t.Fatalf("after register: calls=%d lastLoad=%v; want 1, 0", totalCalls, lastLoad)
+	}
+	mu.Unlock()
+
+	// First poll: 0 → 0.75 (change → fire).
+	manager.poll(context.Background())
+	mu.Lock()
+	if totalCalls != 2 || lastLoad != 0.75 {
+		mu.Unlock()
+		t.Fatalf("after first poll: calls=%d lastLoad=%v; want 2, 0.75", totalCalls, lastLoad)
+	}
+	mu.Unlock()
+
+	// Second & third polls: 0.75 → 0.75 (unchanged → no fire).
+	manager.poll(context.Background())
+	manager.poll(context.Background())
+	mu.Lock()
+	if totalCalls != 2 {
+		mu.Unlock()
+		t.Fatalf("after two unchanged polls: calls=%d; want 2 (no extra fires)", totalCalls)
+	}
+	mu.Unlock()
+
+	// Server flips to 0.5: change → fire.
+	client.getConfigFunc = func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
+		return &bigtablepb.ClientConfiguration{
+			SessionConfiguration: &bigtablepb.SessionClientConfiguration{
+				SessionLoad: 0.5,
+			},
+		}, nil
+	}
+	manager.poll(context.Background())
+	mu.Lock()
+	defer mu.Unlock()
+	if totalCalls != 3 || lastLoad != 0.5 {
+		t.Fatalf("after value-change poll: calls=%d lastLoad=%v; want 3, 0.5", totalCalls, lastLoad)
 	}
 }
 
@@ -354,18 +435,19 @@ func TestAddSessionLoadListener_UnregisterStopsCallbacks(t *testing.T) {
 		totalCalls++
 	})
 
-	// No immediate fire (seq=0 suppression); confirm baseline is 0.
+	// Registration fires once immediately with the default SessionLoad=0;
+	// confirm the baseline before unregistering.
 	mu.Lock()
-	if totalCalls != 0 {
+	if totalCalls != 1 {
 		mu.Unlock()
-		t.Fatalf("listener fired %d times at registration; want 0 (seq=0 suppression)", totalCalls)
+		t.Fatalf("listener fired %d times at registration; want 1 (default-config fire)", totalCalls)
 	}
 	mu.Unlock()
 
 	unregister()
 
 	// Now drive a successful poll. The listener was removed, so its counter
-	// must stay at 0 even though the manager re-notifies all currently
+	// must stay at 1 even though the manager re-notifies all currently
 	// registered listeners.
 	client.getConfigFunc = func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
 		return &bigtablepb.ClientConfiguration{
@@ -378,8 +460,8 @@ func TestAddSessionLoadListener_UnregisterStopsCallbacks(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if totalCalls != 0 {
-		t.Errorf("listener fired %d times after unregister; want 0", totalCalls)
+	if totalCalls != 1 {
+		t.Errorf("listener fired %d times after unregister; want 1 (only the registration-time default fire)", totalCalls)
 	}
 }
 
