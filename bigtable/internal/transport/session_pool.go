@@ -472,6 +472,36 @@ func (p *SessionPoolImpl) recordSlowVRpc(ev SlowVRpcEvent) {
 	p.slowVRpcs = append(p.slowVRpcs, ev)
 }
 
+// recordCheckoutFailure feeds the pool-wide latency histogram and, when the
+// wait exceeded the slow threshold, appends a slow-vRPC row for a call that
+// never got a session. Session / RpcIDOnSession / SessionAge / Peer stay
+// zero — an empty Session cell in the sessionz table is the marker for
+// "checkout never returned a handle".
+func (p *SessionPoolImpl) recordCheckoutFailure(checkoutStart time.Time, desc VRpcDescriptor, err error) {
+	poolWait := time.Since(checkoutStart)
+	p.totalLatencyHist.record(poolWait)
+	if poolWait <= p.slowThreshold() {
+		return
+	}
+	ev := SlowVRpcEvent{
+		At:       checkoutStart,
+		Method:   desc.Method(),
+		Latency:  poolWait,
+		PoolWait: poolWait,
+	}
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		ev.ErrCode = "DeadlineExceeded"
+	case errors.Is(err, context.Canceled):
+		ev.ErrCode = "Canceled"
+	default:
+		ev.ErrCode = status.Code(err).String()
+	}
+	btopt.Debugf(nil, "POOL %s slow checkout failed method=%s pool_wait=%v code=%s raw_err=%v",
+		p.poolName, ev.Method, poolWait, ev.ErrCode, err)
+	p.recordSlowVRpc(ev)
+}
+
 func (p *SessionPoolImpl) snapshotSlowVRpcs() []SlowVRpcEvent {
 	p.slowVRpcsMu.Lock()
 	defer p.slowVRpcsMu.Unlock()
@@ -1259,6 +1289,12 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 	checkoutStart := time.Now()
 	sh, err := p.CheckoutSession(ctx)
 	if err != nil {
+		// Pool-exhaustion incidents are the exact case an operator
+		// opens sessionz to debug. Without recording here, calls that
+		// parked in CheckoutSession until ctx.Done fired never reach
+		// the success-path recorder below — the slow-vRPC table and
+		// the pool-wide latency histogram both silently drop them.
+		p.recordCheckoutFailure(checkoutStart, desc, err)
 		return InvokeResult{}, err
 	}
 	poolWait := time.Since(checkoutStart)

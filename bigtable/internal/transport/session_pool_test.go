@@ -198,3 +198,63 @@ func TestSizer_ScaleDownIsAdvisory(t *testing.T) {
 		t.Errorf("Delta = %d, want negative (advisory scale-down)", d.Delta)
 	}
 }
+
+// TestSessionPool_Invoke_RecordsSlowCheckoutFailure pins the fix for the
+// pool-exhaustion blind spot: if CheckoutSession errors out (typically ctx
+// deadline while parked waiting on freeSignal), Invoke must still push a
+// row into the slow-vRPC ring — otherwise the exact incident an operator
+// opens sessionz to debug ("pool saturated, everything timing out") leaves
+// no evidence in the debug UI.
+func TestSessionPool_Invoke_RecordsSlowCheckoutFailure(t *testing.T) {
+	// Dial that blocks until its own ctx (poolCtx, wrapped) fires. No
+	// session ever lands, so CheckoutSession is forced to park on
+	// freeSignal until the caller's ctx cancels.
+	neverDialing := func(ctx context.Context) (Stream, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	p := NewSessionPoolImpl(
+		"test-pool",
+		0, 1,
+		neverDialing,
+		&spb.OpenSessionRequest{ProtocolVersion: 1},
+		nil,
+		SessionTypeTable,
+	)
+	defer p.Close()
+
+	// Threshold well under the 50ms wait below so the record path fires
+	// deterministically even on slow CI.
+	p.slowVRpcThreshold = time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := p.Invoke(ctx, newRoundTripDesc(), "hello")
+	if err == nil {
+		t.Fatal("Invoke on a pool that cannot dial succeeded; want ctx deadline error")
+	}
+
+	events := p.snapshotSlowVRpcs()
+	if len(events) != 1 {
+		t.Fatalf("snapshotSlowVRpcs len = %d, want 1 — checkout failure was not recorded", len(events))
+	}
+	ev := events[0]
+	if ev.Method != "RoundTrip" {
+		t.Errorf("Method = %q, want RoundTrip", ev.Method)
+	}
+	if ev.Success {
+		t.Error("Success = true, want false (checkout failed)")
+	}
+	if ev.PoolWait <= 0 {
+		t.Errorf("PoolWait = %v, want > 0", ev.PoolWait)
+	}
+	if ev.Latency != ev.PoolWait {
+		t.Errorf("Latency = %v, PoolWait = %v — must match when all time was in checkout", ev.Latency, ev.PoolWait)
+	}
+	if ev.Session != "" {
+		t.Errorf("Session = %q, want empty (no handle was ever returned)", ev.Session)
+	}
+	if ev.ErrCode != "DeadlineExceeded" {
+		t.Errorf("ErrCode = %q, want DeadlineExceeded", ev.ErrCode)
+	}
+}
