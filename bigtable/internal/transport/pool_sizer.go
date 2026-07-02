@@ -17,7 +17,6 @@ package internal
 import (
 	"math"
 	"sync"
-	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 )
@@ -35,16 +34,25 @@ type StatsFetcher func() *PoolStats
 
 // PoolSizer calculates the optimal session pool size based on workload metrics.
 //
-// Mirrors the Java PoolSizer in google-cloud-java:
-//   - effectivePending uses a server-configured divisor
-//     (NewSessionQueueLength), not a hardcoded /10.
-//   - idle headroom is floored to minIdleSessions so the cushion can't
-//     collapse to zero at low load.
-//   - the capacity comparison is split: scale UP only when desired
-//     exceeds eventual (ready + starting), scale DOWN only when desired
-//     is below immediate (ready). The dead band between immediate and
-//     eventual prevents pruning sessions whose handshake is still
-//     landing — the root of the per-second 5↔8 oscillation we saw.
+// Stateless mirror of the Java `PoolSizer` in google-cloud-java (see
+// java-bigtable/.../session/PoolSizer.java). Decisions are made on the
+// current snapshot only — no windowed peak tracking, no scale-down
+// cooldown, no historical state.
+//
+// The client only ever GROWS the pool proactively: growth fires when
+// CheckoutSession misses (Java's `handleNewCall`). Shrinkage is passive
+// — sessions die when the server closes them (GoAway, maxAge, error)
+// and `SessionPoolImpl.OnClose` decides whether to replace based on
+// the sizer's current delta. When the pool is overprovisioned the
+// sizer returns delta < 0, OnClose declines the replacement, and the
+// pool shrinks by exactly one. Convergence rate is bounded by
+// server-driven session churn (~5 min for a typical Bigtable server).
+//
+// This design cannot oscillate: the client never proactively kills a
+// healthy session, so a burst-then-lull traffic wave whose trough sits
+// outside any peak-window cannot trigger a mass prune followed by a
+// cold-start scale-up on the next crest — the pathology observed with
+// the previous active-scale-down design.
 type PoolSizer struct {
 	mu              sync.Mutex
 	fetcher         StatsFetcher
@@ -53,44 +61,11 @@ type PoolSizer struct {
 	headroomPct     float64 // Idle headroom as a fraction of sessions in use (e.g., 0.10 = 10%)
 	newSessionQLen  int     // server-driven per-session pending queue length; divides PendingCount
 	minIdleSessions int     // floor on the idle cushion so headroom never collapses to 0
-	// lastScaleUp is the time we most recently returned a positive delta
-	// (i.e. asked to grow the pool). Scale-down is suppressed for
-	// downscaleCooldown after this — the just-launched sessions need a
-	// chance to land and absorb the next wave before we kill them.
-	lastScaleUp time.Time
-
-	// inUseHist is a ring of recent (timestamp, in_use+effectivePending)
-	// samples used to compute the peak working set over peakInUseWindow.
-	// Scale-DOWN reads the peak instead of the snapshot — without it,
-	// a single momentary dip between bursts is enough to prune a pile
-	// of sessions that would be needed again 300ms later. Scale-UP
-	// continues to read the snapshot so we react fast to genuine
-	// shortages. Net: "fast up, slow down" hysteresis.
-	inUseHist []inUseSample
-}
-
-type inUseSample struct {
-	at    time.Time
-	value int // InUseCount + EffectivePending — the "active work" the sizer cares about
 }
 
 const (
 	defaultNewSessionQueueLength = 10
 	defaultMinIdleSessions       = 1
-	// downscaleCooldown is how long after a scale-up the sizer refuses
-	// to scale down. ~3× the typical handshake budget so freshly-grown
-	// sessions get to serve at least one wave before being eligible
-	// for pruning.
-	downscaleCooldown = 5 * time.Second
-	// peakInUseWindow is how far back the sizer looks when computing the
-	// "peak working set" used for scale-down decisions. Set wide enough
-	// to span a typical wave-shaped traffic cycle (LOW + HIGH phases),
-	// so transient troughs inside a cycle don't trigger pruning.
-	peakInUseWindow = 30 * time.Second
-	// maxInUseSamples caps the in-use history ring. At the 1-Hz heartbeat
-	// plus event-driven CheckoutSession kicks, ~120 samples is plenty
-	// to cover peakInUseWindow even when load is bursty.
-	maxInUseSamples = 128
 )
 
 // NewPoolSizer creates a new PoolSizer.
@@ -145,24 +120,13 @@ type ScaleDecision struct {
 	SessionsInUse     int // InUseCount + EffectivePending
 	IdleHeadroom      int // max(MinIdleSessions, ceil(SessionsInUse * HeadroomPct))
 	DesiredRaw        int // SessionsInUse + IdleHeadroom (pre-clamp)
-	DesiredCapacity   int // clamped to [MinSessions, MaxSessions] — used for SCALE-UP
+	DesiredCapacity   int // clamped to [MinSessions, MaxSessions]
 	ImmediateCapacity int // ReadyCount
 	EventualCapacity  int // ReadyCount + StartingCount
 
-	// Scale-down inputs — derived from peak-over-window, not snapshot.
-	// PeakWorkingSet is max(InUseCount + EffectivePending) over
-	// peakInUseWindow. DesiredCapacityDown is the corresponding desired
-	// pool size. Only used by the scale-down branch — keeps that
-	// decision smoothed across wave troughs.
-	PeakWorkingSet      int
-	DesiredCapacityDown int
-
 	// Final decision
-	Delta             int           // what GetScaleDelta returns
-	WouldDelta        int           // what Delta would have been without cooldown
-	CooldownActive    bool          // true iff downscale was suppressed
-	CooldownRemaining time.Duration // time left in the cooldown window
-	Branch            string        // "scale-up" | "scale-down" | "suppressed" | "dead-band" | "no-stats"
+	Delta  int    // desired − eventual (scale-up) or desired − immediate (scale-down); 0 otherwise
+	Branch string // "scale-up" | "scale-down" | "dead-band" | "no-stats"
 }
 
 // GetScaleDelta evaluates the current statistics and calculates the required scaling delta.
@@ -172,11 +136,21 @@ func (s *PoolSizer) GetScaleDelta() int {
 	return s.Decide().Delta
 }
 
-// Decide computes a full ScaleDecision: every input, every intermediate,
-// and the reasoning behind the final delta. Use this in PerformScaling
-// so each ScalingEvent in the ring buffer carries the decision's
-// provenance. As a side effect, stamps lastScaleUp when Delta > 0 so
-// the cooldown applies to subsequent calls.
+// Decide computes a full ScaleDecision from the current snapshot.
+//
+// Branch semantics match Java's PoolSizer.getScaleDelta:
+//   - scale-up   (Delta > 0): desired capacity exceeds what will be
+//     available once starting sessions finish. Caller SHOULD create
+//     `Delta` new sessions.
+//   - scale-down (Delta < 0): desired capacity is below what's already
+//     ready. Caller MUST NOT proactively kill sessions to close the gap
+//     — that's the whole point of the passive-shrink design. This
+//     branch is advisory: `OnClose` reads the delta and lets the pool
+//     shrink by one (per closed session) when the sign is negative.
+//   - dead-band  (Delta == 0): desired sits between immediate and
+//     eventual capacity — do nothing, in-flight starts will absorb any
+//     pending demand.
+//   - no-stats:  the StatsFetcher returned nil (pool not started yet).
 func (s *PoolSizer) Decide() ScaleDecision {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -208,12 +182,6 @@ func (s *PoolSizer) Decide() ScaleDecision {
 	d.EffectivePending = int(math.Ceil(float64(stats.PendingCount) / float64(divisor)))
 	d.SessionsInUse = stats.InUseCount + d.EffectivePending
 
-	// Sample the current working set into the sliding-window ring and
-	// compute the peak we'll use for scale-DOWN decisions.
-	now := time.Now()
-	s.recordInUseLocked(d.SessionsInUse, now)
-	d.PeakWorkingSet = s.peakInUseLocked(now)
-
 	// Idle headroom as a fraction of in-use, FLOORED so a brief in-use
 	// dip can't collapse the cushion to zero.
 	d.IdleHeadroom = int(math.Ceil(float64(d.SessionsInUse) * s.headroomPct))
@@ -221,82 +189,22 @@ func (s *PoolSizer) Decide() ScaleDecision {
 		d.IdleHeadroom = s.minIdleSessions
 	}
 	d.DesiredRaw = d.SessionsInUse + d.IdleHeadroom
-
-	// Scale-UP desired uses the current snapshot — keeps reaction fast.
 	d.DesiredCapacity = clamp(d.DesiredRaw, s.minSessions, s.maxSessions)
-
-	// Scale-DOWN desired uses the windowed peak — keeps reaction slow.
-	// Headroom rides on the peak too, so the dead band tracks the
-	// actual wave amplitude rather than the trough.
-	downIdle := int(math.Ceil(float64(d.PeakWorkingSet) * s.headroomPct))
-	if downIdle < s.minIdleSessions {
-		downIdle = s.minIdleSessions
-	}
-	d.DesiredCapacityDown = clamp(d.PeakWorkingSet+downIdle, s.minSessions, s.maxSessions)
 
 	d.ImmediateCapacity = stats.ReadyCount
 	d.EventualCapacity = stats.ReadyCount + stats.StartingCount
 
-	if d.DesiredCapacity > d.EventualCapacity {
+	switch {
+	case d.DesiredCapacity > d.EventualCapacity:
 		d.Delta = d.DesiredCapacity - d.EventualCapacity
-		d.WouldDelta = d.Delta
 		d.Branch = "scale-up"
-		s.lastScaleUp = now
-		return d
-	}
-	if d.DesiredCapacityDown < d.ImmediateCapacity {
-		raw := d.DesiredCapacityDown - d.ImmediateCapacity
-		d.WouldDelta = raw
-		if !s.lastScaleUp.IsZero() {
-			elapsed := now.Sub(s.lastScaleUp)
-			if elapsed < downscaleCooldown {
-				d.CooldownActive = true
-				d.CooldownRemaining = downscaleCooldown - elapsed
-				d.Delta = 0
-				d.Branch = "suppressed"
-				return d
-			}
-		}
-		d.Delta = raw
+	case d.DesiredCapacity < d.ImmediateCapacity:
+		d.Delta = d.DesiredCapacity - d.ImmediateCapacity // negative; ADVISORY
 		d.Branch = "scale-down"
-		return d
+	default:
+		d.Branch = "dead-band"
 	}
-	d.Branch = "dead-band"
 	return d
-}
-
-// recordInUseLocked appends a sample, drops any older than peakInUseWindow,
-// and caps the ring at maxInUseSamples. Caller holds s.mu.
-func (s *PoolSizer) recordInUseLocked(value int, now time.Time) {
-	cutoff := now.Add(-peakInUseWindow)
-	// Drop expired prefix.
-	i := 0
-	for i < len(s.inUseHist) && s.inUseHist[i].at.Before(cutoff) {
-		i++
-	}
-	if i > 0 {
-		s.inUseHist = s.inUseHist[i:]
-	}
-	s.inUseHist = append(s.inUseHist, inUseSample{at: now, value: value})
-	if len(s.inUseHist) > maxInUseSamples {
-		s.inUseHist = s.inUseHist[len(s.inUseHist)-maxInUseSamples:]
-	}
-}
-
-// peakInUseLocked returns max(value) across samples within peakInUseWindow.
-// Caller holds s.mu.
-func (s *PoolSizer) peakInUseLocked(now time.Time) int {
-	cutoff := now.Add(-peakInUseWindow)
-	peak := 0
-	for _, sm := range s.inUseHist {
-		if sm.at.Before(cutoff) {
-			continue
-		}
-		if sm.value > peak {
-			peak = sm.value
-		}
-	}
-	return peak
 }
 
 func clamp(v, lo, hi int) int {
@@ -308,3 +216,4 @@ func clamp(v, lo, hi int) int {
 	}
 	return v
 }
+

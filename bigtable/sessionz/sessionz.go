@@ -865,9 +865,7 @@ Low <b>RpcID</b> + small <b>SessionAge</b> → fresh session warm-up cost.
 <th>Branch</th>
 <th class="num" title="Stats at decision time: ready/starting/in-use/pending(waiters)">R/S/U/P</th>
 <th class="num" title="Sizer intermediates: effective-pending / sessions-in-use / idle-cushion / desired-capacity">eP/sU/idle/desired</th>
-<th class="num" title="Scale-down inputs: peak working set over 30s window / desired-capacity-down. Scale-down only fires when desiredDown < immediate.">peak/desiredDown</th>
 <th class="num" title="Immediate vs eventual capacity (ready vs ready+starting)">imm/evt</th>
-<th>Cooldown</th>
 <th>Reason</th>
 </tr></thead>
 <tbody>
@@ -877,12 +875,10 @@ Low <b>RpcID</b> + small <b>SessionAge</b> → fresh session warm-up cost.
 <td class="num">{{.Before}}</td>
 <td class="num">{{signed .Requested}}</td>
 <td class="num">{{scalingOutcome .}}</td>
-<td class="mono" title="scale-up | scale-down | suppressed | dead-band | no-stats">{{.Decision.Branch}}</td>
+<td class="mono" title="scale-up | scale-down (advisory — pool shrinks via non-replacement in OnClose, not via prune) | dead-band | no-stats">{{.Decision.Branch}}</td>
 <td class="num mono" title="ready={{.Decision.ReadyCount}}&#10;starting={{.Decision.StartingCount}}&#10;in_use={{.Decision.InUseCount}}&#10;pending(waiters)={{.Decision.PendingCount}}">{{.Decision.ReadyCount}}/{{.Decision.StartingCount}}/{{.Decision.InUseCount}}/{{.Decision.PendingCount}}</td>
-<td class="num mono" title="effectivePending = ceil(pending/{{.Decision.NewSessionQLen}}) = {{.Decision.EffectivePending}}&#10;sessionsInUse = inUse + effPending = {{.Decision.SessionsInUse}}&#10;idle = max(minIdle={{.Decision.MinIdleSessions}}, ceil(sessionsInUse*{{.Decision.HeadroomPct}})) = {{.Decision.IdleHeadroom}}&#10;desiredUp = clamp(sessionsInUse+idle, min={{.Decision.MinSessions}}, max={{.Decision.MaxSessions}}) = {{.Decision.DesiredCapacity}}">{{.Decision.EffectivePending}}/{{.Decision.SessionsInUse}}/{{.Decision.IdleHeadroom}}/{{.Decision.DesiredCapacity}}</td>
-<td class="num mono" title="peakWorkingSet = max(sessionsInUse) over last 30s = {{.Decision.PeakWorkingSet}}&#10;desiredDown = clamp(peak + ceil(peak*headroom), min, max) = {{.Decision.DesiredCapacityDown}}&#10;Scale-down only fires when desiredDown < immediate ({{.Decision.ImmediateCapacity}}).">{{.Decision.PeakWorkingSet}}/{{.Decision.DesiredCapacityDown}}</td>
-<td class="num mono" title="immediate = ready ({{.Decision.ImmediateCapacity}})&#10;eventual = ready + starting ({{.Decision.EventualCapacity}})&#10;Scale up if desiredUp>eventual; scale down if desiredDown<immediate; dead-band otherwise.">{{.Decision.ImmediateCapacity}}/{{.Decision.EventualCapacity}}</td>
-<td class="mono" title="When active, downscale is suppressed for the remaining duration. wouldDelta is what the sizer would have returned without the cooldown.">{{if .Decision.CooldownActive}}<span style="color:#a60">{{dur .Decision.CooldownRemaining}} (would={{signed .Decision.WouldDelta}})</span>{{else}}—{{end}}</td>
+<td class="num mono" title="effectivePending = ceil(pending/{{.Decision.NewSessionQLen}}) = {{.Decision.EffectivePending}}&#10;sessionsInUse = inUse + effPending = {{.Decision.SessionsInUse}}&#10;idle = max(minIdle={{.Decision.MinIdleSessions}}, ceil(sessionsInUse*{{.Decision.HeadroomPct}})) = {{.Decision.IdleHeadroom}}&#10;desired = clamp(sessionsInUse+idle, min={{.Decision.MinSessions}}, max={{.Decision.MaxSessions}}) = {{.Decision.DesiredCapacity}}">{{.Decision.EffectivePending}}/{{.Decision.SessionsInUse}}/{{.Decision.IdleHeadroom}}/{{.Decision.DesiredCapacity}}</td>
+<td class="num mono" title="immediate = ready ({{.Decision.ImmediateCapacity}})&#10;eventual = ready + starting ({{.Decision.EventualCapacity}})&#10;Scale up if desired>eventual; scale-down is advisory (pool shrinks by non-replacement in OnClose); dead-band otherwise.">{{.Decision.ImmediateCapacity}}/{{.Decision.EventualCapacity}}</td>
 <td>{{.Reason}}</td>
 </tr>
 {{end}}
@@ -890,12 +886,11 @@ Low <b>RpcID</b> + small <b>SessionAge</b> → fresh session warm-up cost.
 </table>
 <div style="font-size:.78em;color:#888;margin-top:.3em">
 <b>Pool&nbsp;was</b> = live pool size when the sizer decided.
-<b>Sizer&nbsp;asked</b> = delta requested (+ scale up, − scale down, 0 when suppressed by cooldown).
-<b>Action&nbsp;result</b> = sessions launched (scale up — these are handshaking and become Active shortly after) or sessions pruned (scale down).
+<b>Sizer&nbsp;asked</b> = delta requested (+ scale up, − advisory scale-down; scale-down deltas are informational — the pool shrinks passively via OnClose's replace-on-death gate, mirroring java-bigtable).
+<b>Action&nbsp;result</b> = sessions launched (scale up — these are handshaking and become Active shortly after).
 <b>R/S/U/P</b> = Ready / Starting / In-use / Pending(waiters) at decision time.
 <b>eP/sU/idle/desired</b> = effectivePending / sessionsInUse / idleCushion / desiredCapacity — hover for the formula.
 <b>imm/evt</b> = immediate (ready) vs eventual (ready+starting) capacity; the dead band between them prevents pruning sessions whose handshake is still landing.
-<b>Cooldown</b> = downscale suppressed because we recently scaled up; <code>would=</code> shows the delta that would have been returned.
 </div>
 {{end}}
 

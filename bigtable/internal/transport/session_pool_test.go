@@ -151,3 +151,50 @@ func TestSessionPool_PruneSessions_RespectsAgeGuard(t *testing.T) {
 func TestSessionPool_Close_BoundedByTimeout(t *testing.T) {
 	t.Skip("requires a session that ignores Close — see integration tests")
 }
+
+// TestPerformScaling_NoLongerPrunesOverprovisioned verifies the passive-
+// shrink design: PerformScaling with a scale-down delta must be a no-op
+// — the pool shrinks only via OnClose's replace-on-death gate, not via a
+// periodic prune. Regression guard against re-introducing the burst-then-
+// lull oscillation that the earlier active-scale-down design produced.
+func TestPerformScaling_NoLongerPrunesOverprovisioned(t *testing.T) {
+	p := newTestPool(t, 1, 20)
+	// 10 idle sessions, none in-flight → sizer will compute
+	// desired ≈ minSessions (5-ish) and delta will be negative.
+	// Age them past minSessionAge so pruneSessions COULD kill them,
+	// making this a true test that PerformScaling declines to.
+	for i := 0; i < 10; i++ {
+		sh := injectActiveSession(t, p, "idle", time.Now().Add(-time.Hour))
+		_ = sh
+	}
+
+	before := len(p.sessions)
+	p.PerformScaling(context.Background())
+
+	p.mu.Lock()
+	after := len(p.sessions)
+	p.mu.Unlock()
+
+	if after != before {
+		t.Errorf("PerformScaling pruned sessions: before=%d after=%d — scale-down must be advisory, not proactive", before, after)
+	}
+}
+
+// TestSizer_ScaleDownIsAdvisory confirms the sizer still RETURNS a
+// negative delta on overprovision (so ScalingHistory / callers can see
+// the intent) but the calling site (PerformScaling) must not act on it.
+// The paired assertion above proves the caller is well-behaved; this one
+// pins the sizer contract.
+func TestSizer_ScaleDownIsAdvisory(t *testing.T) {
+	// InUse=1, Pending=0, Ready=10 → desired ≈ 2, immediate=10.
+	// Expect delta = 2 - 10 = -8 with Branch = "scale-down".
+	stats := &PoolStats{ReadyCount: 10, InUseCount: 1}
+	sizer := NewPoolSizer(func() *PoolStats { return stats }, 1, 20, 0.5)
+	d := sizer.Decide()
+	if d.Branch != "scale-down" {
+		t.Fatalf("Branch = %q, want scale-down", d.Branch)
+	}
+	if d.Delta >= 0 {
+		t.Errorf("Delta = %d, want negative (advisory scale-down)", d.Delta)
+	}
+}

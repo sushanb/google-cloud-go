@@ -993,28 +993,12 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 	currentSessions := len(p.sessions)
 	p.mu.Unlock()
 
-	// Record SUPPRESSED scale-downs even though they don't change the
-	// pool — otherwise cooldown activity is invisible in the ring
-	// buffer and the operator can't see "the sizer wanted to shrink
-	// but I held it back".
-	if delta == 0 && decision.WouldDelta != 0 {
-		p.recordScaling(ScalingEvent{
-			At:        time.Now(),
-			Before:    currentSessions,
-			Requested: 0,
-			Launched:  0,
-			Reason: fmt.Sprintf("suppressed: would=%d (cooldown %v remaining; desired=%d immediate=%d)",
-				decision.WouldDelta, decision.CooldownRemaining,
-				decision.DesiredCapacity, decision.ImmediateCapacity),
-			Decision:  decision,
-			FromCount: currentSessions,
-			ToCount:   currentSessions,
-			Delta:     0,
-		})
-		return
-	}
-	if delta == 0 {
-		// dead-band or no-stats — nothing to record.
+	// Only scale-up is actioned. Scale-down deltas are advisory — the
+	// pool shrinks passively via OnClose's replace-on-death gate (see
+	// java-bigtable's PoolSizer for the same asymmetric design). This
+	// removes the periodic prune that produced the burst-then-lull
+	// oscillation on wave-shaped workloads.
+	if delta <= 0 {
 		return
 	}
 
@@ -1022,9 +1006,6 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 	var launched atomic.Int64
 	defer func() {
 		actual := int(launched.Load())
-		if delta < 0 {
-			actual = -actual
-		}
 		p.recordScaling(ScalingEvent{
 			At:        time.Now(),
 			Before:    currentSessions,
@@ -1042,25 +1023,21 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 		})
 	}()
 
-	if delta > 0 {
-		// Scale up: provision new sessions asynchronously and wait for completion to release the gate
-		var wg sync.WaitGroup
-		for i := 0; i < delta; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if err := p.createSession(ctx); err != nil {
-					btopt.Debugf(nil, "POOL %s PerformScaling createSession failed: %v", p.poolName, err)
-				} else {
-					launched.Add(1)
-				}
-			}()
-		}
-		wg.Wait()
-	} else {
-		// Scale down: prune idle sessions gracefully
-		launched.Store(int64(p.pruneSessions(-delta)))
+	// Scale up: provision new sessions asynchronously and wait for
+	// completion to release the gate.
+	var wg sync.WaitGroup
+	for i := 0; i < delta; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := p.createSession(ctx); err != nil {
+				btopt.Debugf(nil, "POOL %s PerformScaling createSession failed: %v", p.poolName, err)
+			} else {
+				launched.Add(1)
+			}
+		}()
 	}
+	wg.Wait()
 }
 
 func (p *SessionPoolImpl) createSession(ctx context.Context) error {
