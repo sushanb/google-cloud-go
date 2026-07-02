@@ -208,7 +208,7 @@ type SlowVRpcEvent struct {
 
 const (
 	maxSlowVRpcs         = 100
-	defaultSlowThreshold = 1 * time.Second
+	defaultSlowThreshold = 10 * time.Millisecond
 	// maxTimeSeries caps the per-pool sparkline ring. At the 1-Hz heartbeat
 	// sampling rate this covers the most recent 5 minutes — long enough to
 	// span a typical scaling event without ballooning memory.
