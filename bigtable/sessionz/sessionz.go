@@ -695,6 +695,7 @@ details.msgcell>summary:hover{color:#15498a}
 </div>
 <div class="summary">
 <span title="end-to-end wall-clock observed by SessionPoolImpl.Invoke — includes vrpcSem queue wait + network + decode + Backend"><b>TotalLatency</b> p50 {{dur .Pool.TotalLatencyP50}} · p95 {{dur .Pool.TotalLatencyP95}} · p99 {{dur .Pool.TotalLatencyP99}} <span class="mono">(n={{.Pool.TotalLatencyN}})</span></span>
+<span title="client-observed time from vRPC Send() to response Recv() on the bidi stream — network RTT + server queue + Backend"><b>TransportLatency</b> p50 {{dur .Pool.TransportLatencyP50}} · p95 {{dur .Pool.TransportLatencyP95}} · p99 {{dur .Pool.TransportLatencyP99}} <span class="mono">(n={{.Pool.TransportLatencyN}})</span></span>
 <span title="server-reported SessionRequestStats.BackendLatency — pure server processing time"><b>BackendLatency</b> p50 {{dur .Pool.LatencyP50}} · p95 {{dur .Pool.LatencyP95}} · p99 {{dur .Pool.LatencyP99}} <span class="mono">(n={{.Pool.LatencyN}})</span></span>
 {{if .Pool.TimeSeries}}
 <span><b>sessions</b> {{sparkline 120 28 "#1a5fb4" (sessionsSeries .Pool.TimeSeries)}}</span>

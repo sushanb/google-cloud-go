@@ -210,6 +210,17 @@ type PoolSnapshot struct {
 	TotalLatencyP95 time.Duration
 	TotalLatencyP99 time.Duration
 	TotalLatencyN   int
+	// TransportLatencyP50/95/99/N: client-observed time between the
+	// vRPC frame being handed to Send and the response arriving on
+	// the bidi stream. Approximates (network RTT + server queue +
+	// BackendLatency); (TransportLatency - BackendLatency) surfaces
+	// "everything except server processing." Zero-latency samples
+	// (ctx-cancel / pre-Send failure) are excluded so p50 isn't
+	// pulled toward 0.
+	TransportLatencyP50 time.Duration
+	TransportLatencyP95 time.Duration
+	TransportLatencyP99 time.Duration
+	TransportLatencyN   int
 	SlowVRpcs       []SlowVRpcEvent
 	// RecentEvents is the pool-wide merge of every session's RecentEvents,
 	// sorted newest-first and capped at maxPoolRecentEvents. Lets the
@@ -484,6 +495,12 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 		snap.TotalLatencyP95 = p95
 		snap.TotalLatencyP99 = p99
 		snap.TotalLatencyN = int(n)
+	}
+	if p50, p95, p99, n := p.transportLatencyHist.snapshot(); n > 0 {
+		snap.TransportLatencyP50 = p50
+		snap.TransportLatencyP95 = p95
+		snap.TransportLatencyP99 = p99
+		snap.TransportLatencyN = int(n)
 	}
 
 	// Lifetime distribution: render whichever buckets actually have data

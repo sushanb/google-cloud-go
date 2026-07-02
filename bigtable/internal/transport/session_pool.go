@@ -109,8 +109,9 @@ type SessionPoolImpl struct {
 	// bounded by (active sessions × 256) if we relied on them. These
 	// lock-free log2-bucket histograms record every sample as it flows
 	// through Invoke and survive session churn.
-	backendLatencyHist latencyHist
-	totalLatencyHist   latencyHist
+	backendLatencyHist   latencyHist
+	totalLatencyHist     latencyHist
+	transportLatencyHist latencyHist
 
 	// freeSignal is the pool-level "a session became idle" wake-up
 	// channel. CheckoutSession parks here when every active session
@@ -1344,6 +1345,11 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 	p.totalLatencyHist.record(latency)
 	if result.Stats != nil && result.Stats.BackendLatency != nil {
 		p.backendLatencyHist.record(result.Stats.BackendLatency.AsDuration())
+	}
+	// TransportLatency is zero when Invoke bailed before Recv (ctx-done or
+	// pre-Send failure); skip those so the p50 isn't dragged toward 0.
+	if result.TransportLatency > 0 {
+		p.transportLatencyHist.record(result.TransportLatency)
 	}
 	if latency > p.slowThreshold() {
 		ev := SlowVRpcEvent{
