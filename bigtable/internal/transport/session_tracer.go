@@ -32,6 +32,10 @@ var (
 	sessionDurations     metric.Float64Histogram
 	sessionOpenLatencies metric.Float64Histogram
 	sessionUptime        metric.Float64Histogram
+	// transportLatencies is per-vRPC (not per-session-lifecycle), but shares
+	// the same meter + registration path so all session-adjacent metrics
+	// initialize together — matches java-bigtable's MetricRegistry layout.
+	transportLatencies metric.Float64Histogram
 
 	sessionMetricsOnce sync.Once
 	sessionMetricsErr  error
@@ -72,6 +76,14 @@ func InitializeSessionMetrics(meterProvider metric.MeterProvider) error {
 			metric.WithUnit("ms"),
 		); err != nil {
 			sessionMetricsErr = fmt.Errorf("create session.uptime histogram: %w", err)
+			return
+		}
+		if transportLatencies, err = meter.Float64Histogram(
+			"transport_latencies",
+			metric.WithDescription("The latency measured from e2e latencies minus node latencies."),
+			metric.WithUnit("ms"),
+		); err != nil {
+			sessionMetricsErr = fmt.Errorf("create transport_latencies histogram: %w", err)
 			return
 		}
 	})
@@ -255,4 +267,29 @@ func (t *sessionTracer) sampleUptime(ctx context.Context) {
 
 func msSince(t time.Time) float64 {
 	return float64(time.Since(t)) / float64(time.Millisecond)
+}
+
+// recordTransportLatency emits a per-vRPC (transport − backend) sample into
+// the transport_latencies histogram. Java's ClientTransportLatency defines
+// this metric as "e2e latencies minus node latencies" — the wire + AFE
+// overhead outside server processing. Caller supplies both raw durations;
+// this method returns a no-op if the metric isn't registered, the
+// difference isn't positive, or transport itself is unmeasured. Method is
+// the vRPC method name (e.g. "ExecuteVRpc/Read").
+func (t *sessionTracer) recordTransportLatency(ctx context.Context, method string, transport, backend time.Duration) {
+	if transportLatencies == nil {
+		return
+	}
+	overhead := transport - backend
+	if transport <= 0 || overhead <= 0 {
+		return
+	}
+	snap := t.snapshot()
+	transportLatencies.Record(ctx, float64(overhead)/float64(time.Millisecond), metric.WithAttributes(
+		attribute.String("transport_type", snap.transportType),
+		attribute.String("session_type", t.sessionType.String()),
+		attribute.String("afe_location", snap.afeLocation),
+		attribute.String("session_name", snap.poolName),
+		attribute.String("method", method),
+	))
 }

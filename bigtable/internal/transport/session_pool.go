@@ -1350,6 +1350,14 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 	// pre-Send failure); skip those so the p50 isn't dragged toward 0.
 	if result.TransportLatency > 0 {
 		p.transportLatencyHist.record(result.TransportLatency)
+		// Also emit to the exported transport_latencies histogram
+		// (java-parity: (transport − backend) = wire + AFE overhead).
+		// RecordTransportLatency no-ops when backend isn't populated.
+		var backendDur time.Duration
+		if result.Stats != nil && result.Stats.BackendLatency != nil {
+			backendDur = result.Stats.BackendLatency.AsDuration()
+		}
+		sh.session.RecordTransportLatency(ctx, desc.Method(), result.TransportLatency, backendDur)
 	}
 	if latency > p.slowThreshold() {
 		ev := SlowVRpcEvent{

@@ -474,6 +474,15 @@ func (s *Session) SampleUptime(ctx context.Context) {
 	s.tracer.sampleUptime(ctx)
 }
 
+// RecordTransportLatency emits a per-vRPC transport-overhead sample —
+// (transport − backend), i.e. wire + AFE time excluding server processing
+// — to the transport_latencies histogram. Called from the pool's Invoke
+// path once per completed vRPC; no-op unless both durations are
+// meaningful and transport > backend.
+func (s *Session) RecordTransportLatency(ctx context.Context, method string, transport, backend time.Duration) {
+	s.tracer.recordTransportLatency(ctx, method, transport, backend)
+}
+
 // Retries returns the number of vRPCs Invoke processed with AttemptNumber > 1.
 func (s *Session) Retries() int64 { return s.retries.Load() }
 
