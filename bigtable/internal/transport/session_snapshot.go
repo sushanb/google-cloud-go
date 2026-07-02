@@ -392,12 +392,13 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 	}
 
 	// Pool-level aggregates: combine cluster counts + latency samples
-	// across every session. Latency samples are merged from per-session
-	// ring buffers; pool percentiles are computed on the combined window.
+	// across every session. Pool-level latency percentiles come from the
+	// pool's lifetime histograms (see latencyHist) so they reflect every
+	// sample the pool has ever seen, not just the last 256 per active
+	// session. Per-session ring buffers are still surfaced on each row of
+	// the Sessions table.
 	aggregatedClusters := map[string]int64{}
 	stateCounts := map[string]int{}
-	var combinedLatencies []time.Duration
-	var combinedTotalLatencies []time.Duration
 
 	for _, sh := range handles {
 		if sh == nil || sh.session == nil {
@@ -418,8 +419,6 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 		for k, v := range s.ClusterCounts {
 			aggregatedClusters[k] += v
 		}
-		combinedLatencies = append(combinedLatencies, sh.session.snapshotLatencies()...)
-		combinedTotalLatencies = append(combinedTotalLatencies, sh.session.snapshotTotalLatencies()...)
 		// Merge per-session debug events into the pool-wide timeline,
 		// tagging each with the originating session log name so the UI
 		// can attribute them without nesting per-session rows.
@@ -446,23 +445,17 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 	if len(aggregatedClusters) > 0 {
 		snap.ClusterCounts = aggregatedClusters
 	}
-	if len(combinedLatencies) > 0 {
-		sort.Slice(combinedLatencies, func(i, j int) bool {
-			return combinedLatencies[i] < combinedLatencies[j]
-		})
-		snap.LatencyP50 = percentile(combinedLatencies, 50)
-		snap.LatencyP95 = percentile(combinedLatencies, 95)
-		snap.LatencyP99 = percentile(combinedLatencies, 99)
-		snap.LatencyN = len(combinedLatencies)
+	if p50, p95, p99, n := p.backendLatencyHist.snapshot(); n > 0 {
+		snap.LatencyP50 = p50
+		snap.LatencyP95 = p95
+		snap.LatencyP99 = p99
+		snap.LatencyN = int(n)
 	}
-	if len(combinedTotalLatencies) > 0 {
-		sort.Slice(combinedTotalLatencies, func(i, j int) bool {
-			return combinedTotalLatencies[i] < combinedTotalLatencies[j]
-		})
-		snap.TotalLatencyP50 = percentile(combinedTotalLatencies, 50)
-		snap.TotalLatencyP95 = percentile(combinedTotalLatencies, 95)
-		snap.TotalLatencyP99 = percentile(combinedTotalLatencies, 99)
-		snap.TotalLatencyN = len(combinedTotalLatencies)
+	if p50, p95, p99, n := p.totalLatencyHist.snapshot(); n > 0 {
+		snap.TotalLatencyP50 = p50
+		snap.TotalLatencyP95 = p95
+		snap.TotalLatencyP99 = p99
+		snap.TotalLatencyN = int(n)
 	}
 
 	// Lifetime distribution: render whichever buckets actually have data

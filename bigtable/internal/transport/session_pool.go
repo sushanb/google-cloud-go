@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/bits"
 	"math/rand/v2"
 	"strings"
 	"sync"
@@ -100,6 +101,16 @@ type SessionPoolImpl struct {
 	// the debug UI render a churn histogram + p50/p95 lifetime.
 	lifetimesMu sync.Mutex
 	lifetimes   []time.Duration
+
+	// backendLatencyHist / totalLatencyHist keep pool-wide latency
+	// percentiles over the pool's entire lifetime. The per-session ring
+	// buffers on Session cap at 256 samples each and are lost when a
+	// session is recycled, so the pool's "N=…" in the debug UI would be
+	// bounded by (active sessions × 256) if we relied on them. These
+	// lock-free log2-bucket histograms record every sample as it flows
+	// through Invoke and survive session churn.
+	backendLatencyHist latencyHist
+	totalLatencyHist   latencyHist
 
 	// freeSignal is the pool-level "a session became idle" wake-up
 	// channel. CheckoutSession parks here when every active session
@@ -245,6 +256,94 @@ func (p *SessionPoolImpl) snapshotLifetimes() []time.Duration {
 	copy(out, p.lifetimes)
 	p.lifetimesMu.Unlock()
 	return out
+}
+
+// latencyHistBuckets is the log2-bucket count of latencyHist. Bucket i
+// covers durations in [2^i, 2^(i+1)) nanoseconds, so 40 buckets span
+// ~1ns .. ~1000s — plenty of head- and tail-room for RPC latencies.
+const latencyHistBuckets = 40
+
+// latencyHist is a lock-free log2-bucket histogram used to keep pool-wide
+// latency percentiles for the entire lifetime of the pool. Constant
+// memory (40 × uint64 per histogram); each record is a single atomic add.
+//
+// Percentiles are exact at bucket granularity and interpolated linearly
+// within a bucket — that gives ≤2× worst-case error at the tail, which is
+// good enough for a debug UI (server-side histograms have similar
+// resolution). Preferred over per-session ring buffers because sessions
+// churn (GoAway / StreamEnd / scale-down); a pool-level histogram
+// survives churn and reflects every sample the pool has ever seen.
+type latencyHist struct {
+	buckets [latencyHistBuckets]atomic.Uint64
+}
+
+// record adds one observation. Non-positive durations are ignored so
+// callers don't need to pre-filter zero-latency error paths.
+func (h *latencyHist) record(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	// floor(log2(ns)); bits.Len64(x) is one more than that.
+	ns := uint64(d)
+	b := bits.Len64(ns) - 1
+	if b < 0 {
+		b = 0
+	}
+	if b >= latencyHistBuckets {
+		b = latencyHistBuckets - 1
+	}
+	h.buckets[b].Add(1)
+}
+
+// snapshot returns p50/p95/p99 and the total sample count. Reads are
+// lock-free but a concurrent record() may land between per-bucket loads;
+// the resulting skew is bounded by the concurrent write rate over the
+// snapshot window and is not meaningful for a debug UI. n is uint64 so
+// billion-plus counts don't overflow int on 32-bit platforms.
+func (h *latencyHist) snapshot() (p50, p95, p99 time.Duration, n uint64) {
+	var counts [latencyHistBuckets]uint64
+	for i := range h.buckets {
+		counts[i] = h.buckets[i].Load()
+		n += counts[i]
+	}
+	if n == 0 {
+		return
+	}
+	p50 = interpLatencyPercentile(counts[:], n, 50)
+	p95 = interpLatencyPercentile(counts[:], n, 95)
+	p99 = interpLatencyPercentile(counts[:], n, 99)
+	return
+}
+
+// interpLatencyPercentile walks the bucket counts and linearly
+// interpolates the target position inside the containing bucket. Caller
+// guarantees n > 0.
+func interpLatencyPercentile(counts []uint64, n uint64, pct float64) time.Duration {
+	target := uint64(float64(n) * pct / 100)
+	if target == 0 {
+		target = 1
+	}
+	var cum uint64
+	for i, c := range counts {
+		if c == 0 {
+			continue
+		}
+		if cum+c >= target {
+			lo := uint64(1) << i
+			hi := uint64(1) << (i + 1)
+			frac := float64(target-cum) / float64(c)
+			return time.Duration(lo + uint64(float64(hi-lo)*frac))
+		}
+		cum += c
+	}
+	// Only reachable on numerical edge cases (target rounded above
+	// total); fall back to the last non-empty bucket's upper bound.
+	for i := len(counts) - 1; i >= 0; i-- {
+		if counts[i] > 0 {
+			return time.Duration(uint64(1) << (i + 1))
+		}
+	}
+	return 0
 }
 
 // TimeSeriesSample is one point in a pool's sparkline ring buffer.
@@ -1197,10 +1296,15 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 
 	result, invokeErr := sh.session.Invoke(ctx, desc, req)
 	latency := time.Since(start)
-	// Record end-to-end wall-clock latency on the session's ring buffer
-	// so the pool snapshot can render p50/p95/p99 next to the
-	// server-reported BackendLatency percentiles.
-	sh.session.recordTotalLatency(latency)
+	// Feed the pool-level histograms so the debug UI's TotalLatency and
+	// BackendLatency "N=…" grow over the pool's lifetime instead of
+	// being capped at (active sessions × 256) by per-session ring
+	// buffers. BackendLatency only records when the server populated
+	// Stats — client-observed TotalLatency records for every call.
+	p.totalLatencyHist.record(latency)
+	if result.Stats != nil && result.Stats.BackendLatency != nil {
+		p.backendLatencyHist.record(result.Stats.BackendLatency.AsDuration())
+	}
 	if latency > p.slowThreshold() {
 		ev := SlowVRpcEvent{
 			At:               start,

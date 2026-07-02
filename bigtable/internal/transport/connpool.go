@@ -843,6 +843,11 @@ func (p *BigtableChannelPool) replaceConnection(oldEntry *connEntry) {
 		btopt.Debugf(p.logger, "bigtable_connpool: Failed to replace connection at index %d: %v. Closing new conn. Old connection remains (draining).\n", idx, err)
 		return
 	}
+	// The factory returns entries with index zero-valued. Every other
+	// mutation site (initial build, addConnections, removeConnections)
+	// assigns the slot index; recycling must too, or channelz→sessionz
+	// stamping degenerates to 0 for the replaced slot.
+	newEntry.index = idx
 
 	btopt.Debugf(p.logger, "bigtable_connpool: Successfully primed new connection. Replacing connection at index %d\n", idx)
 	// Copy-on-write
