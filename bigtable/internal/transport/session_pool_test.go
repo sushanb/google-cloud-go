@@ -41,9 +41,7 @@ func injectActiveSession(t *testing.T, p *SessionPoolImpl, name string, createdA
 		OnActive: p.OnActive,
 		OnClose:  p.OnClose,
 	}, SessionTypeTable)
-	s.mu.Lock()
-	s.state = StateActive
-	s.mu.Unlock()
+	s.state.Store(int32(StateActive))
 
 	sh := NewSessionHandle(s)
 	p.mu.Lock()

@@ -194,17 +194,14 @@ func TestNewSession_Defaults(t *testing.T) {
 	if got := s.sessionType; got != SessionTypeAuthorizedView {
 		t.Errorf("sessionType = %v, want SessionTypeAuthorizedView", got)
 	}
-	if s.activeRPCs == nil {
-		t.Error("activeRPCs map not initialized")
+	if s.activeRPC.Load() != nil {
+		t.Error("activeRPC slot should start nil")
 	}
 	if s.quiescent == nil {
 		t.Error("quiescent channel not initialized")
 	}
-	if s.heartbeatInterval != defaultHeartbeatInterval {
-		t.Errorf("heartbeatInterval = %v, want %v", s.heartbeatInterval, defaultHeartbeatInterval)
-	}
-	if s.vrpcSem == nil {
-		t.Error("vrpcSem not initialized")
+	if got := time.Duration(s.heartbeatIntervalNano.Load()); got != defaultHeartbeatInterval {
+		t.Errorf("heartbeatInterval = %v, want %v", got, defaultHeartbeatInterval)
 	}
 	if s.PeerInfo() != nil {
 		t.Error("PeerInfo should start nil")
@@ -274,9 +271,7 @@ func makeActive(t *testing.T, hooks SessionHooks) (*Session, *fakeStream) {
 	t.Helper()
 	stream := newFakeStream()
 	s := newTestSession(t, stream, hooks)
-	s.mu.Lock()
-	s.state = StateActive
-	s.mu.Unlock()
+	s.state.Store(int32(StateActive))
 	return s, stream
 }
 
@@ -284,9 +279,7 @@ func TestHandleOpenSession_TransitionsToActive(t *testing.T) {
 	stream := newFakeStream()
 	listener := &hookCounts{}
 	s := newTestSession(t, stream, listener.hooks())
-	s.mu.Lock()
-	s.state = StateStarting
-	s.mu.Unlock()
+	s.state.Store(int32(StateStarting))
 
 	s.handleOpenSession(&spb.OpenSessionResponse{})
 
@@ -308,9 +301,7 @@ func TestHandleVRPCResponse_RoutesByRpcID(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 
 	rpc := &vrpcImpl{id: 7, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
-	s.mu.Lock()
-	s.activeRPCs[7] = rpc
-	s.mu.Unlock()
+	s.activeRPC.Store(rpc)
 
 	resp := &spb.VirtualRpcResponse{RpcId: 7, Payload: []byte("p")}
 	s.handleVRPCResponse(resp)
@@ -334,9 +325,7 @@ func TestHandleVRPCErrorResponse_RoutesByRpcID(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 
 	rpc := &vrpcImpl{id: 3, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
-	s.mu.Lock()
-	s.activeRPCs[3] = rpc
-	s.mu.Unlock()
+	s.activeRPC.Store(rpc)
 
 	errResp := &spb.ErrorResponse{
 		RpcId:  3,
@@ -366,9 +355,7 @@ func TestHandleErrorResponse_SessionFatalForcesClose(t *testing.T) {
 
 	// Pre-existing in-flight RPC; should be cancelled by ForceClose.
 	rpc := &vrpcImpl{id: 11, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
-	s.mu.Lock()
-	s.activeRPCs[11] = rpc
-	s.mu.Unlock()
+	s.activeRPC.Store(rpc)
 
 	s.handleErrorResponse(&spb.ErrorResponse{
 		RpcId:  0,
@@ -391,33 +378,42 @@ func TestHandleErrorResponse_SessionFatalForcesClose(t *testing.T) {
 	}
 }
 
-func TestHandleGoAway_CancelsBeyondAdmitted(t *testing.T) {
+func TestHandleGoAway_UnadmittedIsCancelled(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 
-	// rpc 1 and 2 admitted; 3 and 4 should be cancelled.
-	for _, id := range []int64{1, 2, 3, 4} {
-		s.mu.Lock()
-		s.activeRPCs[id] = &vrpcImpl{id: id, resultChan: make(chan vrpcResult, 1)}
-		s.mu.Unlock()
-	}
+	// With multiPlexingLimit=1 only one vRPC can be in flight at a time.
+	// Exercise both branches of the filter (id > lastAdmitted → cancelled;
+	// id <= lastAdmitted → kept).
+	t.Run("unadmitted cancelled", func(t *testing.T) {
+		rpc := &vrpcImpl{id: 3, resultChan: make(chan vrpcResult, 1)}
+		s.activeRPC.Store(rpc)
+		s.handleGoAway(&spb.GoAwayResponse{LastRpcIdAdmitted: 2, Reason: "test"})
+		if got := s.State(); got != StateClosing {
+			t.Errorf("state = %v, want StateClosing", got)
+		}
+		if s.activeRPC.Load() != nil {
+			t.Error("unadmitted RPC should have been cleared from slot")
+		}
+		select {
+		case res := <-rpc.resultChan:
+			if !errors.Is(res.err, ErrUnavailableGoAway) {
+				t.Errorf("cancelled cause = %v, want ErrUnavailableGoAway", res.err)
+			}
+		default:
+			t.Error("unadmitted RPC not cancelled")
+		}
+	})
 
-	s.handleGoAway(&spb.GoAwayResponse{LastRpcIdAdmitted: 2, Reason: "test"})
-
-	if got := s.State(); got != StateClosing {
-		t.Errorf("state = %v, want StateClosing", got)
-	}
-	s.mu.Lock()
-	_, has1 := s.activeRPCs[1]
-	_, has2 := s.activeRPCs[2]
-	_, has3 := s.activeRPCs[3]
-	_, has4 := s.activeRPCs[4]
-	s.mu.Unlock()
-	if !has1 || !has2 {
-		t.Error("admitted RPCs (1, 2) should remain in activeRPCs")
-	}
-	if has3 || has4 {
-		t.Error("RPCs beyond admitted (3, 4) should have been removed")
-	}
+	t.Run("admitted retained", func(t *testing.T) {
+		// Re-arm on a fresh session since the prior transitioned to Closing.
+		s2, _ := makeActive(t, SessionHooks{})
+		rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
+		s2.activeRPC.Store(rpc)
+		s2.handleGoAway(&spb.GoAwayResponse{LastRpcIdAdmitted: 2, Reason: "test"})
+		if s2.activeRPC.Load() != rpc {
+			t.Error("admitted RPC should remain in slot")
+		}
+	})
 }
 
 func TestHandleSessionParameters_UpdatesIntervalAndDeadline(t *testing.T) {
@@ -428,10 +424,8 @@ func TestHandleSessionParameters_UpdatesIntervalAndDeadline(t *testing.T) {
 		KeepAlive: durationpb.New(2 * time.Second),
 	})
 
-	s.mu.Lock()
-	gotInterval := s.heartbeatInterval
-	gotDeadline := s.nextHeartbeatDeadline
-	s.mu.Unlock()
+	gotInterval := time.Duration(s.heartbeatIntervalNano.Load())
+	gotDeadline := time.Unix(0, s.nextHeartbeatDeadlineNano.Load())
 
 	if gotInterval != 2*time.Second {
 		t.Errorf("heartbeatInterval = %v, want 2s", gotInterval)
@@ -446,11 +440,9 @@ func TestHandleSessionParameters_UpdatesIntervalAndDeadline(t *testing.T) {
 	s.handleSessionParameters(&spb.SessionParametersResponse{})
 	s.handleSessionParameters(&spb.SessionParametersResponse{KeepAlive: durationpb.New(0)})
 
-	s.mu.Lock()
-	if s.heartbeatInterval != 2*time.Second {
-		t.Errorf("heartbeatInterval changed after no-op updates: %v", s.heartbeatInterval)
+	if got := time.Duration(s.heartbeatIntervalNano.Load()); got != 2*time.Second {
+		t.Errorf("heartbeatInterval changed after no-op updates: %v", got)
 	}
-	s.mu.Unlock()
 }
 
 func TestHandleSessionRefreshConfig_Stored(t *testing.T) {
@@ -469,16 +461,12 @@ func TestHandleSessionRefreshConfig_Stored(t *testing.T) {
 
 func TestHandleSessionResponse_UnknownDoesNotResetDeadline(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
-	s.mu.Lock()
-	s.nextHeartbeatDeadline = time.Unix(0, 0) // way in the past
-	s.mu.Unlock()
+	s.nextHeartbeatDeadlineNano.Store(0) // way in the past
 
 	// SessionResponse with no oneof set → unknown payload path.
 	s.handleSessionResponse(&spb.SessionResponse{})
 
-	s.mu.Lock()
-	got := s.nextHeartbeatDeadline
-	s.mu.Unlock()
+	got := time.Unix(0, s.nextHeartbeatDeadlineNano.Load())
 	if !got.Equal(time.Unix(0, 0)) {
 		t.Errorf("unknown payload reset deadline to %v; expected unchanged", got)
 	}
@@ -487,9 +475,7 @@ func TestHandleSessionResponse_UnknownDoesNotResetDeadline(t *testing.T) {
 	s.handleSessionResponse(&spb.SessionResponse{
 		Payload: &spb.SessionResponse_Heartbeat{Heartbeat: &spb.HeartbeatResponse{}},
 	})
-	s.mu.Lock()
-	got = s.nextHeartbeatDeadline
-	s.mu.Unlock()
+	got = time.Unix(0, s.nextHeartbeatDeadlineNano.Load())
 	if got.Equal(time.Unix(0, 0)) {
 		t.Error("recognized heartbeat did not reset deadline")
 	}
@@ -580,19 +566,14 @@ func TestInvoke_SendFailureCleansUpMap(t *testing.T) {
 		return fmt.Errorf("network down")
 	}
 	s := newTestSession(t, stream, SessionHooks{})
-	s.mu.Lock()
-	s.state = StateActive
-	s.mu.Unlock()
+	s.state.Store(int32(StateActive))
 
 	_, err := s.Invoke(context.Background(), newRoundTripDesc(), "hello")
 	if err == nil {
 		t.Fatal("expected error from failed Send")
 	}
-	s.mu.Lock()
-	leftOver := len(s.activeRPCs)
-	s.mu.Unlock()
-	if leftOver != 0 {
-		t.Errorf("activeRPCs = %d, want 0 (defer should clean up on Send failure)", leftOver)
+	if s.activeRPC.Load() != nil {
+		t.Error("activeRPC slot should be cleared by defer on Send failure")
 	}
 }
 
@@ -617,9 +598,7 @@ func TestForceClose_Idempotent(t *testing.T) {
 func TestForceClose_CancelsInflightWithReason(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 	rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
-	s.mu.Lock()
-	s.activeRPCs[1] = rpc
-	s.mu.Unlock()
+	s.activeRPC.Store(rpc)
 
 	s.ForceClose(&spb.CloseSessionRequest{
 		Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_MISSED_HEARTBEAT,
@@ -639,9 +618,7 @@ func TestForceClose_CancelsInflightWithReason(t *testing.T) {
 func TestClose_Graceful_NoInflightSendsCloseRequest(t *testing.T) {
 	stream := newFakeStream()
 	s := newTestSession(t, stream, SessionHooks{})
-	s.mu.Lock()
-	s.state = StateActive
-	s.mu.Unlock()
+	s.state.Store(int32(StateActive))
 
 	if err := s.Close(context.Background(), &spb.CloseSessionRequest{
 		Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_USER,
@@ -664,9 +641,7 @@ func TestClose_Graceful_NoInflightSendsCloseRequest(t *testing.T) {
 func TestClose_AlreadyClosingIsNoop(t *testing.T) {
 	stream := newFakeStream()
 	s := newTestSession(t, stream, SessionHooks{})
-	s.mu.Lock()
-	s.state = StateClosed
-	s.mu.Unlock()
+	s.state.Store(int32(StateClosed))
 
 	if err := s.Close(context.Background(), nil); err != nil {
 		t.Errorf("Close on closed session = %v, want nil", err)
@@ -683,9 +658,7 @@ func TestClose_CtxCancelDuringDrainForceCloses(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 	// Pin an in-flight RPC so the drain loop is forced to wait.
 	rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
-	s.mu.Lock()
-	s.activeRPCs[1] = rpc
-	s.mu.Unlock()
+	s.activeRPC.Store(rpc)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancelDone := make(chan struct{})
@@ -721,10 +694,8 @@ func TestClose_CtxCancelDuringDrainForceCloses(t *testing.T) {
 func TestHeartBeatLoop_ForceClosesOnMissedHeartbeat(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 	rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
-	s.mu.Lock()
-	s.activeRPCs[1] = rpc
-	s.nextHeartbeatDeadline = time.Now().Add(-time.Second) // already missed
-	s.mu.Unlock()
+	s.activeRPC.Store(rpc)
+	s.nextHeartbeatDeadlineNano.Store(time.Now().Add(-time.Second).UnixNano()) // already missed
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -751,11 +722,9 @@ func TestHeartBeatLoop_HeartbeatsKeepInflightVRPCAlive(t *testing.T) {
 	// handleSessionResponse correctly resets the deadline on every
 	// recognized frame.
 	s, _ := makeActive(t, SessionHooks{})
-	s.mu.Lock()
-	s.heartbeatInterval = 30 * time.Millisecond
-	s.nextHeartbeatDeadline = time.Now().Add(90 * time.Millisecond) // 3 * interval
-	s.activeRPCs[1] = &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
-	s.mu.Unlock()
+	s.heartbeatIntervalNano.Store(int64(30 * time.Millisecond))
+	s.nextHeartbeatDeadlineNano.Store(time.Now().Add(90 * time.Millisecond).UnixNano()) // 3 * interval
+	s.activeRPC.Store(&vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -780,10 +749,8 @@ func TestHeartBeatLoop_IdleSessionIsNotTornDown(t *testing.T) {
 	// with an elapsed deadline must NOT be force-closed; the loop should
 	// keep checking until activity returns.
 	s, _ := makeActive(t, SessionHooks{})
-	s.mu.Lock()
-	s.heartbeatInterval = 20 * time.Millisecond // make idle re-check fast
-	s.nextHeartbeatDeadline = time.Now().Add(-time.Hour)
-	s.mu.Unlock()
+	s.heartbeatIntervalNano.Store(int64(20 * time.Millisecond)) // make idle re-check fast
+	s.nextHeartbeatDeadlineNano.Store(time.Now().Add(-time.Hour).UnixNano())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -808,9 +775,7 @@ func TestHeartBeatLoop_IdleSessionIsNotTornDown(t *testing.T) {
 
 func TestHeartBeatLoop_ExitsOnCtxCancel(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
-	s.mu.Lock()
-	s.nextHeartbeatDeadline = time.Now().Add(time.Hour) // never expires
-	s.mu.Unlock()
+	s.nextHeartbeatDeadlineNano.Store(time.Now().Add(time.Hour).UnixNano()) // never expires
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

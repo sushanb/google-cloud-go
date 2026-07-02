@@ -248,21 +248,24 @@ type OpenRequestSnapshot struct {
 	FlagsJSON       string
 }
 
-// Snapshot returns a debug-friendly snapshot of the session. It acquires
-// s.mu once for the mutable fields and reads the atomic counters lock-free.
-// It is safe to call concurrently with Invoke.
+// Snapshot returns a debug-friendly snapshot of the session. Reads every
+// field lock-free via atomics; safe to call concurrently with Invoke and
+// with any lifecycle transition. The individual field reads are not
+// cross-consistent, but the sessionz UI treats each row as an approximate
+// point-in-time picture, which is exactly what atomics give us.
 func (s *Session) Snapshot() SessionSnapshot {
-	s.mu.Lock()
-	state := s.state
+	state := State(s.state.Load())
 	logName := s.logName
-	lastChange := s.lastStateChange
-	hbInterval := s.heartbeatInterval
-	nextHb := s.nextHeartbeatDeadline
-	activeRpcs := len(s.activeRPCs)
-	peer := s.peerInfo
-	hasRefresh := s.refreshConfig != nil
+	lastChange := time.Unix(0, s.lastStateChangeNano.Load())
+	hbInterval := time.Duration(s.heartbeatIntervalNano.Load())
+	nextHb := time.Unix(0, s.nextHeartbeatDeadlineNano.Load())
+	activeRpcs := 0
+	if s.activeRPC.Load() != nil {
+		activeRpcs = 1
+	}
+	peer := s.peerInfo.Load()
+	hasRefresh := s.refreshConfig.Load() != nil
 	sessionType := s.sessionType
-	s.mu.Unlock()
 
 	sortedLat := s.snapshotLatencies()
 	return SessionSnapshot{

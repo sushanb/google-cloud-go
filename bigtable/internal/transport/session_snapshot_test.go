@@ -27,20 +27,18 @@ func TestSession_CountsOkAndErrorRpcs(t *testing.T) {
 
 	for _, id := range []int64{1, 2, 3} {
 		rpc := &vrpcImpl{id: id, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
-		s.mu.Lock()
-		s.activeRPCs[id] = rpc
-		s.mu.Unlock()
+		s.activeRPC.Store(rpc)
 		s.handleVRPCResponse(&spb.VirtualRpcResponse{RpcId: id, Payload: []byte("p")})
+		s.activeRPC.Store(nil)
 	}
 	for _, id := range []int64{10, 11} {
 		rpc := &vrpcImpl{id: id, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
-		s.mu.Lock()
-		s.activeRPCs[id] = rpc
-		s.mu.Unlock()
+		s.activeRPC.Store(rpc)
 		s.handleVRPCErrorResponse(&spb.ErrorResponse{
 			RpcId:  id,
 			Status: &rpcstatus.Status{Code: int32(codes.Unavailable), Message: "boom"},
 		})
+		s.activeRPC.Store(nil)
 	}
 
 	if got := s.OkRpcs(); got != 3 {
@@ -69,13 +67,13 @@ func TestSession_CountsOkAndErrorRpcs(t *testing.T) {
 
 func TestSession_Snapshot_BasicFields(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
-	s.peerInfo = &spb.PeerInfo{
+	s.peerInfo.Store(&spb.PeerInfo{
 		GoogleFrontendId:           42,
 		ApplicationFrontendId:      99,
 		ApplicationFrontendRegion:  "us-central1",
 		ApplicationFrontendSubzone: "us-central1-b1",
 		TransportType:              spb.PeerInfo_TRANSPORT_TYPE_SESSION_DIRECT_ACCESS,
-	}
+	})
 	s.okRpcs.Store(5)
 	s.errorRpcs.Store(1)
 
@@ -135,9 +133,7 @@ func TestPoolSnapshot_AggregatesSessions(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		stream := newFakeStream()
 		s := NewSession("s", stream, SessionHooks{}, SessionTypeTable)
-		s.mu.Lock()
-		s.state = StateActive
-		s.mu.Unlock()
+		s.state.Store(int32(StateActive))
 		sh := NewSessionHandle(s)
 		pool.sessions = append(pool.sessions, sh)
 	}

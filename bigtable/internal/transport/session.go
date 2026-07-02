@@ -26,7 +26,6 @@ import (
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	btopt "cloud.google.com/go/bigtable/internal/option"
-	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -158,13 +157,19 @@ type vrpcImpl struct {
 
 // Session manages the lifecycle of a Bigtable Session and routes vRPCs over
 // its bidirectional Stream.
+//
+// All fields formerly guarded by an internal mu are now atomics — the hot
+// path (Invoke, State(), the picker) no longer takes a per-session mutex,
+// removing four lock/unlock pairs and the cross-goroutine cache-line
+// ping-pong the picker used to trigger by calling State() per session
+// under lock. sendMu still guards concurrent Send() writers since
+// grpc.ClientStream.Send is not safe for concurrent use.
 type Session struct {
 	// nextRPCID is mutated exclusively via atomic ops; using atomic.Int64
 	// guarantees 8-byte alignment on 32-bit platforms without struct layout
 	// constraints.
 	nextRPCID atomic.Int64
 
-	mu     sync.Mutex
 	sendMu sync.Mutex
 
 	logger      *log.Logger
@@ -173,27 +178,54 @@ type Session struct {
 	hooks       SessionHooks
 	sessionType SessionType
 	tracer      *sessionTracer
-	vrpcSem     *semaphore.Weighted
 
-	state           State
-	lastStateChange time.Time
+	// state is the session's lifecycle position (State constants). Read
+	// with State(); mutate through transitionTo. int32 rather than
+	// State-typed atomic because atomic.Int32 is stdlib and we control
+	// the marshal.
+	state atomic.Int32
+	// lastStateChangeNano stamps each successful transitionTo with
+	// time.Now().UnixNano(). Approximate ordering across transitions is
+	// enough for the debug UI.
+	lastStateChangeNano atomic.Int64
 	// closeOnce serializes hooks.OnClose and tracer.recordClose so they
 	// fire exactly once even if multiple paths race to close the session.
 	closeOnce sync.Once
 
-	activeRPCs map[int64]*vrpcImpl
+	// activeRPC holds the single in-flight vRPC (multiPlexingLimit=1).
+	// Replaces a map[int64]*vrpcImpl guarded by mu. Invoke sets it via
+	// CompareAndSwap(nil, rpc) — the CAS is the pool-serialization
+	// invariant check made explicit: if it fails, someone bypassed the
+	// pool's per-session checkout gate. Load is used from the response
+	// dispatch paths and the ctx-done/close paths; a load returning nil
+	// means "no rpc in flight" and a load returning a vrpc means "match
+	// on id before delivering".
+	activeRPC atomic.Pointer[vrpcImpl]
 
-	heartbeatInterval     time.Duration
-	nextHeartbeatDeadline time.Time
+	// heartbeatIntervalNano is the server-negotiated keep-alive
+	// interval (in ns). Stored atomically because handleSessionParameters
+	// mutates it from the readLoop while the vRPC hot path reads it via
+	// resetHeartbeatDeadline.
+	heartbeatIntervalNano atomic.Int64
+	// nextHeartbeatDeadlineNano is the wall-clock deadline (UnixNano) the
+	// heartbeat watchdog compares against. Every outbound frame + every
+	// inbound frame extends it via resetHeartbeatDeadline.
+	nextHeartbeatDeadlineNano atomic.Int64
 
-	// quiescent is closed when no vRPCs remain in activeRPCs after the
-	// session enters StateClosing, or when ForceClose runs. Close() waits on
-	// it to drain in-flight RPCs without polling.
+	// quiescent is closed when the in-flight vRPC (if any) has drained
+	// after the session entered StateClosing, or when ForceClose runs.
+	// Close() waits on it to drain in-flight RPCs without polling.
 	quiescent     chan struct{}
 	quiescentOnce sync.Once
 
-	peerInfo      *spb.PeerInfo
-	refreshConfig *spb.SessionRefreshConfig
+	// peerInfo is populated asynchronously by peerInfoExtracter from the
+	// stream header. atomic.Pointer so peerInfoSummary / snapshot / the
+	// ctx-done event recorder can read it lock-free on the hot path.
+	peerInfo atomic.Pointer[spb.PeerInfo]
+	// refreshConfig is stored once when the server sends
+	// SessionRefreshConfig. atomic.Pointer to keep the getter allocation-
+	// and lock-free.
+	refreshConfig atomic.Pointer[spb.SessionRefreshConfig]
 
 	// okRpcs / errorRpcs are bumped lock-free from the vRPC dispatch paths so
 	// the debug UI can read a numeric total without locking. The booleans
@@ -318,9 +350,7 @@ func (s *Session) snapshotEvents() []SessionEvent {
 // session has not received the asynchronous PeerInfo metadata). Format
 // keeps the ids in hex so they line up with what sessionz renders.
 func (s *Session) peerInfoSummary() string {
-	s.mu.Lock()
-	p := s.peerInfo
-	s.mu.Unlock()
+	p := s.peerInfo.Load()
 	if p == nil {
 		return "peer=unknown"
 	}
@@ -448,19 +478,17 @@ func WithSessionLogger(logger *log.Logger) SessionOption {
 // SessionHooks if you don't need lifecycle callbacks.
 func NewSession(logName string, stream Stream, hooks SessionHooks, sessionType SessionType, opts ...SessionOption) *Session {
 	s := &Session{
-		state:                 StateNew,
-		lastStateChange:       time.Now(),
-		logName:               logName,
-		stream:                stream,
-		hooks:                 hooks,
-		activeRPCs:            make(map[int64]*vrpcImpl),
-		heartbeatInterval:     defaultHeartbeatInterval,
-		nextHeartbeatDeadline: time.Now().Add(initialHeartbeatGrace),
-		quiescent:             make(chan struct{}),
-		tracer:                newSessionTracer(sessionType),
-		sessionType:           sessionType,
-		vrpcSem:               semaphore.NewWeighted(multiPlexingLimit),
+		logName:     logName,
+		stream:      stream,
+		hooks:       hooks,
+		quiescent:   make(chan struct{}),
+		tracer:      newSessionTracer(sessionType),
+		sessionType: sessionType,
 	}
+	s.state.Store(int32(StateNew))
+	s.lastStateChangeNano.Store(time.Now().UnixNano())
+	s.heartbeatIntervalNano.Store(int64(defaultHeartbeatInterval))
+	s.nextHeartbeatDeadlineNano.Store(time.Now().Add(initialHeartbeatGrace).UnixNano())
 	s.channelIndex.Store(-1)
 	for _, o := range opts {
 		o(s)
@@ -468,33 +496,26 @@ func NewSession(logName string, stream Stream, hooks SessionHooks, sessionType S
 	return s
 }
 
-// LogName returns the session's diagnostic identifier.
+// LogName returns the session's diagnostic identifier. Set once at
+// construction; safe to read lock-free.
 func (s *Session) LogName() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.logName
 }
 
 // State returns the current state.
 func (s *Session) State() State {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.state
+	return State(s.state.Load())
 }
 
 // PeerInfo returns the peer info, or nil if it has not been parsed yet.
 func (s *Session) PeerInfo() *spb.PeerInfo {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.peerInfo
+	return s.peerInfo.Load()
 }
 
 // RefreshConfig returns the server-provided refresh configuration, or nil if
 // the server has not sent one.
 func (s *Session) RefreshConfig() *spb.SessionRefreshConfig {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.refreshConfig
+	return s.refreshConfig.Load()
 }
 
 // HasOkRpcs reports whether the session served at least one successful vRPC.
@@ -541,18 +562,19 @@ func (s *Session) debugf(format string, args ...interface{}) {
 
 // transitionTo sets the session state to `to` iff ok(currentState) returns
 // true. Returns the previous state and whether the transition was applied.
-// All callers using this helper share the same lock/timestamp/transition
-// pattern, so adding/removing transitions does not duplicate that bookkeeping.
+// Retries on CAS failure so a losing racer with a still-valid current state
+// still transitions; the predicate is re-evaluated after each spurious loss.
 func (s *Session) transitionTo(to State, ok func(State) bool) (prev State, applied bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	prev = s.state
-	if !ok(prev) {
-		return prev, false
+	for {
+		prev = State(s.state.Load())
+		if !ok(prev) {
+			return prev, false
+		}
+		if s.state.CompareAndSwap(int32(prev), int32(to)) {
+			s.lastStateChangeNano.Store(time.Now().UnixNano())
+			return prev, true
+		}
 	}
-	s.state = to
-	s.lastStateChange = time.Now()
-	return prev, true
 }
 
 // isState returns a predicate matching any of `allowed`.

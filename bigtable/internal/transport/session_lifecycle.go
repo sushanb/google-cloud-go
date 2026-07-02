@@ -110,12 +110,13 @@ func (s *Session) Close(ctx context.Context, req *spb.CloseSessionRequest) error
 	// win over this one.
 	s.setCloseReason(closeReasonLabel(req))
 
-	// Wait for active RPCs to drain. The quiescent channel is closed by the
-	// last RPC's cleanup defer when it sees state==Closing && empty, or by
-	// ForceClose if it races us.
-	s.mu.Lock()
-	empty := len(s.activeRPCs) == 0
-	s.mu.Unlock()
+	// Wait for the in-flight RPC (if any) to drain. The quiescent channel
+	// is closed by the RPC's cleanup defer when it sees state==Closing on
+	// its way out, or by ForceClose if it races us. Order matters: we
+	// transitioned to Closing above BEFORE observing activeRPC — so the
+	// defer's "check state after clearing" side always signals if we miss
+	// the empty snapshot here.
+	empty := s.activeRPC.Load() == nil
 	if empty {
 		s.signalQuiescent()
 	} else {
@@ -266,18 +267,14 @@ func (s *Session) handleSessionParameters(params *spb.SessionParametersResponse)
 	if interval <= 0 {
 		return
 	}
-	s.mu.Lock()
-	s.heartbeatInterval = interval
-	s.nextHeartbeatDeadline = time.Now().Add(3 * interval)
-	s.mu.Unlock()
+	s.heartbeatIntervalNano.Store(int64(interval))
+	s.nextHeartbeatDeadlineNano.Store(time.Now().Add(3 * interval).UnixNano())
 }
 
 // handleSessionRefreshConfig stores the server-provided refresh configuration
 // for later use by reconnection logic.
 func (s *Session) handleSessionRefreshConfig(cfg *spb.SessionRefreshConfig) {
-	s.mu.Lock()
-	s.refreshConfig = cfg
-	s.mu.Unlock()
+	s.refreshConfig.Store(cfg)
 	s.debugf("stored SessionRefreshConfig (optimized_open=%t, metadata_entries=%d)",
 		cfg.GetOptimizedOpenRequest() != nil, len(cfg.GetMetadata()))
 }
@@ -337,9 +334,10 @@ func (s *Session) handleClose(err error) {
 	}
 	reason := streamEndReason(err)
 	s.setCloseReason(reason)
-	s.mu.Lock()
-	inFlight := len(s.activeRPCs)
-	s.mu.Unlock()
+	inFlight := 0
+	if s.activeRPC.Load() != nil {
+		inFlight = 1
+	}
 	age := time.Duration(0)
 	if openedAt := s.OpenedAt(); !openedAt.IsZero() {
 		age = time.Since(openedAt)
@@ -395,11 +393,9 @@ func streamEndReason(err error) string {
 
 // resetHeartbeatDeadline pushes out the watchdog to (3 * heartbeatInterval)
 // from now. The 3x multiplier follows the protocol guidance of tolerating two
-// missed heartbeats.
+// missed heartbeats. Two atomic loads + one atomic store on the hot path.
 func (s *Session) resetHeartbeatDeadline() {
-	s.mu.Lock()
-	s.nextHeartbeatDeadline = time.Now().Add(3 * s.heartbeatInterval)
-	s.mu.Unlock()
+	s.nextHeartbeatDeadlineNano.Store(time.Now().Add(3 * time.Duration(s.heartbeatIntervalNano.Load())).UnixNano())
 }
 
 // heartBeatLoop watches the session's heartbeat deadline using a single Timer
@@ -408,9 +404,7 @@ func (s *Session) resetHeartbeatDeadline() {
 // Heartbeats during long-running VRPCs, so an idle session legitimately
 // receives no heartbeats and must not be torn down.
 func (s *Session) heartBeatLoop(ctx context.Context) {
-	s.mu.Lock()
-	deadline := s.nextHeartbeatDeadline
-	s.mu.Unlock()
+	deadline := time.Unix(0, s.nextHeartbeatDeadlineNano.Load())
 
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
@@ -420,18 +414,18 @@ func (s *Session) heartBeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			s.mu.Lock()
-			if s.state == StateClosed {
-				s.mu.Unlock()
+			if State(s.state.Load()) == StateClosed {
 				return
 			}
-			active := len(s.activeRPCs)
-			remaining := time.Until(s.nextHeartbeatDeadline)
-			interval := s.heartbeatInterval
+			active := 0
+			if s.activeRPC.Load() != nil {
+				active = 1
+			}
+			remaining := time.Until(time.Unix(0, s.nextHeartbeatDeadlineNano.Load()))
+			interval := time.Duration(s.heartbeatIntervalNano.Load())
 			// last-frame age = (deadline - now) inverted into "how long
 			// since the last frame extended us" = 3*interval - remaining.
 			lastFrameAge := 3*interval - remaining
-			s.mu.Unlock()
 
 			if active == 0 {
 				// Idle session: no heartbeats are expected. Re-check after
@@ -498,11 +492,8 @@ func (s *Session) peerInfoExtracter(peerInfoData []string) {
 		s.debugf("unmarshal PeerInfo proto failed: %v", err)
 		return
 	}
-	s.mu.Lock()
-	s.peerInfo = &peerInfo
-	logName := s.logName
-	s.mu.Unlock()
-	s.tracer.setPeerInfo(&peerInfo, logName)
+	s.peerInfo.Store(&peerInfo)
+	s.tracer.setPeerInfo(&peerInfo, s.logName)
 	s.debugf("parsed PeerInfo: transport_type=%s afe=%s",
 		peerInfo.GetTransportType(), peerInfo.GetApplicationFrontendSubzone())
 }

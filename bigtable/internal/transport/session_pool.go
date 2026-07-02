@@ -434,10 +434,8 @@ func (p *SessionPoolImpl) sweepStuckSessions() {
 		if sh == nil || sh.session == nil {
 			continue
 		}
-		sh.session.mu.Lock()
-		stuck := sh.session.state == StateWaitServerClose
-		since := time.Since(sh.session.lastStateChange)
-		sh.session.mu.Unlock()
+		stuck := State(sh.session.state.Load()) == StateWaitServerClose
+		since := time.Since(time.Unix(0, sh.session.lastStateChangeNano.Load()))
 		if stuck && since > waitServerCloseGrace {
 			victims = append(victims, victim{sess: sh.session, stuckFor: since})
 		}
@@ -634,13 +632,25 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 			return nil, errors.New("session pool is closed")
 		}
 
-		// Dead-sweep first so the picker scans only live handles. The
-		// inline scan that lived here previously had a "first idle
-		// wins" break that combined with cap-1 freeSignal to starve
-		// later-activated cohorts (their Picks stayed 0 indefinitely
-		// while PendingCount held above 0). Routing selection through
-		// p.picker (which now applies a lastActivity tie-break) fixes
-		// that.
+		// Fast path: picker already filters non-Active sessions
+		// (LeastInFlightPicker.PickSession does the check), so most
+		// checkouts skip the O(N) dead-sweep entirely. The picker also
+		// applies a lastActivity tie-break so later-activated cohorts
+		// aren't starved by the "first idle wins" pattern that used to
+		// live inline here.
+		if idle := p.picker.PickSession(); idle != nil {
+			idle.IncOutstanding()
+			atomic.AddInt64(&idle.picks, 1)
+			p.mu.Unlock()
+			return idle, nil
+		}
+
+		// Slow path: picker returned nil. Sweep any dead handles now
+		// so subsequent scans stay cheap, then trigger scale-up if
+		// under max. Sweeping only when the picker misses trades a
+		// slightly stale p.sessions view (a session that turned dead
+		// between checkouts stays in the slice until the next miss)
+		// for skipping the sweep on every successful checkout.
 		var dead []*SessionHandle
 		for _, sh := range p.sessions {
 			if sh == nil || sh.session == nil {
@@ -653,16 +663,6 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		if len(dead) > 0 {
 			p.pruneDeadLocked(dead)
 		}
-
-		if idle := p.picker.PickSession(); idle != nil {
-			idle.IncOutstanding()
-			atomic.AddInt64(&idle.picks, 1)
-			p.mu.Unlock()
-			return idle, nil
-		}
-
-		// No idle session. Trigger scale-up if under max — better to
-		// ask too often than leave a worker waiting on a sleeping pool.
 		if len(p.sessions) < p.maxSessions {
 			go p.PerformScaling(ctx)
 		}
@@ -1326,10 +1326,7 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 		// Capture the session's PeerInfo so cohort patterns (e.g. every
 		// Unavailable failure on AFE X) are visible directly in the
 		// slow-vRPC table instead of requiring a per-session cross-ref.
-		sh.session.mu.Lock()
-		peerProto := sh.session.peerInfo
-		sh.session.mu.Unlock()
-		ev.Peer = peerInfoToSnapshot(peerProto)
+		ev.Peer = peerInfoToSnapshot(sh.session.peerInfo.Load())
 		if invokeErr != nil {
 			// Standard library context errors don't implement GRPCStatus(),
 			// so status.Code falls through to Unknown — which mislabels

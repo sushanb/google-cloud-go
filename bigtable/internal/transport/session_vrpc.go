@@ -71,28 +71,22 @@ type InvokeResult struct {
 // respect server-supplied retry hints without losing data on the way out of
 // the transport.
 //
-// Calls are serialized by vrpcSem; concurrent callers queue behind the
-// in-flight RPC until the semaphore is released.
+// The caller MUST have exclusive access to this Session for the duration
+// of the call — the pool guarantees this via CheckoutSession's per-session
+// idle-slot gate. The single-in-flight invariant is enforced with a
+// CompareAndSwap on activeRPC; a failing CAS means the caller bypassed
+// the pool gate and is a programming error, not a runtime condition. This
+// replaces a golang.org/x/sync/semaphore that added two channel ops per
+// call on the hot path.
 func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface{}) (result InvokeResult, err error) {
-	acquireStart := time.Now()
-	if err := s.vrpcSem.Acquire(ctx, multiPlexingLimit); err != nil {
-		return InvokeResult{}, err
-	}
-	result.SemWait = time.Since(acquireStart)
-	defer s.vrpcSem.Release(multiPlexingLimit)
-
 	startTime := time.Now()
 	defer func() {
 		s.tracer.recordOperation(ctx, startTime, desc.Method(), err)
 	}()
 
-	s.mu.Lock()
-	if s.state != StateActive {
-		st := s.state
-		s.mu.Unlock()
+	if st := State(s.state.Load()); st != StateActive {
 		return InvokeResult{}, unavailable(ErrSessionNotActive, "session is not active (state: %v)", st)
 	}
-	s.mu.Unlock()
 
 	reqBytes, err := desc.Encode(req)
 	if err != nil {
@@ -107,15 +101,19 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 		resultChan: make(chan vrpcResult, 1),
 	}
 
-	s.mu.Lock()
-	s.activeRPCs[rpcID] = rpc
-	s.mu.Unlock()
+	// Claim the single in-flight slot. See method doc — a losing CAS is
+	// a caller-side serialization bug, not a runtime backoff condition.
+	if !s.activeRPC.CompareAndSwap(nil, rpc) {
+		return InvokeResult{}, unavailable(ErrSessionNotActive,
+			"concurrent Invoke on session %q: multiPlexingLimit=1 violated", s.logName)
+	}
 	defer func() {
-		s.mu.Lock()
-		delete(s.activeRPCs, rpcID)
-		drained := s.state == StateClosing && len(s.activeRPCs) == 0
-		s.mu.Unlock()
-		if drained {
+		s.activeRPC.CompareAndSwap(rpc, nil)
+		// Order matters: clear the slot first, THEN check state. Close()
+		// transitions to StateClosing first and only then observes
+		// activeRPC — so at least one side signals. signalQuiescent is
+		// once-guarded, so a double-signal is harmless.
+		if State(s.state.Load()) == StateClosing {
 			s.signalQuiescent()
 		}
 	}()
@@ -174,10 +172,8 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 
 	select {
 	case <-ctx.Done():
-		s.mu.Lock()
-		stillActive := s.activeRPCs[rpcID] != nil
-		sessState := s.state
-		s.mu.Unlock()
+		stillActive := s.activeRPC.Load() == rpc
+		sessState := State(s.state.Load())
 		waited := time.Since(sentAt)
 		peer := s.peerInfoSummary()
 		s.debugf("vRPC %s rpc_id=%d ctx.Done waited=%v err=%v session_state=%v still_in_flight=%v %s",
@@ -213,11 +209,8 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 // handleVRPCResponse delivers a server VirtualRpcResponse to the waiting
 // Invoke caller, if any.
 func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
-	s.mu.Lock()
-	rpc, ok := s.activeRPCs[resp.RpcId]
-	s.mu.Unlock()
-
-	if !ok {
+	rpc := s.activeRPC.Load()
+	if rpc == nil || rpc.id != resp.RpcId {
 		s.debugf("dropping VirtualRpcResponse for unknown rpc_id=%d", resp.RpcId)
 		return
 	}
@@ -228,11 +221,8 @@ func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
 // handleVRPCErrorResponse routes per-vRPC errors to the waiting caller.
 // Session-level errors (rpc_id == 0) are handled in handleSessionResponse.
 func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
-	s.mu.Lock()
-	rpc, ok := s.activeRPCs[errResp.RpcId]
-	s.mu.Unlock()
-
-	if !ok {
+	rpc := s.activeRPC.Load()
+	if rpc == nil || rpc.id != errResp.RpcId {
 		s.debugf("dropping ErrorResponse for unknown rpc_id=%d", errResp.RpcId)
 		return
 	}
@@ -271,20 +261,22 @@ func (s *Session) deliver(rpc *vrpcImpl, res vrpcResult) {
 	}
 }
 
-// cancelActiveRPCs removes and notifies every in-flight RPC matching filter
-// (or all, if filter is nil) with the given error.
+// cancelActiveRPCs cancels the in-flight vRPC (if any) that matches filter
+// with the given error. With multiPlexingLimit=1 there is at most one such
+// vRPC. Clear-then-deliver so a racing handleVRPCResponse can't double-
+// deliver on the same slot.
 func (s *Session) cancelActiveRPCs(err error, filter func(rpcID int64) bool) {
-	s.mu.Lock()
-	cancelled := make([]*vrpcImpl, 0, len(s.activeRPCs))
-	for id, rpc := range s.activeRPCs {
-		if filter == nil || filter(id) {
-			cancelled = append(cancelled, rpc)
-			delete(s.activeRPCs, id)
-		}
+	rpc := s.activeRPC.Load()
+	if rpc == nil {
+		return
 	}
-	s.mu.Unlock()
-
-	for _, rpc := range cancelled {
-		s.deliver(rpc, vrpcResult{err: err})
+	if filter != nil && !filter(rpc.id) {
+		return
 	}
+	if !s.activeRPC.CompareAndSwap(rpc, nil) {
+		// Concurrent completion cleared the slot; the caller already
+		// received a result. Nothing to cancel.
+		return
+	}
+	s.deliver(rpc, vrpcResult{err: err})
 }
