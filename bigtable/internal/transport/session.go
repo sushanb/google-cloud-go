@@ -466,6 +466,14 @@ func (s *Session) CloseReason() string {
 	return ""
 }
 
+// SampleUptime records the session's current alive time into the
+// session.uptime histogram. Intended for periodic invocation by the pool
+// heartbeat over still-active sessions; no-op if the session hasn't
+// finished opening.
+func (s *Session) SampleUptime(ctx context.Context) {
+	s.tracer.sampleUptime(ctx)
+}
+
 // Retries returns the number of vRPCs Invoke processed with AttemptNumber > 1.
 func (s *Session) Retries() int64 { return s.retries.Load() }
 
@@ -482,6 +490,15 @@ type SessionOption func(*Session)
 // session logs nothing.
 func WithSessionLogger(logger *log.Logger) SessionOption {
 	return func(s *Session) { s.logger = logger }
+}
+
+// WithSessionPoolName stamps the pool-scoped name used for the session_name
+// label on session lifecycle metrics. Matches java-bigtable's per-pool
+// SessionPoolInfo name — cardinality stays bounded by the number of pools
+// per process, not per session. Omit for tests / standalone sessions; the
+// label will be empty.
+func WithSessionPoolName(name string) SessionOption {
+	return func(s *Session) { s.tracer.setPoolName(name) }
 }
 
 // NewSession constructs a Session bound to the given stream. Pass a zero-value

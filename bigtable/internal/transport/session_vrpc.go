@@ -80,9 +80,6 @@ type InvokeResult struct {
 // call on the hot path.
 func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface{}) (result InvokeResult, err error) {
 	startTime := time.Now()
-	defer func() {
-		s.tracer.recordOperation(ctx, startTime, desc.Method(), err)
-	}()
 
 	if st := State(s.state.Load()); st != StateActive {
 		return InvokeResult{}, unavailable(ErrSessionNotActive, "session is not active (state: %v)", st)

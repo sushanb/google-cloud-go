@@ -52,7 +52,7 @@ func InitializeSessionMetrics(meterProvider metric.MeterProvider) error {
 		var err error
 		if sessionDurations, err = meter.Float64Histogram(
 			"session.durations",
-			metric.WithDescription("Duration of operations within a session"),
+			metric.WithDescription("Duration a session was alive (openedAt → close)"),
 			metric.WithUnit("ms"),
 		); err != nil {
 			sessionMetricsErr = fmt.Errorf("create session.durations histogram: %w", err)
@@ -68,7 +68,7 @@ func InitializeSessionMetrics(meterProvider metric.MeterProvider) error {
 		}
 		if sessionUptime, err = meter.Float64Histogram(
 			"session.uptime",
-			metric.WithDescription("Total lifetime of a session"),
+			metric.WithDescription("Age of currently-active sessions, sampled periodically"),
 			metric.WithUnit("ms"),
 		); err != nil {
 			sessionMetricsErr = fmt.Errorf("create session.uptime histogram: %w", err)
@@ -79,13 +79,16 @@ func InitializeSessionMetrics(meterProvider metric.MeterProvider) error {
 }
 
 // sessionTracer tracks and records metrics for a Session's lifecycle and
-// individual operations.
+// individual operations. poolName is a pool-scoped identifier stamped on
+// the session_name metric label — matches java-bigtable's SessionPoolInfo
+// name semantics (bounded cardinality, one per pool per process), NOT the
+// per-session logName (which lives on Session and is unbounded).
 type sessionTracer struct {
 	mu          sync.Mutex
 	startTime   time.Time
 	openedAt    time.Time
 	peerInfo    *spb.PeerInfo
-	sessionName string
+	poolName    string
 	sessionType SessionType
 }
 
@@ -97,6 +100,15 @@ func newSessionTracer(sessionType SessionType) *sessionTracer {
 	}
 }
 
+// setPoolName stamps the pool-scoped name used for the session_name label
+// on every emitted metric. Called from WithSessionPoolName during
+// NewSession.
+func (t *sessionTracer) setPoolName(name string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.poolName = name
+}
+
 // openedAtSnapshot returns the cached open timestamp under the lock so
 // callers don't read a torn value.
 func (t *sessionTracer) openedAtSnapshot() time.Time {
@@ -105,28 +117,29 @@ func (t *sessionTracer) openedAtSnapshot() time.Time {
 	return t.openedAt
 }
 
-func (t *sessionTracer) setPeerInfo(peerInfo *spb.PeerInfo, sessionName string) {
+func (t *sessionTracer) setPeerInfo(peerInfo *spb.PeerInfo) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.peerInfo = peerInfo
-	t.sessionName = sessionName
 }
 
 // snapshot captures the fields we need under the lock so that we can do
 // allocating work (string formatting, attribute builds) without holding it.
 type tracerSnapshot struct {
+	startTime     time.Time
 	openedAt      time.Time
 	transportType string
 	afeLocation   string
-	sessionName   string
+	poolName      string
 }
 
 func (t *sessionTracer) snapshot() tracerSnapshot {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	snap := tracerSnapshot{
+		startTime:     t.startTime,
 		openedAt:      t.openedAt,
-		sessionName:   t.sessionName,
+		poolName:      t.poolName,
 		transportType: "unknown",
 	}
 	if t.peerInfo != nil {
@@ -159,12 +172,71 @@ func (t *sessionTracer) recordOpen(ctx context.Context, err error) {
 		attribute.String("status", statusStr),
 		attribute.String("session_type", t.sessionType.String()),
 		attribute.String("afe_location", snap.afeLocation),
-		attribute.String("session_name", snap.sessionName),
+		attribute.String("session_name", snap.poolName),
 	))
 }
 
-// recordClose records the total uptime when the session closes.
-func (t *sessionTracer) recordClose(ctx context.Context) {
+// recordClose records the session's total elapsed time on close.
+//   - closingReason: the terminal Session.CloseReason(), or "" if none.
+//   - streamErr: the terminal stream error; nil means clean close ("OK").
+//   - hadOk / hadErr: whether the session served any OK / error vRPCs.
+//
+// For sessions that reached Active (openedAt set), duration is openedAt→now
+// and ready=true. For sessions that never opened, duration is startTime→now
+// and ready=false — matches java-bigtable SessionTracerImpl.onClose, which
+// records the metric for pre-open sessions too.
+func (t *sessionTracer) recordClose(ctx context.Context, closingReason string, streamErr error, hadOk, hadErr bool) {
+	if sessionDurations == nil {
+		return
+	}
+	snap := t.snapshot()
+
+	ready := !snap.openedAt.IsZero()
+	var elapsed float64
+	if ready {
+		elapsed = msSince(snap.openedAt)
+	} else if !snap.startTime.IsZero() {
+		elapsed = msSince(snap.startTime)
+	}
+
+	statusStr := "OK"
+	if streamErr != nil {
+		statusStr = status.Code(streamErr).String()
+	}
+
+	sessionDurations.Record(ctx, elapsed, metric.WithAttributes(
+		attribute.String("transport_type", snap.transportType),
+		attribute.String("status", statusStr),
+		attribute.String("session_type", t.sessionType.String()),
+		attribute.String("closing_reason", closingReason),
+		attribute.String("vrpcs", vrpcCloseState(hadOk, hadErr)),
+		attribute.Bool("ready", ready),
+		attribute.String("afe_location", snap.afeLocation),
+		attribute.String("session_name", snap.poolName),
+	))
+}
+
+// vrpcCloseState mirrors java-bigtable's SessionCloseVRpcState.find —
+// (hadOk, hadErr) → {none, all_ok, all_error, some_ok}. The labels match
+// Java exactly so cross-language dashboards work.
+func vrpcCloseState(hadOk, hadErr bool) string {
+	switch {
+	case hadOk && hadErr:
+		return "some_ok"
+	case hadOk:
+		return "all_ok"
+	case hadErr:
+		return "all_error"
+	default:
+		return "none"
+	}
+}
+
+// sampleUptime records the current alive time (openedAt → now) of a
+// still-active session into sessionUptime. Called periodically from the
+// pool heartbeat so the histogram represents the distribution of ages
+// across currently-active sessions.
+func (t *sessionTracer) sampleUptime(ctx context.Context) {
 	if sessionUptime == nil {
 		return
 	}
@@ -177,29 +249,7 @@ func (t *sessionTracer) recordClose(ctx context.Context) {
 		attribute.String("session_type", t.sessionType.String()),
 		attribute.Bool("ready", true),
 		attribute.String("afe_location", snap.afeLocation),
-		attribute.String("session_name", snap.sessionName),
-	))
-}
-
-// recordOperation records the execution duration of a single virtual RPC.
-func (t *sessionTracer) recordOperation(ctx context.Context, opStartTime time.Time, method string, err error) {
-	if sessionDurations == nil {
-		return
-	}
-	snap := t.snapshot()
-	statusStr := "OK"
-	if err != nil {
-		statusStr = status.Code(err).String()
-	}
-	sessionDurations.Record(ctx, msSince(opStartTime), metric.WithAttributes(
-		attribute.String("transport_type", snap.transportType),
-		attribute.String("status", statusStr),
-		attribute.String("vrpcs", method),
-		attribute.String("session_type", t.sessionType.String()),
-		attribute.String("closing_reason", ""),
-		attribute.Bool("ready", true),
-		attribute.String("afe_location", snap.afeLocation),
-		attribute.String("session_name", snap.sessionName),
+		attribute.String("session_name", snap.poolName),
 	))
 }
 

@@ -78,7 +78,13 @@ func (s *Session) ForceClose(req *spb.CloseSessionRequest) {
 // the lifetime of a Session.
 func (s *Session) notifyClosed(streamErr error) {
 	s.closeOnce.Do(func() {
-		s.tracer.recordClose(context.Background())
+		s.tracer.recordClose(
+			context.Background(),
+			s.CloseReason(),
+			streamErr,
+			s.HasOkRpcs(),
+			s.HasErrorRpcs(),
+		)
 		s.hooks.onClose(s, streamErr)
 	})
 }
@@ -493,7 +499,7 @@ func (s *Session) peerInfoExtracter(peerInfoData []string) {
 		return
 	}
 	s.peerInfo.Store(&peerInfo)
-	s.tracer.setPeerInfo(&peerInfo, s.logName)
+	s.tracer.setPeerInfo(&peerInfo)
 	s.debugf("parsed PeerInfo: transport_type=%s afe=%s",
 		peerInfo.GetTransportType(), peerInfo.GetApplicationFrontendSubzone())
 }

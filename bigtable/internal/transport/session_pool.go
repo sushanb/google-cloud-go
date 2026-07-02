@@ -422,6 +422,29 @@ const waitServerCloseGrace = 30 * time.Second
 // Runs from PerformScaling at the heartbeat cadence; takes p.mu only long
 // enough to snapshot the (handle, last-state-change) tuples then issues
 // ForceClose calls outside the lock.
+// sampleActiveUptimes snapshots the currently-active session list under
+// the pool lock and records each session's current age into the
+// session.uptime histogram. Sampling happens without the pool lock so
+// tracer work never blocks CheckoutSession / OnClose.
+func (p *SessionPoolImpl) sampleActiveUptimes(ctx context.Context) {
+	p.mu.Lock()
+	active := make([]*Session, 0, len(p.sessions))
+	for _, sh := range p.sessions {
+		if sh == nil || sh.session == nil {
+			continue
+		}
+		if State(sh.session.state.Load()) != StateActive {
+			continue
+		}
+		active = append(active, sh.session)
+	}
+	p.mu.Unlock()
+
+	for _, s := range active {
+		s.SampleUptime(ctx)
+	}
+}
+
 func (p *SessionPoolImpl) sweepStuckSessions() {
 	type victim struct {
 		sess     *Session
@@ -990,6 +1013,10 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 	// buffer fills at the heartbeat cadence regardless of whether scaling
 	// actually fires below.
 	p.recordTimeSeries()
+	// Sample each active session's current age into session.uptime so the
+	// histogram reflects the distribution of live session ages, not just
+	// per-close lifetimes (that's session.durations).
+	p.sampleActiveUptimes(ctx)
 	// Sweep for sessions stuck in WaitServerClose past the grace window —
 	// happens when a server sent GoAway / accepted CloseSession but never
 	// followed up with a stream EOF. ForceClose drives them to Closed so
@@ -1155,7 +1182,7 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 		OnStart:  p.OnStart,
 		OnActive: p.OnActive,
 		OnClose:  p.OnClose,
-	}, p.sessionType)
+	}, p.sessionType, WithSessionPoolName(p.poolName))
 	if hint := int(pickedChannel.Load()); hint >= 0 {
 		s.SetChannelIndex(hint)
 	}
