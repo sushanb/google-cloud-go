@@ -821,7 +821,7 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 <table>
 <thead><tr>
 <th>When</th><th>Method</th><th class="num">Latency</th>
-<th class="num">PoolWait</th><th class="num">SemWait</th><th class="num">Backend</th>
+<th class="num">PoolWait</th><th class="num">SemWait</th><th class="num">Transport</th><th class="num">Backend</th>
 <th>Session</th><th class="num">RpcID</th><th class="num">SessionAge</th>
 <th>Peer (afe/region/subzone)</th>
 <th>Status</th>
@@ -834,6 +834,7 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 <td class="num {{latencyClass .Latency}}">{{dur .Latency}}</td>
 <td class="num" title="time inside CheckoutSession — waiting for an idle session at the pool boundary">{{dur .PoolWait}}</td>
 <td class="num" title="time spent in vrpcSem.Acquire — queue wait for the session's single in-flight slot">{{dur .SemWait}}</td>
+<td class="num" title="client-observed time between vRPC Send() and response Recv() on the stream — network RTT + server queue + Backend">{{dur .TransportLatency}}</td>
 <td class="num" title="server-reported BackendLatency">{{dur .BackendLatency}}</td>
 <td class="mono">{{.Session}}</td>
 <td class="num" title="per-session 1-indexed RPC id; small values indicate a fresh session">{{.RpcIDOnSession}}</td>
@@ -847,6 +848,7 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 <div style="font-size:.78em;color:#888;margin-top:.3em">
 <b>PoolWait</b> ≈ <b>Latency</b> → workers exceeded pool capacity; queued at the pool boundary waiting for an idle session.
 <b>SemWait</b> ≈ <b>Latency</b> → call was queued on the per-session semaphore (would indicate the pool-level checkout missed a busy session — should be rare with pool-queue checkout).
+<b>Transport</b> ≫ <b>Backend</b> → time was spent on the wire (network RTT / server queue), not in server processing.
 <b>Backend</b> close to <b>Latency</b> → server itself was slow.
 Low <b>RpcID</b> + small <b>SessionAge</b> → fresh session warm-up cost.
 </div>

@@ -175,6 +175,11 @@ type SlowVRpcEvent struct {
 	// BackendLatency is the server-reported processing time
 	// (SessionRequestStats.BackendLatency); zero if not present.
 	BackendLatency time.Duration
+	// TransportLatency is the time from vRPC frame Send to response
+	// Recv on the stream — network RTT + server queue + Backend.
+	// Zero if the call errored before a Recv event (context
+	// cancellation, pre-Send failure).
+	TransportLatency time.Duration
 	// RpcIDOnSession is the per-session 1-indexed RPC id; very small
 	// values mean this was a freshly-opened session.
 	RpcIDOnSession int64
@@ -1198,14 +1203,15 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 	sh.session.recordTotalLatency(latency)
 	if latency > p.slowThreshold() {
 		ev := SlowVRpcEvent{
-			At:             start,
-			Method:         desc.Method(),
-			Latency:        latency,
-			Session:        sh.session.LogName(),
-			Success:        invokeErr == nil,
-			PoolWait:       poolWait,
-			SemWait:        result.SemWait,
-			RpcIDOnSession: result.RpcIDOnSession,
+			At:               start,
+			Method:           desc.Method(),
+			Latency:          latency,
+			Session:          sh.session.LogName(),
+			Success:          invokeErr == nil,
+			PoolWait:         poolWait,
+			SemWait:          result.SemWait,
+			TransportLatency: result.TransportLatency,
+			RpcIDOnSession:   result.RpcIDOnSession,
 		}
 		if result.Stats != nil && result.Stats.BackendLatency != nil {
 			ev.BackendLatency = result.Stats.BackendLatency.AsDuration()
