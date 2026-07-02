@@ -151,8 +151,9 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 			AttemptStart:  timestamppb.New(startTime),
 		},
 	}
-	if dl, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(dl); remaining > 0 {
+	ctxDeadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		if remaining := time.Until(ctxDeadline); remaining > 0 {
 			virtRpc.Deadline = durationpb.New(remaining)
 		}
 	}
@@ -166,6 +167,15 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 	// (SentAt - attemptStart) without double-counting encode/setup overhead.
 	sentAt := time.Now()
 	result.SentAt = sentAt
+	// Stash sentAt / deadline / attempt on the vRPC so the flightz debug
+	// page can render live in-flight state without allocating or locking
+	// on the hot path. Reuses the three values Invoke already computed
+	// (for virtRpc.Deadline and Metadata.AttemptNumber above).
+	rpc.sentAt = sentAt
+	if hasDeadline {
+		rpc.deadline = ctxDeadline
+	}
+	rpc.attempt = int32(attempt)
 	if err := s.Send(sessionReq); err != nil {
 		return result, fmt.Errorf("send vRPC request: %w", err)
 	}

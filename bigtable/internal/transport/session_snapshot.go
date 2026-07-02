@@ -120,6 +120,22 @@ type SessionSnapshot struct {
 	// at maxSessionEvents and ordered oldest-first. Empty for healthy
 	// long-lived sessions.
 	RecentEvents []SessionEvent
+	// InFlight is the vRPC currently occupying the session's single
+	// in-flight slot, if any. nil when the session is idle. Populated
+	// lock-free from activeRPC.Load() at snapshot time and consumed by
+	// the flightz debug page.
+	InFlight *InFlightVRpc
+}
+
+// InFlightVRpc is a snapshot of the vRPC currently owning a session's
+// activeRPC slot. Everything is a value copy so the snapshot survives
+// the vRPC completing between capture and render.
+type InFlightVRpc struct {
+	RpcID    int64     `json:"rpcId"`
+	Method   string    `json:"method"`
+	SentAt   time.Time `json:"sentAt"`             // wall-clock stamp captured right before Send
+	Deadline time.Time `json:"deadline,omitempty"` // zero if the caller ctx has no deadline
+	Attempt  int32     `json:"attempt"`            // 1 = first try, 2+ = retry
 }
 
 // PeerInfoSnapshot is a JSON-friendly mirror of the relevant fields of
@@ -260,8 +276,16 @@ func (s *Session) Snapshot() SessionSnapshot {
 	hbInterval := time.Duration(s.heartbeatIntervalNano.Load())
 	nextHb := time.Unix(0, s.nextHeartbeatDeadlineNano.Load())
 	activeRpcs := 0
-	if s.activeRPC.Load() != nil {
+	var inFlight *InFlightVRpc
+	if rpc := s.activeRPC.Load(); rpc != nil {
 		activeRpcs = 1
+		inFlight = &InFlightVRpc{
+			RpcID:    rpc.id,
+			Method:   rpc.method,
+			SentAt:   rpc.sentAt,
+			Deadline: rpc.deadline,
+			Attempt:  rpc.attempt,
+		}
 	}
 	peer := s.peerInfo.Load()
 	hasRefresh := s.refreshConfig.Load() != nil
@@ -293,6 +317,7 @@ func (s *Session) Snapshot() SessionSnapshot {
 		HasRefreshConfig:  hasRefresh,
 		Peer:              peerInfoToSnapshot(peer),
 		RecentEvents:      s.snapshotEvents(),
+		InFlight:          inFlight,
 	}
 }
 
