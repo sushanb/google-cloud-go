@@ -79,6 +79,10 @@ func (f *fakeStream) Header() (metadata.MD, error) {
 	return f.hdr, f.hdrErr
 }
 
+func (f *fakeStream) Context() context.Context {
+	return context.Background()
+}
+
 func (f *fakeStream) snapshotSent() []*spb.SessionRequest {
 	f.sentMu.Lock()
 	defer f.sentMu.Unlock()

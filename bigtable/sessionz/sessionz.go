@@ -825,6 +825,7 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 <th class="num">PoolWait</th><th class="num">SemWait</th><th class="num">Transport</th><th class="num">Backend</th>
 <th>Session</th><th class="num">RpcID</th><th class="num">SessionAge</th>
 <th>Peer (afe/region/subzone)</th>
+<th>Remote (→ tcpz)</th>
 <th>Status</th>
 </tr></thead>
 <tbody>
@@ -841,6 +842,7 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 <td class="num" title="per-session 1-indexed RPC id; small values indicate a fresh session">{{.RpcIDOnSession}}</td>
 <td class="num" title="age of the session at the time of this call">{{dur .SessionAge}}</td>
 <td class="mono" title="ApplicationFrontendId (hex) / region / subzone of the AFE this session was bound to at call time">{{peerShort .Peer}}</td>
+<td class="mono" title="TCP remote (AFE) addr this session's stream is bound to. Click to filter tcpz to the conn(s) with this remote.">{{if .RemoteAddr}}<a href="../tcpz/?remote={{.RemoteAddr | urlquery}}">{{.RemoteAddr}}</a>{{else}}—{{end}}</td>
 <td>{{if .Success}}OK{{else}}<span style="color:#922">{{.ErrCode}}</span>{{end}}</td>
 </tr>
 {{end}}
@@ -852,6 +854,7 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 <b>Transport</b> ≫ <b>Backend</b> → time was spent on the wire (network RTT / server queue), not in server processing.
 <b>Backend</b> close to <b>Latency</b> → server itself was slow.
 Low <b>RpcID</b> + small <b>SessionAge</b> → fresh session warm-up cost.
+<b>Remote</b> → click to filter tcpz to the conn this session is bound to (per-conn TCP_INFO: RTT/cwnd/retrans).
 </div>
 {{end}}
 

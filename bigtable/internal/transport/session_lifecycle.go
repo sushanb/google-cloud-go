@@ -23,6 +23,7 @@ import (
 	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
@@ -168,7 +169,9 @@ func (s *Session) Send(req *spb.SessionRequest) error {
 // readLoop drives the inbound side of the stream until Recv returns an error.
 func (s *Session) readLoop(ctx context.Context) {
 	// Extract peer info from the header metadata asynchronously so we don't
-	// block reads on the header arriving.
+	// block reads on the header arriving. Also stamps the TCP remote addr
+	// from the stream's peer info so sessionz can link a slow-vRPC row to
+	// the exact conn in tcpz.
 	go func() {
 		headerMD, err := s.stream.Header()
 		if err != nil {
@@ -176,6 +179,10 @@ func (s *Session) readLoop(ctx context.Context) {
 			return
 		}
 		s.peerInfoExtracter(headerMD.Get(peerInfoHeaderKey))
+		if p, ok := peer.FromContext(s.stream.Context()); ok && p.Addr != nil {
+			addr := p.Addr.String()
+			s.remoteAddr.Store(&addr)
+		}
 	}()
 
 	// Supervisor: if ctx is cancelled, mark the session closed so callers

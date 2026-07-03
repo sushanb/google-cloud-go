@@ -205,6 +205,12 @@ type SlowVRpcEvent struct {
 	// "Unavailable cohort tied to one AFE" without manually cross-
 	// referencing every per-session Peer block.
 	Peer PeerInfoSnapshot
+	// RemoteAddr is the TCP remote (AFE) socket address ("ip:port")
+	// captured from gRPC peer info once the stream Header returned.
+	// Empty on very young sessions. Sessionz renders this as a link
+	// to tcpz filtered by remote, closing the loop between a slow
+	// vRPC and the underlying conn's TCP_INFO.
+	RemoteAddr string
 }
 
 const (
@@ -1383,6 +1389,7 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 		// Unavailable failure on AFE X) are visible directly in the
 		// slow-vRPC table instead of requiring a per-session cross-ref.
 		ev.Peer = peerInfoToSnapshot(sh.session.peerInfo.Load())
+		ev.RemoteAddr = sh.session.RemoteAddr()
 		if invokeErr != nil {
 			// Standard library context errors don't implement GRPCStatus(),
 			// so status.Code falls through to Unknown — which mislabels

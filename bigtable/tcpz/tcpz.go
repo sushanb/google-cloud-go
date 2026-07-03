@@ -334,12 +334,26 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	all := q.Get("all") == "1"
 	onlyHot := q.Get("only") == "hot"
+	// ?remote=<ip:port> narrows to conns whose RemoteAddr matches exactly.
+	// Sessionz uses this to link a slow-vRPC row to the specific conn(s)
+	// its session was bound to. Empty string means no filter.
+	remoteFilter := q.Get("remote")
 	sortKey, sortDir := parseSort(q)
 
 	raw := s.snapshot()
 	total := len(raw)
 	hidden := 0
-	if !all {
+	if remoteFilter != "" {
+		filtered := raw[:0]
+		for _, snap := range raw {
+			if snap.RemoteAddr != remoteFilter {
+				hidden++
+				continue
+			}
+			filtered = append(filtered, snap)
+		}
+		raw = filtered
+	} else if !all {
 		filtered := raw[:0]
 		for _, snap := range raw {
 			// Default view hides remote :443 conns — those are the

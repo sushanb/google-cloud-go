@@ -111,6 +111,10 @@ type Stream interface {
 	Send(*spb.SessionRequest) error
 	Recv() (*spb.SessionResponse, error)
 	Header() (metadata.MD, error)
+	// Context is the stream's context. After Header() returns, peer info
+	// (remote TCP addr) is available via peer.FromContext — sessionz uses
+	// it to link a slow vRPC row to the specific conn in tcpz.
+	Context() context.Context
 }
 
 // SessionHooks contains optional callbacks invoked at points in a session's
@@ -232,6 +236,11 @@ type Session struct {
 	// stream header. atomic.Pointer so peerInfoSummary / snapshot / the
 	// ctx-done event recorder can read it lock-free on the hot path.
 	peerInfo atomic.Pointer[spb.PeerInfo]
+	// remoteAddr is the TCP remote (AFE) socket address in "ip:port" form,
+	// captured from grpc peer.FromContext once the stream Header returns.
+	// atomic.Pointer so the vRPC hot path can read it lock-free to stamp
+	// slow-vRPC rows for the sessionz→tcpz cross-link.
+	remoteAddr atomic.Pointer[string]
 	// refreshConfig is stored once when the server sends
 	// SessionRefreshConfig. atomic.Pointer to keep the getter allocation-
 	// and lock-free.
@@ -541,6 +550,17 @@ func (s *Session) LogName() string {
 // State returns the current state.
 func (s *Session) State() State {
 	return State(s.state.Load())
+}
+
+// RemoteAddr returns the TCP remote (AFE) socket address in "ip:port" form,
+// or "" if the stream Header hasn't been observed yet or gRPC didn't
+// populate peer info. Used by sessionz to link a slow-vRPC row to the
+// specific conn in tcpz.
+func (s *Session) RemoteAddr() string {
+	if p := s.remoteAddr.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // PeerInfo returns the peer info, or nil if it has not been parsed yet.
