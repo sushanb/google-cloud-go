@@ -474,13 +474,13 @@ func (s *Session) SampleUptime(ctx context.Context) {
 	s.tracer.sampleUptime(ctx)
 }
 
-// RecordTransportLatency emits a per-vRPC transport-overhead sample —
-// (transport − backend), i.e. wire + AFE time excluding server processing
-// — to the transport_latencies histogram. Called from the pool's Invoke
-// path once per completed vRPC; no-op unless both durations are
-// meaningful and transport > backend.
-func (s *Session) RecordTransportLatency(ctx context.Context, method string, transport, backend time.Duration) {
-	s.tracer.recordTransportLatency(ctx, method, transport, backend)
+// RecordTransportOverhead emits a per-vRPC transport-overhead sample —
+// (stream − backend), i.e. wire + AFE + client-decode time excluding
+// server processing — to the transport_latencies histogram. Caller has
+// already computed the delta and validated it's positive; this is a
+// no-op only if the metric isn't registered.
+func (s *Session) RecordTransportOverhead(ctx context.Context, method string, overhead time.Duration) {
+	s.tracer.recordTransportOverhead(ctx, method, overhead)
 }
 
 // Retries returns the number of vRPCs Invoke processed with AttemptNumber > 1.

@@ -269,19 +269,14 @@ func msSince(t time.Time) float64 {
 	return float64(time.Since(t)) / float64(time.Millisecond)
 }
 
-// recordTransportLatency emits a per-vRPC (transport − backend) sample into
+// recordTransportOverhead emits a per-vRPC (stream − backend) sample into
 // the transport_latencies histogram. Java's ClientTransportLatency defines
 // this metric as "e2e latencies minus node latencies" — the wire + AFE
-// overhead outside server processing. Caller supplies both raw durations;
-// this method returns a no-op if the metric isn't registered, the
-// difference isn't positive, or transport itself is unmeasured. Method is
-// the vRPC method name (e.g. "ExecuteVRpc/Read").
-func (t *sessionTracer) recordTransportLatency(ctx context.Context, method string, transport, backend time.Duration) {
-	if transportLatencies == nil {
-		return
-	}
-	overhead := transport - backend
-	if transport <= 0 || overhead <= 0 {
+// overhead outside server processing. Caller has already validated the
+// delta is positive; this is a no-op if the metric isn't registered.
+// Method is the vRPC method name (e.g. "ExecuteVRpc/Read").
+func (t *sessionTracer) recordTransportOverhead(ctx context.Context, method string, overhead time.Duration) {
+	if transportLatencies == nil || overhead <= 0 {
 		return
 	}
 	snap := t.snapshot()

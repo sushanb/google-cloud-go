@@ -210,13 +210,12 @@ type PoolSnapshot struct {
 	TotalLatencyP95 time.Duration
 	TotalLatencyP99 time.Duration
 	TotalLatencyN   int
-	// TransportLatencyP50/95/99/N: client-observed time between the
-	// vRPC frame being handed to Send and the response arriving on
-	// the bidi stream. Approximates (network RTT + server queue +
-	// BackendLatency); (TransportLatency - BackendLatency) surfaces
-	// "everything except server processing." Zero-latency samples
-	// (ctx-cancel / pre-Send failure) are excluded so p50 isn't
-	// pulled toward 0.
+	// TransportLatencyP50/95/99/N: java-parity ClientTransportLatency
+	// = (stream Send→Recv) − server-reported BackendLatency. Isolates
+	// wire + AFE + client-decode overhead outside server processing.
+	// Samples are excluded when either half is missing (pre-Recv
+	// failure, no server Stats) or the delta is non-positive (clock
+	// skew) so p50 isn't dragged toward 0.
 	TransportLatencyP50 time.Duration
 	TransportLatencyP95 time.Duration
 	TransportLatencyP99 time.Duration

@@ -187,10 +187,11 @@ type SlowVRpcEvent struct {
 	// BackendLatency is the server-reported processing time
 	// (SessionRequestStats.BackendLatency); zero if not present.
 	BackendLatency time.Duration
-	// TransportLatency is the time from vRPC frame Send to response
-	// Recv on the stream — network RTT + server queue + Backend.
-	// Zero if the call errored before a Recv event (context
-	// cancellation, pre-Send failure).
+	// TransportLatency on SlowVRpcEvent is the java-parity delta:
+	// (stream Send→Recv) − BackendLatency. Isolates wire + AFE +
+	// client-decode overhead outside server processing. Zero when
+	// BackendLatency isn't populated (server didn't return Stats) or
+	// when the call errored before a Recv event.
 	TransportLatency time.Duration
 	// RpcIDOnSession is the per-session 1-indexed RPC id; very small
 	// values mean this was a freshly-opened session.
@@ -1343,21 +1344,24 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 	// buffers. BackendLatency only records when the server populated
 	// Stats — client-observed TotalLatency records for every call.
 	p.totalLatencyHist.record(latency)
+	var backendDur time.Duration
 	if result.Stats != nil && result.Stats.BackendLatency != nil {
-		p.backendLatencyHist.record(result.Stats.BackendLatency.AsDuration())
+		backendDur = result.Stats.BackendLatency.AsDuration()
+		p.backendLatencyHist.record(backendDur)
 	}
-	// TransportLatency is zero when Invoke bailed before Recv (ctx-done or
-	// pre-Send failure); skip those so the p50 isn't dragged toward 0.
-	if result.TransportLatency > 0 {
-		p.transportLatencyHist.record(result.TransportLatency)
-		// Also emit to the exported transport_latencies histogram
-		// (java-parity: (transport − backend) = wire + AFE overhead).
-		// RecordTransportLatency no-ops when backend isn't populated.
-		var backendDur time.Duration
-		if result.Stats != nil && result.Stats.BackendLatency != nil {
-			backendDur = result.Stats.BackendLatency.AsDuration()
+	// Java-parity ClientTransportLatency: (stream Send→Recv) − backend =
+	// wire + AFE + client-decode overhead outside server processing.
+	// Skip samples missing either half (pre-Recv error, no server Stats)
+	// or with a non-positive delta (clock skew, backend > stream) so
+	// the p50 isn't dragged toward 0. Compute once, share with the
+	// pool histogram, the slow-event row, and the exported OTel metric.
+	var transportOverhead time.Duration
+	if result.TransportLatency > 0 && backendDur > 0 {
+		if d := result.TransportLatency - backendDur; d > 0 {
+			transportOverhead = d
+			p.transportLatencyHist.record(d)
+			sh.session.RecordTransportOverhead(ctx, desc.Method(), d)
 		}
-		sh.session.RecordTransportLatency(ctx, desc.Method(), result.TransportLatency, backendDur)
 	}
 	if latency > p.slowThreshold() {
 		ev := SlowVRpcEvent{
@@ -1368,11 +1372,9 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 			Success:          invokeErr == nil,
 			PoolWait:         poolWait,
 			SemWait:          result.SemWait,
-			TransportLatency: result.TransportLatency,
+			BackendLatency:   backendDur,
+			TransportLatency: transportOverhead,
 			RpcIDOnSession:   result.RpcIDOnSession,
-		}
-		if result.Stats != nil && result.Stats.BackendLatency != nil {
-			ev.BackendLatency = result.Stats.BackendLatency.AsDuration()
 		}
 		if openedAt := sh.session.OpenedAt(); !openedAt.IsZero() {
 			ev.SessionAge = start.Sub(openedAt)
