@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/bigtable"
@@ -67,7 +68,24 @@ func (s *server) snapshot() []btransport.TCPInfoSnapshot {
 }
 
 func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	all := r.URL.Query().Get("all") == "1"
 	rows := s.snapshot()
+	total := len(rows)
+	hidden := 0
+	if !all {
+		filtered := rows[:0]
+		for _, row := range rows {
+			// Default view hides remote :443 conns — those are the
+			// classic-path CFE / metrics-export channels, not the AFE
+			// data path most tcpz users care about. ?all=1 restores.
+			if strings.HasSuffix(row.RemoteAddr, ":443") {
+				hidden++
+				continue
+			}
+			filtered = append(filtered, row)
+		}
+		rows = filtered
+	}
 
 	if r.URL.Query().Get("format") == "json" {
 		w.Header().Set("Content-Type", "application/json")
@@ -81,10 +99,16 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	data := struct {
 		Rows      []btransport.TCPInfoSnapshot
 		Count     int
+		Total     int
+		Hidden    int
+		ShowAll   bool
 		Generated time.Time
 	}{
 		Rows:      rows,
 		Count:     len(rows),
+		Total:     total,
+		Hidden:    hidden,
+		ShowAll:   all,
 		Generated: time.Now(),
 	}
 	if err := tpl.Execute(w, data); err != nil {
@@ -196,8 +220,9 @@ tr:hover td { background: #fafafa; }
 </style>
 </head>
 <body>
-<h1>tcpz — {{.Count}} conn{{if ne .Count 1}}s{{end}}</h1>
-<div class="meta">Snapshot at {{.Generated.Format "15:04:05.000"}} · auto-refresh 2s · <a href="?format=json">JSON</a></div>
+<h1>tcpz — {{.Count}} conn{{if ne .Count 1}}s{{end}}{{if .Hidden}} <span style="color:#888;font-weight:400;font-size:.85em">({{.Hidden}} :443 hidden)</span>{{end}}</h1>
+<div class="meta">Snapshot at {{.Generated.Format "15:04:05.000"}} · auto-refresh 2s · <a href="?format=json{{if .ShowAll}}&amp;all=1{{end}}">JSON</a>
+{{if .ShowAll}} · <a href="?">hide :443 (default)</a>{{else if .Hidden}} · <a href="?all=1">show all ({{.Total}})</a>{{end}}</div>
 {{if not .Rows}}
 <div class="empty">No conns registered. Either the client uses DirectPath (xDS bypasses the standard dialer, so nothing is captured), no traffic has been dialed yet, or bigtable.TCPStats was never passed into the Client's options.</div>
 {{else}}
