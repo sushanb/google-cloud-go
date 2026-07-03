@@ -111,6 +111,53 @@ var funcs = template.FuncMap{
 		}
 		return fmt.Sprintf("%d", v)
 	},
+	"num64": func(v uint64) string {
+		if v == 0 {
+			return "—"
+		}
+		return fmt.Sprintf("%d", v)
+	},
+	"pct": func(v float64) string {
+		if v == 0 {
+			return "—"
+		}
+		if v < 0.01 {
+			return "<0.01%"
+		}
+		return fmt.Sprintf("%.2f%%", v)
+	},
+	// rate renders a bytes/sec value as a human-scaled MB/s or KB/s.
+	"rate": func(v uint64) string {
+		if v == 0 {
+			return "—"
+		}
+		f := float64(v)
+		switch {
+		case f >= 1<<20:
+			return fmt.Sprintf("%.1f MB/s", f/(1<<20))
+		case f >= 1<<10:
+			return fmt.Sprintf("%.1f KB/s", f/(1<<10))
+		default:
+			return fmt.Sprintf("%.0f B/s", f)
+		}
+	},
+	// bytes renders a byte count similarly for BytesSent / BytesRetrans.
+	"bytes": func(v uint64) string {
+		if v == 0 {
+			return "—"
+		}
+		f := float64(v)
+		switch {
+		case f >= 1<<30:
+			return fmt.Sprintf("%.1f GiB", f/(1<<30))
+		case f >= 1<<20:
+			return fmt.Sprintf("%.1f MiB", f/(1<<20))
+		case f >= 1<<10:
+			return fmt.Sprintf("%.1f KiB", f/(1<<10))
+		default:
+			return fmt.Sprintf("%d B", v)
+		}
+	},
 	"or": func(s, fallback string) string {
 		if s == "" {
 			return fallback
@@ -141,6 +188,11 @@ tr:hover td { background: #fafafa; }
 .err { color: #a04500; }
 .state-ESTABLISHED { color: #197a1f; }
 .state-CLOSE_WAIT, .state-FIN_WAIT1, .state-FIN_WAIT2, .state-CLOSING, .state-LAST_ACK, .state-TIME_WAIT { color: #a04500; }
+.ca-Open { color: #197a1f; }
+.ca-Disorder { color: #a06a00; }
+.ca-CWR { color: #a04500; }
+.ca-Recovery { color: #b32222; }
+.ca-Loss { color: #b32222; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -155,15 +207,28 @@ tr:hover td { background: #fafafa; }
 <th class="mono" title="Local socket address.">Local</th>
 <th title="Time since this conn was dialed.">Age</th>
 <th title="Linux TCP state (ESTABLISHED, CLOSE_WAIT, etc.).">State</th>
+<th title="Congestion-control state: Open=healthy, Disorder=watching for loss, CWR=cwnd-reducing after ECN, Recovery=fast-retransmitting, Loss=RTO-driven collapse (worst).">Ca</th>
+<th class="num" title="RTO backoff count. >0 means we've timed out at least once and are waiting exponentially longer.">Bkoff</th>
 <th class="num" title="Smoothed round-trip time — the primary 'wire' latency signal.">RTT</th>
 <th class="num" title="RTT variance (jitter). High values suggest an unstable path.">RTTVar</th>
 <th class="num" title="Minimum RTT observed on this conn — the floor of what the network can deliver.">MinRTT</th>
+<th class="num" title="Current retransmit timeout — kernel will re-send unacked bytes after this long. Grows with backoff.">RTO</th>
 <th class="num" title="Send MSS (max segment size).">MSS</th>
 <th class="num" title="Send congestion window in MSS units.">CWnd</th>
+<th class="num" title="Slow-start threshold in MSS units. When cwnd &lt; ssthresh we're in slow-start (often after a loss event).">SSTh</th>
 <th class="num" title="Recent retransmits (kernel counter).">Retr</th>
 <th class="num" title="Total retransmits since conn open — high count means path is lossy.">TotalRetr</th>
-<th class="num" title="Segments the kernel considers lost.">Lost</th>
-<th class="num" title="Segments sent but not yet ACKed.">Unacked</th>
+<th class="num" title="Retransmit ratio: bytes retransmitted / bytes sent. The 'actual loss rate' this conn observed.">RtxRate</th>
+<th class="num" title="Segments the kernel considers lost right now.">Lost</th>
+<th class="num" title="Segments selectively-ACK'd by the receiver.">SACKd</th>
+<th class="num" title="Segments sent but not yet ACKed (in flight).">Unacked</th>
+<th class="num" title="Duplicate-SACK count — number of SPURIOUS retransmits (we resent bytes the receiver actually got). High DSACK relative to TotalRetr = timing false-positives, not real loss.">DSACK</th>
+<th class="num" title="Times reordering was observed. Reordering can trigger fast-retransmit even without loss.">ReordS</th>
+<th class="num" title="Packets delivered with ECN Congestion-Experienced marks. Non-zero = a router is signaling congestion before dropping.">ECN</th>
+<th class="num" title="Total bytes sent (data).">Sent</th>
+<th class="num" title="Total bytes retransmitted (data).">Retrans</th>
+<th class="num" title="Recent delivery rate (BBR estimate).">DelRate</th>
+<th class="num" title="Bytes buffered but not yet on wire. High = we're app-limited or CPU-limited, not network-limited.">NotSent</th>
 <th title="Time since the socket last received data.">LastRecv</th>
 <th title="Time since the socket last sent data.">LastSent</th>
 <th class="err" title="Populated when TCP_INFO couldn't be read on a live fd (e.g. non-Linux OS).">Err</th>
@@ -175,15 +240,28 @@ tr:hover td { background: #fafafa; }
 <td class="mono">{{.LocalAddr}}</td>
 <td>{{ago .DialedAt}}</td>
 <td class="state-{{or .State "UNKNOWN"}}">{{or .State "—"}}</td>
+<td class="ca-{{or .CAState "Unknown"}}">{{or .CAState "—"}}</td>
+<td class="num">{{num .Backoff}}</td>
 <td class="num">{{dur .RTT}}</td>
 <td class="num">{{dur .RTTVar}}</td>
 <td class="num">{{dur .MinRTT}}</td>
+<td class="num">{{dur .RTO}}</td>
 <td class="num">{{num .MSS}}</td>
 <td class="num">{{num .SndCwnd}}</td>
+<td class="num">{{num .SndSsthresh}}</td>
 <td class="num">{{num .Retransmits}}</td>
 <td class="num">{{num .TotalRetrans}}</td>
+<td class="num">{{pct .RetransRatioPct}}</td>
 <td class="num">{{num .Lost}}</td>
+<td class="num">{{num .Sacked}}</td>
 <td class="num">{{num .Unacked}}</td>
+<td class="num">{{num .DsackDups}}</td>
+<td class="num">{{num .ReordSeen}}</td>
+<td class="num">{{num .DeliveredCE}}</td>
+<td class="num">{{bytes .BytesSent}}</td>
+<td class="num">{{bytes .BytesRetrans}}</td>
+<td class="num">{{rate .DeliveryRate}}</td>
+<td class="num">{{num .NotsentBytes}}</td>
 <td>{{dur .LastDataRecv}}</td>
 <td>{{dur .LastDataSent}}</td>
 <td class="err">{{.Err}}</td>

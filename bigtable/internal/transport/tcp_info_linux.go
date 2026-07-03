@@ -41,6 +41,22 @@ var tcpStateName = [...]string{
 	12: "NEW_SYN_RECV",
 }
 
+// caStateName maps tcp_info's ca_state byte to the short CA-state label.
+// Values from include/uapi/linux/tcp.h:
+//
+//	Open     — no loss, normal operation
+//	Disorder — got a dupACK or SACK, kernel is watching for real loss
+//	CWR      — cwnd reduced by ECN CE mark; still cwr'ing
+//	Recovery — fast retransmit in progress
+//	Loss     — RTO fired (worst); cwnd collapsed to 1 MSS
+var caStateName = [...]string{
+	0: "Open",
+	1: "Disorder",
+	2: "CWR",
+	3: "Recovery",
+	4: "Loss",
+}
+
 // readTCPInfo pulls struct tcp_info from the socket via
 // getsockopt(SOL_TCP, TCP_INFO). This is a read-only kernel syscall — it
 // never blocks on the network, never touches the socket's data path, and
@@ -68,26 +84,81 @@ func readTCPInfo(c *net.TCPConn) (TCPInfoSnapshot, error) {
 }
 
 // tcpInfoToSnapshot converts the kernel struct into our platform-agnostic
-// snapshot. Duration fields come out of the kernel in microseconds
-// (Rtt/Rttvar/Min_rtt) or milliseconds (Last_data_recv/Last_data_sent).
+// snapshot. Kernel unit conventions:
+//   - Rtt / Rttvar / Min_rtt / Rto / Ato : microseconds
+//   - Last_data_recv / Last_data_sent    : milliseconds
+//   - Busy_time / Rwnd_limited / Sndbuf_limited : microseconds
+//   - Total_rto_time                     : milliseconds
 func tcpInfoToSnapshot(info *unix.TCPInfo) TCPInfoSnapshot {
 	state := ""
 	if int(info.State) < len(tcpStateName) {
 		state = tcpStateName[info.State]
 	}
+	caState := ""
+	if int(info.Ca_state) < len(caStateName) {
+		caState = caStateName[info.Ca_state]
+	}
+
+	var retransRatio float64
+	if info.Bytes_sent > 0 {
+		retransRatio = float64(info.Bytes_retrans) / float64(info.Bytes_sent) * 100
+	}
+
 	return TCPInfoSnapshot{
-		State:        state,
-		RTT:          time.Duration(info.Rtt) * time.Microsecond,
-		RTTVar:       time.Duration(info.Rttvar) * time.Microsecond,
-		MinRTT:       time.Duration(info.Min_rtt) * time.Microsecond,
-		MSS:          info.Snd_mss,
-		SndCwnd:      info.Snd_cwnd,
+		State:   state,
+		CAState: caState,
+		Backoff: uint32(info.Backoff),
+
+		RTT:    time.Duration(info.Rtt) * time.Microsecond,
+		RTTVar: time.Duration(info.Rttvar) * time.Microsecond,
+		MinRTT: time.Duration(info.Min_rtt) * time.Microsecond,
+
+		MSS:         info.Snd_mss,
+		SndCwnd:     info.Snd_cwnd,
+		SndSsthresh: info.Snd_ssthresh,
+		SndWnd:      info.Snd_wnd,
+		RcvWnd:      info.Rcv_wnd,
+
 		Retransmits:  uint32(info.Retransmits),
+		Retrans:      info.Retrans,
 		TotalRetrans: info.Total_retrans,
 		Lost:         info.Lost,
+		Sacked:       info.Sacked,
 		Unacked:      info.Unacked,
+		Reordering:   info.Reordering,
+		ReordSeen:    info.Reord_seen,
+		DsackDups:    info.Dsack_dups,
+		DeliveredCE:  info.Delivered_ce,
+		RcvOooPack:   info.Rcv_ooopack,
+
+		RTO:                time.Duration(info.Rto) * time.Microsecond,
+		ATO:                time.Duration(info.Ato) * time.Microsecond,
+		Probes:             uint32(info.Probes),
+		TotalRTO:           uint32(info.Total_rto),
+		TotalRTORecoveries: uint32(info.Total_rto_recoveries),
+		TotalRTOTime:       time.Duration(info.Total_rto_time) * time.Millisecond,
+
+		SegsOut:       info.Segs_out,
+		SegsIn:        info.Segs_in,
+		DataSegsOut:   info.Data_segs_out,
+		DataSegsIn:    info.Data_segs_in,
+		BytesSent:     info.Bytes_sent,
+		BytesAcked:    info.Bytes_acked,
+		BytesRetrans:  info.Bytes_retrans,
+		BytesReceived: info.Bytes_received,
+		Delivered:     info.Delivered,
+		DeliveryRate:  info.Delivery_rate,
+		PacingRate:    info.Pacing_rate,
+		NotsentBytes:  info.Notsent_bytes,
+		BusyTime:      time.Duration(info.Busy_time) * time.Microsecond,
+		RwndLimited:   time.Duration(info.Rwnd_limited) * time.Microsecond,
+		SndbufLimited: time.Duration(info.Sndbuf_limited) * time.Microsecond,
+		Rehash:        info.Rehash,
+
 		LastDataRecv: time.Duration(info.Last_data_recv) * time.Millisecond,
 		LastDataSent: time.Duration(info.Last_data_sent) * time.Millisecond,
+
+		RetransRatioPct: retransRatio,
 	}
 }
 

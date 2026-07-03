@@ -85,26 +85,86 @@ func (r *ConnRegistry) add(tc *net.TCPConn) {
 // via getsockopt(TCP_INFO); on other platforms Err is populated and the
 // numeric fields are zero. RemoteAddr / LocalAddr / DialedAt are captured
 // at dial time and are always present.
+//
+// Fields are grouped by what question they answer. "Why is TotalRetrans
+// high?" is answered by the Congestion + Loss-classification blocks:
+// CAState/Backoff say what the kernel thinks the loss regime is; DSACK,
+// Reordering, and DeliveredCE distinguish real drops from spurious /
+// out-of-order / ECN-signaled events; BytesRetrans + BytesSent give the
+// actual retrans ratio.
 type TCPInfoSnapshot struct {
-	RemoteAddr   string
-	LocalAddr    string
-	DialedAt     time.Time
-	State        string
-	RTT          time.Duration
-	RTTVar       time.Duration
-	MinRTT       time.Duration
-	MSS          uint32
-	SndCwnd      uint32
-	Retransmits  uint32
-	TotalRetrans uint32
-	Lost         uint32
-	Unacked      uint32
+	// Identity — captured at dial time.
+	RemoteAddr string
+	LocalAddr  string
+	DialedAt   time.Time
+
+	// TCP + congestion state.
+	State   string // TCP FSM state (ESTABLISHED, CLOSE_WAIT, …)
+	CAState string // congestion-control state (Open/Disorder/CWR/Recovery/Loss)
+	Backoff uint32 // RTO exponential-backoff count; >0 = we've timed out and are waiting longer
+
+	// Round-trip time.
+	RTT    time.Duration
+	RTTVar time.Duration
+	MinRTT time.Duration
+
+	// Window + segment sizing.
+	MSS         uint32 // send MSS
+	SndCwnd     uint32 // send congestion window (MSS units)
+	SndSsthresh uint32 // slow-start threshold; drop = we've reduced cwnd from loss
+	SndWnd      uint32 // current send window (bytes)
+	RcvWnd      uint32 // current receive window (bytes)
+
+	// Loss + retransmit counters.
+	Retransmits  uint32 // current burst of retransmits
+	Retrans      uint32 // currently-outstanding retransmits
+	TotalRetrans uint32 // cumulative retransmits over conn lifetime
+	Lost         uint32 // segments the kernel considers lost right now
+	Sacked       uint32 // segments selectively-ACK'd
+	Unacked      uint32 // segments in flight
+	Reordering   uint32 // reordering-tolerance estimate (bigger = kernel is being patient)
+	ReordSeen    uint32 // times reordering has been observed
+	DsackDups    uint32 // duplicate SACKs — spurious retransmits (receiver actually got the byte)
+	DeliveredCE  uint32 // packets delivered with ECN Congestion-Experienced marks
+	RcvOooPack   uint32 // packets received out-of-order
+
+	// RTO / probe timing.
+	RTO                time.Duration // current retransmit timeout
+	ATO                time.Duration // delayed-ACK timeout
+	Probes             uint32        // zero-window probes attempted
+	TotalRTO           uint32        // cumulative RTOs (Linux 4.20+)
+	TotalRTORecoveries uint32        // cumulative RTO-driven recovery events
+	TotalRTOTime       time.Duration // cumulative time spent in RTO
+
+	// Volume / rate.
+	SegsOut       uint32
+	SegsIn        uint32
+	DataSegsOut   uint32
+	DataSegsIn    uint32
+	BytesSent     uint64        // total data bytes sent
+	BytesAcked    uint64        // total data bytes acknowledged
+	BytesRetrans  uint64        // total data bytes retransmitted (retrans ratio = /BytesSent)
+	BytesReceived uint64        // total data bytes received
+	Delivered     uint32        // total packets delivered
+	DeliveryRate  uint64        // recent delivery rate, bytes/sec (BBR estimate)
+	PacingRate    uint64        // target pacing rate, bytes/sec
+	NotsentBytes  uint32        // bytes buffered but not yet on the wire — app-limited signal
+	BusyTime      time.Duration // cumulative time socket was busy sending
+	RwndLimited   time.Duration // cumulative time limited by receiver window
+	SndbufLimited time.Duration // cumulative time limited by send buffer
+	Rehash        uint32        // times the flow was rehashed (indicates path changes)
+
 	// LastDataRecv / LastDataSent express "how long since the socket last
 	// carried data" — helps distinguish "idle since forever" from "just
-	// hung." Both derived from tcp_info's last_data_{recv,sent} which are
-	// in milliseconds since the last event.
+	// hung." Both derived from tcp_info's last_data_{recv,sent}.
 	LastDataRecv time.Duration
 	LastDataSent time.Duration
+
+	// RetransRatioPct = BytesRetrans / BytesSent * 100, precomputed for
+	// the common "% of bytes retransmitted" view. Zero when BytesSent is
+	// zero (no data has flowed yet).
+	RetransRatioPct float64
+
 	// Err is set when this platform can't read TCP_INFO or the read
 	// failed on a live fd. Dead fds (EBADF/ENOTCONN) are pruned rather
 	// than surfaced, so a populated Err always means "conn exists but
