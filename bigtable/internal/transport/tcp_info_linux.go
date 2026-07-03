@@ -114,6 +114,7 @@ func tcpInfoToSnapshot(info *unix.TCPInfo) TCPInfoSnapshot {
 		MinRTT: time.Duration(info.Min_rtt) * time.Microsecond,
 
 		MSS:         info.Snd_mss,
+		PMTU:        info.Pmtu,
 		SndCwnd:     info.Snd_cwnd,
 		SndSsthresh: info.Snd_ssthresh,
 		SndWnd:      info.Snd_wnd,

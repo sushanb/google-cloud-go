@@ -110,6 +110,7 @@ type TCPInfoSnapshot struct {
 
 	// Window + segment sizing.
 	MSS         uint32 // send MSS
+	PMTU        uint32 // path MTU (bytes). <1500 = tunneling/VPN in path; silent throughput killer if a middlebox black-holes PMTUD ICMP.
 	SndCwnd     uint32 // send congestion window (MSS units)
 	SndSsthresh uint32 // slow-start threshold; drop = we've reduced cwnd from loss
 	SndWnd      uint32 // current send window (bytes)

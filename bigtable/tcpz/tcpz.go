@@ -218,6 +218,7 @@ var cols = []colDef{
 	{Key: "minrtt", Label: "MinRTT", Class: "num", Title: "Minimum RTT observed on this conn — the floor of what the network can deliver.", Body: `{{dur .MinRTT}}`, Cmp: cmpDur(func(s btransport.TCPInfoSnapshot) time.Duration { return s.MinRTT }), Desc: true},
 	{Key: "rto", Label: "RTO", Class: "num", Title: "Current retransmit timeout — kernel will re-send unacked bytes after this long. Grows with backoff.", Body: `{{dur .RTO}}`, Cmp: cmpDur(func(s btransport.TCPInfoSnapshot) time.Duration { return s.RTO }), Desc: true},
 	{Key: "mss", Label: "MSS", Class: "num", Title: "Send MSS (max segment size).", Body: `{{num .MSS}}`, Cmp: cmpU32(func(s btransport.TCPInfoSnapshot) uint32 { return s.MSS }), Desc: true},
+	{Key: "pmtu", Label: "PMTU", Class: "num", Title: "Path MTU (bytes). <1500 = tunneling/VPN in path. Watch for PMTU black holes: silent drops if ICMP frag-needed replies are filtered.", Body: `{{pmtu .PMTU}}`, Cmp: cmpU32(func(s btransport.TCPInfoSnapshot) uint32 { return s.PMTU }), Desc: false},
 	{Key: "cwnd", Label: "CWnd", Class: "num", Title: "Send congestion window in MSS units.", Body: `{{num .SndCwnd}}`, Cmp: cmpU32(func(s btransport.TCPInfoSnapshot) uint32 { return s.SndCwnd }), Desc: true},
 	{Key: "ssth", Label: "SSTh", Class: "num", Title: "Slow-start threshold in MSS units. When cwnd &lt; ssthresh we're in slow-start (often after a loss event).", Body: `{{num .SndSsthresh}}`, Cmp: cmpU32(func(s btransport.TCPInfoSnapshot) uint32 { return s.SndSsthresh }), Desc: true},
 	{Key: "retr", Label: "Retr", Class: "num", Title: "Recent retransmits (kernel counter).", Body: `{{hotNum .Retransmits}}`, Cmp: cmpU32(func(s btransport.TCPInfoSnapshot) uint32 { return s.Retransmits }), Desc: true},
@@ -572,6 +573,26 @@ var funcs = template.FuncMap{
 			return "—"
 		}
 		return fmt.Sprintf("%d", v)
+	},
+	// pmtu renders a path-MTU value with a subtle hint about the path:
+	//   0     → "—" (unknown / not populated on this kernel)
+	//   1500  → plain (standard ethernet — nothing exotic)
+	//   <1500 → dimmed with the delta from 1500 shown in a tooltip; the
+	//           delta is exactly how many bytes of tunnel headers the
+	//           path is eating (Andromeda ≈ 40, IPsec ≈ 60, GRE ≈ 24…).
+	//   <1300 → hot (unusually heavy encapsulation — worth investigating)
+	"pmtu": func(v uint32) template.HTML {
+		if v == 0 {
+			return template.HTML("—")
+		}
+		switch {
+		case v >= 1500:
+			return template.HTML(fmt.Sprintf("%d", v))
+		case v < 1300:
+			return template.HTML(fmt.Sprintf(`<b class="hot" title="%d B below 1500 — unusually heavy encapsulation">%d</b>`, 1500-v, v))
+		default:
+			return template.HTML(fmt.Sprintf(`<span title="%d B below 1500 — tunneling in path">%d</span>`, 1500-v, v))
+		}
 	},
 	"num64": func(v uint64) string {
 		if v == 0 {
