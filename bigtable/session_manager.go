@@ -131,6 +131,35 @@ func (m *SessionManager) ManagerSnapshot() []btransport.PoolSnapshot {
 	return out
 }
 
+// LoadBalancingSnapshots returns one per-pool picker + pick-history
+// snapshot for the loadz debug page. Ordered by pool key for stable
+// rendering. Same lock discipline as ManagerSnapshot — hold m.mu only
+// long enough to copy the (key, *pool) pairs; the per-pool
+// LoadBalancingSnapshot has its own inner locks.
+func (m *SessionManager) LoadBalancingSnapshots() []btransport.LoadBalancingSnapshot {
+	m.mu.Lock()
+	type entry struct {
+		key  string
+		pool *btransport.SessionPoolImpl
+	}
+	entries := make([]entry, 0, len(m.sessionPools))
+	for k, mp := range m.sessionPools {
+		entries = append(entries, entry{key: k, pool: mp.pool})
+	}
+	m.mu.Unlock()
+
+	sort.Slice(entries, func(i, j int) bool { return entries[i].key < entries[j].key })
+
+	out := make([]btransport.LoadBalancingSnapshot, 0, len(entries))
+	for _, e := range entries {
+		if e.pool == nil {
+			continue
+		}
+		out = append(out, e.pool.LoadBalancingSnapshot())
+	}
+	return out
+}
+
 // Close closes all session pools managed by the SessionManager.
 func (m *SessionManager) Close() error {
 	m.mu.Lock()

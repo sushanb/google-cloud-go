@@ -274,6 +274,34 @@ type AfeSnapshotRow struct {
 	LastConnected time.Time
 }
 
+// LoadBalancingSnapshot is the pool's view of its picker state, decision
+// history, and per-AFE fanout — the input to the loadz debug page. Not
+// embedded in PoolSnapshot because it's a heavier surface (ring buffer,
+// cumulative counters) and only the loadz page consumes it; sessionz /
+// afez use the lighter AFEs slice on PoolSnapshot instead.
+type LoadBalancingSnapshot struct {
+	// PoolName / PickerName echo the pool identity + current picker so
+	// the loadz page can render self-contained rows per pool.
+	PoolName   string
+	PickerName string
+
+	// AFEs mirrors PoolSnapshot.AFEs so loadz can render the per-AFE
+	// table without cross-referencing another snapshot.
+	AFEs []AfeSnapshotRow
+
+	// PickCounts is the cumulative per-AFE pick tally over the pool's
+	// lifetime. Loadz computes actual-share as PickCounts[afe] /
+	// sum(PickCounts).
+	PickCounts map[int64]int64
+
+	// Recent is the ring buffer of the last N pick decisions,
+	// newest-last. Powers the "recent picks" table.
+	Recent []PickHistoryEvent
+
+	// CapturedAt is the snapshot wall-clock.
+	CapturedAt time.Time
+}
+
 // LifetimeBucketCount is one bar in the session-lifetime histogram.
 type LifetimeBucketCount struct {
 	Label string
@@ -402,6 +430,34 @@ func peerInfoToSnapshot(p *spb.PeerInfo) PeerInfoSnapshot {
 		ApplicationFrontendID:      p.GetApplicationFrontendId(),
 		ApplicationFrontendRegion:  p.GetApplicationFrontendRegion(),
 		ApplicationFrontendSubzone: p.GetApplicationFrontendSubzone(),
+	}
+}
+
+// LoadBalancingSnapshot returns the pool's picker state + decision
+// history + per-AFE fanout — the input to the loadz debug page. Takes
+// p.mu briefly to read picker name + pool name, then hands off to the
+// ring-buffer / sessionList accessors (each has its own lock).
+func (p *SessionPoolImpl) LoadBalancingSnapshot() LoadBalancingSnapshot {
+	p.mu.Lock()
+	name := p.poolName
+	pickerName := "unknown"
+	if p.picker != nil {
+		pickerName = p.picker.Name()
+	}
+	p.mu.Unlock()
+
+	counts := p.snapshotAfePickCounts()
+	countsInt64 := make(map[int64]int64, len(counts))
+	for k, v := range counts {
+		countsInt64[int64(k)] = v
+	}
+	return LoadBalancingSnapshot{
+		PoolName:   name,
+		PickerName: pickerName,
+		AFEs:       p.sl.Snapshot(),
+		PickCounts: countsInt64,
+		Recent:     p.snapshotPickHistory(),
+		CapturedAt: time.Now(),
 	}
 }
 

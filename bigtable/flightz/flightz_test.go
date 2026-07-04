@@ -32,6 +32,7 @@ type fakeProvider struct {
 
 func (f fakeProvider) Snapshot() []btransport.PoolSnapshot { return f.pools }
 func (fakeProvider) Diverter() btransport.DiverterSnapshot { return btransport.DiverterSnapshot{} }
+func (fakeProvider) LoadBalancingSnapshots() []btransport.LoadBalancingSnapshot { return nil }
 
 // samplePools returns a two-pool snapshot with a controlled mix of
 // in-flight and idle sessions so tests can pin exact row counts and

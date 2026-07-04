@@ -24,18 +24,41 @@ import (
 // randomSubsetSize=2 for K-choice-two picking.
 const defaultAfeRandomSubsetSize = 2
 
-// AfePicker picks one AFE from a snapshot of ready buckets. The pool's
-// two-tier CheckoutSession chains this with sessionList.Checkout to
-// dequeue a session from the chosen AFE.
+// PickCandidate is one AFE the picker considered during a K-choice draw,
+// with the cost value the picker's decision rule used to score it.
+// Cost's interpretation depends on the picker in play: NumOutstanding
+// (int as float) for LeastInFlight, e2e PeakEwma nanos for LeastLatency,
+// 0 for Simple (which ignores cost).
+type PickCandidate struct {
+	AfeID afeID
+	Cost  float64
+}
+
+// PickDecision captures what candidates a picker sampled, which one won,
+// and why. Populated on every PickAfe call so operators can trace picker
+// reasoning through loadz without re-running the pick.
+type PickDecision struct {
+	// Candidates is the K sampled AFEs (K == 1 for SimplePicker,
+	// otherwise K == min(RandomSubsetSize, len(ready)) via partial
+	// Fisher-Yates). Empty when no ready AFE existed.
+	Candidates []PickCandidate
+	// Winner is the AFE the picker returned. Zero when ready was empty.
+	Winner afeID
+	// Reason is a short lower-kebab tag identifying the decision rule
+	// ("uniform-random" / "min-inflight" / "min-latency" /
+	// "no-candidates"). Machine-readable; loadz maps to prose.
+	Reason string
+}
+
+// AfePicker picks one AFE from a snapshot of ready buckets AND returns
+// the decision metadata for loadz. Callers use the *afeHandle; the
+// PickDecision is passed to SessionPoolImpl.recordPickDecision.
 //
-// Returning nil means "no AFE eligible" — the pool treats that the same
-// as len(ready) == 0 (park the caller on freeSignal, kick scale-up).
-//
-// Introduced ahead of the pool wiring (step 5). Existing consumers keep
-// calling Picker.PickSession() from picker.go; those types will be
-// deleted when the pool moves to the two-tier flow.
+// Returning nil handle means "no AFE eligible" — the pool treats that
+// the same as len(ready) == 0 (park the caller on freeSignal, kick
+// scale-up).
 type AfePicker interface {
-	PickAfe(ready []afeSnapshot) *afeHandle
+	PickAfe(ready []afeSnapshot) (*afeHandle, PickDecision)
 	Name() string
 }
 
@@ -50,11 +73,16 @@ func NewSimpleAfePicker() *SimpleAfePicker { return &SimpleAfePicker{} }
 func (SimpleAfePicker) Name() string { return "simple" }
 
 // PickAfe uniformly-at-random picks one bucket from ready.
-func (SimpleAfePicker) PickAfe(ready []afeSnapshot) *afeHandle {
+func (SimpleAfePicker) PickAfe(ready []afeSnapshot) (*afeHandle, PickDecision) {
 	if len(ready) == 0 {
-		return nil
+		return nil, PickDecision{Reason: "no-candidates"}
 	}
-	return ready[rand.IntN(len(ready))].Handle
+	winner := ready[rand.IntN(len(ready))]
+	return winner.Handle, PickDecision{
+		Candidates: []PickCandidate{{AfeID: winner.Handle.ID(), Cost: 0}},
+		Winner:     winner.Handle.ID(),
+		Reason:     "uniform-random",
+	}
 }
 
 // LeastInFlightAfePicker picks the AFE with the smallest in-flight count.
@@ -80,10 +108,11 @@ func (LeastInFlightAfePicker) Name() string { return "least-inflight" }
 
 // PickAfe returns the AFE with the fewest NumOutstanding among K
 // randomly-drawn ready candidates.
-func (p LeastInFlightAfePicker) PickAfe(ready []afeSnapshot) *afeHandle {
-	return kChoiceMinCost(ready, p.RandomSubsetSize, func(s afeSnapshot) float64 {
+func (p LeastInFlightAfePicker) PickAfe(ready []afeSnapshot) (*afeHandle, PickDecision) {
+	winner, cands := kChoiceMinCost(ready, p.RandomSubsetSize, func(s afeSnapshot) float64 {
 		return float64(s.NumOutstanding)
 	})
+	return decisionFor(winner, cands, "min-inflight")
 }
 
 // LeastLatencyAfePicker picks the AFE with the lowest per-AFE e2e
@@ -104,10 +133,23 @@ func (LeastLatencyAfePicker) Name() string { return "least-latency" }
 
 // PickAfe returns the AFE with the smallest E2eCost among K randomly-
 // drawn ready candidates.
-func (p LeastLatencyAfePicker) PickAfe(ready []afeSnapshot) *afeHandle {
-	return kChoiceMinCost(ready, p.RandomSubsetSize, func(s afeSnapshot) float64 {
+func (p LeastLatencyAfePicker) PickAfe(ready []afeSnapshot) (*afeHandle, PickDecision) {
+	winner, cands := kChoiceMinCost(ready, p.RandomSubsetSize, func(s afeSnapshot) float64 {
 		return s.E2eCost
 	})
+	return decisionFor(winner, cands, "min-latency")
+}
+
+// decisionFor packages kChoiceMinCost's return into a PickDecision.
+func decisionFor(winner *afeHandle, cands []PickCandidate, reason string) (*afeHandle, PickDecision) {
+	if winner == nil {
+		return nil, PickDecision{Reason: "no-candidates"}
+	}
+	return winner, PickDecision{
+		Candidates: cands,
+		Winner:     winner.ID(),
+		Reason:     reason,
+	}
 }
 
 // kChoiceMinCost implements Java's partial-Fisher-Yates + min-cost
@@ -117,10 +159,12 @@ func (p LeastLatencyAfePicker) PickAfe(ready []afeSnapshot) *afeHandle {
 //
 // The algorithm mutates a local copy of ready (swap-to-front) so the
 // caller's snapshot is untouched. cost is called at most K times.
-func kChoiceMinCost(ready []afeSnapshot, k int, cost func(afeSnapshot) float64) *afeHandle {
+// Returns the winner plus the list of sampled candidates (with their
+// costs) so callers can build a PickDecision for loadz.
+func kChoiceMinCost(ready []afeSnapshot, k int, cost func(afeSnapshot) float64) (*afeHandle, []PickCandidate) {
 	n := len(ready)
 	if n == 0 {
-		return nil
+		return nil, nil
 	}
 	if k <= 0 {
 		k = defaultAfeRandomSubsetSize
@@ -132,17 +176,19 @@ func kChoiceMinCost(ready []afeSnapshot, k int, cost func(afeSnapshot) float64) 
 	cand := make([]afeSnapshot, n)
 	copy(cand, ready)
 
+	sampled := make([]PickCandidate, 0, k)
 	var best *afeHandle
 	bestCost := -1.0
 	for i := 0; i < k; i++ {
 		j := i + rand.IntN(n-i)
 		picked := cand[j]
 		c := cost(picked)
+		sampled = append(sampled, PickCandidate{AfeID: picked.Handle.ID(), Cost: c})
 		if bestCost < 0 || c < bestCost {
 			bestCost = c
 			best = picked.Handle
 		}
 		cand[i], cand[j] = cand[j], cand[i]
 	}
-	return best
+	return best, sampled
 }
