@@ -441,11 +441,6 @@ func (p *SessionPoolImpl) recordTimeSeries() {
 // this gives us a deterministic teardown so OnClose fires and counters move.
 const waitServerCloseGrace = 30 * time.Second
 
-// sweepStuckSessions scans the pool for sessions parked in
-// StateWaitServerClose beyond waitServerCloseGrace and force-closes them.
-// Runs from PerformScaling at the heartbeat cadence; takes p.mu only long
-// enough to snapshot the (handle, last-state-change) tuples then issues
-// ForceClose calls outside the lock.
 // sampleActiveUptimes snapshots the currently-active session list under
 // the pool lock and records each session's current age into the
 // session.uptime histogram. Sampling happens without the pool lock so
@@ -469,6 +464,11 @@ func (p *SessionPoolImpl) sampleActiveUptimes(ctx context.Context) {
 	}
 }
 
+// sweepStuckSessions scans the pool for sessions parked in
+// StateWaitServerClose beyond waitServerCloseGrace and force-closes them.
+// Runs from PerformScaling at the heartbeat cadence; takes p.mu only long
+// enough to snapshot the (handle, last-state-change) tuples then issues
+// ForceClose calls outside the lock.
 func (p *SessionPoolImpl) sweepStuckSessions() {
 	type victim struct {
 		sess     *Session
@@ -996,7 +996,14 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 	delete(p.startingSessions, s)
 
 	if p.closed {
-		s.ForceClose(&spb.CloseSessionRequest{
+		// Dispatch to a goroutine so this method returns and releases
+		// p.mu before the OnClose callback chain fires. ForceClose →
+		// notifyClosed → hooks.onClose == p.OnClose, and p.OnClose
+		// re-acquires p.mu — synchronous would deadlock on the
+		// non-reentrant mutex. Race window: Close() sets p.closed=true
+		// then releases p.mu; a session already in flight through
+		// OpenSession can land here up to ~30s later.
+		go s.ForceClose(&spb.CloseSessionRequest{
 			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR,
 			Description: "pool closed before session became active",
 		})
@@ -1295,7 +1302,7 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 	atomic.AddUint64(&p.nextSessionID, 1)
 	p.mu.Unlock()
 
-	// Create and start new session wrapper passing pool pointer as the lifecycle listener!
+	// Create and start new session wrapper passing pool pointer as the lifecycle hooks target.
 	s := NewSession(sessionName, stream, SessionHooks{
 		OnStart:  p.OnStart,
 		OnActive: p.OnActive,

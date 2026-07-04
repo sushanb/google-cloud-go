@@ -59,7 +59,7 @@ func (s *Session) Start(ctx context.Context, req *spb.OpenSessionRequest) error 
 
 // ForceClose immediately transitions the session to StateClosed and cancels
 // every in-flight RPC. It is safe to call multiple times; only the first call
-// fires listener/tracer callbacks.
+// fires the tracer.recordClose and hooks.onClose callbacks.
 func (s *Session) ForceClose(req *spb.CloseSessionRequest) {
 	if _, ok := s.transitionTo(StateClosed, notState(StateClosed)); !ok {
 		return
@@ -75,7 +75,7 @@ func (s *Session) ForceClose(req *spb.CloseSessionRequest) {
 	s.notifyClosed(nil)
 }
 
-// notifyClosed fires tracer.recordClose and listener.OnClose exactly once over
+// notifyClosed fires tracer.recordClose and hooks.onClose exactly once over
 // the lifetime of a Session.
 func (s *Session) notifyClosed(streamErr error) {
 	s.closeOnce.Do(func() {
@@ -224,7 +224,7 @@ func (s *Session) handleSessionResponse(resp *spb.SessionResponse) {
 	s.resetHeartbeatDeadline()
 }
 
-// handleOpenSession transitions Starting -> Active and signals listeners.
+// handleOpenSession transitions Starting -> Ready and fires hooks.onActive.
 // Peer info (from the bigtable-peer-info header) and the TCP remote addr are
 // captured synchronously here — gRPC guarantees the header frame precedes
 // any bidi message, so by the time we've received the OpenSession response

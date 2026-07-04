@@ -138,13 +138,13 @@ func NewSessionTable(
 
 type sessionMetricsTracer struct{}
 
-func (l sessionMetricsTracer) OnAttemptStart(ctx context.Context) {
+func (sessionMetricsTracer) OnAttemptStart(ctx context.Context) {
 	if mt := metricsTracerFromContext(ctx); mt != nil {
 		mt.recordAttemptStart()
 	}
 }
 
-func (l sessionMetricsTracer) OnAttemptComplete(ctx context.Context, err error) {
+func (sessionMetricsTracer) OnAttemptComplete(ctx context.Context, err error) {
 	if mt := metricsTracerFromContext(ctx); mt != nil {
 		mt.recordAttemptCompletion(nil, nil, err)
 	}

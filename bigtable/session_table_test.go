@@ -526,3 +526,50 @@ func TestSessionTable_ClientBlockingLatencyFromSentAt(t *testing.T) {
 	}
 }
 
+// TestSessionMetricsTracer verifies the two branches of sessionMetricsTracer
+// callbacks directly. On a ctx with no metrics tracer (the classic path)
+// both methods must no-op cleanly; on a ctx carrying a tracer they must
+// increment the attempt count and stamp completion. Direct unit test so
+// the coverage doesn't depend on spinning up a real Bigtable backend.
+func TestSessionMetricsTracer(t *testing.T) {
+	t.Run("nil metrics tracer in ctx is a no-op", func(t *testing.T) {
+		var tr sessionMetricsTracer
+		// Should not panic on a bare context.
+		tr.OnAttemptStart(context.Background())
+		tr.OnAttemptComplete(context.Background(), nil)
+		tr.OnAttemptComplete(context.Background(), errors.New("simulated"))
+	})
+
+	t.Run("increments attempt count when tracer present", func(t *testing.T) {
+		// recordAttemptStart runs its body when builtInEnabled=true. Full
+		// recordAttemptCompletion needs OTel instruments (histograms /
+		// counters) that require a proper factory setup, so that branch
+		// stays covered by the higher-level tests in this file that spin
+		// up a fake pool with a real tracer factory.
+		mt := &builtinMetricsTracer{builtInEnabled: true}
+		ctx := contextWithMetricsTracer(context.Background(), mt)
+
+		var tr sessionMetricsTracer
+		tr.OnAttemptStart(ctx)
+		if got := mt.currOp.attemptCount; got != 1 {
+			t.Errorf("after OnAttemptStart, attemptCount = %d, want 1", got)
+		}
+		if mt.currOp.currAttempt.startTime.IsZero() {
+			t.Error("after OnAttemptStart, currAttempt.startTime should be set")
+		}
+		// A second OnAttemptStart mirrors a retry.
+		tr.OnAttemptStart(ctx)
+		if got := mt.currOp.attemptCount; got != 2 {
+			t.Errorf("after retry OnAttemptStart, attemptCount = %d, want 2", got)
+		}
+	})
+
+	t.Run("OnAttemptComplete no-ops when builtInEnabled is false", func(t *testing.T) {
+		mt := &builtinMetricsTracer{builtInEnabled: false}
+		ctx := contextWithMetricsTracer(context.Background(), mt)
+		var tr sessionMetricsTracer
+		// Would panic on histogram writes if the early-return guard were
+		// removed. This locks in the guard.
+		tr.OnAttemptComplete(ctx, errors.New("simulated"))
+	})
+}

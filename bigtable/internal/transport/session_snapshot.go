@@ -205,9 +205,9 @@ type PoolSnapshot struct {
 	LatencyN   int
 	// TotalLatencyP50/95/99/N: end-to-end wall-clock latency as
 	// observed by the caller of SessionPoolImpl.Invoke — includes
-	// vrpcSem queue wait + network + decode + BackendLatency. The
-	// gap between Total and Backend percentiles is the client-side
-	// overhead (mostly vrpcSem queue wait when the pool is hot).
+	// pool-boundary checkout wait + network + decode + BackendLatency.
+	// The gap between Total and Backend percentiles is the client-side
+	// overhead (mostly CheckoutSession wait when the pool is hot).
 	TotalLatencyP50 time.Duration
 	TotalLatencyP95 time.Duration
 	TotalLatencyP99 time.Duration
