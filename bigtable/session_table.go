@@ -18,11 +18,70 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+	btopt "cloud.google.com/go/bigtable/internal/option"
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 )
+
+// lazyPool wraps an Invoker (typically *btransport.SessionPoolImpl) that
+// is opened on first use. Callers invoke get(); the first winner runs
+// the open closure (synchronously — dial + handshake happens here) and
+// stores the result; subsequent callers see the stored pool with no
+// work.
+//
+// The stored type is Invoker rather than the concrete pool so tests can
+// substitute a fake that only implements the .Invoke method.
+//
+// Failed opens are NOT cached: the next caller retries. This matters
+// because pool creation can fail transiently (proto.Marshal is the only
+// obvious source today, but future descriptor variants may add more).
+// A permanent error-cache would leave the SessionTable stuck in
+// classic-fallback for the process lifetime.
+//
+// A nil *lazyPool or one with a nil open closure returns (nil, nil) —
+// "no session support, use fallback." Used for the write side of
+// materialized views (read-only) and for the SessionManager-disabled
+// case.
+type lazyPool struct {
+	mu   sync.Mutex
+	pool Invoker
+	open func() (Invoker, error)
+}
+
+// get returns the underlying pool, opening it on first call. Concurrent
+// callers block until the open completes. See type doc for error /
+// nil-lazyPool semantics.
+func (l *lazyPool) get() (Invoker, error) {
+	if l == nil || l.open == nil {
+		return nil, nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.pool != nil {
+		return l.pool, nil
+	}
+	p, err := l.open()
+	if err != nil {
+		return nil, err
+	}
+	l.pool = p
+	return p, nil
+}
+
+// opened reports whether the pool has been opened yet — for tests and
+// for the sessionz debug UI which wants to render "read pool: not yet
+// opened" versus a live pool.
+func (l *lazyPool) opened() bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.pool != nil
+}
 
 // Invoker is the narrow surface SessionTable needs from a session pool:
 // the ability to dispatch a single virtual RPC and surface the full
@@ -40,40 +99,41 @@ type Invoker interface {
 }
 
 // SessionTable implements TableAPI by routing calls via virtual RPCs through dedicated session pools.
+// The pools are opened lazily on first ReadRow / Apply — read-only tables
+// never pay for a write pool that they'll never use, and constructing a
+// SessionTable no longer dials sessions upfront.
 type SessionTable struct {
 	tableName     string
 	classic       *Table
-	readPool      Invoker
-	writePool     Invoker
+	readPool      *lazyPool
+	writePool     *lazyPool
 	readVRpcDesc  btransport.VRpcDescriptor
 	writeVRpcDesc btransport.VRpcDescriptor
 }
 
-// NewSessionTable creates a new SessionTable instance.
+// NewSessionTable creates a SessionTable whose read and write pools open
+// on first use. openRead / openWrite are the closures that construct the
+// underlying SessionPoolImpl (typically calling into SessionManager's
+// keyed cache so pool sharing across tables is preserved). Either
+// closure may be nil to indicate "no session pool for this op" —
+// materialized views use nil for openWrite. A nil closure causes the
+// corresponding call to fall back to the classic *Table.
 func NewSessionTable(
 	tableName string,
 	classic *Table,
-	readPool *btransport.SessionPoolImpl,
-	writePool *btransport.SessionPoolImpl,
+	openRead func() (Invoker, error),
+	openWrite func() (Invoker, error),
 	readVRpcDesc btransport.VRpcDescriptor,
 	writeVRpcDesc btransport.VRpcDescriptor,
 ) *SessionTable {
-	st := &SessionTable{
+	return &SessionTable{
 		tableName:     tableName,
 		classic:       classic,
+		readPool:      &lazyPool{open: openRead},
+		writePool:     &lazyPool{open: openWrite},
 		readVRpcDesc:  readVRpcDesc,
 		writeVRpcDesc: writeVRpcDesc,
 	}
-	// Avoid storing a typed-nil *SessionPoolImpl in the interface field: the
-	// nil-pool checks in ReadRow/Apply use a plain `pool == nil` comparison,
-	// which is false for a typed-nil-wrapped-in-interface value.
-	if readPool != nil {
-		st.readPool = readPool
-	}
-	if writePool != nil {
-		st.writePool = writePool
-	}
-	return st
 }
 
 type sessionMetricsListener struct{}
@@ -90,9 +150,17 @@ func (l sessionMetricsListener) OnAttemptComplete(ctx context.Context, err error
 	}
 }
 
-// ReadRow reads a single row via vRPC.
+// ReadRow reads a single row via vRPC. Opens the read pool on first
+// call — see lazyPool. Falls back to the classic *Table when there is
+// no session support for this table or when the pool open fails
+// transiently (next call retries the open).
 func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOption) (rowVal Row, err error) {
-	if t.readPool == nil {
+	readPool, poolErr := t.readPool.get()
+	if poolErr != nil {
+		btopt.Debugf(nil, "SessionTable.ReadRow: readPool open failed: %v; falling back to classic", poolErr)
+		return t.classic.ReadRow(ctx, row, opts...)
+	}
+	if readPool == nil {
 		return t.classic.ReadRow(ctx, row, opts...)
 	}
 
@@ -133,7 +201,7 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 	}
 
 	baseHandler := func(attemptCtx context.Context, request interface{}) (interface{}, error) {
-		result, err := t.readPool.Invoke(attemptCtx, t.readVRpcDesc, request)
+		result, err := readPool.Invoke(attemptCtx, t.readVRpcDesc, request)
 		if mt := metricsTracerFromContext(attemptCtx); mt != nil {
 			if result.ClusterInfo != nil {
 				mt.currOp.currAttempt.setClusterID(result.ClusterInfo.ClusterId)
@@ -177,12 +245,21 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 	return protoRowToRow(readResp.GetRow()), nil
 }
 
-// Apply applies a single mutation via vRPC.
+// Apply applies a single mutation via vRPC. Opens the write pool on
+// first call — see lazyPool. Conditional mutations always fall through
+// to classic. Returns an error if there is no session write support
+// (writePool closure was nil) — matches the classic-side "no writes on
+// this resource" behaviour.
 func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts ...ApplyOption) (err error) {
 	if m.isConditional {
 		return t.classic.Apply(ctx, row, m, opts...)
 	}
-	if t.writePool == nil {
+	writePool, poolErr := t.writePool.get()
+	if poolErr != nil {
+		btopt.Debugf(nil, "SessionTable.Apply: writePool open failed: %v; falling back to classic", poolErr)
+		return t.classic.Apply(ctx, row, m, opts...)
+	}
+	if writePool == nil {
 		return errors.New("bigtable: write operations not supported on this resource")
 	}
 
@@ -227,7 +304,7 @@ func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts 
 	}
 
 	baseHandler := func(attemptCtx context.Context, request interface{}) (interface{}, error) {
-		result, err := t.writePool.Invoke(attemptCtx, t.writeVRpcDesc, request)
+		result, err := writePool.Invoke(attemptCtx, t.writeVRpcDesc, request)
 		if mt := metricsTracerFromContext(attemptCtx); mt != nil {
 			if result.ClusterInfo != nil {
 				mt.currOp.currAttempt.setClusterID(result.ClusterInfo.ClusterId)

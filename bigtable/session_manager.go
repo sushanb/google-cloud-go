@@ -25,7 +25,6 @@ import (
 	"time"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
-	btopt "cloud.google.com/go/bigtable/internal/option"
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/metadata"
@@ -149,7 +148,14 @@ func (m *SessionManager) Close() error {
 	return err
 }
 
-// GetOrCreateSessionTable initializes or retrieves session-based transport pools for a table/view.
+// GetOrCreateSessionTable initializes session-based transport for a
+// table/view. The read and write pools are NOT opened here — they open
+// lazily on the first ReadRow / Apply so read-only tables never pay
+// for a write pool that goes unused.
+//
+// The classic *Table is captured for the fallback path (used when
+// session pooling is disabled, when a lazy pool open fails, or by
+// non-session methods like ReadRows / SampleRowKeys).
 func (m *SessionManager) GetOrCreateSessionTable(
 	resourceName string,
 	classic *Table,
@@ -162,7 +168,7 @@ func (m *SessionManager) GetOrCreateSessionTable(
 	writeVRpcDesc btransport.VRpcDescriptor,
 	keyPrefix string,
 ) TableAPI {
-	if !m.enableSessionPool {
+	if !m.enableSessionPool || m.diverter == nil {
 		return &tableImpl{*classic}
 	}
 
@@ -178,26 +184,42 @@ func (m *SessionManager) GetOrCreateSessionTable(
 		PeerInfo:                 true,
 	}
 
-	readKey := fmt.Sprintf("%s:read", keyPrefix)
-	readPool, err := m.createPoolForPayload(resourceName, sessionDesc, readStreamFactory, readPayload, flags, readKey)
-	if err != nil {
-		btopt.Debugf(nil, "SessionManager: failed to create read pool for key=%s: %v; falling back to classic", readKey, err)
-		return &tableImpl{*classic}
-	}
+	openRead := m.buildLazyOpener(resourceName, sessionDesc, readStreamFactory, readPayload, flags, fmt.Sprintf("%s:read", keyPrefix))
+	openWrite := m.buildLazyOpener(resourceName, sessionDesc, writeStreamFactory, writePayload, flags, fmt.Sprintf("%s:write", keyPrefix))
 
-	writeKey := fmt.Sprintf("%s:write", keyPrefix)
-	writePool, err := m.createPoolForPayload(resourceName, sessionDesc, writeStreamFactory, writePayload, flags, writeKey)
-	if err != nil {
-		btopt.Debugf(nil, "SessionManager: failed to create write pool for key=%s: %v; falling back to classic", writeKey, err)
-		return &tableImpl{*classic}
-	}
+	sessionTable := NewSessionTable(classic.table, classic, openRead, openWrite, readVRpcDesc, writeVRpcDesc)
+	return NewTableShim(&tableImpl{*classic}, sessionTable, m.diverter)
+}
 
-	if readPool != nil && m.diverter != nil {
-		sessionTable := NewSessionTable(classic.table, classic, readPool, writePool, readVRpcDesc, writeVRpcDesc)
-		return NewTableShim(&tableImpl{*classic}, sessionTable, m.diverter)
+// buildLazyOpener returns a closure that, on first invocation, creates
+// (or reuses via GetOrCreateSessionPool's keyed cache) the pool for the
+// given payload/key. Returns nil when payload is nil — that's the
+// materialized-view write side, which should map to
+// "no session write support" (Apply falls back to classic-error).
+//
+// The Invoker return type widens *SessionPoolImpl to an interface so
+// SessionTable's lazyPool doesn't leak the concrete transport type.
+func (m *SessionManager) buildLazyOpener(
+	resourceName string,
+	sessionDesc *btransport.SessionDescriptor,
+	streamFactory func(ctx context.Context) (btransport.Stream, error),
+	payload proto.Message,
+	flags *btpb.FeatureFlags,
+	key string,
+) func() (Invoker, error) {
+	if payload == nil {
+		return nil
 	}
-
-	return &tableImpl{*classic}
+	return func() (Invoker, error) {
+		pool, err := m.createPoolForPayload(resourceName, sessionDesc, streamFactory, payload, flags, key)
+		if err != nil {
+			return nil, err
+		}
+		if pool == nil {
+			return nil, nil
+		}
+		return pool, nil
+	}
 }
 
 func (m *SessionManager) createPoolForPayload(

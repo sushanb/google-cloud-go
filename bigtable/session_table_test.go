@@ -16,6 +16,7 @@ package bigtable
 
 import (
 	"context"
+	"errors"
 	"math"
 	"strings"
 	"sync"
@@ -85,16 +86,150 @@ func newSessionTestTable(t *testing.T, readPool, writePool Invoker) *SessionTabl
 		},
 		table: "t",
 	}
+	// Wrap each fake in a lazyPool whose open() is a no-op returning the
+	// pre-supplied Invoker. Tests that previously fed nil for a pool now
+	// get an unopened lazyPool with no opener, which get() reports as
+	// (nil, nil) — same fallback semantics as the pre-lazy design.
+	toLazy := func(inv Invoker) *lazyPool {
+		if inv == nil {
+			return &lazyPool{}
+		}
+		return &lazyPool{open: func() (Invoker, error) { return inv, nil }}
+	}
 	st := &SessionTable{
 		tableName:     "projects/P/instances/I/tables/t",
 		classic:       classic,
-		readPool:      readPool,
-		writePool:     writePool,
+		readPool:      toLazy(readPool),
+		writePool:     toLazy(writePool),
 		readVRpcDesc:  btransport.READ_ROW,
 		writeVRpcDesc: btransport.MUTATE_ROW,
 	}
 	return st
 }
+
+// --- Lazy pool creation ------------------------------------------------------
+
+// TestSessionTable_LazyPools_OpenersDeferred verifies the core lazy contract:
+// constructing a SessionTable does NOT invoke either opener; ReadRow opens
+// only the read pool; Apply opens only the write pool.
+func TestSessionTable_LazyPools_OpenersDeferred(t *testing.T) {
+	classic := &Table{
+		c: &Client{
+			project:              "P",
+			instance:             "I",
+			metricsTracerFactory: &builtinMetricsTracerFactory{enabled: false, shutdown: func() {}},
+		},
+		table: "t",
+	}
+
+	readOpens, writeOpens := 0, 0
+	readInvoker := &fakeInvoker{resp: &btpb.SessionReadRowResponse{}}
+	writeInvoker := &fakeInvoker{resp: &btpb.SessionMutateRowResponse{}}
+
+	st := NewSessionTable(
+		"projects/P/instances/I/tables/t",
+		classic,
+		func() (Invoker, error) { readOpens++; return readInvoker, nil },
+		func() (Invoker, error) { writeOpens++; return writeInvoker, nil },
+		btransport.READ_ROW,
+		btransport.MUTATE_ROW,
+	)
+
+	// Construction alone must not open either pool.
+	if readOpens != 0 || writeOpens != 0 {
+		t.Fatalf("openers ran at construction: reads=%d writes=%d, want 0/0", readOpens, writeOpens)
+	}
+	if st.readPool.opened() || st.writePool.opened() {
+		t.Fatal("lazyPool.opened() true at construction; want both false")
+	}
+
+	// First ReadRow opens the read pool only.
+	if _, err := st.ReadRow(context.Background(), "row"); err != nil {
+		t.Fatalf("ReadRow: %v", err)
+	}
+	if readOpens != 1 {
+		t.Errorf("readOpens = %d after first ReadRow, want 1", readOpens)
+	}
+	if writeOpens != 0 {
+		t.Errorf("writeOpens = %d after first ReadRow, want 0 (write side untouched)", writeOpens)
+	}
+	if !st.readPool.opened() || st.writePool.opened() {
+		t.Errorf("opened() after first ReadRow: read=%v write=%v, want true/false",
+			st.readPool.opened(), st.writePool.opened())
+	}
+
+	// Second ReadRow reuses the cached pool — opener does not fire again.
+	if _, err := st.ReadRow(context.Background(), "row"); err != nil {
+		t.Fatalf("second ReadRow: %v", err)
+	}
+	if readOpens != 1 {
+		t.Errorf("readOpens = %d after second ReadRow, want 1 (opener must be one-shot per success)", readOpens)
+	}
+
+	// First Apply opens the write pool.
+	if err := st.Apply(context.Background(), "row", NewMutation()); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if writeOpens != 1 {
+		t.Errorf("writeOpens = %d after first Apply, want 1", writeOpens)
+	}
+}
+
+// TestSessionTable_LazyPools_OpenErrorNotCached verifies that a transient
+// opener failure is NOT permanently cached — the next call retries. Prevents a
+// single dial hiccup from stranding the table in classic-fallback forever.
+func TestSessionTable_LazyPools_OpenErrorNotCached(t *testing.T) {
+	classic := &Table{
+		c: &Client{
+			project:              "P",
+			instance:             "I",
+			metricsTracerFactory: &builtinMetricsTracerFactory{enabled: false, shutdown: func() {}},
+		},
+		table: "t",
+	}
+
+	var attempts int32
+	readInvoker := &fakeInvoker{resp: &btpb.SessionReadRowResponse{}}
+
+	openRead := func() (Invoker, error) {
+		n := atomic.AddInt32(&attempts, 1)
+		if n == 1 {
+			return nil, errFakeTransientOpen
+		}
+		return readInvoker, nil
+	}
+
+	st := NewSessionTable(
+		"projects/P/instances/I/tables/t",
+		classic,
+		openRead,
+		nil, // write side irrelevant for this test
+		btransport.READ_ROW,
+		btransport.MUTATE_ROW,
+	)
+
+	// First get(): opener returns err, nothing cached.
+	if _, err := st.readPool.get(); err == nil {
+		t.Fatal("first get() err = nil; want fake transient error")
+	}
+	if st.readPool.opened() {
+		t.Fatal("opened() true after failed open; want false so next call retries")
+	}
+
+	// Second get(): opener succeeds, pool cached.
+	got, err := st.readPool.get()
+	if err != nil {
+		t.Fatalf("second get() err = %v; want nil (transient error not cached)", err)
+	}
+	if got == nil {
+		t.Fatal("second get() returned nil pool; want the fake Invoker")
+	}
+	if atomic.LoadInt32(&attempts) != 2 {
+		t.Errorf("opener attempts = %d, want 2 (first failed, second succeeded)", attempts)
+	}
+}
+
+var errFakeTransientOpen = errors.New("fake transient open failure")
 
 // --- Apply: retry-idempotency ------------------------------------------------
 
