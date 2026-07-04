@@ -241,7 +241,7 @@ func TestInvoke_SentAtIsSetEvenOnSendFailure(t *testing.T) {
 		return fmt.Errorf("network down")
 	}
 	s := newTestSession(t, stream, SessionHooks{})
-	s.state.Store(int32(StateActive))
+	s.state.Store(int32(StateReady))
 
 	before := time.Now()
 	res, err := s.Invoke(context.Background(), newRoundTripDesc(), "hello")

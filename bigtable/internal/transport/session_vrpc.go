@@ -81,7 +81,7 @@ type InvokeResult struct {
 func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface{}) (result InvokeResult, err error) {
 	startTime := time.Now()
 
-	if st := State(s.state.Load()); st != StateActive {
+	if st := State(s.state.Load()); st != StateReady {
 		return InvokeResult{}, unavailable(ErrSessionNotActive, "session is not active (state: %v)", st)
 	}
 

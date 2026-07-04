@@ -29,7 +29,7 @@ func stubPoolStreamFactory(_ context.Context) (Stream, error) {
 	return newFakeStream(), nil
 }
 
-// injectActiveSession builds a fakeStream-backed Session in StateActive,
+// injectActiveSession builds a fakeStream-backed Session in StateReady,
 // wraps it in a SessionHandle, and pushes it into pool.sessions (registering
 // the createdAt time). This bypasses the real Start/handshake path so tests
 // can exercise pool-level logic in milliseconds.
@@ -41,7 +41,7 @@ func injectActiveSession(t *testing.T, p *SessionPoolImpl, name string, createdA
 		OnActive: p.OnActive,
 		OnClose:  p.OnClose,
 	}, SessionTypeTable)
-	s.state.Store(int32(StateActive))
+	s.state.Store(int32(StateReady))
 
 	sh := NewSessionHandle(s)
 	p.mu.Lock()

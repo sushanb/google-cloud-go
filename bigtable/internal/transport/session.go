@@ -72,8 +72,8 @@ const (
 	StateNew State = iota
 	// StateStarting indicates the session is dialing and handshaking.
 	StateStarting
-	// StateActive indicates the session is active and ready for RPCs.
-	StateActive
+	// StateReady indicates the session is active and ready for RPCs.
+	StateReady
 	// StateClosing indicates the client has decided to close the session
 	// and is draining outstanding vRPCs before sending CloseSession.
 	StateClosing
@@ -93,8 +93,8 @@ func (s State) String() string {
 		return "New"
 	case StateStarting:
 		return "Starting"
-	case StateActive:
-		return "Active"
+	case StateReady:
+		return "Ready"
 	case StateClosing:
 		return "Closing"
 	case StateWaitServerClose:
@@ -496,7 +496,7 @@ func (s *Session) RecordTransportOverhead(ctx context.Context, method string, ov
 // Retries returns the number of vRPCs Invoke processed with AttemptNumber > 1.
 func (s *Session) Retries() int64 { return s.retries.Load() }
 
-// OpenedAt returns when the session reached StateActive (zero until then).
+// OpenedAt returns when the session reached StateReady (zero until then).
 // Used by callers that want to compute a session's age for diagnostics.
 func (s *Session) OpenedAt() time.Time {
 	return s.tracer.openedAtSnapshot()
@@ -581,7 +581,7 @@ type afeID int64
 // AfeID returns the AFE identifier for this session, or 0 if PeerInfo is
 // nil (header absent or session pre-Active). Stable for the session's
 // lifetime — PeerInfo is populated once, synchronously with the transition
-// to StateActive (see handleOpenSession).
+// to StateReady (see handleOpenSession).
 func (s *Session) AfeID() afeID {
 	if p := s.peerInfo.Load(); p != nil {
 		return afeID(p.GetApplicationFrontendId())

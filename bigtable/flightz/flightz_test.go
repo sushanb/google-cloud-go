@@ -42,7 +42,7 @@ func samplePools(now time.Time) []btransport.PoolSnapshot {
 			Name: "OpenTable1[READ]",
 			Sessions: []btransport.SessionSnapshot{
 				{
-					LogName: "session-1a", State: "Active",
+					LogName: "session-1a", State: "Ready",
 					InFlight: &btransport.InFlightVRpc{
 						RpcID:    42,
 						Method:   "ReadRow",
@@ -52,9 +52,9 @@ func samplePools(now time.Time) []btransport.PoolSnapshot {
 					},
 					Peer: btransport.PeerInfoSnapshot{ApplicationFrontendID: 0xabc, ApplicationFrontendRegion: "us-central1", ApplicationFrontendSubzone: "tm"},
 				},
-				{LogName: "session-1b", State: "Active"}, // idle — no InFlight
+				{LogName: "session-1b", State: "Ready"}, // idle — no InFlight
 				{
-					LogName: "session-1c", State: "Active",
+					LogName: "session-1c", State: "Ready",
 					InFlight: &btransport.InFlightVRpc{
 						RpcID:   7,
 						Method:  "ReadRow",
@@ -69,7 +69,7 @@ func samplePools(now time.Time) []btransport.PoolSnapshot {
 			Name: "OpenTable1[WRITE]",
 			Sessions: []btransport.SessionSnapshot{
 				{
-					LogName: "session-2a", State: "Active",
+					LogName: "session-2a", State: "Ready",
 					InFlight: &btransport.InFlightVRpc{
 						RpcID:    3,
 						Method:   "MutateRow",
@@ -78,7 +78,7 @@ func samplePools(now time.Time) []btransport.PoolSnapshot {
 						Attempt:  1,
 					},
 				},
-				{LogName: "session-2b", State: "Active"}, // idle
+				{LogName: "session-2b", State: "Ready"}, // idle
 			},
 		},
 	}
@@ -174,8 +174,8 @@ func TestFlightz_EmptyState(t *testing.T) {
 		{
 			Name: "idle-pool",
 			Sessions: []btransport.SessionSnapshot{
-				{LogName: "s1", State: "Active"},
-				{LogName: "s2", State: "Active"},
+				{LogName: "s1", State: "Ready"},
+				{LogName: "s2", State: "Ready"},
 			},
 		},
 	}

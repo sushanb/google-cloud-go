@@ -104,7 +104,7 @@ func (s *Session) notifyClosed(streamErr error) {
 func (s *Session) Close(ctx context.Context, req *spb.CloseSessionRequest) error {
 	// Allow being called from Closing too — handleGoAway already
 	// transitioned and now wants the drain + send + WaitServerClose dance.
-	s.transitionTo(StateClosing, isState(StateNew, StateStarting, StateActive))
+	s.transitionTo(StateClosing, isState(StateNew, StateStarting, StateReady))
 	st := s.State()
 	if st != StateClosing {
 		// Already past Closing (WaitServerClose / Closed); nothing to do.
@@ -233,7 +233,7 @@ func (s *Session) handleSessionResponse(resp *spb.SessionResponse) {
 // sees a session whose PeerInfo (and therefore AfeID) is populated. This
 // matches Java's onHeaders synchrony.
 func (s *Session) handleOpenSession(_ *spb.OpenSessionResponse) {
-	if _, ok := s.transitionTo(StateActive, isState(StateStarting)); !ok {
+	if _, ok := s.transitionTo(StateReady, isState(StateStarting)); !ok {
 		return
 	}
 	if md, err := s.stream.Header(); err == nil {

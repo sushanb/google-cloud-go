@@ -172,7 +172,7 @@ func TestState_String(t *testing.T) {
 	}{
 		{StateNew, "New"},
 		{StateStarting, "Starting"},
-		{StateActive, "Active"},
+		{StateReady, "Ready"},
 		{StateClosing, "Closing"},
 		{StateWaitServerClose, "WaitServerClose"},
 		{StateClosed, "Closed"},
@@ -269,13 +269,13 @@ func TestUnavailable_WrapsCauseAndStatus(t *testing.T) {
 
 // --- handler-level tests (no Start/readLoop) ---------------------------------
 
-// makeActive constructs a session and forces it into StateActive without going
+// makeActive constructs a session and forces it into StateReady without going
 // through the handshake.
 func makeActive(t *testing.T, hooks SessionHooks) (*Session, *fakeStream) {
 	t.Helper()
 	stream := newFakeStream()
 	s := newTestSession(t, stream, hooks)
-	s.state.Store(int32(StateActive))
+	s.state.Store(int32(StateReady))
 	return s, stream
 }
 
@@ -287,8 +287,8 @@ func TestHandleOpenSession_TransitionsToActive(t *testing.T) {
 
 	s.handleOpenSession(&spb.OpenSessionResponse{})
 
-	if got := s.State(); got != StateActive {
-		t.Errorf("state = %v, want StateActive", got)
+	if got := s.State(); got != StateReady {
+		t.Errorf("state = %v, want StateReady", got)
 	}
 	if _, active, _ := listener.counts(); active != 1 {
 		t.Errorf("OnActive called %d times, want 1", active)
@@ -613,7 +613,7 @@ func TestInvoke_SendFailureCleansUpMap(t *testing.T) {
 		return fmt.Errorf("network down")
 	}
 	s := newTestSession(t, stream, SessionHooks{})
-	s.state.Store(int32(StateActive))
+	s.state.Store(int32(StateReady))
 
 	_, err := s.Invoke(context.Background(), newRoundTripDesc(), "hello")
 	if err == nil {
@@ -665,7 +665,7 @@ func TestForceClose_CancelsInflightWithReason(t *testing.T) {
 func TestClose_Graceful_NoInflightSendsCloseRequest(t *testing.T) {
 	stream := newFakeStream()
 	s := newTestSession(t, stream, SessionHooks{})
-	s.state.Store(int32(StateActive))
+	s.state.Store(int32(StateReady))
 
 	if err := s.Close(context.Background(), &spb.CloseSessionRequest{
 		Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_USER,
@@ -786,7 +786,7 @@ func TestHeartBeatLoop_HeartbeatsKeepInflightVRPCAlive(t *testing.T) {
 		})
 	}
 
-	if got := s.State(); got != StateActive {
+	if got := s.State(); got != StateReady {
 		t.Errorf("session torn down despite arriving heartbeats; state = %v", got)
 	}
 }
@@ -836,8 +836,8 @@ func TestHeartBeatLoop_ExitsOnCtxCancel(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("heartBeatLoop did not exit on ctx cancel")
 	}
-	if s.State() != StateActive {
-		t.Errorf("state = %v, want StateActive (no force-close on ctx exit)", s.State())
+	if s.State() != StateReady {
+		t.Errorf("state = %v, want StateReady (no force-close on ctx exit)", s.State())
 	}
 }
 
@@ -932,7 +932,7 @@ func TestStart_HandshakeAndClose(t *testing.T) {
 	stream.recv <- recvOp{resp: &spb.SessionResponse{
 		Payload: &spb.SessionResponse_OpenSession{OpenSession: &spb.OpenSessionResponse{}},
 	}}
-	waitFor(t, time.Second, func() bool { return s.State() == StateActive }, "StateActive")
+	waitFor(t, time.Second, func() bool { return s.State() == StateReady }, "StateReady")
 	if _, active, _ := listener.counts(); active != 1 {
 		t.Errorf("OnActive fired %d times, want 1", active)
 	}

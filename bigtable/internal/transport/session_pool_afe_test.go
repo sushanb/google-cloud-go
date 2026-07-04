@@ -33,7 +33,7 @@ func injectActiveOnAfe(t *testing.T, p *SessionPoolImpl, name string, afe afeID)
 		OnActive: p.OnActive,
 		OnClose:  p.OnClose,
 	}, SessionTypeTable)
-	s.state.Store(int32(StateActive))
+	s.state.Store(int32(StateReady))
 	// Stamp PeerInfo BEFORE registering — sessionList reads AfeID() at
 	// OnSessionStarted, matching production's sync-PeerInfo invariant.
 	s.peerInfo.Store(&spb.PeerInfo{ApplicationFrontendId: int64(afe)})
