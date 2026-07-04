@@ -99,7 +99,7 @@ func (p *SessionPoolImpl) bumpCloseReason(label string) {
 	if label == "" {
 		label = "Unspecified"
 	}
-	c, _ := p.closesByReason.LoadOrStore(label, new(atomic.Int64))
+	c, _ := p.m.closesByReason.LoadOrStore(label, new(atomic.Int64))
 	c.(*atomic.Int64).Add(1)
 }
 
@@ -125,7 +125,7 @@ func (p *SessionPoolImpl) recordSessionClose(s *Session, fallbackReason string) 
 	if reason == "" {
 		reason = fallbackReason
 	}
-	p.sessionsClosed.Add(1)
+	p.m.sessionsClosed.Add(1)
 	p.bumpCloseReason(reason)
 }
 
@@ -140,7 +140,7 @@ func (p *SessionPoolImpl) bumpStartingClose(s *Session) {
 // snapshotCloseReasons returns the per-reason counts as a flat map.
 func (p *SessionPoolImpl) snapshotCloseReasons() map[string]int64 {
 	out := map[string]int64{}
-	p.closesByReason.Range(func(k, v interface{}) bool {
+	p.m.closesByReason.Range(func(k, v interface{}) bool {
 		out[k.(string)] = v.(*atomic.Int64).Load()
 		return true
 	})
@@ -264,7 +264,7 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 	sh := NewSessionHandle(s)
 	p.sessions = append(p.sessions, sh)
 	p.sessionCreatedAt[sh] = time.Now()
-	p.sessionsOpened.Add(1)
+	p.m.sessionsOpened.Add(1)
 
 	// Register the newly-Active session in its AFE bucket. PeerInfo is
 	// guaranteed populated at this point — handleOpenSession parses it

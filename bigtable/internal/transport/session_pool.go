@@ -76,12 +76,6 @@ type SessionPoolImpl struct {
 	// when no short name was provided.
 	poolShortName string
 
-	// Lifecycle counters surfaced via PoolSnapshot. All bumped lock-free.
-	sessionsOpened atomic.Int64
-	sessionsClosed atomic.Int64
-	listenerFires  atomic.Int64
-	closesByReason sync.Map // close-reason label → *atomic.Int64
-
 	// waitersCount is the live count of callers parked inside
 	// CheckoutSession waiting for an idle session at the pool boundary.
 	// This is the "pending vRPCs" signal the sizer needs — Java tracks
@@ -90,59 +84,13 @@ type SessionPoolImpl struct {
 	// InUseCount and made the sizer oscillate.
 	waitersCount atomic.Int32
 
-	// scalingHistory is a ring buffer of the last N scaling decisions made
-	// by PerformScaling. Guarded by scalingHistoryMu so the snapshot reader
-	// gets a consistent slice copy without dropping events.
-	scalingHistoryMu sync.Mutex
-	scalingHistory   []ScalingEvent
-
-	// slowVRpcs is a ring buffer of the last N vRPCs that exceeded the
-	// slow-call threshold. Lets operators answer "which call was slow?"
-	// without trawling logs.
-	slowVRpcsMu       sync.Mutex
-	slowVRpcs         []SlowVRpcEvent
-	slowVRpcThreshold time.Duration
-
-	// timeSeriesMu / timeSeries is a 1-Hz ring buffer of pool-level
-	// observations driven by PerformScaling. Powers inline SVG sparklines
-	// in the sessionz UI. Capped at maxTimeSeries.
-	timeSeriesMu    sync.Mutex
-	timeSeries      []TimeSeriesSample
-	tsLastOkRpcs    int64
-	tsLastErrorRpcs int64
-
-	// lifetimesMu / lifetimes is a ring buffer of the last N completed
-	// session lifetimes (from pool admission to recordSessionClose). Lets
-	// the debug UI render a churn histogram + p50/p95 lifetime.
-	lifetimesMu sync.Mutex
-	lifetimes   []time.Duration
-
-	// pickHistoryMu / pickHistory is a circular ring buffer of the last N
-	// picker decisions from CheckoutSession. Powers the loadz debug page's
-	// "recent pick decisions" table so operators can trace picker
-	// reasoning without re-running the pick. pickHistoryHead is the index
-	// of the oldest slot (= next write slot once len == maxPickHistory);
-	// snapshotPickHistory unwraps oldest-first. Constant-time append —
-	// this path runs under every CheckoutSession.
-	pickHistoryMu   sync.Mutex
-	pickHistory     []PickHistoryEvent
-	pickHistoryHead int
-	// afePickCounts is a running per-AFE tally of successful picks over
-	// the pool's lifetime. loadz consumes it to compute actual-share vs.
-	// ideal-share tables. Keyed by afeID; a small map (single-digit AFEs
-	// typically).
-	afePickCounts map[afeID]int64
-
-	// backendLatencyHist / totalLatencyHist keep pool-wide latency
-	// percentiles over the pool's entire lifetime. The per-session ring
-	// buffers on Session cap at 256 samples each and are lost when a
-	// session is recycled, so the pool's "N=…" in the debug UI would be
-	// bounded by (active sessions × 256) if we relied on them. These
-	// lock-free log2-bucket histograms record every sample as it flows
-	// through Invoke and survive session churn.
-	backendLatencyHist   latencyHist
-	totalLatencyHist     latencyHist
-	transportLatencyHist latencyHist
+	// m owns every observability-only field — counters, ring buffers,
+	// histograms. Extracted into a sub-struct so this definition shows
+	// the pool's operational shape (sessions, sizer, hooks) without
+	// wading through 100+ lines of bookkeeping. See poolMetrics in
+	// session_pool_debug.go for the breakdown; every accessor spells
+	// out its intent via p.m.<field>.
+	m poolMetrics
 
 	// freeSignal is the pool-level "a session became idle" wake-up
 	// channel. CheckoutSession parks here when every active session
@@ -193,8 +141,8 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 		poolCtx:            poolCtx,
 		poolCancel:         poolCancel,
 		sl:                 newSessionList(),
-		afePickCounts:      make(map[afeID]int64),
 	}
+	pool.m.afePickCounts = make(map[afeID]int64)
 
 	fetcher := func() *PoolStats {
 		return pool.Stats()
@@ -357,7 +305,7 @@ func (p *SessionPoolImpl) Stats() *PoolStats {
 
 // UpdateConfig dynamically adjusts the pool size constraints and budget governor limits at runtime.
 func (p *SessionPoolImpl) UpdateConfig(config *spb.SessionClientConfiguration_SessionPoolConfiguration) {
-	p.listenerFires.Add(1)
+	p.m.listenerFires.Add(1)
 	p.mu.Lock()
 	p.minSessions = int(config.MinSessionCount)
 	p.maxSessions = int(config.MaxSessionCount)
@@ -437,10 +385,10 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 	// being capped at (active sessions × 256) by per-session ring
 	// buffers. BackendLatency only records when the server populated
 	// Stats — client-observed TotalLatency records for every call.
-	p.totalLatencyHist.record(latency)
+	p.m.totalLatencyHist.record(latency)
 	if result.Stats != nil && result.Stats.BackendLatency != nil {
 		backendDur = result.Stats.BackendLatency.AsDuration()
-		p.backendLatencyHist.record(backendDur)
+		p.m.backendLatencyHist.record(backendDur)
 	}
 	// Java-parity ClientTransportLatency: (stream Send→Recv) − backend =
 	// wire + AFE + client-decode overhead outside server processing.
@@ -452,7 +400,7 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 	if result.TransportLatency > 0 && backendDur > 0 {
 		if d := result.TransportLatency - backendDur; d > 0 {
 			transportOverhead = d
-			p.transportLatencyHist.record(d)
+			p.m.transportLatencyHist.record(d)
 			sh.session.RecordTransportOverhead(ctx, desc.Method(), d)
 		}
 	}

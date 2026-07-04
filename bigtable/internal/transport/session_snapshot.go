@@ -479,10 +479,10 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 		TotalSessions:  len(handles),
 		Sessions:       make([]SessionSnapshot, 0, len(handles)),
 		CapturedAt:     time.Now(),
-		SessionsOpened: p.sessionsOpened.Load(),
-		SessionsClosed: p.sessionsClosed.Load(),
+		SessionsOpened: p.m.sessionsOpened.Load(),
+		SessionsClosed: p.m.sessionsClosed.Load(),
 		CloseReasons:   p.snapshotCloseReasons(),
-		ListenerFires:  p.listenerFires.Load(),
+		ListenerFires:  p.m.listenerFires.Load(),
 		Throttler:      throttler,
 		ScalingHistory: p.snapshotScalingHistory(),
 		OpenRequest:    buildOpenRequestSnapshot(p.openSessionRequest, sessionType),
@@ -549,19 +549,19 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 	if len(aggregatedClusters) > 0 {
 		snap.ClusterCounts = aggregatedClusters
 	}
-	if p50, p95, p99, n := p.backendLatencyHist.snapshot(); n > 0 {
+	if p50, p95, p99, n := p.m.backendLatencyHist.snapshot(); n > 0 {
 		snap.LatencyP50 = p50
 		snap.LatencyP95 = p95
 		snap.LatencyP99 = p99
 		snap.LatencyN = int(n)
 	}
-	if p50, p95, p99, n := p.totalLatencyHist.snapshot(); n > 0 {
+	if p50, p95, p99, n := p.m.totalLatencyHist.snapshot(); n > 0 {
 		snap.TotalLatencyP50 = p50
 		snap.TotalLatencyP95 = p95
 		snap.TotalLatencyP99 = p99
 		snap.TotalLatencyN = int(n)
 	}
-	if p50, p95, p99, n := p.transportLatencyHist.snapshot(); n > 0 {
+	if p50, p95, p99, n := p.m.transportLatencyHist.snapshot(); n > 0 {
 		snap.TransportLatencyP50 = p50
 		snap.TransportLatencyP95 = p95
 		snap.TransportLatencyP99 = p99

@@ -53,7 +53,7 @@ func TestRecordSessionClose_OnceFlag(t *testing.T) {
 	p.recordSessionClose(s, "SecondShouldNotFire")
 	p.recordSessionClose(s, "ThirdShouldNotFire")
 
-	if got := p.sessionsClosed.Load(); got != 1 {
+	if got := p.m.sessionsClosed.Load(); got != 1 {
 		t.Errorf("sessionsClosed = %d, want 1 (once-flag violated)", got)
 	}
 	reasons := p.snapshotCloseReasons()
@@ -82,7 +82,7 @@ func TestRecordSessionClose_UsesSessionReasonOverFallback(t *testing.T) {
 func TestRecordSessionClose_NilSessionIsNoOp(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	p.recordSessionClose(nil, "Anything")
-	if got := p.sessionsClosed.Load(); got != 0 {
+	if got := p.m.sessionsClosed.Load(); got != 0 {
 		t.Errorf("sessionsClosed = %d, want 0 for nil session", got)
 	}
 }
@@ -174,7 +174,7 @@ func TestOnClose_ActiveSessionRemovedAndRecorded(t *testing.T) {
 	if found {
 		t.Error("session still in p.sessions after OnClose")
 	}
-	if got := p.sessionsClosed.Load(); got != 1 {
+	if got := p.m.sessionsClosed.Load(); got != 1 {
 		t.Errorf("sessionsClosed = %d, want 1", got)
 	}
 	if got := len(p.snapshotLifetimes()); got != 1 {
@@ -193,7 +193,7 @@ func TestOnClose_IdxNotFoundStillRecords(t *testing.T) {
 	s := NewSession("s-ghost", stream, SessionHooks{}, SessionTypeTable)
 
 	p.OnClose(s, nil)
-	if got := p.sessionsClosed.Load(); got != 1 {
+	if got := p.m.sessionsClosed.Load(); got != 1 {
 		t.Errorf("sessionsClosed = %d, want 1", got)
 	}
 }
@@ -237,9 +237,9 @@ func TestOnStart_NoOp(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	// OnStart takes a ctx and does nothing. Just verify it doesn't
 	// panic and doesn't touch any counters.
-	before := p.sessionsOpened.Load()
+	before := p.m.sessionsOpened.Load()
 	p.OnStart(nil)
-	if got := p.sessionsOpened.Load(); got != before {
+	if got := p.m.sessionsOpened.Load(); got != before {
 		t.Errorf("OnStart mutated sessionsOpened: %d → %d", before, got)
 	}
 }

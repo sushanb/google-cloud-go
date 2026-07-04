@@ -269,7 +269,7 @@ func TestSlowThreshold_DefaultAndOverride(t *testing.T) {
 	if got := p.slowThreshold(); got != defaultSlowThreshold {
 		t.Errorf("default threshold = %v, want %v", got, defaultSlowThreshold)
 	}
-	p.slowVRpcThreshold = 500 * time.Microsecond
+	p.m.slowVRpcThreshold = 500 * time.Microsecond
 	if got := p.slowThreshold(); got != 500*time.Microsecond {
 		t.Errorf("overridden threshold = %v, want 500µs", got)
 	}

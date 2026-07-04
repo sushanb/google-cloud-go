@@ -183,7 +183,7 @@ func TestSessionPool_Invoke_RecordsSlowCheckoutFailure(t *testing.T) {
 
 	// Threshold well under the 50ms wait below so the record path fires
 	// deterministically even on slow CI.
-	p.slowVRpcThreshold = time.Millisecond
+	p.m.slowVRpcThreshold = time.Millisecond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -388,7 +388,7 @@ func TestUpdateConfig_SwapsPickerAndBounds(t *testing.T) {
 		t.Errorf("after PeakEwma swap, picker = %q, want least-latency", got)
 	}
 	// listenerFires counter bumps once per UpdateConfig.
-	if got := p.listenerFires.Load(); got != 2 {
+	if got := p.m.listenerFires.Load(); got != 2 {
 		t.Errorf("listenerFires = %d, want 2 (one per UpdateConfig)", got)
 	}
 }

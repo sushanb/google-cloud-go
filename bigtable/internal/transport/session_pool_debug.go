@@ -24,12 +24,60 @@ import (
 	"context"
 	"errors"
 	"math/bits"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	btopt "cloud.google.com/go/bigtable/internal/option"
 	"google.golang.org/grpc/status"
 )
+
+// poolMetrics owns every observability-only field that used to hang
+// directly off SessionPoolImpl — counters, ring buffers, and
+// histograms. Extracted so a reader opening SessionPoolImpl sees the
+// operational shape (sessions, sizer, hooks) without wading through
+// 100+ lines of bookkeeping. All methods that mutate these fields live
+// in session_pool_debug.go / _lifecycle.go / _scaling.go and access
+// via p.m.<field>. The struct is embedded by value on the pool (single
+// pointer chase is fine on the hot path — Go inlines it).
+type poolMetrics struct {
+	// Lifecycle counters, lock-free.
+	sessionsOpened atomic.Int64
+	sessionsClosed atomic.Int64
+	listenerFires  atomic.Int64
+	closesByReason sync.Map // close-reason label → *atomic.Int64
+
+	// Scaling history ring buffer.
+	scalingHistoryMu sync.Mutex
+	scalingHistory   []ScalingEvent
+
+	// Slow-vRPC log ring buffer.
+	slowVRpcsMu       sync.Mutex
+	slowVRpcs         []SlowVRpcEvent
+	slowVRpcThreshold time.Duration
+
+	// Time-series sparkline ring buffer + rate-computation state.
+	timeSeriesMu    sync.Mutex
+	timeSeries      []TimeSeriesSample
+	tsLastOkRpcs    int64
+	tsLastErrorRpcs int64
+
+	// Session-lifetime ring buffer.
+	lifetimesMu sync.Mutex
+	lifetimes   []time.Duration
+
+	// Picker-decision ring buffer + per-AFE counters.
+	pickHistoryMu   sync.Mutex
+	pickHistory     []PickHistoryEvent
+	pickHistoryHead int
+	afePickCounts   map[afeID]int64
+
+	// Pool-wide latency histograms — lifetime-of-pool, survive session
+	// churn (per-session ring buffers cap at 256 samples each).
+	backendLatencyHist   latencyHist
+	totalLatencyHist     latencyHist
+	transportLatencyHist latencyHist
+}
 
 // SlowVRpcEvent is one row in the pool's slow-vRPC log.
 type SlowVRpcEvent struct {
@@ -109,20 +157,20 @@ func (p *SessionPoolImpl) recordLifetime(d time.Duration) {
 	if d <= 0 {
 		return
 	}
-	p.lifetimesMu.Lock()
-	defer p.lifetimesMu.Unlock()
-	if len(p.lifetimes) >= maxLifetimes {
-		copy(p.lifetimes, p.lifetimes[1:])
-		p.lifetimes = p.lifetimes[:len(p.lifetimes)-1]
+	p.m.lifetimesMu.Lock()
+	defer p.m.lifetimesMu.Unlock()
+	if len(p.m.lifetimes) >= maxLifetimes {
+		copy(p.m.lifetimes, p.m.lifetimes[1:])
+		p.m.lifetimes = p.m.lifetimes[:len(p.m.lifetimes)-1]
 	}
-	p.lifetimes = append(p.lifetimes, d)
+	p.m.lifetimes = append(p.m.lifetimes, d)
 }
 
 func (p *SessionPoolImpl) snapshotLifetimes() []time.Duration {
-	p.lifetimesMu.Lock()
-	out := make([]time.Duration, len(p.lifetimes))
-	copy(out, p.lifetimes)
-	p.lifetimesMu.Unlock()
+	p.m.lifetimesMu.Lock()
+	out := make([]time.Duration, len(p.m.lifetimes))
+	copy(out, p.m.lifetimes)
+	p.m.lifetimesMu.Unlock()
 	return out
 }
 
@@ -249,20 +297,20 @@ func (p *SessionPoolImpl) recordTimeSeries() {
 	pending := int(p.waitersCount.Load())
 
 	now := time.Now()
-	p.timeSeriesMu.Lock()
-	defer p.timeSeriesMu.Unlock()
+	p.m.timeSeriesMu.Lock()
+	defer p.m.timeSeriesMu.Unlock()
 
 	var okRate, errRate float64
-	if len(p.timeSeries) > 0 {
-		prev := p.timeSeries[len(p.timeSeries)-1]
+	if len(p.m.timeSeries) > 0 {
+		prev := p.m.timeSeries[len(p.m.timeSeries)-1]
 		dt := now.Sub(prev.At).Seconds()
 		if dt > 0 {
-			okRate = float64(okTotal-p.tsLastOkRpcs) / dt
-			errRate = float64(errTotal-p.tsLastErrorRpcs) / dt
+			okRate = float64(okTotal-p.m.tsLastOkRpcs) / dt
+			errRate = float64(errTotal-p.m.tsLastErrorRpcs) / dt
 		}
 	}
-	p.tsLastOkRpcs = okTotal
-	p.tsLastErrorRpcs = errTotal
+	p.m.tsLastOkRpcs = okTotal
+	p.m.tsLastErrorRpcs = errTotal
 
 	sample := TimeSeriesSample{
 		At:        now,
@@ -272,31 +320,31 @@ func (p *SessionPoolImpl) recordTimeSeries() {
 		InUse:     inUse,
 		Pending:   pending,
 	}
-	if len(p.timeSeries) >= maxTimeSeries {
-		copy(p.timeSeries, p.timeSeries[1:])
-		p.timeSeries = p.timeSeries[:len(p.timeSeries)-1]
+	if len(p.m.timeSeries) >= maxTimeSeries {
+		copy(p.m.timeSeries, p.m.timeSeries[1:])
+		p.m.timeSeries = p.m.timeSeries[:len(p.m.timeSeries)-1]
 	}
-	p.timeSeries = append(p.timeSeries, sample)
+	p.m.timeSeries = append(p.m.timeSeries, sample)
 }
 
 func (p *SessionPoolImpl) snapshotTimeSeries() []TimeSeriesSample {
-	p.timeSeriesMu.Lock()
-	defer p.timeSeriesMu.Unlock()
-	out := make([]TimeSeriesSample, len(p.timeSeries))
-	copy(out, p.timeSeries)
+	p.m.timeSeriesMu.Lock()
+	defer p.m.timeSeriesMu.Unlock()
+	out := make([]TimeSeriesSample, len(p.m.timeSeries))
+	copy(out, p.m.timeSeries)
 	return out
 }
 
 // recordSlowVRpc appends to the slow-vRPC ring buffer. Only called from
 // SessionPoolImpl.Invoke after a call exceeds the threshold.
 func (p *SessionPoolImpl) recordSlowVRpc(ev SlowVRpcEvent) {
-	p.slowVRpcsMu.Lock()
-	defer p.slowVRpcsMu.Unlock()
-	if len(p.slowVRpcs) >= maxSlowVRpcs {
-		copy(p.slowVRpcs, p.slowVRpcs[1:])
-		p.slowVRpcs = p.slowVRpcs[:len(p.slowVRpcs)-1]
+	p.m.slowVRpcsMu.Lock()
+	defer p.m.slowVRpcsMu.Unlock()
+	if len(p.m.slowVRpcs) >= maxSlowVRpcs {
+		copy(p.m.slowVRpcs, p.m.slowVRpcs[1:])
+		p.m.slowVRpcs = p.m.slowVRpcs[:len(p.m.slowVRpcs)-1]
 	}
-	p.slowVRpcs = append(p.slowVRpcs, ev)
+	p.m.slowVRpcs = append(p.m.slowVRpcs, ev)
 }
 
 // recordCheckoutFailure feeds the pool-wide latency histogram and, when the
@@ -306,7 +354,7 @@ func (p *SessionPoolImpl) recordSlowVRpc(ev SlowVRpcEvent) {
 // "checkout never returned a handle".
 func (p *SessionPoolImpl) recordCheckoutFailure(checkoutStart time.Time, desc VRpcDescriptor, err error) {
 	poolWait := time.Since(checkoutStart)
-	p.totalLatencyHist.record(poolWait)
+	p.m.totalLatencyHist.record(poolWait)
 	if poolWait <= p.slowThreshold() {
 		return
 	}
@@ -330,16 +378,16 @@ func (p *SessionPoolImpl) recordCheckoutFailure(checkoutStart time.Time, desc VR
 }
 
 func (p *SessionPoolImpl) snapshotSlowVRpcs() []SlowVRpcEvent {
-	p.slowVRpcsMu.Lock()
-	defer p.slowVRpcsMu.Unlock()
-	out := make([]SlowVRpcEvent, len(p.slowVRpcs))
-	copy(out, p.slowVRpcs)
+	p.m.slowVRpcsMu.Lock()
+	defer p.m.slowVRpcsMu.Unlock()
+	out := make([]SlowVRpcEvent, len(p.m.slowVRpcs))
+	copy(out, p.m.slowVRpcs)
 	return out
 }
 
 func (p *SessionPoolImpl) slowThreshold() time.Duration {
-	if p.slowVRpcThreshold > 0 {
-		return p.slowVRpcThreshold
+	if p.m.slowVRpcThreshold > 0 {
+		return p.m.slowVRpcThreshold
 	}
 	return defaultSlowThreshold
 }
@@ -375,41 +423,41 @@ func (p *SessionPoolImpl) recordPickDecision(d PickDecision, pickerName string) 
 		Decision:   d,
 		PickerName: pickerName,
 	}
-	p.pickHistoryMu.Lock()
+	p.m.pickHistoryMu.Lock()
 	// Circular append: grow to cap, then overwrite oldest at head. Constant
 	// time. The previous shift-left implementation memmoved ~500 events
 	// per CheckoutSession once the buffer filled — a p95 regression at
 	// even moderate QPS.
-	if len(p.pickHistory) < maxPickHistory {
-		p.pickHistory = append(p.pickHistory, ev)
+	if len(p.m.pickHistory) < maxPickHistory {
+		p.m.pickHistory = append(p.m.pickHistory, ev)
 	} else {
-		p.pickHistory[p.pickHistoryHead] = ev
-		p.pickHistoryHead++
-		if p.pickHistoryHead == maxPickHistory {
-			p.pickHistoryHead = 0
+		p.m.pickHistory[p.m.pickHistoryHead] = ev
+		p.m.pickHistoryHead++
+		if p.m.pickHistoryHead == maxPickHistory {
+			p.m.pickHistoryHead = 0
 		}
 	}
 	if d.Winner != 0 {
-		p.afePickCounts[d.Winner]++
+		p.m.afePickCounts[d.Winner]++
 	}
-	p.pickHistoryMu.Unlock()
+	p.m.pickHistoryMu.Unlock()
 }
 
 // snapshotPickHistory returns a copy of the pick-decision ring buffer,
 // oldest-first / newest-last. Safe to call concurrently with
 // recordPickDecision.
 func (p *SessionPoolImpl) snapshotPickHistory() []PickHistoryEvent {
-	p.pickHistoryMu.Lock()
-	defer p.pickHistoryMu.Unlock()
-	out := make([]PickHistoryEvent, len(p.pickHistory))
-	if len(p.pickHistory) < maxPickHistory {
+	p.m.pickHistoryMu.Lock()
+	defer p.m.pickHistoryMu.Unlock()
+	out := make([]PickHistoryEvent, len(p.m.pickHistory))
+	if len(p.m.pickHistory) < maxPickHistory {
 		// Buffer hasn't wrapped yet; slice is already oldest-first.
-		copy(out, p.pickHistory)
+		copy(out, p.m.pickHistory)
 	} else {
 		// Full ring: oldest event lives at pickHistoryHead. Copy the tail
 		// (head..end) then the head (0..pickHistoryHead).
-		n := copy(out, p.pickHistory[p.pickHistoryHead:])
-		copy(out[n:], p.pickHistory[:p.pickHistoryHead])
+		n := copy(out, p.m.pickHistory[p.m.pickHistoryHead:])
+		copy(out[n:], p.m.pickHistory[:p.m.pickHistoryHead])
 	}
 	return out
 }
@@ -417,10 +465,10 @@ func (p *SessionPoolImpl) snapshotPickHistory() []PickHistoryEvent {
 // snapshotAfePickCounts returns a copy of the per-AFE cumulative pick
 // counter map. Used by loadz to compute actual-share vs. ideal-share.
 func (p *SessionPoolImpl) snapshotAfePickCounts() map[afeID]int64 {
-	p.pickHistoryMu.Lock()
-	defer p.pickHistoryMu.Unlock()
-	out := make(map[afeID]int64, len(p.afePickCounts))
-	for k, v := range p.afePickCounts {
+	p.m.pickHistoryMu.Lock()
+	defer p.m.pickHistoryMu.Unlock()
+	out := make(map[afeID]int64, len(p.m.afePickCounts))
+	for k, v := range p.m.afePickCounts {
 		out[k] = v
 	}
 	return out

@@ -81,21 +81,21 @@ const maxScalingHistory = 1024
 // recordScaling appends an event to the ring buffer, dropping the oldest
 // entry when full.
 func (p *SessionPoolImpl) recordScaling(ev ScalingEvent) {
-	p.scalingHistoryMu.Lock()
-	defer p.scalingHistoryMu.Unlock()
-	if len(p.scalingHistory) >= maxScalingHistory {
-		copy(p.scalingHistory, p.scalingHistory[1:])
-		p.scalingHistory = p.scalingHistory[:len(p.scalingHistory)-1]
+	p.m.scalingHistoryMu.Lock()
+	defer p.m.scalingHistoryMu.Unlock()
+	if len(p.m.scalingHistory) >= maxScalingHistory {
+		copy(p.m.scalingHistory, p.m.scalingHistory[1:])
+		p.m.scalingHistory = p.m.scalingHistory[:len(p.m.scalingHistory)-1]
 	}
-	p.scalingHistory = append(p.scalingHistory, ev)
+	p.m.scalingHistory = append(p.m.scalingHistory, ev)
 }
 
 // snapshotScalingHistory returns a copy of the ring buffer, oldest first.
 func (p *SessionPoolImpl) snapshotScalingHistory() []ScalingEvent {
-	p.scalingHistoryMu.Lock()
-	defer p.scalingHistoryMu.Unlock()
-	out := make([]ScalingEvent, len(p.scalingHistory))
-	copy(out, p.scalingHistory)
+	p.m.scalingHistoryMu.Lock()
+	defer p.m.scalingHistoryMu.Unlock()
+	out := make([]ScalingEvent, len(p.m.scalingHistory))
+	copy(out, p.m.scalingHistory)
 	return out
 }
 
