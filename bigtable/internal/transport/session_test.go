@@ -841,6 +841,30 @@ func TestHeartBeatLoop_ExitsOnCtxCancel(t *testing.T) {
 	}
 }
 
+// --- AfeID -------------------------------------------------------------------
+
+func TestSessionAfeID(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		peerInfo *spb.PeerInfo
+		want     afeID
+	}{
+		{"nil-peer-info", nil, 0},
+		{"empty-afe-id", &spb.PeerInfo{}, 0},
+		{"set-afe-id", &spb.PeerInfo{ApplicationFrontendId: 4242}, 4242},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestSession(t, newFakeStream(), SessionHooks{})
+			if tc.peerInfo != nil {
+				s.peerInfo.Store(tc.peerInfo)
+			}
+			if got := s.AfeID(); got != tc.want {
+				t.Errorf("AfeID() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 // --- peerInfoExtracter -------------------------------------------------------
 
 func TestPeerInfoExtracter_ParsesValidHeader(t *testing.T) {

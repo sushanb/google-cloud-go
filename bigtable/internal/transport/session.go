@@ -232,9 +232,10 @@ type Session struct {
 	quiescent     chan struct{}
 	quiescentOnce sync.Once
 
-	// peerInfo is populated asynchronously by peerInfoExtracter from the
-	// stream header. atomic.Pointer so peerInfoSummary / snapshot / the
-	// ctx-done event recorder can read it lock-free on the hot path.
+	// peerInfo is populated by peerInfoExtracter from the stream header,
+	// synchronously in handleOpenSession before hooks.onActive fires.
+	// atomic.Pointer so peerInfoSummary / snapshot / the ctx-done event
+	// recorder can read it lock-free on the hot path.
 	peerInfo atomic.Pointer[spb.PeerInfo]
 	// remoteAddr is the TCP remote (AFE) socket address in "ip:port" form,
 	// captured from grpc peer.FromContext once the stream Header returns.
@@ -566,6 +567,25 @@ func (s *Session) RemoteAddr() string {
 // PeerInfo returns the peer info, or nil if it has not been parsed yet.
 func (s *Session) PeerInfo() *spb.PeerInfo {
 	return s.peerInfo.Load()
+}
+
+// afeID identifies the AFE (Application Front End) a session is pinned to,
+// derived from PeerInfo.ApplicationFrontendId. The zero value is the
+// sentinel for "unknown" — used before PeerInfo is populated or when the
+// server did not send the bigtable-peer-info header. Java-parity: mirrors
+// the AutoValue AfeId in SessionList.java, which wraps the same
+// long/uint64 id.
+type afeID uint64
+
+// AfeID returns the AFE identifier for this session, or 0 if PeerInfo is
+// nil (header absent or session pre-Active). Stable for the session's
+// lifetime — PeerInfo is populated once, synchronously with the transition
+// to StateActive (see handleOpenSession).
+func (s *Session) AfeID() afeID {
+	if p := s.peerInfo.Load(); p != nil {
+		return afeID(p.GetApplicationFrontendId())
+	}
+	return 0
 }
 
 // RefreshConfig returns the server-provided refresh configuration, or nil if
