@@ -513,8 +513,10 @@ func (s *Session) OpenedAt() time.Time {
 // SessionOption configures a Session at construction time.
 type SessionOption func(*Session)
 
-// WithSessionLogger attaches a logger for diagnostic output. Without it, the
-// session logs nothing.
+// WithSessionLogger attaches a logger for diagnostic output. Without it,
+// the session's Debugf calls no-op. Retained even though no in-tree
+// caller sets it — this is the intended escape hatch for enabling
+// per-session diagnostic logging.
 func WithSessionLogger(logger *log.Logger) SessionOption {
 	return func(s *Session) { s.logger = logger }
 }

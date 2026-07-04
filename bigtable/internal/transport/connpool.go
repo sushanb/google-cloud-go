@@ -133,7 +133,10 @@ func WithDirectAccessFeatureFlagsMetadata(directAccessFeatureFlagsMD metadata.MD
 	}
 }
 
-// WithLogger provides the logger for logging events
+// WithLogger provides the logger for logging events. Retained even
+// though no in-tree caller sets it — the debug-path Debugf calls
+// throughout connpool no-op on a nil logger, so this is the intended
+// escape hatch for wiring up diagnostic output.
 func WithLogger(logger *log.Logger) BigtableChannelPoolOption {
 	return func(p *BigtableChannelPool) {
 		p.logger = logger

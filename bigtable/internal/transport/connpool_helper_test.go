@@ -58,12 +58,6 @@ func (s *fakeService) setDelay(duration time.Duration) {
 	s.delay = duration
 }
 
-func (s *fakeService) getDelay() time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.delay
-}
-
 func (s *fakeService) UnaryCall(ctx context.Context, req *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 	s.mu.Lock()
 	s.callCount++
