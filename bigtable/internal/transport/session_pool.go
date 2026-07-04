@@ -112,12 +112,16 @@ type SessionPoolImpl struct {
 	lifetimesMu sync.Mutex
 	lifetimes   []time.Duration
 
-	// pickHistoryMu / pickHistory is a ring buffer of the last N picker
-	// decisions from CheckoutSession. Powers the loadz debug page's
+	// pickHistoryMu / pickHistory is a circular ring buffer of the last N
+	// picker decisions from CheckoutSession. Powers the loadz debug page's
 	// "recent pick decisions" table so operators can trace picker
-	// reasoning without re-running the pick.
-	pickHistoryMu sync.Mutex
-	pickHistory   []PickHistoryEvent
+	// reasoning without re-running the pick. pickHistoryHead is the index
+	// of the oldest slot (= next write slot once len == maxPickHistory);
+	// snapshotPickHistory unwraps oldest-first. Constant-time append —
+	// this path runs under every CheckoutSession.
+	pickHistoryMu   sync.Mutex
+	pickHistory     []PickHistoryEvent
+	pickHistoryHead int
 	// afePickCounts is a running per-AFE tally of successful picks over
 	// the pool's lifetime. loadz consumes it to compute actual-share vs.
 	// ideal-share tables. Keyed by afeID; a small map (single-digit AFEs
@@ -590,16 +594,25 @@ type PickHistoryEvent struct {
 // deadlock here). Cheap enough to call from every CheckoutSession
 // without gating.
 func (p *SessionPoolImpl) recordPickDecision(d PickDecision, pickerName string) {
-	p.pickHistoryMu.Lock()
-	if len(p.pickHistory) >= maxPickHistory {
-		copy(p.pickHistory, p.pickHistory[1:])
-		p.pickHistory = p.pickHistory[:len(p.pickHistory)-1]
-	}
-	p.pickHistory = append(p.pickHistory, PickHistoryEvent{
+	ev := PickHistoryEvent{
 		At:         time.Now(),
 		Decision:   d,
 		PickerName: pickerName,
-	})
+	}
+	p.pickHistoryMu.Lock()
+	// Circular append: grow to cap, then overwrite oldest at head. Constant
+	// time. The previous shift-left implementation memmoved ~500 events
+	// per CheckoutSession once the buffer filled — a p95 regression at
+	// even moderate QPS.
+	if len(p.pickHistory) < maxPickHistory {
+		p.pickHistory = append(p.pickHistory, ev)
+	} else {
+		p.pickHistory[p.pickHistoryHead] = ev
+		p.pickHistoryHead++
+		if p.pickHistoryHead == maxPickHistory {
+			p.pickHistoryHead = 0
+		}
+	}
 	if d.Winner != 0 {
 		p.afePickCounts[d.Winner]++
 	}
@@ -607,12 +620,21 @@ func (p *SessionPoolImpl) recordPickDecision(d PickDecision, pickerName string) 
 }
 
 // snapshotPickHistory returns a copy of the pick-decision ring buffer,
-// newest-last. Safe to call concurrently with recordPickDecision.
+// oldest-first / newest-last. Safe to call concurrently with
+// recordPickDecision.
 func (p *SessionPoolImpl) snapshotPickHistory() []PickHistoryEvent {
 	p.pickHistoryMu.Lock()
 	defer p.pickHistoryMu.Unlock()
 	out := make([]PickHistoryEvent, len(p.pickHistory))
-	copy(out, p.pickHistory)
+	if len(p.pickHistory) < maxPickHistory {
+		// Buffer hasn't wrapped yet; slice is already oldest-first.
+		copy(out, p.pickHistory)
+	} else {
+		// Full ring: oldest event lives at pickHistoryHead. Copy the tail
+		// (head..end) then the head (0..pickHistoryHead).
+		n := copy(out, p.pickHistory[p.pickHistoryHead:])
+		copy(out[n:], p.pickHistory[:p.pickHistoryHead])
+	}
 	return out
 }
 

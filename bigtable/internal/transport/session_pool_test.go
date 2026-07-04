@@ -216,3 +216,52 @@ func TestSessionPool_Invoke_RecordsSlowCheckoutFailure(t *testing.T) {
 		t.Errorf("ErrCode = %q, want DeadlineExceeded", ev.ErrCode)
 	}
 }
+
+// TestRecordPickDecision_RingWrap verifies the O(1) circular-buffer
+// implementation of pickHistory: pre-wrap events are in insertion order,
+// post-wrap events preserve oldest-first ordering, and the ring keeps
+// exactly maxPickHistory entries. Regression guard against the previous
+// shift-based implementation that memmoved the whole buffer per record
+// (~24µs p99 CheckoutSession regression at moderate QPS).
+func TestRecordPickDecision_RingWrap(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+
+	// Phase 1: fill up to cap-1 → snapshot should be insertion-ordered.
+	for i := 0; i < maxPickHistory-1; i++ {
+		p.recordPickDecision(PickDecision{Reason: "phase1", Winner: afeID(i + 1)}, "test")
+	}
+	snap := p.snapshotPickHistory()
+	if len(snap) != maxPickHistory-1 {
+		t.Fatalf("pre-wrap snapshot len = %d, want %d", len(snap), maxPickHistory-1)
+	}
+	if snap[0].Decision.Winner != afeID(1) || snap[len(snap)-1].Decision.Winner != afeID(maxPickHistory-1) {
+		t.Errorf("pre-wrap ordering broken: first=%d last=%d",
+			snap[0].Decision.Winner, snap[len(snap)-1].Decision.Winner)
+	}
+
+	// Phase 2: overshoot cap by 100 → ring wraps.
+	for i := maxPickHistory - 1; i < maxPickHistory+100; i++ {
+		p.recordPickDecision(PickDecision{Reason: "phase2", Winner: afeID(i + 1)}, "test")
+	}
+	snap = p.snapshotPickHistory()
+	if len(snap) != maxPickHistory {
+		t.Fatalf("post-wrap snapshot len = %d, want %d (ring must cap)", len(snap), maxPickHistory)
+	}
+	// After 100 overshoots, the oldest surviving Winner is 101; newest is
+	// maxPickHistory+100.
+	wantOldest := afeID(101)
+	wantNewest := afeID(maxPickHistory + 100)
+	if snap[0].Decision.Winner != wantOldest {
+		t.Errorf("post-wrap oldest = %d, want %d", snap[0].Decision.Winner, wantOldest)
+	}
+	if snap[len(snap)-1].Decision.Winner != wantNewest {
+		t.Errorf("post-wrap newest = %d, want %d", snap[len(snap)-1].Decision.Winner, wantNewest)
+	}
+	// Ordering must be monotonic (oldest-first).
+	for i := 1; i < len(snap); i++ {
+		if snap[i].Decision.Winner <= snap[i-1].Decision.Winner {
+			t.Fatalf("ordering broken at i=%d: snap[i-1].Winner=%d snap[i].Winner=%d",
+				i, snap[i-1].Decision.Winner, snap[i].Decision.Winner)
+		}
+	}
+}
