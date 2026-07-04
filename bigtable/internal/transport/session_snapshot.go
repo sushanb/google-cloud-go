@@ -239,6 +239,39 @@ type PoolSnapshot struct {
 	LifetimeP95       time.Duration
 	LifetimeP99       time.Duration
 	LifetimeN         int
+	// AFEs is the per-AFE view of the pool's sessionList — the picker's
+	// primary bucketing unit. One entry per AFE the pool has ever seen
+	// (empty buckets aged past afePruneMaxIdle are GC'd). Populated from
+	// sessionList.Snapshot so afez / sessionz can render the fanout
+	// without reaching into the internal type.
+	AFEs []AfeSnapshotRow
+}
+
+// AfeSnapshotRow is one row of the pool's per-AFE view — mirrors the
+// fields of the internal afeHandle that operators care about.
+type AfeSnapshotRow struct {
+	// ID is the AFE identifier (PeerInfo.ApplicationFrontendId). 0 is
+	// the sentinel bucket used for sessions whose handshake did not
+	// carry a peer-info header (older backends / tests).
+	ID int64
+	// RefCount is idle + inUse — the total number of sessions the pool
+	// still tracks on this AFE. When RefCount drops to 0 the bucket
+	// waits ~10 min before Prune drops it.
+	RefCount int
+	// IdleCount is the number of sessions currently in the AFE's queue
+	// (available to Checkout). Ready = IdleCount, InUse = RefCount −
+	// IdleCount.
+	IdleCount int
+	// TransportEwma is the current PeakEwma of (e2e − backend) per-AFE.
+	// Only OK responses feed this — Java parity.
+	TransportEwma time.Duration
+	// E2eEwma is the current PeakEwma of e2e latency per-AFE — the
+	// signal LeastLatencyAfePicker uses to steer.
+	E2eEwma time.Duration
+	// LastConnected is the last time a session on this AFE transitioned
+	// to Active. Drives Prune's aging window and gives operators a
+	// quick "when did I last see this AFE?" answer.
+	LastConnected time.Time
 }
 
 // LifetimeBucketCount is one bar in the session-lifetime histogram.
@@ -424,6 +457,7 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 		OpenRequest:    buildOpenRequestSnapshot(p.openSessionRequest, sessionType),
 		SlowVRpcs:      p.snapshotSlowVRpcs(),
 		TimeSeries:     p.snapshotTimeSeries(),
+		AFEs:           p.sl.Snapshot(),
 	}
 
 	// Pool-level aggregates: combine cluster counts + latency samples

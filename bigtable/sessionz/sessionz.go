@@ -576,7 +576,7 @@ a:hover{text-decoration:underline}
 </style>
 </head><body>
 <h1>Bigtable Session Pools</h1>
-<h2>generated {{timestamp .Generated}} · auto-refresh 5s</h2>
+<h2>generated {{timestamp .Generated}} · auto-refresh 5s · <a href="../afez/">afez ▸ per-AFE view</a></h2>
 {{if .HasProvider}}
 <div style="margin-bottom:1em;background:#fff;padding:.6em 1em;box-shadow:0 1px 2px rgba(0,0,0,.06)">
 <b>Diverter</b>

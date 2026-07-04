@@ -265,6 +265,32 @@ func (sl *sessionList) ReadyAfes() []afeSnapshot {
 	return out
 }
 
+// Snapshot returns a stable, human-readable view of every AFE bucket
+// currently tracked, sorted by ID for deterministic rendering. Cheap
+// (single lock acquisition) — safe to call from the sessionz / afez
+// snapshot paths.
+func (sl *sessionList) Snapshot() []AfeSnapshotRow {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	if len(sl.afeHandles) == 0 {
+		return nil
+	}
+	rows := make([]AfeSnapshotRow, 0, len(sl.afeHandles))
+	for _, afe := range sl.afeHandles {
+		idle := len(afe.sessions)
+		rows = append(rows, AfeSnapshotRow{
+			ID:            int64(afe.id),
+			RefCount:      afe.refCount,
+			IdleCount:     idle,
+			TransportEwma: time.Duration(afe.transportEwma.Value()),
+			E2eEwma:       time.Duration(afe.e2eEwma.Value()),
+			LastConnected: afe.lastConnected,
+		})
+	}
+	sortAfeRowsByID(rows)
+	return rows
+}
+
 // Prune deletes AfeHandles that have been empty (refCount == 0) since
 // before `now.Sub(afePruneMaxIdle)`. AFEs with any live session (idle
 // or in-flight) are never pruned. Java parity: SessionList.prune runs
@@ -309,4 +335,15 @@ func removeFromQueueLocked(afe *afeHandle, sh *SessionHandle) bool {
 		}
 	}
 	return false
+}
+
+// sortAfeRowsByID sorts an AFE snapshot slice by ID ascending. Used to
+// keep the sessionz / afez rendering deterministic across snapshots
+// (map iteration order is randomised in Go).
+func sortAfeRowsByID(rows []AfeSnapshotRow) {
+	for i := 1; i < len(rows); i++ {
+		for j := i; j > 0 && rows[j-1].ID > rows[j].ID; j-- {
+			rows[j-1], rows[j] = rows[j], rows[j-1]
+		}
+	}
 }

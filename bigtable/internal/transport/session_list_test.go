@@ -249,6 +249,35 @@ func TestSessionList_Prune(t *testing.T) {
 	}
 }
 
+func TestSessionList_Snapshot(t *testing.T) {
+	sl := newSessionList()
+
+	h5 := makeHandleWithAfe(t, 5)
+	h1a := makeHandleWithAfe(t, 1)
+	h1b := makeHandleWithAfe(t, 1)
+	sl.OnSessionStarted(h5)
+	sl.OnSessionStarted(h1a)
+	sl.OnSessionStarted(h1b)
+
+	// Mark one AFE-1 session as in-flight (idle=1, refCount=2).
+	sl.Checkout(sl.afeHandles[1])
+
+	rows := sl.Snapshot()
+	if len(rows) != 2 {
+		t.Fatalf("Snapshot rows = %d, want 2", len(rows))
+	}
+	// Deterministic sort by ID ascending → AFE 1 first, AFE 5 second.
+	if rows[0].ID != 1 || rows[0].RefCount != 2 || rows[0].IdleCount != 1 {
+		t.Errorf("rows[0] = %+v, want ID=1 RefCount=2 IdleCount=1", rows[0])
+	}
+	if rows[1].ID != 5 || rows[1].RefCount != 1 || rows[1].IdleCount != 1 {
+		t.Errorf("rows[1] = %+v, want ID=5 RefCount=1 IdleCount=1", rows[1])
+	}
+	if rows[0].LastConnected.IsZero() {
+		t.Error("LastConnected should be populated after OnSessionStarted")
+	}
+}
+
 func TestSessionList_Prune_KeepsRecentlyActiveEmpty(t *testing.T) {
 	sl := newSessionList()
 	h := makeHandleWithAfe(t, 1)
