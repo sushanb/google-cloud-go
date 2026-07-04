@@ -22,6 +22,7 @@
 package internal
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -35,6 +36,17 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
+
+// waiter is one parked CheckoutSession caller. ready is closed by
+// signalFree when this waiter is selected to wake, or by removeWaiter
+// when ctx cancellation pulls the waiter out of the queue.
+// close-exactly-once is guarded by the waitersMu / w.elem invariant:
+// the waiter is only in the queue while w.elem != nil, and both wake
+// paths hold waitersMu when they nil w.elem out.
+type waiter struct {
+	ready chan struct{}
+	elem  *list.Element // non-nil while enqueued; nil after dequeue
+}
 
 // SessionPoolImpl implements a thread-safe session pool.
 type SessionPoolImpl struct {
@@ -92,13 +104,19 @@ type SessionPoolImpl struct {
 	// out its intent via p.m.<field>.
 	m poolMetrics
 
-	// freeSignal is the pool-level "a session became idle" wake-up
-	// channel. CheckoutSession parks here when every active session
-	// has outstanding > 0; DecOutstanding does a non-blocking send
-	// when it brings a session back to outstanding == 0; OnActive
-	// does the same when a freshly-handshaked session enters the
-	// ready set. Buffer 1 so at most one wake-up is in flight.
-	freeSignal chan struct{}
+	// waiters is a FIFO queue of CheckoutSession callers parked because
+	// no idle session was available at pick time. Java-parity design
+	// (see PendingVRpc/ArrayDeque in SessionPoolImpl.java) — each free-
+	// session event wakes exactly one waiter, in insertion order. Fair
+	// under contention (no random-select unfairness like a shared chan
+	// gives). Every wake is delivered (no cap-1 collapse), so the old
+	// 50ms polling hedge is gone.
+	//
+	// Cancellation removes the waiter from the queue on the way out, so
+	// a cancelled caller doesn't hold a wake-up token that could
+	// otherwise get dropped.
+	waitersMu sync.Mutex
+	waiters   *list.List // *waiter
 
 	// poolCtx is a cancellable context scoped to the lifetime of the pool. It
 	// is passed (wrapped to strip deadlines but preserve cancellation) to the
@@ -137,7 +155,7 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 		startingSessions:   make(map[*Session]bool),
 		sessionCreatedAt:   make(map[*SessionHandle]time.Time),
 		sessionType:        sessionType,
-		freeSignal:         make(chan struct{}, 1),
+		waiters:            list.New(),
 		poolCtx:            poolCtx,
 		poolCancel:         poolCancel,
 		sl:                 newSessionList(),
@@ -169,46 +187,55 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 // which superseded an earlier per-session semaphore scheme where random
 // picks stacked on busy sessions even when idle ones existed.
 func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, error) {
+	// One-shot kick if the pool is empty. Cheap check; PerformScaling
+	// gates on its own in-progress flag so a duplicate goroutine here
+	// exits immediately.
 	p.mu.Lock()
-	if !p.closed && len(p.sessions) == 0 {
-		go p.PerformScaling(ctx)
-	}
+	empty := !p.closed && len(p.sessions) == 0
 	p.mu.Unlock()
+	if empty {
+		go p.PerformScaling(p.poolCtx)
+	}
 
 	for {
+		// Snapshot pool state under the lock. We take p.mu only long
+		// enough to (a) check closed and (b) grab a stable picker
+		// reference. Everything expensive — the picker call, the
+		// sessionList checkout, the ring-buffer record — happens
+		// OUTSIDE the lock so concurrent CheckoutSession callers can
+		// run in parallel. UpdateConfig writes p.picker under p.mu so
+		// this snapshot is a consistent picker instance for the whole
+		// pick attempt.
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
 			return nil, errors.New("session pool is closed")
 		}
+		picker := p.picker
+		p.mu.Unlock()
 
-		// Fast path: two-tier pick — pool.picker chooses an AFE from the
+		// Fast path: two-tier pick — picker chooses an AFE from the
 		// ready snapshot, then sessionList dequeues one idle session
-		// from that AFE. sessionList's queue only contains idle
-		// sessions, so we don't scan busy ones. The pool-lock we hold
-		// covers p.sessions + p.closed; sessionList uses its own inner
-		// lock (ordering: never take p.mu while holding sl.mu — here we
-		// call sl AFTER establishing !p.closed but the sl calls don't
-		// acquire p.mu, so ordering is trivially satisfied).
+		// from that AFE. sessionList uses its own lock; ordering rule
+		// (never take p.mu while holding sl.mu) holds trivially since
+		// we've released p.mu.
 		ready := p.sl.ReadyAfes()
-		pickerName := p.picker.Name()
-		afe, decision := p.picker.PickAfe(ready)
+		pickerName := picker.Name()
+		afe, decision := picker.PickAfe(ready)
 		p.recordPickDecision(decision, pickerName)
 		if afe != nil {
 			if idle := p.sl.Checkout(afe); idle != nil {
 				idle.IncOutstanding()
 				atomic.AddInt64(&idle.picks, 1)
-				p.mu.Unlock()
 				return idle, nil
 			}
 		}
 
-		// Slow path: picker returned nil. Sweep any dead handles now
-		// so subsequent scans stay cheap, then trigger scale-up if
-		// under max. Sweeping only when the picker misses trades a
-		// slightly stale p.sessions view (a session that turned dead
-		// between checkouts stays in the slice until the next miss)
-		// for skipping the sweep on every successful checkout.
+		// Slow path: picker returned nil. Sweep any dead handles under
+		// the lock and trigger scale-up if under max. Sweeping only on
+		// misses trades a slightly stale p.sessions view for skipping
+		// the O(n) walk on every successful checkout.
+		p.mu.Lock()
 		var dead []*SessionHandle
 		for _, sh := range p.sessions {
 			if sh == nil || sh.session == nil {
@@ -221,30 +248,47 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		if len(dead) > 0 {
 			p.pruneDeadLocked(dead)
 		}
-		if len(p.sessions) < p.maxSessions {
-			go p.PerformScaling(ctx)
-		}
+		needScale := len(p.sessions) < p.maxSessions
 		p.mu.Unlock()
+		if needScale {
+			go p.PerformScaling(p.poolCtx)
+		}
 
-		// Park on the wake-up channel. DecOutstanding posts when any
-		// session returns to outstanding == 0; OnActive posts when a
-		// fresh session lands. The 50ms timer is a safety net in case
-		// a wake-up was dropped (cap-1 buffer; concurrent posts
-		// collapse). ctx.Done unblocks immediately.
-		//
-		// Bracket the wait with waitersCount so the sizer (via Stats())
-		// sees the real queue depth at the pool boundary. Java tracks
-		// the same signal through its Sized pendingRpcs input.
+		// Park in the FIFO waiter queue. Each free-session event
+		// wakes exactly one waiter (queue head). No polling timer —
+		// the queue can't miss a wake-up. Bracket with waitersCount
+		// so the sizer (via Stats()) sees real queue depth.
+		w := &waiter{ready: make(chan struct{})}
+		p.waitersMu.Lock()
+		w.elem = p.waiters.PushBack(w)
+		p.waitersMu.Unlock()
+
 		p.waitersCount.Add(1)
 		select {
 		case <-ctx.Done():
 			p.waitersCount.Add(-1)
+			// Remove from queue so a subsequent free-session wake
+			// doesn't burn on a caller that's already given up.
+			p.removeWaiter(w)
 			return nil, fmt.Errorf("no active sessions available: %w", ctx.Err())
-		case <-p.freeSignal:
-		case <-time.After(50 * time.Millisecond):
+		case <-w.ready:
+			p.waitersCount.Add(-1)
+			// Woken by signalFree. Loop back to re-pick.
 		}
-		p.waitersCount.Add(-1)
 	}
+}
+
+// removeWaiter pulls w out of the waiter queue if still present. Safe
+// to call from the ctx-cancel path even when signalFree has already
+// removed the waiter (checks w.elem — nil means already dequeued by
+// signalFree, which will have closed w.ready).
+func (p *SessionPoolImpl) removeWaiter(w *waiter) {
+	p.waitersMu.Lock()
+	if w.elem != nil {
+		p.waiters.Remove(w.elem)
+		w.elem = nil
+	}
+	p.waitersMu.Unlock()
 }
 
 // pruneDeadLocked removes the given handles from p.sessions (caller
@@ -269,14 +313,20 @@ func (p *SessionPoolImpl) pruneDeadLocked(dead []*SessionHandle) {
 	go p.PerformScaling(context.Background())
 }
 
-// signalFree posts to p.freeSignal without blocking. Cap-1 buffer
-// collapses concurrent signals; that's fine — the woken waiter
-// re-scans everything under the lock.
+// signalFree wakes exactly one parked CheckoutSession waiter — the
+// FIFO queue head. No-op when the queue is empty. Called from
+// Invoke's defer (session-freed) and OnActive (new session became
+// ready). Never blocks: the wake channel is dedicated per-waiter, so
+// there's no cap-1 collapse to worry about.
 func (p *SessionPoolImpl) signalFree() {
-	select {
-	case p.freeSignal <- struct{}{}:
-	default:
+	p.waitersMu.Lock()
+	if e := p.waiters.Front(); e != nil {
+		w := e.Value.(*waiter)
+		p.waiters.Remove(e)
+		w.elem = nil
+		close(w.ready)
 	}
+	p.waitersMu.Unlock()
 }
 
 // Stats returns the current operational statistics of the session pool.

@@ -288,38 +288,99 @@ func TestSetPoolShortName_FlattensSlashes(t *testing.T) {
 	}
 }
 
-func TestSignalFree_NonBlockingWhenBufferFull(t *testing.T) {
+// TestSignalFree_NoWaitersIsNoOp verifies the queue-based signalFree
+// exits fast when no CheckoutSession caller is parked (nothing to
+// wake). Regression guard against re-introducing a cap-1 channel or
+// any other "buffer a spare wake-up" scheme.
+func TestSignalFree_NoWaitersIsNoOp(t *testing.T) {
 	p := newTestPool(t, 1, 10)
-	// Drain first so we know starting state.
-	select {
-	case <-p.freeSignal:
-	default:
-	}
-	// First signal fills the cap-1 buffer.
-	p.signalFree()
-	// Second signal must be dropped, not block. Race the call against a
-	// timeout — signalFree not returning within a beat is the failure.
 	done := make(chan struct{})
 	go func() {
+		p.signalFree()
+		p.signalFree()
 		p.signalFree()
 		close(done)
 	}()
 	select {
 	case <-done:
+		// expected — no blocking
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("signalFree blocked with empty waiter queue")
+	}
+	// No accumulated tokens: signalFree with no waiters is truly a no-op.
+	p.waitersMu.Lock()
+	remaining := p.waiters.Len()
+	p.waitersMu.Unlock()
+	if remaining != 0 {
+		t.Errorf("waiters queue = %d, want 0 (signalFree must not add anything)", remaining)
+	}
+}
+
+// TestSignalFree_WakesHeadWaiter parks two waiters directly on the
+// queue and verifies the first signalFree wakes exactly the first one
+// (FIFO), and a second signalFree wakes the second. Java-parity
+// pendingRpcs.removeFirst semantic.
+func TestSignalFree_WakesHeadWaiter(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+
+	w1 := &waiter{ready: make(chan struct{})}
+	w2 := &waiter{ready: make(chan struct{})}
+	p.waitersMu.Lock()
+	w1.elem = p.waiters.PushBack(w1)
+	w2.elem = p.waiters.PushBack(w2)
+	p.waitersMu.Unlock()
+
+	p.signalFree()
+	select {
+	case <-w1.ready:
 		// expected
 	case <-time.After(100 * time.Millisecond):
-		t.Fatal("signalFree blocked with buffer full; should drop silently")
-	}
-	// Buffer should still hold exactly one wake-up.
-	select {
-	case <-p.freeSignal:
-	default:
-		t.Error("no wake-up available after two signalFree calls; first was lost")
+		t.Fatal("head waiter not woken by first signalFree")
 	}
 	select {
-	case <-p.freeSignal:
-		t.Error("second wake-up was somehow queued; buffer should have collapsed the duplicate")
+	case <-w2.ready:
+		t.Error("second waiter woken by first signalFree — FIFO broken")
 	default:
+	}
+
+	p.signalFree()
+	select {
+	case <-w2.ready:
+		// expected
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("second waiter not woken by second signalFree")
+	}
+}
+
+// TestRemoveWaiter_IdempotentWithSignalFree verifies the concurrency
+// contract: signalFree and removeWaiter never double-close w.ready.
+// signalFree removes+closes; if the caller subsequently ctx-cancels,
+// removeWaiter checks w.elem == nil and skips the close.
+func TestRemoveWaiter_IdempotentWithSignalFree(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+
+	w := &waiter{ready: make(chan struct{})}
+	p.waitersMu.Lock()
+	w.elem = p.waiters.PushBack(w)
+	p.waitersMu.Unlock()
+
+	// signalFree removes and closes.
+	p.signalFree()
+	select {
+	case <-w.ready:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("waiter not woken by signalFree")
+	}
+
+	// removeWaiter called AFTER signalFree must not panic (would
+	// double-close if it re-issued close on an already-closed channel).
+	p.removeWaiter(w)
+	// Sanity: w.elem stays nil.
+	p.waitersMu.Lock()
+	elem := w.elem
+	p.waitersMu.Unlock()
+	if elem != nil {
+		t.Errorf("w.elem = %p, want nil after signalFree", elem)
 	}
 }
 

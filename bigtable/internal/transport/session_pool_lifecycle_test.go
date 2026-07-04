@@ -112,12 +112,13 @@ func TestOnActive_DuplicateSessionSkipped(t *testing.T) {
 
 func TestOnActive_SignalsFree(t *testing.T) {
 	p := newTestPool(t, 1, 10)
-	// Drain any pre-existing signal.
-	select {
-	case <-p.freeSignal:
-	default:
-	}
-	// Craft a fresh session and fire OnActive — must post to freeSignal.
+	// Park a waiter directly on the queue. OnActive should wake it.
+	w := &waiter{ready: make(chan struct{})}
+	p.waitersMu.Lock()
+	w.elem = p.waiters.PushBack(w)
+	p.waitersMu.Unlock()
+
+	// Craft a fresh session and fire OnActive — must wake the parked waiter.
 	stream := newFakeStream()
 	s := NewSession("s-fresh", stream, SessionHooks{
 		OnStart:  p.OnStart,
@@ -127,10 +128,10 @@ func TestOnActive_SignalsFree(t *testing.T) {
 	s.state.Store(int32(StateReady))
 	p.OnActive(s)
 	select {
-	case <-p.freeSignal:
+	case <-w.ready:
 		// expected
 	case <-time.After(100 * time.Millisecond):
-		t.Error("OnActive did not signal freeSignal within 100ms")
+		t.Error("OnActive did not wake the parked waiter within 100ms")
 	}
 }
 
