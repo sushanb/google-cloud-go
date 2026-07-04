@@ -66,6 +66,10 @@ type flightzPage struct {
 	TotalSessions  int
 	ActiveSessions int
 	PoolFilter     string // empty for cross-pool view
+	// LinkBase is the relative prefix templates use for cross-view links
+	// (../sessionz/ etc). "../" on the /flightz/ index; "../../" on the
+	// /flightz/pool/{key} sub-page so links resolve to /debug/<view>/.
+	LinkBase string
 }
 
 func (s *flightzServer) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -102,12 +106,17 @@ func (s *flightzServer) render(w http.ResponseWriter, r *http.Request, poolFilte
 		return
 	}
 
+	linkBase := "../"
+	if poolFilter != "" {
+		linkBase = "../../"
+	}
 	writeHTML(w, flightzTpl, flightzPage{
 		Generated:      now,
 		Rows:           rows,
 		TotalSessions:  totalSess,
 		ActiveSessions: activeSess,
 		PoolFilter:     poolFilter,
+		LinkBase:       linkBase,
 	})
 }
 
@@ -242,7 +251,7 @@ td.mono, td.age, td.deadline { font-family: ui-monospace, SFMono-Regular, Menlo,
   {{if .HasDeadline}}{{remaining .DeadlineRemaining}}{{else}}—{{end}}
 </td>
 <td class="num">{{.RpcID}}</td>
-<td class="mono"><a href="../sessionz/pool/{{queryEscape .Pool}}#session-{{.Session}}" title="Open this session in sessionz">{{.Session}}</a></td>
+<td class="mono"><a href="{{$.LinkBase}}sessionz/pool/{{queryEscape .Pool}}#session-{{.Session}}" title="Open this session in sessionz">{{.Session}}</a></td>
 {{if not $.PoolFilter}}<td class="mono"><a href="pool/{{pathEscape .Pool}}" title="Filter flightz to this pool">{{.Pool}}</a></td>{{end}}
 <td class="mono">{{peerShort .Peer}}</td>
 <td>{{.SessionState}}</td>
@@ -260,9 +269,9 @@ No in-flight vRPCs.
 
 <div class="foot">
 <a href="?format=json">JSON</a>
-<a href="../sessionz/">sessionz</a>
-<a href="../channelz/">channelz</a>
-<a href="../configz/">configz</a>
+<a href="{{.LinkBase}}sessionz/">sessionz</a>
+<a href="{{.LinkBase}}channelz/">channelz</a>
+<a href="{{.LinkBase}}configz/">configz</a>
 </div>
 </body></html>
 `
