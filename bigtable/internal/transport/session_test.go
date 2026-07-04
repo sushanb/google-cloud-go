@@ -301,6 +301,65 @@ func TestHandleOpenSession_TransitionsToActive(t *testing.T) {
 	}
 }
 
+// TestHandleOpenSession_PeerInfoBeforeOnActive verifies the invariant that
+// PeerInfo is populated *before* the onActive hook fires. The AFE-grouping
+// picker relies on this: it reads s.AfeID() (which reads PeerInfo) inside
+// its OnActive path, so a nil PeerInfo would silently bucket the session
+// under AfeID=0.
+func TestHandleOpenSession_PeerInfoBeforeOnActive(t *testing.T) {
+	pi := &spb.PeerInfo{
+		ApplicationFrontendSubzone: "us-central1-a",
+		TransportType:              spb.PeerInfo_TRANSPORT_TYPE_DIRECT_ACCESS,
+	}
+	raw, err := proto.Marshal(pi)
+	if err != nil {
+		t.Fatalf("proto.Marshal: %v", err)
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(raw)
+
+	stream := newFakeStream()
+	stream.hdr = metadata.MD{peerInfoHeaderKey: []string{encoded}}
+
+	var peerInfoAtActive *spb.PeerInfo
+	hooks := SessionHooks{
+		OnActive: func(s *Session) {
+			peerInfoAtActive = s.PeerInfo()
+		},
+	}
+	s := newTestSession(t, stream, hooks)
+	s.state.Store(int32(StateStarting))
+
+	s.handleOpenSession(&spb.OpenSessionResponse{})
+
+	if peerInfoAtActive == nil {
+		t.Fatal("PeerInfo was nil when onActive fired; expected populated")
+	}
+	if got := peerInfoAtActive.GetApplicationFrontendSubzone(); got != "us-central1-a" {
+		t.Errorf("PeerInfo.ApplicationFrontendSubzone = %q, want us-central1-a", got)
+	}
+}
+
+// TestHandleOpenSession_MissingHeaderStillFiresOnActive covers the case where
+// the server did not send the bigtable-peer-info header (older backends /
+// tests). onActive must still fire; PeerInfo simply remains nil.
+func TestHandleOpenSession_MissingHeaderStillFiresOnActive(t *testing.T) {
+	stream := newFakeStream()
+	// stream.hdr is an empty MD by default; no peer-info header.
+
+	listener := &hookCounts{}
+	s := newTestSession(t, stream, listener.hooks())
+	s.state.Store(int32(StateStarting))
+
+	s.handleOpenSession(&spb.OpenSessionResponse{})
+
+	if _, active, _ := listener.counts(); active != 1 {
+		t.Errorf("OnActive called %d times, want 1", active)
+	}
+	if s.PeerInfo() != nil {
+		t.Error("PeerInfo should be nil when header absent")
+	}
+}
+
 func TestHandleVRPCResponse_RoutesByRpcID(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 

@@ -168,23 +168,6 @@ func (s *Session) Send(req *spb.SessionRequest) error {
 
 // readLoop drives the inbound side of the stream until Recv returns an error.
 func (s *Session) readLoop(ctx context.Context) {
-	// Extract peer info from the header metadata asynchronously so we don't
-	// block reads on the header arriving. Also stamps the TCP remote addr
-	// from the stream's peer info so sessionz can link a slow-vRPC row to
-	// the exact conn in tcpz.
-	go func() {
-		headerMD, err := s.stream.Header()
-		if err != nil {
-			s.debugf("stream Header() failed: %v", err)
-			return
-		}
-		s.peerInfoExtracter(headerMD.Get(peerInfoHeaderKey))
-		if p, ok := peer.FromContext(s.stream.Context()); ok && p.Addr != nil {
-			addr := p.Addr.String()
-			s.remoteAddr.Store(&addr)
-		}
-	}()
-
 	// Supervisor: if ctx is cancelled, mark the session closed so callers
 	// observe state immediately. Unblocking Recv() requires the underlying
 	// stream's context to be cancelled by the caller.
@@ -242,9 +225,25 @@ func (s *Session) handleSessionResponse(resp *spb.SessionResponse) {
 }
 
 // handleOpenSession transitions Starting -> Active and signals listeners.
+// Peer info (from the bigtable-peer-info header) and the TCP remote addr are
+// captured synchronously here — gRPC guarantees the header frame precedes
+// any bidi message, so by the time we've received the OpenSession response
+// the header is already buffered and stream.Header() returns without
+// blocking. Ordering: extract first, then fire onActive, so every observer
+// sees a session whose PeerInfo (and therefore AfeID) is populated. This
+// matches Java's onHeaders synchrony.
 func (s *Session) handleOpenSession(_ *spb.OpenSessionResponse) {
 	if _, ok := s.transitionTo(StateActive, isState(StateStarting)); !ok {
 		return
+	}
+	if md, err := s.stream.Header(); err == nil {
+		s.peerInfoExtracter(md.Get(peerInfoHeaderKey))
+	} else {
+		s.debugf("stream Header() failed: %v", err)
+	}
+	if p, ok := peer.FromContext(s.stream.Context()); ok && p.Addr != nil {
+		addr := p.Addr.String()
+		s.remoteAddr.Store(&addr)
 	}
 	s.tracer.recordOpen(context.Background(), nil)
 	s.hooks.onActive(s)
