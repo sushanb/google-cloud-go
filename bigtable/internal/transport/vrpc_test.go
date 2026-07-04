@@ -27,20 +27,20 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
-type mockListener struct {
+type mockTracer struct {
 	mu              sync.Mutex
 	starts          []int
 	completes       []int
 	completeErrors  []error
 }
 
-func (m *mockListener) OnAttemptStart(ctx context.Context) {
+func (m *mockTracer) OnAttemptStart(ctx context.Context) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.starts = append(m.starts, VRpcAttempt(ctx))
 }
 
-func (m *mockListener) OnAttemptComplete(ctx context.Context, err error) {
+func (m *mockTracer) OnAttemptComplete(ctx context.Context, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.completes = append(m.completes, VRpcAttempt(ctx))
@@ -110,11 +110,11 @@ func TestRetryingVRpc_SuccessOnRetry(t *testing.T) {
 		return "success_resp", nil
 	}
 
-	listener := &mockListener{}
+	tracer := &mockTracer{}
 	retryInterceptor := RetryingVRpc(RetryingOptions{
 		MaxAttempts:    5,
 		InitialBackoff: 1 * time.Millisecond,
-		Listener:       listener,
+		Tracer:         tracer,
 		Idempotent:     true,
 	})
 
@@ -132,22 +132,22 @@ func TestRetryingVRpc_SuccessOnRetry(t *testing.T) {
 		t.Errorf("Expected 3 attempts, got %d", attempts)
 	}
 
-	listener.mu.Lock()
-	defer listener.mu.Unlock()
+	tracer.mu.Lock()
+	defer tracer.mu.Unlock()
 
 	expectedStarts := []int{1, 2, 3}
-	if len(listener.starts) != len(expectedStarts) {
-		t.Errorf("Expected %d starts, got %d", len(expectedStarts), len(listener.starts))
+	if len(tracer.starts) != len(expectedStarts) {
+		t.Errorf("Expected %d starts, got %d", len(expectedStarts), len(tracer.starts))
 	}
 	for i, v := range expectedStarts {
-		if listener.starts[i] != v {
-			t.Errorf("Expected start attempt at index %d to be %d, got %d", i, v, listener.starts[i])
+		if tracer.starts[i] != v {
+			t.Errorf("Expected start attempt at index %d to be %d, got %d", i, v, tracer.starts[i])
 		}
 	}
 
 	expectedCompletes := []int{1, 2, 3}
-	if len(listener.completes) != len(expectedCompletes) {
-		t.Errorf("Expected %d completes, got %d", len(expectedCompletes), len(listener.completes))
+	if len(tracer.completes) != len(expectedCompletes) {
+		t.Errorf("Expected %d completes, got %d", len(expectedCompletes), len(tracer.completes))
 	}
 }
 

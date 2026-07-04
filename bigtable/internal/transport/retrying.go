@@ -29,7 +29,7 @@ type RetryingOptions struct {
 	InitialBackoff    time.Duration
 	MaxBackoff        time.Duration
 	BackoffMultiplier float64
-	Listener          VRpcListener
+	Tracer            VRpcTracer
 	// Idempotent tells the interceptor whether TransportFailure attempts
 	// (frame handed to the wire, no server response observed) are safe to
 	// retry. Reads set this true; non-idempotent Apply sets it false.
@@ -62,7 +62,7 @@ func RetryingVRpc(opts RetryingOptions) Interceptor {
 	return func(ctx context.Context, req interface{}, next Handler) (interface{}, error) {
 		var attempt int32
 		backoff := opts.InitialBackoff
-		listener := opts.Listener // may be nil
+		tracer := opts.Tracer // may be nil
 
 		var lastErr error
 
@@ -81,14 +81,14 @@ func RetryingVRpc(opts RetryingOptions) Interceptor {
 				attemptCtx = WithPrevAttemptErr(attemptCtx, lastErr)
 			}
 
-			if listener != nil {
-				listener.OnAttemptStart(attemptCtx)
+			if tracer != nil {
+				tracer.OnAttemptStart(attemptCtx)
 			}
 
 			res, err := next(attemptCtx, req)
 
-			if listener != nil {
-				listener.OnAttemptComplete(attemptCtx, err)
+			if tracer != nil {
+				tracer.OnAttemptComplete(attemptCtx, err)
 			}
 
 			if err == nil {

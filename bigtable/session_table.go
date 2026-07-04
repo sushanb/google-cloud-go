@@ -136,15 +136,15 @@ func NewSessionTable(
 	}
 }
 
-type sessionMetricsListener struct{}
+type sessionMetricsTracer struct{}
 
-func (l sessionMetricsListener) OnAttemptStart(ctx context.Context) {
+func (l sessionMetricsTracer) OnAttemptStart(ctx context.Context) {
 	if mt := metricsTracerFromContext(ctx); mt != nil {
 		mt.recordAttemptStart()
 	}
 }
 
-func (l sessionMetricsListener) OnAttemptComplete(ctx context.Context, err error) {
+func (l sessionMetricsTracer) OnAttemptComplete(ctx context.Context, err error) {
 	if mt := metricsTracerFromContext(ctx); mt != nil {
 		mt.recordAttemptCompletion(nil, nil, err)
 	}
@@ -192,7 +192,7 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 		InitialBackoff:    10 * time.Millisecond,
 		MaxBackoff:        32 * time.Second,
 		BackoffMultiplier: 1.5,
-		Listener:          sessionMetricsListener{},
+		Tracer:            sessionMetricsTracer{},
 		Idempotent:        true, // reads are always idempotent
 	})
 
@@ -287,7 +287,7 @@ func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts 
 		InitialBackoff:    10 * time.Millisecond,
 		MaxBackoff:        32 * time.Second,
 		BackoffMultiplier: 1.5,
-		Listener:          sessionMetricsListener{},
+		Tracer:            sessionMetricsTracer{},
 		Idempotent:        mutationsAreRetryable(m.ops),
 	})
 

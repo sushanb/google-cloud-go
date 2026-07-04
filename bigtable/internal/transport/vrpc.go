@@ -89,8 +89,11 @@ type Handler func(ctx context.Context, req interface{}) (interface{}, error)
 // Interceptor represents a decorator middleware that intercepts a virtual RPC downstream invocation.
 type Interceptor func(ctx context.Context, req interface{}, handler Handler) (interface{}, error)
 
-// VRpcListener receives notifications of vRPC attempt lifecycles.
-type VRpcListener interface {
+// VRpcTracer receives per-attempt lifecycle notifications from
+// RetryingVRpc. Matches Java's VRpcTracer role and the tracing/OTel
+// vocabulary — this is a passive observer, not an event subscription
+// (nothing is buffered or delivered asynchronously).
+type VRpcTracer interface {
 	// OnAttemptStart is called before a new attempt is executed.
 	OnAttemptStart(ctx context.Context)
 	// OnAttemptComplete is called after an attempt completes (with success or error).
