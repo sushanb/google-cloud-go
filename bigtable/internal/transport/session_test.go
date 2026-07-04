@@ -382,42 +382,26 @@ func TestHandleErrorResponse_SessionFatalForcesClose(t *testing.T) {
 	}
 }
 
-func TestHandleGoAway_UnadmittedIsCancelled(t *testing.T) {
+func TestHandleGoAway_CancelsInFlightRPC(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 
-	// With multiPlexingLimit=1 only one vRPC can be in flight at a time.
-	// Exercise both branches of the filter (id > lastAdmitted → cancelled;
-	// id <= lastAdmitted → kept).
-	t.Run("unadmitted cancelled", func(t *testing.T) {
-		rpc := &vrpcImpl{id: 3, resultChan: make(chan vrpcResult, 1)}
-		s.activeRPC.Store(rpc)
-		s.handleGoAway(&spb.GoAwayResponse{LastRpcIdAdmitted: 2, Reason: "test"})
-		if got := s.State(); got != StateClosing {
-			t.Errorf("state = %v, want StateClosing", got)
+	rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
+	s.activeRPC.Store(rpc)
+	s.handleGoAway(&spb.GoAwayResponse{Reason: "test"})
+	if got := s.State(); got != StateClosing {
+		t.Errorf("state = %v, want StateClosing", got)
+	}
+	if s.activeRPC.Load() != nil {
+		t.Error("in-flight RPC should have been cleared from slot")
+	}
+	select {
+	case res := <-rpc.resultChan:
+		if !errors.Is(res.err, ErrUnavailableGoAway) {
+			t.Errorf("cancelled cause = %v, want ErrUnavailableGoAway", res.err)
 		}
-		if s.activeRPC.Load() != nil {
-			t.Error("unadmitted RPC should have been cleared from slot")
-		}
-		select {
-		case res := <-rpc.resultChan:
-			if !errors.Is(res.err, ErrUnavailableGoAway) {
-				t.Errorf("cancelled cause = %v, want ErrUnavailableGoAway", res.err)
-			}
-		default:
-			t.Error("unadmitted RPC not cancelled")
-		}
-	})
-
-	t.Run("admitted retained", func(t *testing.T) {
-		// Re-arm on a fresh session since the prior transitioned to Closing.
-		s2, _ := makeActive(t, SessionHooks{})
-		rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
-		s2.activeRPC.Store(rpc)
-		s2.handleGoAway(&spb.GoAwayResponse{LastRpcIdAdmitted: 2, Reason: "test"})
-		if s2.activeRPC.Load() != rpc {
-			t.Error("admitted RPC should remain in slot")
-		}
-	})
+	default:
+		t.Error("in-flight RPC not cancelled")
+	}
 }
 
 func TestHandleSessionParameters_UpdatesIntervalAndDeadline(t *testing.T) {

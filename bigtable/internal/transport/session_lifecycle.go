@@ -296,8 +296,8 @@ func (s *Session) handleSessionRefreshConfig(cfg *spb.SessionRefreshConfig) {
 //  1. Transitions to StateClosing (no backwards motion from terminal states).
 //  2. Stamps "GoAway" as the close reason so it survives the eventual
 //     handleClose stamp.
-//  3. Cancels every in-flight RPC whose id exceeds lastAdmitted — the server
-//     has promised never to ack those.
+//  3. Cancels every in-flight RPC — once the server has sent GOAWAY we
+//     never treat any pending vRPC as admitted.
 //  4. Spawns a goroutine that drives the session through Closing →
 //     WaitServerClose → Closed via s.Close, so the lifecycle completes even
 //     when the server forgets to follow up with a stream EOF.
@@ -309,16 +309,12 @@ func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
 	}
 	s.setCloseReason("GoAway")
 
-	lastAdmitted := goAway.GetLastRpcIdAdmitted()
-	s.debugf("received GOAWAY reason=%q description=%q last_rpc_id_admitted=%d",
-		goAway.GetReason(), goAway.GetDescription(), lastAdmitted)
+	s.debugf("received GOAWAY reason=%q description=%q",
+		goAway.GetReason(), goAway.GetDescription())
 
-	err := unavailable(ErrUnavailableGoAway,
-		"vRPC not admitted before GOAWAY (last_admitted=%d)", lastAdmitted)
-	s.cancelActiveRPCs(err, func(id int64) bool { return id > lastAdmitted })
+	s.cancelActiveRPCs(unavailable(ErrUnavailableGoAway, "server sent GOAWAY"), nil)
 
-	// Drive the lifecycle to completion off the readLoop. s.Close drains
-	// the remaining admitted RPCs (or returns on ctx-timeout via ForceClose),
+	// Drive the lifecycle to completion off the readLoop. s.Close
 	// sends CloseSession, transitions to WaitServerClose, and then the
 	// pool's stuck-session monitor or the server's EOF moves us to Closed.
 	go func() {

@@ -54,8 +54,8 @@ var (
 	// ErrUnavailableHeartBeatMissed indicates the session was torn down because
 	// the server stopped sending heartbeats within the negotiated window.
 	ErrUnavailableHeartBeatMissed = errors.New("bigtable: session unavailable: server heartbeat missed")
-	// ErrUnavailableGoAway indicates the server sent a GOAWAY and cancelled
-	// vRPCs that had not yet been admitted.
+	// ErrUnavailableGoAway indicates the server sent a GOAWAY, which cancels
+	// every in-flight vRPC on the session.
 	ErrUnavailableGoAway = errors.New("bigtable: session unavailable: server sent GOAWAY")
 	// ErrUnavailableSessionError indicates the server reported a fatal
 	// session-level error (an ErrorResponse with rpc_id == 0).
