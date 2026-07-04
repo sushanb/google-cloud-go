@@ -78,7 +78,7 @@ func TestSession_Snapshot_BasicFields(t *testing.T) {
 	s.errorRpcs.Store(1)
 
 	snap := s.Snapshot()
-	if snap.State != "Active" {
+	if snap.State != "Ready" {
 		t.Errorf("State = %q, want Active", snap.State)
 	}
 	if snap.LogName != "test-session" {
@@ -133,7 +133,7 @@ func TestPoolSnapshot_AggregatesSessions(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		stream := newFakeStream()
 		s := NewSession("s", stream, SessionHooks{}, SessionTypeTable)
-		s.state.Store(int32(StateActive))
+		s.state.Store(int32(StateReady))
 		sh := NewSessionHandle(s)
 		pool.sessions = append(pool.sessions, sh)
 	}

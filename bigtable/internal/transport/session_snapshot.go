@@ -192,7 +192,7 @@ type PoolSnapshot struct {
 	// non-session pool state.
 	ClusterCounts map[string]int64
 	// StateCounts is the per-state population summary across every session
-	// currently in the pool: e.g. {"Active": 5, "Closing": 1,
+	// currently in the pool: e.g. {"Ready": 5, "Closing": 1,
 	// "WaitServerClose": 2}. Lets the debug UI render "how many are
 	// healthy right now" without rescanning each row. Keys come from
 	// State.String() so they line up with the per-session State column.
@@ -478,7 +478,7 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 		snap.Sessions = append(snap.Sessions, s)
 
 		stateCounts[s.State]++
-		if s.State == StateActive.String() {
+		if s.State == StateReady.String() {
 			snap.ReadyCount++
 		}
 		if s.Handle.Outstanding > 0 {

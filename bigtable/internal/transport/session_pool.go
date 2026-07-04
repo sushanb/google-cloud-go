@@ -206,7 +206,7 @@ type SlowVRpcEvent struct {
 	// RpcIDOnSession is the per-session 1-indexed RPC id; very small
 	// values mean this was a freshly-opened session.
 	RpcIDOnSession int64
-	// SessionAge is time since the session entered StateActive — zero
+	// SessionAge is time since the session entered StateReady — zero
 	// if the session never reached Active (rare error path).
 	SessionAge time.Duration
 	// Peer captures the AFE/GFE the session was bound to at the time
@@ -451,7 +451,7 @@ func (p *SessionPoolImpl) sampleActiveUptimes(ctx context.Context) {
 		if sh == nil || sh.session == nil {
 			continue
 		}
-		if State(sh.session.state.Load()) != StateActive {
+		if State(sh.session.state.Load()) != StateReady {
 			continue
 		}
 		active = append(active, sh.session)
@@ -736,7 +736,7 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 			if sh == nil || sh.session == nil {
 				continue
 			}
-			if sh.session.State() != StateActive {
+			if sh.session.State() != StateReady {
 				dead = append(dead, sh)
 			}
 		}
@@ -809,7 +809,7 @@ func (p *SessionPoolImpl) Stats() *PoolStats {
 	ready := 0
 	inUse := 0
 	for _, sh := range p.sessions {
-		if sh.session.State() == StateActive {
+		if sh.session.State() == StateReady {
 			ready++
 		}
 		if atomic.LoadInt64(&sh.outstanding) > 0 {

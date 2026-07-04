@@ -205,7 +205,7 @@ var funcs = template.FuncMap{
 	},
 	"stateClass": func(state string) string {
 		switch state {
-		case "Active":
+		case "Ready":
 			return "state-active"
 		case "Starting", "New":
 			return "state-starting"
@@ -349,7 +349,7 @@ var funcs = template.FuncMap{
 			return template.HTML("—")
 		}
 		// Render in a stable canonical order so similar pools line up.
-		order := []string{"New", "Starting", "Active", "Closing", "WaitServerClose", "Closed"}
+		order := []string{"New", "Starting", "Ready", "Closing", "WaitServerClose", "Closed"}
 		var b strings.Builder
 		for _, k := range order {
 			v, ok := m[k]
@@ -358,7 +358,7 @@ var funcs = template.FuncMap{
 			}
 			cls := "chip"
 			switch k {
-			case "Active":
+			case "Ready":
 				cls += " chip-active"
 			case "Starting", "New":
 				cls += " chip-starting"

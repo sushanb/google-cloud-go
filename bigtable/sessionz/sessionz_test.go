@@ -49,7 +49,7 @@ func sampleSnapshot() []btransport.PoolSnapshot {
 			Sessions: []btransport.SessionSnapshot{
 				{
 					LogName:           "session-read-1",
-					State:             "Active",
+					State:             "Ready",
 					SessionType:       "table",
 					LastStateChange:   time.Now().Add(-90 * time.Second),
 					OkRpcs:            42,
@@ -139,7 +139,7 @@ func TestPool_HTML_RendersSessions(t *testing.T) {
 	wants := []string{
 		"my-table:read",
 		"session-read-1", "session-read-2",
-		"Active", "Starting",
+		"Ready", "Starting",
 		"TRANSPORT_TYPE_SESSION_DIRECT_ACCESS",
 		"us-central1", "us-central1-b1",
 		"42",  // OK count
