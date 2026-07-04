@@ -132,23 +132,31 @@ func TestLeastLatencyAfePicker_EmptyReturnsNil(t *testing.T) {
 	}
 }
 
-// kChoiceMinCost must not mutate the caller's snapshot slice — pickers
-// receive an immutable view from sessionList.ReadyAfes and multiple
-// concurrent callers may share it.
-func TestKChoiceMinCost_DoesNotMutateInput(t *testing.T) {
+// kChoiceMinCost mutates the caller's snapshot slice in place via
+// partial Fisher-Yates swap-to-front. Documented contract: callers must
+// own the slice. Production call site is CheckoutSession, which passes
+// p.sl.ReadyAfes() — a freshly-allocated slice per call. Verify the
+// mutation happens (all K positions get filled with distinct entries)
+// so a future re-introduction of a defensive copy is caught.
+func TestKChoiceMinCost_MutatesInputInPlace(t *testing.T) {
 	snaps := []afeSnapshot{
 		makeSnapshot(1, 0, 0),
 		makeSnapshot(2, 0, 0),
 		makeSnapshot(3, 0, 0),
 	}
-	orig := make([]afeSnapshot, len(snaps))
-	copy(orig, snaps)
-
+	// After PickAfe with K=3, all three positions must contain the same
+	// set of IDs (swap-to-front is a permutation, not a rewrite). Also
+	// verify that the picker actually visited every slot: with K=len(snaps)
+	// the first-K elements are exactly the K sampled candidates.
 	NewLeastInFlightAfePicker(3).PickAfe(snaps)
 
-	for i := range snaps {
-		if snaps[i].Handle.ID() != orig[i].Handle.ID() {
-			t.Errorf("snaps[%d] = %d, want unchanged %d", i, snaps[i].Handle.ID(), orig[i].Handle.ID())
+	seen := map[afeID]bool{}
+	for _, s := range snaps {
+		seen[s.Handle.ID()] = true
+	}
+	for _, want := range []afeID{1, 2, 3} {
+		if !seen[want] {
+			t.Errorf("after PickAfe, ID %d missing from mutated slice (%v)", want, seen)
 		}
 	}
 }

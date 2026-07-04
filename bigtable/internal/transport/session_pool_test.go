@@ -33,7 +33,7 @@ func stubPoolStreamFactory(_ context.Context) (Stream, error) {
 // wraps it in a SessionHandle, and pushes it into pool.sessions (registering
 // the createdAt time). This bypasses the real Start/handshake path so tests
 // can exercise pool-level logic in milliseconds.
-func injectActiveSession(t *testing.T, p *SessionPoolImpl, name string, createdAt time.Time) *SessionHandle {
+func injectActiveSession(t testing.TB, p *SessionPoolImpl, name string, createdAt time.Time) *SessionHandle {
 	t.Helper()
 	stream := newFakeStream()
 	s := NewSession(name, stream, SessionHooks{
@@ -56,7 +56,7 @@ func injectActiveSession(t *testing.T, p *SessionPoolImpl, name string, createdA
 	return sh
 }
 
-func newTestPool(t *testing.T, min, max int) *SessionPoolImpl {
+func newTestPool(t testing.TB, min, max int) *SessionPoolImpl {
 	t.Helper()
 	return NewSessionPoolImpl(
 		"test-pool",
