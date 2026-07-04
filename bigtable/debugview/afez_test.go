@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package afez
+package debugview
 
 import (
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -25,15 +24,7 @@ import (
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 )
 
-type fakeProvider struct {
-	pools []btransport.PoolSnapshot
-}
-
-func (f fakeProvider) Snapshot() []btransport.PoolSnapshot { return f.pools }
-func (fakeProvider) Diverter() btransport.DiverterSnapshot { return btransport.DiverterSnapshot{} }
-func (fakeProvider) LoadBalancingSnapshots() []btransport.LoadBalancingSnapshot { return nil }
-
-func sampleSnapshot() []btransport.PoolSnapshot {
+func afezSampleSnapshot() []btransport.PoolSnapshot {
 	now := time.Now()
 	// Provider returns rows in whatever order it chooses. Production
 	// sessionList.Snapshot sorts by ID; this fake mirrors that (0
@@ -62,16 +53,8 @@ func sampleSnapshot() []btransport.PoolSnapshot {
 	}
 }
 
-func get(t *testing.T, h http.Handler, target string) *httptest.ResponseRecorder {
-	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, target, nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	return rec
-}
-
-func TestIndex_HTML_RendersAFEs(t *testing.T) {
-	h := HandlerFromProvider(fakeProvider{pools: sampleSnapshot()})
+func TestAfez_Index_HTML_RendersAFEs(t *testing.T) {
+	h := newAfezHandler(fakeSessionProvider{pools: afezSampleSnapshot()})
 	rec := get(t, h, "/")
 
 	if rec.Code != http.StatusOK {
@@ -88,16 +71,16 @@ func TestIndex_HTML_RendersAFEs(t *testing.T) {
 	}
 }
 
-func TestIndex_JSON_RoundTrips(t *testing.T) {
-	h := HandlerFromProvider(fakeProvider{pools: sampleSnapshot()})
+func TestAfez_Index_JSON_RoundTrips(t *testing.T) {
+	h := newAfezHandler(fakeSessionProvider{pools: afezSampleSnapshot()})
 	rec := get(t, h, "/?format=json")
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	var got struct {
-		AFEs []Row `json:"afes"`
-		Total int  `json:"total"`
+		AFEs  []afezRow `json:"afes"`
+		Total int       `json:"total"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("json.Unmarshal: %v", err)
@@ -117,8 +100,8 @@ func TestIndex_JSON_RoundTrips(t *testing.T) {
 	}
 }
 
-func TestIndex_NilProvider(t *testing.T) {
-	h := HandlerFromProvider(nil)
+func TestAfez_Index_NilProvider(t *testing.T) {
+	h := newAfezHandler(nil)
 	rec := get(t, h, "/")
 
 	if rec.Code != http.StatusOK {

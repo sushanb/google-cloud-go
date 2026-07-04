@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package flightz
+package debugview
 
 import (
 	"encoding/json"
@@ -26,18 +26,10 @@ import (
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 )
 
-type fakeProvider struct {
-	pools []btransport.PoolSnapshot
-}
-
-func (f fakeProvider) Snapshot() []btransport.PoolSnapshot { return f.pools }
-func (fakeProvider) Diverter() btransport.DiverterSnapshot { return btransport.DiverterSnapshot{} }
-func (fakeProvider) LoadBalancingSnapshots() []btransport.LoadBalancingSnapshot { return nil }
-
-// samplePools returns a two-pool snapshot with a controlled mix of
-// in-flight and idle sessions so tests can pin exact row counts and
+// flightzSamplePools returns a two-pool snapshot with a controlled mix
+// of in-flight and idle sessions so tests can pin exact row counts and
 // sort order.
-func samplePools(now time.Time) []btransport.PoolSnapshot {
+func flightzSamplePools(now time.Time) []btransport.PoolSnapshot {
 	return []btransport.PoolSnapshot{
 		{
 			Name: "OpenTable1[READ]",
@@ -60,7 +52,7 @@ func samplePools(now time.Time) []btransport.PoolSnapshot {
 						RpcID:   7,
 						Method:  "ReadRow",
 						SentAt:  now.Add(-6 * time.Second), // stuck — should be top row
-						Attempt: 2,                          // retry
+						Attempt: 2,                         // retry
 					},
 					Peer: btransport.PeerInfoSnapshot{ApplicationFrontendID: 0xdef, ApplicationFrontendRegion: "us-central1", ApplicationFrontendSubzone: "tm"},
 				},
@@ -85,13 +77,13 @@ func samplePools(now time.Time) []btransport.PoolSnapshot {
 	}
 }
 
-func newTestServer(pools []btransport.PoolSnapshot) *httptest.Server {
-	return httptest.NewServer(HandlerFromProvider(fakeProvider{pools: pools}))
+func newFlightzTestServer(pools []btransport.PoolSnapshot) *httptest.Server {
+	return httptest.NewServer(newFlightzHandler(fakeSessionProvider{pools: pools}))
 }
 
 func TestFlightz_CrossPool_RowCountAndSortOrder(t *testing.T) {
 	now := time.Now()
-	ts := newTestServer(samplePools(now))
+	ts := newFlightzTestServer(flightzSamplePools(now))
 	defer ts.Close()
 
 	resp, err := http.Get(ts.URL + "/?format=json")
@@ -103,9 +95,9 @@ func TestFlightz_CrossPool_RowCountAndSortOrder(t *testing.T) {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
 	var got struct {
-		InFlight       []Row `json:"inFlight"`
-		TotalSessions  int   `json:"totalSessions"`
-		ActiveSessions int   `json:"activeSessions"`
+		InFlight       []flightzRow `json:"inFlight"`
+		TotalSessions  int          `json:"totalSessions"`
+		ActiveSessions int          `json:"activeSessions"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -132,7 +124,7 @@ func TestFlightz_CrossPool_RowCountAndSortOrder(t *testing.T) {
 
 func TestFlightz_PoolFilter(t *testing.T) {
 	now := time.Now()
-	ts := newTestServer(samplePools(now))
+	ts := newFlightzTestServer(flightzSamplePools(now))
 	defer ts.Close()
 
 	resp, err := http.Get(ts.URL + "/pool/OpenTable1%5BWRITE%5D?format=json")
@@ -141,10 +133,10 @@ func TestFlightz_PoolFilter(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	var got struct {
-		InFlight       []Row  `json:"inFlight"`
-		PoolFilter     string `json:"poolFilter"`
-		TotalSessions  int    `json:"totalSessions"`
-		ActiveSessions int    `json:"activeSessions"`
+		InFlight       []flightzRow `json:"inFlight"`
+		PoolFilter     string       `json:"poolFilter"`
+		TotalSessions  int          `json:"totalSessions"`
+		ActiveSessions int          `json:"activeSessions"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -181,7 +173,7 @@ func TestFlightz_EmptyState(t *testing.T) {
 		},
 	}
 	_ = now
-	ts := newTestServer(pools)
+	ts := newFlightzTestServer(pools)
 	defer ts.Close()
 
 	resp, err := http.Get(ts.URL + "/")
@@ -200,7 +192,7 @@ func TestFlightz_EmptyState(t *testing.T) {
 
 func TestFlightz_DeadlineExpiredMarkedRed(t *testing.T) {
 	now := time.Now()
-	ts := newTestServer(samplePools(now))
+	ts := newFlightzTestServer(flightzSamplePools(now))
 	defer ts.Close()
 
 	resp, err := http.Get(ts.URL + "/")
@@ -217,7 +209,7 @@ func TestFlightz_DeadlineExpiredMarkedRed(t *testing.T) {
 
 func TestFlightz_RetryMarked(t *testing.T) {
 	now := time.Now()
-	ts := newTestServer(samplePools(now))
+	ts := newFlightzTestServer(flightzSamplePools(now))
 	defer ts.Close()
 
 	resp, err := http.Get(ts.URL + "/")
@@ -233,7 +225,7 @@ func TestFlightz_RetryMarked(t *testing.T) {
 }
 
 func TestFlightz_NilProvider(t *testing.T) {
-	ts := httptest.NewServer(HandlerFromProvider(nil))
+	ts := httptest.NewServer(newFlightzHandler(nil))
 	defer ts.Close()
 
 	// Nil provider must not panic — should render an empty page with 0 sessions.
@@ -243,9 +235,9 @@ func TestFlightz_NilProvider(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	var got struct {
-		InFlight       []Row `json:"inFlight"`
-		TotalSessions  int   `json:"totalSessions"`
-		ActiveSessions int   `json:"activeSessions"`
+		InFlight       []flightzRow `json:"inFlight"`
+		TotalSessions  int          `json:"totalSessions"`
+		ActiveSessions int          `json:"activeSessions"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -253,11 +245,4 @@ func TestFlightz_NilProvider(t *testing.T) {
 	if len(got.InFlight) != 0 || got.TotalSessions != 0 || got.ActiveSessions != 0 {
 		t.Errorf("nil-provider response = %+v, want all zero", got)
 	}
-}
-
-func head(b []byte, n int) string {
-	if len(b) <= n {
-		return string(b)
-	}
-	return string(b[:n]) + "…"
 }

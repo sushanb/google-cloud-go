@@ -12,29 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package loadz renders the picker's decision reasoning for every
-// session pool a Bigtable client owns. It answers "why did the picker
-// choose this AFE?" by surfacing:
-//
-//   - the current picker + algorithm gloss
-//   - the actual per-AFE traffic share vs. uniform ideal (with skew)
-//   - a ring buffer of the last N pick decisions (candidates + cost + winner)
-//   - per-AFE latency signals the LeastLatencyPicker consumes
-//
-// Complements the other debug views: afez shows per-AFE state, sessionz
-// shows per-session lifecycle, flightz shows in-flight vRPCs. loadz is
-// the *why* view — the narrative layer on top.
-//
-// Mount into any http.ServeMux:
-//
-//	http.Handle("/debug/loadz/", http.StripPrefix("/debug/loadz",
-//	    loadz.Handler(c)))
-//
-// The page auto-refreshes every 3s. JSON at ?format=json.
-package loadz
+// loadz view — the picker's decision reasoning per session pool.
+// Surfaces the picker + gloss, per-AFE actual vs uniform-ideal traffic
+// share (with skew), a ring buffer of the last N pick decisions
+// (candidates + cost + winner), and per-AFE latency signals the
+// LeastLatencyPicker consumes.
+
+package debugview
 
 import (
-	"encoding/json"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -45,47 +31,32 @@ import (
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 )
 
-// Handler returns an http.Handler rendering the loadz view for c's
-// session pools. Handler(nil) or a client without EnableSessionPool
-// yields a handler that serves an empty page.
-func Handler(c *bigtable.Client) http.Handler {
-	return HandlerFromProvider(providerForClient(c))
-}
-
-// HandlerFromProvider is Handler for an arbitrary SessionDebugProvider.
-func HandlerFromProvider(p bigtable.SessionDebugProvider) http.Handler {
+func newLoadzHandler(p bigtable.SessionDebugProvider) http.Handler {
 	mux := http.NewServeMux()
-	srv := &server{provider: p}
+	srv := &loadzServer{provider: p}
 	mux.HandleFunc("/", srv.handleIndex)
 	return mux
 }
 
-func providerForClient(c *bigtable.Client) bigtable.SessionDebugProvider {
-	if c == nil {
-		return nil
-	}
-	return c.SessionDebug()
-}
-
-type server struct {
+type loadzServer struct {
 	provider bigtable.SessionDebugProvider
 }
 
-// PoolView is one pool block on the loadz page. All fields JSON-tagged
-// so ?format=json returns a stable machine-readable shape.
-type PoolView struct {
-	PoolName      string     `json:"pool"`
-	PickerName    string     `json:"picker"`
-	PickerGloss   string     `json:"pickerGloss"`
-	TotalPicks    int64      `json:"totalPicks"`
-	AFEs          []AfeRow   `json:"afes"`
-	RecentPicks   []PickRow  `json:"recentPicks"`
-	CapturedAt    time.Time  `json:"capturedAt"`
+// loadzPoolView is one pool block on the loadz page. All fields
+// JSON-tagged so ?format=json returns a stable machine-readable shape.
+type loadzPoolView struct {
+	PoolName    string          `json:"pool"`
+	PickerName  string          `json:"picker"`
+	PickerGloss string          `json:"pickerGloss"`
+	TotalPicks  int64           `json:"totalPicks"`
+	AFEs        []loadzAfeRow   `json:"afes"`
+	RecentPicks []loadzPickRow  `json:"recentPicks"`
+	CapturedAt  time.Time       `json:"capturedAt"`
 }
 
-// AfeRow is one row in the per-AFE fanout table — actual traffic share
-// side-by-side with the uniform-ideal share and the skew.
-type AfeRow struct {
+// loadzAfeRow is one row in the per-AFE fanout table — actual traffic
+// share side-by-side with the uniform-ideal share and the skew.
+type loadzAfeRow struct {
 	AfeID          int64         `json:"afeId"`
 	AfeIDHex       string        `json:"afeIdHex"`
 	Idle           int           `json:"idle"`
@@ -102,31 +73,31 @@ type AfeRow struct {
 	LastConnected time.Time `json:"lastConnected"`
 }
 
-// PickRow is one row in the recent-picks table. Candidates lists what
-// the picker sampled (K-choice draw); Winner is the chosen AFE.
-type PickRow struct {
-	At         time.Time    `json:"at"`
-	PickerName string       `json:"picker"`
-	Winner     int64        `json:"winner"`
-	Reason     string       `json:"reason"`
-	Candidates []PickCandRow `json:"candidates"`
+// loadzPickRow is one row in the recent-picks table. Candidates lists
+// what the picker sampled (K-choice draw); Winner is the chosen AFE.
+type loadzPickRow struct {
+	At         time.Time          `json:"at"`
+	PickerName string             `json:"picker"`
+	Winner     int64              `json:"winner"`
+	Reason     string             `json:"reason"`
+	Candidates []loadzPickCandRow `json:"candidates"`
 }
 
-// PickCandRow is one candidate from a K-choice draw. Cost's units
+// loadzPickCandRow is one candidate from a K-choice draw. Cost's units
 // depend on the picker: NumOutstanding (int-as-float) for
 // least-inflight, e2e PeakEwma nanos for least-latency.
-type PickCandRow struct {
+type loadzPickCandRow struct {
 	AfeID    int64   `json:"afeId"`
 	AfeIDHex string  `json:"afeIdHex"`
 	Cost     float64 `json:"cost"`
 }
 
-type page struct {
+type loadzPage struct {
 	Generated time.Time
-	Pools     []PoolView
+	Pools     []loadzPoolView
 }
 
-func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
+func (s *loadzServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" && r.URL.Path != "" {
 		http.NotFound(w, r)
 		return
@@ -136,32 +107,31 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 	if r.URL.Query().Get("format") == "json" {
 		writeJSON(w, struct {
-			CapturedAt time.Time  `json:"capturedAt"`
-			Pools      []PoolView `json:"pools"`
+			CapturedAt time.Time       `json:"capturedAt"`
+			Pools      []loadzPoolView `json:"pools"`
 		}{now, views})
 		return
 	}
 
-	writeHTML(w, tpl, page{Generated: now, Pools: views})
+	writeHTML(w, loadzTpl, loadzPage{Generated: now, Pools: views})
 }
 
-// collect turns each per-pool LoadBalancingSnapshot into a PoolView
+// collect turns each per-pool LoadBalancingSnapshot into a loadzPoolView
 // enriched with derived fields (actual-share, ideal-share, skew).
-func (s *server) collect(now time.Time) []PoolView {
+func (s *loadzServer) collect(now time.Time) []loadzPoolView {
 	if s.provider == nil {
 		return nil
 	}
 	snaps := s.provider.LoadBalancingSnapshots()
-	views := make([]PoolView, 0, len(snaps))
+	views := make([]loadzPoolView, 0, len(snaps))
 	for _, snap := range snaps {
-		views = append(views, buildPoolView(snap, now))
+		views = append(views, buildLoadzPoolView(snap, now))
 	}
 	return views
 }
 
-func buildPoolView(snap btransport.LoadBalancingSnapshot, now time.Time) PoolView {
-	// Total picks = sum of per-AFE counts. Use it to derive actual
-	// share.
+func buildLoadzPoolView(snap btransport.LoadBalancingSnapshot, now time.Time) loadzPoolView {
+	// Total picks = sum of per-AFE counts. Use it to derive actual share.
 	var total int64
 	for _, n := range snap.PickCounts {
 		total += n
@@ -172,7 +142,7 @@ func buildPoolView(snap btransport.LoadBalancingSnapshot, now time.Time) PoolVie
 	}
 
 	// Merge AFE rows with per-AFE pick counts so callers see one table.
-	afeRows := make([]AfeRow, 0, len(snap.AFEs))
+	afeRows := make([]loadzAfeRow, 0, len(snap.AFEs))
 	for _, a := range snap.AFEs {
 		picks := snap.PickCounts[a.ID]
 		actual := 0.0
@@ -183,7 +153,7 @@ func buildPoolView(snap btransport.LoadBalancingSnapshot, now time.Time) PoolVie
 		if inUse < 0 {
 			inUse = 0
 		}
-		afeRows = append(afeRows, AfeRow{
+		afeRows = append(afeRows, loadzAfeRow{
 			AfeID:          a.ID,
 			AfeIDHex:       fmt.Sprintf("%x", uint64(a.ID)),
 			Idle:           a.IdleCount,
@@ -202,18 +172,18 @@ func buildPoolView(snap btransport.LoadBalancingSnapshot, now time.Time) PoolVie
 
 	// Recent picks are stored oldest-first in the ring buffer; render
 	// newest-first so the top of the table is the freshest.
-	pickRows := make([]PickRow, 0, len(snap.Recent))
+	pickRows := make([]loadzPickRow, 0, len(snap.Recent))
 	for i := len(snap.Recent) - 1; i >= 0; i-- {
 		ev := snap.Recent[i]
-		cands := make([]PickCandRow, 0, len(ev.Decision.Candidates))
+		cands := make([]loadzPickCandRow, 0, len(ev.Decision.Candidates))
 		for _, c := range ev.Decision.Candidates {
-			cands = append(cands, PickCandRow{
+			cands = append(cands, loadzPickCandRow{
 				AfeID:    int64(c.AfeID),
 				AfeIDHex: fmt.Sprintf("%x", uint64(c.AfeID)),
 				Cost:     c.Cost,
 			})
 		}
-		pickRows = append(pickRows, PickRow{
+		pickRows = append(pickRows, loadzPickRow{
 			At:         ev.At,
 			PickerName: ev.PickerName,
 			Winner:     int64(ev.Decision.Winner),
@@ -222,7 +192,7 @@ func buildPoolView(snap btransport.LoadBalancingSnapshot, now time.Time) PoolVie
 		})
 	}
 
-	return PoolView{
+	return loadzPoolView{
 		PoolName:    snap.PoolName,
 		PickerName:  snap.PickerName,
 		PickerGloss: glossFor(snap.PickerName),
@@ -248,67 +218,33 @@ func glossFor(name string) string {
 	}
 }
 
-func writeJSON(w http.ResponseWriter, v interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(v); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
-}
-
-func writeHTML(w http.ResponseWriter, tpl *template.Template, data interface{}) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	if err := tpl.Execute(w, data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
-}
-
-// roundDuration keeps latency columns terse — matches the flightz /
-// afez rounding rules for consistent debug UX.
-func roundDuration(d time.Duration) time.Duration {
-	switch {
-	case d < 0:
-		return -roundDuration(-d)
-	case d == 0:
-		return 0
-	case d < time.Millisecond:
-		return d.Round(time.Microsecond)
-	case d < time.Second:
-		return d.Round(time.Millisecond)
-	default:
-		return d.Round(10 * time.Millisecond)
-	}
-}
-
-var funcs = template.FuncMap{
-	"dur": func(d time.Duration) string {
+func loadzFuncs() template.FuncMap {
+	m := commonFuncs()
+	m["dur"] = func(d time.Duration) string {
 		if d == 0 {
 			return "—"
 		}
-		return roundDuration(d).String()
-	},
-	"ago": func(t time.Time) string {
+		return roundDurationShort(d).String()
+	}
+	m["ago"] = func(t time.Time) string {
 		if t.IsZero() {
 			return "—"
 		}
-		return roundDuration(time.Since(t)).String() + " ago"
-	},
-	"timeHM": func(t time.Time) string {
+		return roundDurationShort(time.Since(t)).String() + " ago"
+	}
+	m["timeHM"] = func(t time.Time) string {
 		return t.Format("15:04:05.000")
-	},
-	"pct": func(v float64) string {
+	}
+	m["pct"] = func(v float64) string {
 		return fmt.Sprintf("%.1f%%", v)
-	},
-	"ppSigned": func(v float64) string {
+	}
+	m["ppSigned"] = func(v float64) string {
 		if v > 0 {
 			return fmt.Sprintf("+%.1fpp", v)
 		}
 		return fmt.Sprintf("%.1fpp", v)
-	},
-	"skewClass": func(v float64) string {
+	}
+	m["skewClass"] = func(v float64) string {
 		abs := v
 		if abs < 0 {
 			abs = -abs
@@ -321,9 +257,9 @@ var funcs = template.FuncMap{
 		default:
 			return "skew-hot"
 		}
-	},
+	}
 	// bar renders an inline ASCII share bar 0..100% at fixed width 12.
-	"bar": func(v float64) string {
+	m["bar"] = func(v float64) string {
 		if v < 0 {
 			v = 0
 		}
@@ -341,8 +277,8 @@ var funcs = template.FuncMap{
 			}
 		}
 		return string(out)
-	},
-	"cost": func(v float64) string {
+	}
+	m["cost"] = func(v float64) string {
 		if v == 0 {
 			return "0"
 		}
@@ -350,18 +286,19 @@ var funcs = template.FuncMap{
 			return fmt.Sprintf("%.1f", v)
 		}
 		return fmt.Sprintf("%.3f", v)
-	},
-	"hex": func(v int64) string {
+	}
+	m["hex"] = func(v int64) string {
 		if v == 0 {
 			return "unknown"
 		}
 		return fmt.Sprintf("0x%x", uint64(v))
-	},
+	}
+	return m
 }
 
-var tpl = template.Must(template.New("loadz").Funcs(funcs).Parse(tplSrc))
+var loadzTpl = template.Must(template.New("loadz").Funcs(loadzFuncs()).Parse(loadzTplSrc))
 
-const tplSrc = `<!doctype html>
+const loadzTplSrc = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta http-equiv="refresh" content="3">

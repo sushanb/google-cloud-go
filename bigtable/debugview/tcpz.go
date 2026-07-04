@@ -12,33 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package tcpz renders live per-connection TCP_INFO (RTT, retransmits,
-// cwnd, MSS, TCP state) for every gRPC dial a bigtable client made
-// through bigtable.TCPStats. Answers "is wire really <1ms?" without
-// leaving the browser.
-//
-// Wiring:
-//
-//	stats := bigtable.NewTCPStats()
-//	client, err := bigtable.NewClient(ctx, proj, inst, stats.ClientOption())
-//	http.Handle("/debug/tcpz/", http.StripPrefix("/debug/tcpz", tcpz.Handler(stats)))
-//
-// Routes (relative to the mount point):
-//
-//	GET /              → HTML table, interesting conns first, 2-second refresh.
-//	GET /?format=json  → JSON array of every registered conn's TCP_INFO.
-//	GET /?only=hot     → HTML, hides healthy rows (only warn+crit).
-//	GET /?all=1        → HTML, includes remote :443 conns (default hides).
-//	GET /?sort=<key>&dir=<asc|desc>
-//	                   → HTML, sorted by any column (click a header to set).
-//	                     Special keys: sev (default, interesting-first) and
-//	                     dial (oldest-first). All other keys are per-column
-//	                     — e.g. sort=rtt&dir=desc for slowest wire first.
+// tcpz view — per-connection TCP_INFO (RTT, retransmits, cwnd, MSS, TCP
+// state) for every gRPC dial a bigtable client made through
+// bigtable.TCPStats.
 //
 // Linux only. On other platforms every row surfaces "tcp_info not
 // supported on this platform" in the Err column. Not compatible with
 // DirectPath (xDS bypasses the standard dialer, so nothing is captured).
-package tcpz
+
+package debugview
 
 import (
 	"encoding/json"
@@ -54,45 +36,39 @@ import (
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 )
 
-// Handler returns an http.Handler that renders per-connection TCP_INFO
-// for every conn captured by stats. Bound to stats for its lifetime;
-// draining the underlying registry (all conns closed) leaves the handler
-// serving an empty snapshot.
-func Handler(stats *bigtable.TCPStats) http.Handler {
+func newTcpzHandler(stats *bigtable.TCPStats) http.Handler {
 	mux := http.NewServeMux()
-	srv := &server{stats: stats}
+	srv := &tcpzServer{stats: stats}
 	mux.HandleFunc("/", srv.handleIndex)
 	return mux
 }
 
-type server struct {
+type tcpzServer struct {
 	stats *bigtable.TCPStats
 }
 
-func (s *server) snapshot() []btransport.TCPInfoSnapshot {
+func (s *tcpzServer) snapshot() []btransport.TCPInfoSnapshot {
 	if s.stats == nil {
 		return nil
 	}
 	return s.stats.Snapshot()
 }
 
-// severity ranks conns by how much the kernel's TCP_INFO says is wrong
-// with them. Ordering is exploited by the sort (higher first) and by the
-// row-color CSS classes below.
-type severity int
+// tcpzSeverity ranks conns by how much the kernel's TCP_INFO says is
+// wrong with them. Ordering is exploited by the sort (higher first) and
+// by the row-color CSS classes below.
+type tcpzSeverity int
 
 const (
-	sevOK   severity = iota // healthy, no signal
-	sevNote                 // interesting but not a problem (draining, unreadable)
-	sevWarn                 // any real loss/retrans/ECN/reord signal
-	sevCrit                 // RTO-driven Loss state or currently backing off
+	sevOK   tcpzSeverity = iota // healthy, no signal
+	sevNote                     // interesting but not a problem (draining, unreadable)
+	sevWarn                     // any real loss/retrans/ECN/reord signal
+	sevCrit                     // RTO-driven Loss state or currently backing off
 )
 
-// classify inspects one TCP_INFO snapshot and returns its severity plus a
-// short "why" list of the specific signals that triggered it. The why list
-// drives the tooltip on the colored row so a user can see at a glance
-// *what* made this row interesting (e.g. "dsack+ecn") without scanning
-// 25 numeric cells. Empty list ↔ sevOK.
+// classify inspects one TCP_INFO snapshot and returns its severity plus
+// a short "why" list of the specific signals that triggered it. Empty
+// list ↔ sevOK.
 //
 // Rules (highest wins):
 //   - crit: CAState=Loss OR Backoff>0 — RTO-driven loss or currently timing out
@@ -101,13 +77,13 @@ const (
 //   - note: State != ESTABLISHED (closing/draining) OR Err populated
 //     (couldn't read info — usually non-Linux)
 //   - ok:   everything else
-func classify(r btransport.TCPInfoSnapshot) (severity, []string) {
+func classify(r btransport.TCPInfoSnapshot) (tcpzSeverity, []string) {
 	if r.Err != "" {
 		return sevNote, []string{"unreadable"}
 	}
 	var why []string
 	sev := sevOK
-	bump := func(s severity, tag string) {
+	bump := func(s tcpzSeverity, tag string) {
 		if s > sev {
 			sev = s
 		}
@@ -132,7 +108,6 @@ func classify(r btransport.TCPInfoSnapshot) (severity, []string) {
 		bump(sevWarn, "retrans")
 	}
 	if r.TotalRetrans > 0 && r.Retransmits == 0 {
-		// only mention historical retrans if there isn't a current burst
 		bump(sevWarn, "past-retrans")
 	}
 	if r.Lost > 0 {
@@ -155,7 +130,7 @@ func classify(r btransport.TCPInfoSnapshot) (severity, []string) {
 }
 
 // rowClass returns the CSS class for the row background.
-func (s severity) rowClass() string {
+func (s tcpzSeverity) rowClass() string {
 	switch s {
 	case sevCrit:
 		return "row-crit"
@@ -167,45 +142,35 @@ func (s severity) rowClass() string {
 	return "row-ok"
 }
 
-// row bundles a snapshot with its precomputed severity so the template
-// doesn't have to re-classify on every template action.
-type row struct {
+// tcpzRow bundles a snapshot with its precomputed severity so the
+// template doesn't have to re-classify on every template action.
+type tcpzRow struct {
 	btransport.TCPInfoSnapshot
 	Sev      string // rowClass string ("row-crit", …)
 	Why      string // joined why list, e.g. "Loss+backoff+lost"
 	Interest bool   // sev > sevOK — the "N interesting" count uses this
 }
 
-// colDef describes one column of the tcpz table: header label, tooltip,
-// CSS class for both th/td, and (if sortable) a comparator returning
-// <0/0/>0 in the natural ascending sense. The "Body" field is the exact
-// template snippet used inside the row's <td> — kept alongside the header
-// so adding a column is a single-slice-entry change.
-//
-// Comparators receive raw snapshots (not row-wrapped) so callers can share
-// them with alternative renderers.
-type colDef struct {
+// tcpzColDef describes one column of the tcpz table: header label,
+// tooltip, CSS class for both th/td, and (if sortable) a comparator
+// returning <0/0/>0 in the natural ascending sense. The "Body" field is
+// the exact template snippet used inside the row's <td> — kept
+// alongside the header so adding a column is a single-slice-entry
+// change.
+type tcpzColDef struct {
 	Key   string // URL sort key; empty = not sortable
 	Label string
 	Class string // "num" / "mono" / "err" / ""
 	Title string
 	Body  string // inner-cell template action, e.g. `{{num .MSS}}`
-	// Cmp orders two snapshots ascending on this column. Nil for the
-	// "Why" and "Err" columns where clicking a header wouldn't buy
-	// anything (Why is derived from severity, Err is almost always
-	// empty on Linux).
-	Cmp func(a, b btransport.TCPInfoSnapshot) int
-	// Desc = true if the natural first-click direction is descending
-	// (biggest / worst first). True for counters and latency; false for
-	// alphabetical / oldest-first columns.
-	Desc bool
+	Cmp   func(a, b btransport.TCPInfoSnapshot) int
+	Desc  bool
 }
 
-// cols is the single source of truth for every column in the tcpz table.
-// The template renders <thead> and <tbody> by iterating this slice. Order
-// here is the display order. Adding, removing, or reordering columns is a
-// one-slice-entry edit — no template surgery required.
-var cols = []colDef{
+// tcpzCols is the single source of truth for every column in the tcpz
+// table. The template renders <thead> and <tbody> by iterating this
+// slice. Order here is the display order.
+var tcpzCols = []tcpzColDef{
 	{Key: "", Label: "Why", Class: "why", Title: "Why this row is highlighted — the list of TCP_INFO signals that classified it.", Body: `{{.Why}}`},
 	{Key: "remote", Label: "Remote", Class: "mono", Title: "Peer address (ip:port).", Body: `{{.RemoteAddr}}`, Cmp: cmpStr(func(s btransport.TCPInfoSnapshot) string { return s.RemoteAddr })},
 	{Key: "local", Label: "Local", Class: "mono", Title: "Local socket address.", Body: `{{.LocalAddr}}`, Cmp: cmpStr(func(s btransport.TCPInfoSnapshot) string { return s.LocalAddr })},
@@ -239,20 +204,20 @@ var cols = []colDef{
 	{Key: "", Label: "Err", Class: "err", Title: "Populated when TCP_INFO couldn't be read on a live fd (e.g. non-Linux OS).", Body: `{{.Err}}`},
 }
 
-// colByKey builds a lookup for cols; done once at init so the request
-// handler doesn't re-scan the slice per request.
-var colByKey = func() map[string]*colDef {
-	m := make(map[string]*colDef, len(cols))
-	for i := range cols {
-		if cols[i].Key != "" {
-			m[cols[i].Key] = &cols[i]
+// tcpzColByKey builds a lookup for tcpzCols; done once at init so the
+// request handler doesn't re-scan the slice per request.
+var tcpzColByKey = func() map[string]*tcpzColDef {
+	m := make(map[string]*tcpzColDef, len(tcpzCols))
+	for i := range tcpzCols {
+		if tcpzCols[i].Key != "" {
+			m[tcpzCols[i].Key] = &tcpzCols[i]
 		}
 	}
 	return m
 }()
 
 // cmp* factories: thin wrappers that turn "extract field X" into a
-// comparator. Keeps the colDef literals dense and readable.
+// comparator. Keeps the tcpzColDef literals dense and readable.
 func cmpStr(get func(btransport.TCPInfoSnapshot) string) func(a, b btransport.TCPInfoSnapshot) int {
 	return func(a, b btransport.TCPInfoSnapshot) int { return strings.Compare(get(a), get(b)) }
 }
@@ -317,10 +282,10 @@ func cmpTime(get func(btransport.TCPInfoSnapshot) time.Time) func(a, b btranspor
 	}
 }
 
-// headerCell is the per-column view struct the template iterates. Built
-// once per request so all the "which arrow, which link" logic lives in
-// Go — the template just prints strings.
-type headerCell struct {
+// tcpzHeaderCell is the per-column view struct the template iterates.
+// Built once per request so all the "which arrow, which link" logic
+// lives in Go — the template just prints strings.
+type tcpzHeaderCell struct {
 	Label     string
 	Class     string
 	Title     string
@@ -330,13 +295,10 @@ type headerCell struct {
 	CellClass string        // repeated per row via BodyTpl already; kept for possible reuse
 }
 
-func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
+func (s *tcpzServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	all := q.Get("all") == "1"
 	onlyHot := q.Get("only") == "hot"
-	// ?remote=<ip:port> narrows to conns whose RemoteAddr matches exactly.
-	// Sessionz uses this to link a slow-vRPC row to the specific conn(s)
-	// its session was bound to. Empty string means no filter.
 	remoteFilter := q.Get("remote")
 	sortKey, sortDir := parseSort(q)
 
@@ -356,9 +318,6 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	} else if !all {
 		filtered := raw[:0]
 		for _, snap := range raw {
-			// Default view hides remote :443 conns — those are the
-			// classic-path CFE / metrics-export channels, not the AFE
-			// data path most tcpz users care about. ?all=1 restores.
 			if strings.HasSuffix(snap.RemoteAddr, ":443") {
 				hidden++
 				continue
@@ -376,7 +335,7 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows := make([]row, 0, len(raw))
+	rows := make([]tcpzRow, 0, len(raw))
 	interesting := 0
 	dropped := 0
 	for _, snap := range raw {
@@ -388,7 +347,7 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			dropped++
 			continue
 		}
-		rows = append(rows, row{
+		rows = append(rows, tcpzRow{
 			TCPInfoSnapshot: snap,
 			Sev:             sev.rowClass(),
 			Why:             strings.Join(why, "+"),
@@ -398,8 +357,6 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 	sortRows(rows, sortKey, sortDir)
 
-	// Build the header cells once per request — the "which arrow, which
-	// link" logic lives here so the template just concatenates strings.
 	baseParams := url.Values{}
 	if all {
 		baseParams.Set("all", "1")
@@ -407,12 +364,10 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if onlyHot {
 		baseParams.Set("only", "hot")
 	}
-	headers := make([]headerCell, len(cols))
-	for i, c := range cols {
-		hc := headerCell{Label: c.Label, Class: c.Class, Title: c.Title}
+	headers := make([]tcpzHeaderCell, len(tcpzCols))
+	for i, c := range tcpzCols {
+		hc := tcpzHeaderCell{Label: c.Label, Class: c.Class, Title: c.Title}
 		if c.Cmp != nil {
-			// Toggle direction when clicking the already-active column;
-			// otherwise use the column's natural first-click direction.
 			nextDir := "asc"
 			if c.Desc {
 				nextDir = "desc"
@@ -437,9 +392,9 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	data := struct {
-		Rows        []row
-		Cols        []colDef
-		Headers     []headerCell
+		Rows        []tcpzRow
+		Cols        []tcpzColDef
+		Headers     []tcpzHeaderCell
 		Count       int
 		Total       int
 		Hidden      int
@@ -453,7 +408,7 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		Generated   time.Time
 	}{
 		Rows:        rows,
-		Cols:        cols,
+		Cols:        tcpzCols,
 		Headers:     headers,
 		Count:       len(rows),
 		Total:       total,
@@ -467,7 +422,7 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		SortByDial:  sortKey == "dial",
 		Generated:   time.Now(),
 	}
-	if err := tpl.Execute(w, data); err != nil {
+	if err := tcpzTpl.Execute(w, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -488,7 +443,7 @@ func parseSort(q url.Values) (key, dir string) {
 		}
 		return key, dir
 	}
-	if _, ok := colByKey[key]; !ok {
+	if _, ok := tcpzColByKey[key]; !ok {
 		return "sev", "" // unknown column — fall back cleanly
 	}
 	return key, dir
@@ -496,12 +451,10 @@ func parseSort(q url.Values) (key, dir string) {
 
 // sortRows reorders rows in place per key+dir. Special keys "sev" and
 // "dial" don't map to columns and get their own comparators. All other
-// keys map to a colDef.Cmp.
-func sortRows(rows []row, key, dir string) {
+// keys map to a tcpzColDef.Cmp.
+func sortRows(rows []tcpzRow, key, dir string) {
 	switch key {
 	case "sev":
-		// Interesting-first, ties broken by dial order (older on top) so
-		// a still-hot conn keeps its position across the 2s refresh.
 		sort.SliceStable(rows, func(i, j int) bool {
 			si := sevRank(rows[i].Sev)
 			sj := sevRank(rows[j].Sev)
@@ -517,14 +470,10 @@ func sortRows(rows []row, key, dir string) {
 		})
 		return
 	}
-	c, ok := colByKey[key]
+	c, ok := tcpzColByKey[key]
 	if !ok || c.Cmp == nil {
 		return
 	}
-	// Direction: explicit "asc"/"desc" wins; otherwise use the column's
-	// natural direction so a fresh click on an unset column lands on the
-	// direction the user usually wants (biggest-first for counters,
-	// alphabetical for strings).
 	desc := c.Desc
 	if dir == "asc" {
 		desc = false
@@ -534,8 +483,6 @@ func sortRows(rows []row, key, dir string) {
 	sort.SliceStable(rows, func(i, j int) bool {
 		r := c.Cmp(rows[i].TCPInfoSnapshot, rows[j].TCPInfoSnapshot)
 		if r == 0 {
-			// Deterministic tie-break by dial order so refreshes are
-			// stable when two conns have identical counter values.
 			return rows[i].DialedAt.Before(rows[j].DialedAt)
 		}
 		if desc {
@@ -555,8 +502,9 @@ func cloneValues(v url.Values) url.Values {
 	return out
 }
 
-// sevRank maps the row-class string back to a comparable int so the sort
-// comparator doesn't have to hold onto the severity enum separately.
+// sevRank maps the row-class string back to a comparable int so the
+// sort comparator doesn't have to hold onto the severity enum
+// separately.
 func sevRank(cls string) int {
 	switch cls {
 	case "row-crit":
@@ -569,183 +517,171 @@ func sevRank(cls string) int {
 	return 0
 }
 
-var funcs = template.FuncMap{
-	"dur": func(d time.Duration) string {
-		if d == 0 {
-			return "—"
-		}
-		return d.String()
-	},
-	"ago": func(t time.Time) string {
-		if t.IsZero() {
-			return "—"
-		}
-		return time.Since(t).Round(time.Second).String()
-	},
-	"num": func(v uint32) string {
-		if v == 0 {
-			return "—"
-		}
-		return fmt.Sprintf("%d", v)
-	},
-	// pmtu renders a path-MTU value with a subtle hint about the path:
-	//   0     → "—" (unknown / not populated on this kernel)
-	//   1500  → plain (standard ethernet — nothing exotic)
-	//   <1500 → dimmed with the delta from 1500 shown in a tooltip; the
-	//           delta is exactly how many bytes of tunnel headers the
-	//           path is eating (Andromeda ≈ 40, IPsec ≈ 60, GRE ≈ 24…).
-	//   <1300 → hot (unusually heavy encapsulation — worth investigating)
-	"pmtu": func(v uint32) template.HTML {
-		if v == 0 {
-			return template.HTML("—")
-		}
-		switch {
-		case v >= 1500:
-			return template.HTML(fmt.Sprintf("%d", v))
-		case v < 1300:
-			return template.HTML(fmt.Sprintf(`<b class="hot" title="%d B below 1500 — unusually heavy encapsulation">%d</b>`, 1500-v, v))
-		default:
-			return template.HTML(fmt.Sprintf(`<span title="%d B below 1500 — tunneling in path">%d</span>`, 1500-v, v))
-		}
-	},
-	"num64": func(v uint64) string {
-		if v == 0 {
-			return "—"
-		}
-		return fmt.Sprintf("%d", v)
-	},
-	"pct": func(v float64) string {
-		if v == 0 {
-			return "—"
-		}
-		if v < 0.01 {
-			return "<0.01%"
-		}
-		return fmt.Sprintf("%.2f%%", v)
-	},
-	// rate renders a bytes/sec value as a human-scaled MB/s or KB/s.
-	"rate": func(v uint64) string {
-		if v == 0 {
-			return "—"
-		}
-		f := float64(v)
-		switch {
-		case f >= 1<<20:
-			return fmt.Sprintf("%.1f MB/s", f/(1<<20))
-		case f >= 1<<10:
-			return fmt.Sprintf("%.1f KB/s", f/(1<<10))
-		default:
-			return fmt.Sprintf("%.0f B/s", f)
-		}
-	},
-	// bytes renders a byte count similarly for BytesSent / BytesRetrans.
-	"bytes": func(v uint64) string {
-		if v == 0 {
-			return "—"
-		}
-		f := float64(v)
-		switch {
-		case f >= 1<<30:
-			return fmt.Sprintf("%.1f GiB", f/(1<<30))
-		case f >= 1<<20:
-			return fmt.Sprintf("%.1f MiB", f/(1<<20))
-		case f >= 1<<10:
-			return fmt.Sprintf("%.1f KiB", f/(1<<10))
-		default:
-			return fmt.Sprintf("%d B", v)
-		}
-	},
-	// hotNum / hotBytes / hotPct wrap num/bytes/pct with a <b class="hot">
-	// span when non-zero. Row color says "this row is interesting"; hot
-	// cells say "and here's the specific counter that flagged it."
-	"hotNum": func(v uint32) template.HTML {
-		if v == 0 {
-			return template.HTML("—")
-		}
-		return template.HTML(fmt.Sprintf(`<b class="hot">%d</b>`, v))
-	},
-	"critNum": func(v uint32) template.HTML {
-		// critNum is for Backoff — non-zero means we're actively timing
-		// out, which is the sharpest single signal in TCP_INFO.
-		if v == 0 {
-			return template.HTML("—")
-		}
-		return template.HTML(fmt.Sprintf(`<b class="hot crit">%d</b>`, v))
-	},
-	"hotBytes": func(v uint64) template.HTML {
-		if v == 0 {
-			return template.HTML("—")
-		}
-		f := float64(v)
-		var s string
-		switch {
-		case f >= 1<<30:
-			s = fmt.Sprintf("%.1f GiB", f/(1<<30))
-		case f >= 1<<20:
-			s = fmt.Sprintf("%.1f MiB", f/(1<<20))
-		case f >= 1<<10:
-			s = fmt.Sprintf("%.1f KiB", f/(1<<10))
-		default:
-			s = fmt.Sprintf("%d B", v)
-		}
-		return template.HTML(fmt.Sprintf(`<b class="hot">%s</b>`, s))
-	},
-	"hotPct": func(v float64) template.HTML {
-		if v == 0 {
-			return template.HTML("—")
-		}
-		var s string
-		if v < 0.01 {
-			s = "<0.01%"
-		} else {
-			s = fmt.Sprintf("%.2f%%", v)
-		}
-		return template.HTML(fmt.Sprintf(`<b class="hot">%s</b>`, s))
-	},
-	"or": func(s, fallback string) string {
-		if s == "" {
-			return fallback
-		}
-		return s
-	},
-	// cell renders one column's inner HTML for one row by executing the
-	// per-column body template. bodyTpls is populated in init(); Parse
-	// only needs the func to exist, not for bodies to be ready yet.
-	"cell": func(idx int, r row) (template.HTML, error) {
-		var buf strings.Builder
-		if err := bodyTpls[idx].Execute(&buf, r); err != nil {
-			return "", err
-		}
-		return template.HTML(buf.String()), nil
-	},
-}
+// tcpzBodyTpls holds each column's cell-body snippet, parsed once at
+// package init against the same funcs map the outer template uses. The
+// outer template's per-row loop calls {{cell $i $row}} which executes
+// the matching bodyTpl — this keeps the outer template short and lets
+// column order / additions be a one-slice-entry change to tcpzCols.
+var tcpzBodyTpls []*template.Template
 
-// bodyTpls holds each column's cell-body snippet, parsed once at package
-// init against the same funcs map the outer template uses. The outer
-// template's per-row loop calls {{cell $i $row}} which executes the
-// matching bodyTpl — this keeps the outer template short and lets column
-// order / additions be a one-slice-entry change to cols.
-//
-// Populated in init() (see below). The "cell" template func in funcs
-// closes over this variable; funcs is finalized before Parse so the
-// outer template parses cleanly, then init() fills the bodies before
-// any Execute call runs.
-var bodyTpls []*template.Template
-
-func init() {
-	bodyTpls = make([]*template.Template, len(cols))
-	for i, c := range cols {
-		t, err := template.New(fmt.Sprintf("col-%d", i)).Funcs(funcs).Parse(c.Body)
-		if err != nil {
-			panic(fmt.Sprintf("tcpz: parse column %q body: %v", c.Label, err))
-		}
-		bodyTpls[i] = t
+func tcpzFuncs() template.FuncMap {
+	return template.FuncMap{
+		"dur": func(d time.Duration) string {
+			if d == 0 {
+				return "—"
+			}
+			return d.String()
+		},
+		"ago": func(t time.Time) string {
+			if t.IsZero() {
+				return "—"
+			}
+			return time.Since(t).Round(time.Second).String()
+		},
+		"num": func(v uint32) string {
+			if v == 0 {
+				return "—"
+			}
+			return fmt.Sprintf("%d", v)
+		},
+		"pmtu": func(v uint32) template.HTML {
+			if v == 0 {
+				return template.HTML("—")
+			}
+			switch {
+			case v >= 1500:
+				return template.HTML(fmt.Sprintf("%d", v))
+			case v < 1300:
+				return template.HTML(fmt.Sprintf(`<b class="hot" title="%d B below 1500 — unusually heavy encapsulation">%d</b>`, 1500-v, v))
+			default:
+				return template.HTML(fmt.Sprintf(`<span title="%d B below 1500 — tunneling in path">%d</span>`, 1500-v, v))
+			}
+		},
+		"num64": func(v uint64) string {
+			if v == 0 {
+				return "—"
+			}
+			return fmt.Sprintf("%d", v)
+		},
+		"pct": func(v float64) string {
+			if v == 0 {
+				return "—"
+			}
+			if v < 0.01 {
+				return "<0.01%"
+			}
+			return fmt.Sprintf("%.2f%%", v)
+		},
+		"rate": func(v uint64) string {
+			if v == 0 {
+				return "—"
+			}
+			f := float64(v)
+			switch {
+			case f >= 1<<20:
+				return fmt.Sprintf("%.1f MB/s", f/(1<<20))
+			case f >= 1<<10:
+				return fmt.Sprintf("%.1f KB/s", f/(1<<10))
+			default:
+				return fmt.Sprintf("%.0f B/s", f)
+			}
+		},
+		"bytes": func(v uint64) string {
+			if v == 0 {
+				return "—"
+			}
+			f := float64(v)
+			switch {
+			case f >= 1<<30:
+				return fmt.Sprintf("%.1f GiB", f/(1<<30))
+			case f >= 1<<20:
+				return fmt.Sprintf("%.1f MiB", f/(1<<20))
+			case f >= 1<<10:
+				return fmt.Sprintf("%.1f KiB", f/(1<<10))
+			default:
+				return fmt.Sprintf("%d B", v)
+			}
+		},
+		"hotNum": func(v uint32) template.HTML {
+			if v == 0 {
+				return template.HTML("—")
+			}
+			return template.HTML(fmt.Sprintf(`<b class="hot">%d</b>`, v))
+		},
+		"critNum": func(v uint32) template.HTML {
+			if v == 0 {
+				return template.HTML("—")
+			}
+			return template.HTML(fmt.Sprintf(`<b class="hot crit">%d</b>`, v))
+		},
+		"hotBytes": func(v uint64) template.HTML {
+			if v == 0 {
+				return template.HTML("—")
+			}
+			f := float64(v)
+			var s string
+			switch {
+			case f >= 1<<30:
+				s = fmt.Sprintf("%.1f GiB", f/(1<<30))
+			case f >= 1<<20:
+				s = fmt.Sprintf("%.1f MiB", f/(1<<20))
+			case f >= 1<<10:
+				s = fmt.Sprintf("%.1f KiB", f/(1<<10))
+			default:
+				s = fmt.Sprintf("%d B", v)
+			}
+			return template.HTML(fmt.Sprintf(`<b class="hot">%s</b>`, s))
+		},
+		"hotPct": func(v float64) template.HTML {
+			if v == 0 {
+				return template.HTML("—")
+			}
+			var s string
+			if v < 0.01 {
+				s = "<0.01%"
+			} else {
+				s = fmt.Sprintf("%.2f%%", v)
+			}
+			return template.HTML(fmt.Sprintf(`<b class="hot">%s</b>`, s))
+		},
+		"or": func(s, fallback string) string {
+			if s == "" {
+				return fallback
+			}
+			return s
+		},
+		// cell renders one column's inner HTML for one row by executing
+		// the per-column body template. tcpzBodyTpls is populated in
+		// init(); Parse only needs the func to exist, not for bodies to
+		// be ready yet.
+		"cell": func(idx int, r tcpzRow) (template.HTML, error) {
+			var buf strings.Builder
+			if err := tcpzBodyTpls[idx].Execute(&buf, r); err != nil {
+				return "", err
+			}
+			return template.HTML(buf.String()), nil
+		},
 	}
 }
 
-var tpl = template.Must(template.New("tcpz").Funcs(funcs).Parse(tplSrc))
+// Cache the funcs so column bodies parse against the exact same map the
+// outer template uses.
+var tcpzFuncsCached = tcpzFuncs()
 
-const tplSrc = `<!doctype html>
+func init() {
+	tcpzBodyTpls = make([]*template.Template, len(tcpzCols))
+	for i, c := range tcpzCols {
+		t, err := template.New(fmt.Sprintf("tcpz-col-%d", i)).Funcs(tcpzFuncsCached).Parse(c.Body)
+		if err != nil {
+			panic(fmt.Sprintf("tcpz: parse column %q body: %v", c.Label, err))
+		}
+		tcpzBodyTpls[i] = t
+	}
+}
+
+var tcpzTpl = template.Must(template.New("tcpz").Funcs(tcpzFuncsCached).Parse(tcpzTplSrc))
+
+const tcpzTplSrc = `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">

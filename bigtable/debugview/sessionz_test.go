@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sessionz
+package debugview
 
 import (
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -25,15 +24,7 @@ import (
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 )
 
-type fakeProvider struct {
-	pools []btransport.PoolSnapshot
-}
-
-func (f fakeProvider) Snapshot() []btransport.PoolSnapshot { return f.pools }
-func (fakeProvider) Diverter() btransport.DiverterSnapshot { return btransport.DiverterSnapshot{} }
-func (fakeProvider) LoadBalancingSnapshots() []btransport.LoadBalancingSnapshot { return nil }
-
-func sampleSnapshot() []btransport.PoolSnapshot {
+func sessionzSampleSnapshot() []btransport.PoolSnapshot {
 	return []btransport.PoolSnapshot{
 		{
 			Name:          "my-table:read",
@@ -80,16 +71,8 @@ func sampleSnapshot() []btransport.PoolSnapshot {
 	}
 }
 
-func get(t *testing.T, h http.Handler, target string) *httptest.ResponseRecorder {
-	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, target, nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	return rec
-}
-
-func TestIndex_HTML_RendersPools(t *testing.T) {
-	h := HandlerFromProvider(fakeProvider{pools: sampleSnapshot()})
+func TestSessionz_Index_HTML_RendersPools(t *testing.T) {
+	h := newSessionzHandler(fakeSessionProvider{pools: sessionzSampleSnapshot()})
 	rec := get(t, h, "/")
 
 	if rec.Code != http.StatusOK {
@@ -106,9 +89,9 @@ func TestIndex_HTML_RendersPools(t *testing.T) {
 	}
 }
 
-func TestIndex_JSON_RoundTrips(t *testing.T) {
-	pools := sampleSnapshot()
-	h := HandlerFromProvider(fakeProvider{pools: pools})
+func TestSessionz_Index_JSON_RoundTrips(t *testing.T) {
+	pools := sessionzSampleSnapshot()
+	h := newSessionzHandler(fakeSessionProvider{pools: pools})
 	rec := get(t, h, "/?format=json")
 
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
@@ -129,8 +112,8 @@ func TestIndex_JSON_RoundTrips(t *testing.T) {
 	}
 }
 
-func TestPool_HTML_RendersSessions(t *testing.T) {
-	h := HandlerFromProvider(fakeProvider{pools: sampleSnapshot()})
+func TestSessionz_Pool_HTML_RendersSessions(t *testing.T) {
+	h := newSessionzHandler(fakeSessionProvider{pools: sessionzSampleSnapshot()})
 	rec := get(t, h, "/pool/my-table:read")
 
 	if rec.Code != http.StatusOK {
@@ -143,7 +126,7 @@ func TestPool_HTML_RendersSessions(t *testing.T) {
 		"Ready", "Starting",
 		"TRANSPORT_TYPE_SESSION_DIRECT_ACCESS",
 		"us-central1", "us-central1-b1",
-		"42",  // OK count
+		"42", // OK count
 	}
 	for _, w := range wants {
 		if !strings.Contains(body, w) {
@@ -152,16 +135,16 @@ func TestPool_HTML_RendersSessions(t *testing.T) {
 	}
 }
 
-func TestPool_NotFound(t *testing.T) {
-	h := HandlerFromProvider(fakeProvider{pools: sampleSnapshot()})
+func TestSessionz_Pool_NotFound(t *testing.T) {
+	h := newSessionzHandler(fakeSessionProvider{pools: sessionzSampleSnapshot()})
 	rec := get(t, h, "/pool/does-not-exist")
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
 	}
 }
 
-func TestIndex_NoProvider_Disabled(t *testing.T) {
-	h := HandlerFromProvider(nil)
+func TestSessionz_Index_NoProvider_Disabled(t *testing.T) {
+	h := newSessionzHandler(nil)
 	rec := get(t, h, "/")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -171,8 +154,8 @@ func TestIndex_NoProvider_Disabled(t *testing.T) {
 	}
 }
 
-func TestIndex_NoPools_Empty(t *testing.T) {
-	h := HandlerFromProvider(fakeProvider{pools: nil})
+func TestSessionz_Index_NoPools_Empty(t *testing.T) {
+	h := newSessionzHandler(fakeSessionProvider{pools: nil})
 	rec := get(t, h, "/")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -182,9 +165,9 @@ func TestIndex_NoPools_Empty(t *testing.T) {
 	}
 }
 
-func TestPool_JSON(t *testing.T) {
-	pools := sampleSnapshot()
-	h := HandlerFromProvider(fakeProvider{pools: pools})
+func TestSessionz_Pool_JSON(t *testing.T) {
+	pools := sessionzSampleSnapshot()
+	h := newSessionzHandler(fakeSessionProvider{pools: pools})
 	rec := get(t, h, "/pool/my-table:read?format=json")
 
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {

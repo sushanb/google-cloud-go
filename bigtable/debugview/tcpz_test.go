@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package tcpz
+package debugview
 
 import (
 	"encoding/json"
@@ -27,12 +27,12 @@ import (
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 )
 
-// TestHandler_EmptyRenders confirms the handler serves a valid HTML page
+// TestTcpz_EmptyRenders confirms the handler serves a valid HTML page
 // with the "no conns registered" hint when no dials have happened yet.
 // Exercises the template on the empty-slice path (guards against a
 // template bug that only surfaces without data).
-func TestHandler_EmptyRenders(t *testing.T) {
-	h := Handler(bigtable.NewTCPStats())
+func TestTcpz_EmptyRenders(t *testing.T) {
+	h := newTcpzHandler(bigtable.NewTCPStats())
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -48,11 +48,11 @@ func TestHandler_EmptyRenders(t *testing.T) {
 	}
 }
 
-// TestHandler_JSON confirms ?format=json returns a JSON array (empty is
-// fine) with the right Content-Type. Cheap regression guard for template
-// bypass logic.
-func TestHandler_JSON(t *testing.T) {
-	h := Handler(bigtable.NewTCPStats())
+// TestTcpz_JSON confirms ?format=json returns a JSON array (empty is
+// fine) with the right Content-Type. Cheap regression guard for
+// template bypass logic.
+func TestTcpz_JSON(t *testing.T) {
+	h := newTcpzHandler(bigtable.NewTCPStats())
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/?format=json", nil))
@@ -71,10 +71,10 @@ func TestHandler_JSON(t *testing.T) {
 	}
 }
 
-// TestHandler_NilStatsSafe guards against a panic when a caller wires the
+// TestTcpz_NilStatsSafe guards against a panic when a caller wires the
 // handler without a TCPStats. Renders as if empty.
-func TestHandler_NilStatsSafe(t *testing.T) {
-	h := Handler(nil)
+func TestTcpz_NilStatsSafe(t *testing.T) {
+	h := newTcpzHandler(nil)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rr.Code != http.StatusOK {
@@ -82,15 +82,16 @@ func TestHandler_NilStatsSafe(t *testing.T) {
 	}
 }
 
-// TestClassify pins the severity buckets so that a future edit to the
-// classifier can't quietly re-color rows. Each row picks the *sharpest*
-// signal for that severity — CAState=Loss for crit, TotalRetrans>0 for
-// warn, CLOSE_WAIT for note, an all-zero snapshot for ok.
-func TestClassify(t *testing.T) {
+// TestTcpz_Classify pins the severity buckets so that a future edit to
+// the classifier can't quietly re-color rows. Each row picks the
+// *sharpest* signal for that severity — CAState=Loss for crit,
+// TotalRetrans>0 for warn, CLOSE_WAIT for note, an all-zero snapshot
+// for ok.
+func TestTcpz_Classify(t *testing.T) {
 	tests := []struct {
 		name    string
 		snap    btransport.TCPInfoSnapshot
-		wantSev severity
+		wantSev tcpzSeverity
 		wantWhy string // substring match
 	}{
 		{
@@ -176,11 +177,11 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-// TestParseSort covers the three shapes: default (sev), known column, and
-// unknown-key fallback to sev. Also asserts that a bad direction gets
-// squashed to "" so column comparators can fall back to their natural
-// direction.
-func TestParseSort(t *testing.T) {
+// TestTcpz_ParseSort covers the three shapes: default (sev), known
+// column, and unknown-key fallback to sev. Also asserts that a bad
+// direction gets squashed to "" so column comparators can fall back to
+// their natural direction.
+func TestTcpz_ParseSort(t *testing.T) {
 	tests := []struct {
 		name    string
 		q       string
@@ -207,27 +208,27 @@ func TestParseSort(t *testing.T) {
 	}
 }
 
-// TestSortRows_byColumn exercises the per-column sort path with a
+// TestTcpz_SortRows_byColumn exercises the per-column sort path with a
 // small mixed row set. We only assert first/last row identity (peer
 // address) — that's the observable behavior clicking a header changes.
-func TestSortRows_byColumn(t *testing.T) {
+func TestTcpz_SortRows_byColumn(t *testing.T) {
 	t0 := time.Unix(1_700_000_000, 0)
-	mk := func(peer string, rtt time.Duration, retrans uint32, dialOffset time.Duration) row {
+	mk := func(peer string, rtt time.Duration, retrans uint32, dialOffset time.Duration) tcpzRow {
 		snap := btransport.TCPInfoSnapshot{
 			RemoteAddr: peer, RTT: rtt, TotalRetrans: retrans,
 			DialedAt: t0.Add(dialOffset),
 			CAState:  "Open", State: "ESTABLISHED",
 		}
 		sev, why := classify(snap)
-		return row{
+		return tcpzRow{
 			TCPInfoSnapshot: snap,
 			Sev:             sev.rowClass(),
 			Why:             strings.Join(why, "+"),
 			Interest:        sev > sevOK,
 		}
 	}
-	base := func() []row {
-		return []row{
+	base := func() []tcpzRow {
+		return []tcpzRow{
 			mk("a:1", 12*time.Millisecond, 0, 0),
 			mk("b:2", 3*time.Millisecond, 5, time.Second),
 			mk("c:3", 40*time.Millisecond, 0, 2*time.Second),
@@ -255,8 +256,6 @@ func TestSortRows_byColumn(t *testing.T) {
 	if rows[0].RemoteAddr != "b:2" {
 		t.Errorf("totalretr desc: got %v first, want b:2", rows[0].RemoteAddr)
 	}
-	// After b, remaining three all have TotalRetrans=0 — expect a, c, d
-	// (dial order) since the sort is stable and we tie-break by DialedAt.
 	if rows[1].RemoteAddr != "a:1" || rows[2].RemoteAddr != "c:3" || rows[3].RemoteAddr != "d:4" {
 		t.Errorf("totalretr desc tie-break order: got %v,%v,%v; want a:1,c:3,d:4",
 			rows[1].RemoteAddr, rows[2].RemoteAddr, rows[3].RemoteAddr)
@@ -271,8 +270,7 @@ func TestSortRows_byColumn(t *testing.T) {
 		}
 	}
 
-	// unknown key is a no-op — order preserved (this matches parseSort's
-	// fallback, but sortRows also guards against a mismatched key).
+	// unknown key is a no-op — order preserved.
 	rows = base()
 	sortRows(rows, "no-such-key", "desc")
 	if rows[0].RemoteAddr != "a:1" {
@@ -280,49 +278,50 @@ func TestSortRows_byColumn(t *testing.T) {
 	}
 }
 
-// TestSortRows_sevPromotesInteresting confirms that the default sev sort
-// puts a Loss-state conn ahead of a healthy conn dialed earlier.
-func TestSortRows_sevPromotesInteresting(t *testing.T) {
+// TestTcpz_SortRows_sevPromotesInteresting confirms that the default
+// sev sort puts a Loss-state conn ahead of a healthy conn dialed
+// earlier.
+func TestTcpz_SortRows_sevPromotesInteresting(t *testing.T) {
 	t0 := time.Unix(1_700_000_000, 0)
 	healthy := btransport.TCPInfoSnapshot{RemoteAddr: "healthy:1", State: "ESTABLISHED", CAState: "Open", DialedAt: t0}
 	bad := btransport.TCPInfoSnapshot{RemoteAddr: "bad:2", State: "ESTABLISHED", CAState: "Loss", DialedAt: t0.Add(time.Second)}
-	toRow := func(s btransport.TCPInfoSnapshot) row {
+	toRow := func(s btransport.TCPInfoSnapshot) tcpzRow {
 		sev, why := classify(s)
-		return row{TCPInfoSnapshot: s, Sev: sev.rowClass(), Why: strings.Join(why, "+"), Interest: sev > sevOK}
+		return tcpzRow{TCPInfoSnapshot: s, Sev: sev.rowClass(), Why: strings.Join(why, "+"), Interest: sev > sevOK}
 	}
-	rows := []row{toRow(healthy), toRow(bad)}
+	rows := []tcpzRow{toRow(healthy), toRow(bad)}
 	sortRows(rows, "sev", "")
 	if rows[0].RemoteAddr != "bad:2" {
 		t.Errorf("sev sort: healthy conn came before Loss conn (got %v first)", rows[0].RemoteAddr)
 	}
 }
 
-// TestHandler_ColumnSortLinksRender is a smoke test that the rendered
-// HTML contains a sortable header link for at least one column. Catches
-// template-level regressions (e.g. .Href accidentally always empty).
-func TestHandler_ColumnSortLinksRender(t *testing.T) {
-	h := Handler(bigtable.NewTCPStats())
+// TestTcpz_ColumnSortLinksRender is a smoke test that the rendered
+// HTML contains a sortable header link for at least one column.
+// Catches template-level regressions (e.g. .Href accidentally always
+// empty).
+func TestTcpz_ColumnSortLinksRender(t *testing.T) {
+	h := newTcpzHandler(bigtable.NewTCPStats())
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("HTTP %d, want 200", rr.Code)
 	}
 	body := rr.Body.String()
-	// With no rows the table is skipped; drive the empty branch by asking
-	// for a sort — the headers themselves are only rendered when Rows>0.
-	// So this test just guards against a template parse regression: the
-	// page must contain the sort meta-bar links.
+	// With no rows the table is skipped; the page must still contain
+	// the sort meta-bar links.
 	if !strings.Contains(body, "sort=sev") && !strings.Contains(body, "sort=dial") {
 		t.Errorf("meta bar missing sort links; body:\n%s", body)
 	}
 }
 
-// TestSevRank_matchesRowClass ensures the string-based sort rank stays in
-// lockstep with the severity enum. If someone adds a new severity, this
-// test flags the missing case before it becomes a silent mis-sort.
-func TestSevRank_matchesRowClass(t *testing.T) {
+// TestTcpz_SevRank_matchesRowClass ensures the string-based sort rank
+// stays in lockstep with the severity enum. If someone adds a new
+// severity, this test flags the missing case before it becomes a silent
+// mis-sort.
+func TestTcpz_SevRank_matchesRowClass(t *testing.T) {
 	pairs := []struct {
-		sev severity
+		sev tcpzSeverity
 	}{
 		{sevOK}, {sevNote}, {sevWarn}, {sevCrit},
 	}

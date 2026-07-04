@@ -12,30 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package channelz provides an HTTP debug page for a *bigtable.Client's
-// underlying gRPC channel pools — sister to sessionz and configz.
-//
-// What it shows, per BigtableChannelPool ("classic" and, when enabled,
-// "session"): the LB policy, total channel count, and one row per channel
-// with outstanding unary load, outstanding streaming load, error count,
-// ALTS/DirectAccess flag, IP protocol, gRPC connectivity state, age, and
-// draining flag.
-//
-// Mount it under any path:
-//
-//	http.Handle("/debug/channelz/", http.StripPrefix("/debug/channelz",
-//	    channelz.Handler(c)))
-//
-// Routes (relative to the mount point):
-//
-//	GET /              → HTML table of every channel pool + its channels.
-//	GET /?format=json  → same data as JSON.
-//
-// The handler does no work until a request lands on it. The snapshot reads
-// the existing atomics non-destructively (unlike the metrics exporter, which
-// swaps errorCount to 0 on each report) so polling the debug UI does not
-// disturb metric counts.
-package channelz
+// channelz view — one row per gRPC channel with outstanding unary /
+// streaming load, error count, ALTS/DirectAccess flag, IP protocol,
+// gRPC connectivity state, age, and draining flag.
+
+package debugview
 
 import (
 	"encoding/json"
@@ -47,33 +28,18 @@ import (
 	"cloud.google.com/go/bigtable"
 )
 
-// Handler returns an http.Handler that renders a debug page for the
-// channel pools owned by c.
-func Handler(c *bigtable.Client) http.Handler {
-	return HandlerFromProvider(providerForClient(c))
-}
-
-// HandlerFromProvider is the same as Handler but accepts an arbitrary
-// ChannelDebugProvider — useful for tests.
-func HandlerFromProvider(p bigtable.ChannelDebugProvider) http.Handler {
+func newChannelzHandler(p bigtable.ChannelDebugProvider) http.Handler {
 	mux := http.NewServeMux()
-	srv := &server{provider: p}
+	srv := &channelzServer{provider: p}
 	mux.HandleFunc("/", srv.handle)
 	return mux
 }
 
-func providerForClient(c *bigtable.Client) bigtable.ChannelDebugProvider {
-	if c == nil {
-		return nil
-	}
-	return c.ChannelDebug()
-}
-
-type server struct {
+type channelzServer struct {
 	provider bigtable.ChannelDebugProvider
 }
 
-func (s *server) handle(w http.ResponseWriter, r *http.Request) {
+func (s *channelzServer) handle(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" && r.URL.Path != "" {
 		http.NotFound(w, r)
 		return
@@ -94,7 +60,7 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := pageTpl.Execute(w, pageData{
+	if err := channelzTpl.Execute(w, channelzPageData{
 		Pools:       pools,
 		Generated:   time.Now(),
 		HasProvider: s.provider != nil,
@@ -103,52 +69,39 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-type pageData struct {
+type channelzPageData struct {
 	Pools       []bigtable.ChannelPoolDebug
 	Generated   time.Time
 	HasProvider bool
 }
 
-var funcs = template.FuncMap{
-	"age": func(t time.Time) string {
+func channelzFuncs() template.FuncMap {
+	m := commonFuncs()
+	m["age"] = func(t time.Time) string {
 		if t.IsZero() {
 			return "—"
 		}
-		return roundDuration(time.Since(t)).String() + " ago"
-	},
-	"until": func(t time.Time) string {
+		return roundDurationLong(time.Since(t)).String() + " ago"
+	}
+	m["until"] = func(t time.Time) string {
 		if t.IsZero() {
 			return "—"
 		}
 		d := time.Until(t)
 		if d < 0 {
-			return "expired " + roundDuration(-d).String() + " ago"
+			return "expired " + roundDurationLong(-d).String() + " ago"
 		}
-		return "in " + roundDuration(d).String()
-	},
-	"orDash": func(s string) string {
-		if s == "" {
-			return "—"
-		}
-		return s
-	},
-	"timestamp": func(t time.Time) string {
-		if t.IsZero() {
-			return "—"
-		}
-		return t.Format(time.RFC3339)
-	},
-	"boolMark": func(b bool) string {
-		if b {
-			return "✓"
-		}
-		return ""
-	},
-	"sessionsOn": func(m map[int][]bigtable.SessionRef, idx int) template.HTML {
-		if m == nil {
+		return "in " + roundDurationLong(d).String()
+	}
+	// sessionsOn renders inline links from a channel row into the matching
+	// sessionz pool-detail anchor. Uses a relative "../sessionz/..." path
+	// which resolves correctly whether debugview is mounted at "/debug/" or
+	// any other prefix (channelz and sessionz are always siblings).
+	m["sessionsOn"] = func(byIdx map[int][]bigtable.SessionRef, idx int) template.HTML {
+		if byIdx == nil {
 			return template.HTML("—")
 		}
-		refs, ok := m[idx]
+		refs, ok := byIdx[idx]
 		if !ok || len(refs) == 0 {
 			return template.HTML("—")
 		}
@@ -172,8 +125,8 @@ var funcs = template.FuncMap{
 			b.WriteString(`</a>`)
 		}
 		return template.HTML(b.String())
-	},
-	"connStateClass": func(s string) string {
+	}
+	m["connStateClass"] = func(s string) string {
 		switch s {
 		case "READY":
 			return "state-active"
@@ -185,23 +138,13 @@ var funcs = template.FuncMap{
 			return "state-closed"
 		}
 		return ""
-	},
-}
-
-func roundDuration(d time.Duration) time.Duration {
-	switch {
-	case d > time.Hour:
-		return d.Round(time.Minute)
-	case d > time.Minute:
-		return d.Round(time.Second)
-	case d > time.Second:
-		return d.Round(10 * time.Millisecond)
-	default:
-		return d.Round(time.Microsecond)
 	}
+	return m
 }
 
-const pageTplSrc = `<!doctype html>
+var channelzTpl = template.Must(template.New("channelz").Funcs(channelzFuncs()).Parse(channelzTplSrc))
+
+const channelzTplSrc = `<!doctype html>
 <html><head>
 <meta charset="utf-8">
 <title>bigtable channelz</title>
@@ -286,5 +229,3 @@ a:hover{text-decoration:underline}
 <div class="foot"><a href="?format=json">JSON</a></div>
 </body></html>
 `
-
-var pageTpl = template.Must(template.New("channelz").Funcs(funcs).Parse(pageTplSrc))

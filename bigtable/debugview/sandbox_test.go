@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sessionz_test
+package debugview_test
 
 import (
 	"context"
@@ -27,19 +27,19 @@ import (
 	"time"
 
 	"cloud.google.com/go/bigtable"
-	"cloud.google.com/go/bigtable/sessionz"
+	"cloud.google.com/go/bigtable/debugview"
 	"google.golang.org/api/option"
 )
 
 // TestHighQpsSessionSandboxWithDebugUI mirrors TestHighQpsSessionSandbox in
-// bigtable/read_session_test.go but additionally mounts the sessionz debug
+// bigtable/read_session_test.go but additionally mounts the debugview
 // handler on a local HTTP port so the live session pool can be inspected in
 // a browser while the load runs.
 //
 // This test hits the sandbox endpoint and requires GCP credentials. Run with:
 //
 //	SESSIONZ_PORT=6060 go test -run TestHighQpsSessionSandboxWithDebugUI \
-//	    ./sessionz/ -timeout 15m -v
+//	    ./debugview/ -timeout 15m -v
 //
 // Set SESSIONZ_PORT=0 (or unset) to pick a random free port; the URL is
 // logged on startup either way.
@@ -69,7 +69,7 @@ func TestHighQpsSessionSandboxWithDebugUI(t *testing.T) {
 	}
 	defer client.Close()
 
-	// Mount sessionz on a TCP port. SESSIONZ_PORT=0 (or unset) → ephemeral
+	// Mount debugview on a TCP port. SESSIONZ_PORT=0 (or unset) → ephemeral
 	// port; an explicit port is honored verbatim so the user can bookmark
 	// a known URL.
 	port := 0
@@ -83,11 +83,11 @@ func TestHighQpsSessionSandboxWithDebugUI(t *testing.T) {
 		t.Fatalf("net.Listen on port %d: %v", port, err)
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/debug/sessionz/", http.StripPrefix("/debug/sessionz", sessionz.Handler(client)))
+	mux.Handle("/debug/", http.StripPrefix("/debug", debugview.Handler(client, nil)))
 	srv := &http.Server{Handler: mux}
 	go func() {
 		if err := srv.Serve(lis); err != nil && err != http.ErrServerClosed {
-			t.Logf("sessionz http server exited: %v", err)
+			t.Logf("debugview http server exited: %v", err)
 		}
 	}()
 	defer func() {
@@ -95,8 +95,8 @@ func TestHighQpsSessionSandboxWithDebugUI(t *testing.T) {
 		defer c()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
-	t.Logf("sessionz debug UI: http://%s/debug/sessionz/", lis.Addr().String())
-	fmt.Printf(">>> SESSIONZ UI: http://%s/debug/sessionz/ <<<\n", lis.Addr().String())
+	t.Logf("debug UI: http://%s/debug/", lis.Addr().String())
+	fmt.Printf(">>> DEBUG UI: http://%s/debug/ <<<\n", lis.Addr().String())
 
 	tbl := client.OpenTable(table)
 
@@ -158,7 +158,7 @@ func TestHighQpsSessionSandboxWithDebugUI(t *testing.T) {
 				fr := atomic.LoadInt64(&failedReads)
 				elapsed := time.Since(start)
 				qps := float64(sw+sr) / elapsed.Seconds()
-				fmt.Printf(">>> STATS [%.1fs elapsed]: Success (W:%d, R:%d), Failed (W:%d, R:%d), QPS: %.2f — UI http://%s/debug/sessionz/ <<<\n",
+				fmt.Printf(">>> STATS [%.1fs elapsed]: Success (W:%d, R:%d), Failed (W:%d, R:%d), QPS: %.2f — UI http://%s/debug/ <<<\n",
 					elapsed.Seconds(), sw, sr, fw, fr, qps, lis.Addr().String())
 			}
 		}

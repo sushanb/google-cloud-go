@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package configz
+package debugview
 
 import (
 	"errors"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -27,13 +26,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
-type fakeProvider struct {
-	snap btransport.ConfigSnapshot
-}
-
-func (f fakeProvider) Snapshot() btransport.ConfigSnapshot { return f.snap }
-
-func sampleSnapshot() btransport.ConfigSnapshot {
+func configzSampleSnapshot() btransport.ConfigSnapshot {
 	return btransport.ConfigSnapshot{
 		InstanceName: "projects/p/instances/inst",
 		AppProfileID: "my-app-profile",
@@ -60,16 +53,8 @@ func sampleSnapshot() btransport.ConfigSnapshot {
 	}
 }
 
-func get(t *testing.T, h http.Handler, target string) *httptest.ResponseRecorder {
-	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, target, nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	return rec
-}
-
 func TestConfigz_HTML_RendersFields(t *testing.T) {
-	h := HandlerFromProvider(fakeProvider{snap: sampleSnapshot()})
+	h := newConfigzHandler(fakeConfigProvider{snap: configzSampleSnapshot()})
 	rec := get(t, h, "/")
 
 	if rec.Code != http.StatusOK {
@@ -93,7 +78,7 @@ func TestConfigz_HTML_RendersFields(t *testing.T) {
 }
 
 func TestConfigz_JSON_ReturnsProtoJSON(t *testing.T) {
-	h := HandlerFromProvider(fakeProvider{snap: sampleSnapshot()})
+	h := newConfigzHandler(fakeConfigProvider{snap: configzSampleSnapshot()})
 	rec := get(t, h, "/?format=json")
 
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
@@ -113,7 +98,7 @@ func TestConfigz_JSON_ReturnsProtoJSON(t *testing.T) {
 }
 
 func TestConfigz_NoProvider(t *testing.T) {
-	h := HandlerFromProvider(nil)
+	h := newConfigzHandler(nil)
 	rec := get(t, h, "/")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -124,10 +109,10 @@ func TestConfigz_NoProvider(t *testing.T) {
 }
 
 func TestConfigz_LastErr_RendersBanner(t *testing.T) {
-	snap := sampleSnapshot()
+	snap := configzSampleSnapshot()
 	snap.LastErr = errors.New("simulated transient failure")
 	snap.LastErrAt = time.Now().Add(-2 * time.Second)
-	h := HandlerFromProvider(fakeProvider{snap: snap})
+	h := newConfigzHandler(fakeConfigProvider{snap: snap})
 	rec := get(t, h, "/")
 
 	body := rec.Body.String()
@@ -144,7 +129,7 @@ func TestConfigz_NoResponseYet(t *testing.T) {
 		InstanceName: "projects/p/instances/inst",
 		CapturedAt:   time.Now(),
 	}
-	h := HandlerFromProvider(fakeProvider{snap: snap})
+	h := newConfigzHandler(fakeConfigProvider{snap: snap})
 	rec := get(t, h, "/")
 	if !strings.Contains(rec.Body.String(), "No successful GetClientConfiguration") {
 		t.Errorf("expected empty-response message; got %q", rec.Body.String())
@@ -153,7 +138,7 @@ func TestConfigz_NoResponseYet(t *testing.T) {
 
 func TestConfigz_JSON_NullWhenEmpty(t *testing.T) {
 	snap := btransport.ConfigSnapshot{CapturedAt: time.Now()}
-	h := HandlerFromProvider(fakeProvider{snap: snap})
+	h := newConfigzHandler(fakeConfigProvider{snap: snap})
 	rec := get(t, h, "/?format=json")
 	if got := strings.TrimSpace(rec.Body.String()); got != "null" {
 		t.Errorf("empty-response JSON = %q, want null", got)
@@ -161,7 +146,7 @@ func TestConfigz_JSON_NullWhenEmpty(t *testing.T) {
 }
 
 func TestConfigz_NotFound(t *testing.T) {
-	h := HandlerFromProvider(fakeProvider{snap: sampleSnapshot()})
+	h := newConfigzHandler(fakeConfigProvider{snap: configzSampleSnapshot()})
 	rec := get(t, h, "/anything-else")
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)

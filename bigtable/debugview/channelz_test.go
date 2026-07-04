@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package channelz
+package debugview
 
 import (
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -26,13 +25,7 @@ import (
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 )
 
-type fakeProvider struct {
-	pools []bigtable.ChannelPoolDebug
-}
-
-func (f fakeProvider) Snapshot() []bigtable.ChannelPoolDebug { return f.pools }
-
-func samplePools() []bigtable.ChannelPoolDebug {
+func channelzSamplePools() []bigtable.ChannelPoolDebug {
 	now := time.Now()
 	return []bigtable.ChannelPoolDebug{
 		{
@@ -78,16 +71,8 @@ func samplePools() []bigtable.ChannelPoolDebug {
 	}
 }
 
-func get(t *testing.T, h http.Handler, target string) *httptest.ResponseRecorder {
-	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, target, nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	return rec
-}
-
 func TestChannelz_HTML(t *testing.T) {
-	h := HandlerFromProvider(fakeProvider{pools: samplePools()})
+	h := newChannelzHandler(fakeChannelProvider{pools: channelzSamplePools()})
 	rec := get(t, h, "/")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -106,7 +91,7 @@ func TestChannelz_HTML(t *testing.T) {
 }
 
 func TestChannelz_JSON(t *testing.T) {
-	h := HandlerFromProvider(fakeProvider{pools: samplePools()})
+	h := newChannelzHandler(fakeChannelProvider{pools: channelzSamplePools()})
 	rec := get(t, h, "/?format=json")
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", ct)
@@ -121,7 +106,7 @@ func TestChannelz_JSON(t *testing.T) {
 }
 
 func TestChannelz_NoProvider(t *testing.T) {
-	h := HandlerFromProvider(nil)
+	h := newChannelzHandler(nil)
 	rec := get(t, h, "/")
 	if !strings.Contains(rec.Body.String(), "No channel debug provider") {
 		t.Errorf("expected no-provider message; got %q", rec.Body.String())
@@ -129,7 +114,7 @@ func TestChannelz_NoProvider(t *testing.T) {
 }
 
 func TestChannelz_NoPools(t *testing.T) {
-	h := HandlerFromProvider(fakeProvider{pools: nil})
+	h := newChannelzHandler(fakeChannelProvider{pools: nil})
 	rec := get(t, h, "/")
 	if !strings.Contains(rec.Body.String(), "No Bigtable channel pools") {
 		t.Errorf("expected empty-state message; got %q", rec.Body.String())
@@ -137,7 +122,7 @@ func TestChannelz_NoPools(t *testing.T) {
 }
 
 func TestChannelz_NotFound(t *testing.T) {
-	h := HandlerFromProvider(fakeProvider{pools: samplePools()})
+	h := newChannelzHandler(fakeChannelProvider{pools: channelzSamplePools()})
 	rec := get(t, h, "/anything")
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)

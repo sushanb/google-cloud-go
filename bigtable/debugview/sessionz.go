@@ -12,27 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package sessionz provides an HTTP debug UI for a *bigtable.Client's session
-// pools — analogous to net/http/pprof for goroutines or rantav/go-grpc-channelz
-// for gRPC channels.
-//
-// Mount the handler under any path you like (the routes are relative to the
-// mount point):
-//
-//	c, _ := bigtable.NewClientWithConfig(ctx, "proj", "inst",
-//	    bigtable.ClientConfig{EnableSessionPool: true})
-//	http.Handle("/debug/sessionz/", http.StripPrefix("/debug/sessionz",
-//	    sessionz.Handler(c)))
-//	go http.ListenAndServe(":6060", nil)
-//
-// The handler pulls live state on each request — there are no background
-// goroutines and no per-RPC overhead beyond two atomic increments. Mounting
-// it on a client whose ClientConfig.EnableSessionPool is false yields a
-// page reporting that session pooling is disabled.
-package sessionz
+// sessionz view — per-pool session state, latency histograms, slow-vRPC
+// log, and scaling history. The most detailed view; pulls live state on
+// each request with no background goroutines and no per-RPC overhead
+// beyond two atomic increments.
+
+package debugview
 
 import (
-	"encoding/json"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -45,46 +32,19 @@ import (
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 )
 
-// Handler returns an http.Handler that renders a debug UI for the session
-// pools owned by c. The returned handler is bound to c for its lifetime —
-// close c and the handler will simply report no pools.
-//
-// Routes (relative to the mount point):
-//
-//	GET /                  → HTML index of pools.
-//	GET /pool/{key}        → HTML detail of one pool and its sessions.
-//	GET /?format=json      → JSON dump of every pool snapshot.
-//	GET /pool/{key}?format=json → JSON dump of one pool.
-//
-// All HTML pages set Cache-Control: no-store; JSON responses set
-// Content-Type: application/json.
-func Handler(c *bigtable.Client) http.Handler {
-	return HandlerFromProvider(providerForClient(c))
-}
-
-// HandlerFromProvider is the same as Handler but accepts an arbitrary
-// SessionDebugProvider — useful for tests and for adapters that want to
-// fan multiple clients into one debug surface.
-func HandlerFromProvider(p bigtable.SessionDebugProvider) http.Handler {
+func newSessionzHandler(p bigtable.SessionDebugProvider) http.Handler {
 	mux := http.NewServeMux()
-	srv := &server{provider: p}
+	srv := &sessionzServer{provider: p}
 	mux.HandleFunc("/", srv.handleIndex)
 	mux.HandleFunc("/pool/", srv.handlePool)
 	return mux
 }
 
-func providerForClient(c *bigtable.Client) bigtable.SessionDebugProvider {
-	if c == nil {
-		return nil
-	}
-	return c.SessionDebug()
-}
-
-type server struct {
+type sessionzServer struct {
 	provider bigtable.SessionDebugProvider
 }
 
-func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
+func (s *sessionzServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" && r.URL.Path != "" {
 		http.NotFound(w, r)
 		return
@@ -96,12 +56,12 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Query().Get("format") == "json" {
 		writeJSON(w, struct {
-			Pools    []btransport.PoolSnapshot `json:"pools"`
+			Pools    []btransport.PoolSnapshot   `json:"pools"`
 			Diverter btransport.DiverterSnapshot `json:"diverter"`
 		}{snaps, diverter})
 		return
 	}
-	writeHTML(w, indexTpl, indexData{
+	writeHTML(w, sessionzIndexTpl, sessionzIndexData{
 		Pools:       snaps,
 		Diverter:    diverter,
 		Generated:   time.Now(),
@@ -109,7 +69,7 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *server) handlePool(w http.ResponseWriter, r *http.Request) {
+func (s *sessionzServer) handlePool(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimPrefix(r.URL.Path, "/pool/")
 	if key == "" {
 		http.NotFound(w, r)
@@ -131,79 +91,56 @@ func (s *server) handlePool(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, found)
 		return
 	}
-	writeHTML(w, poolTpl, poolData{
+	writeHTML(w, sessionzPoolTpl, sessionzPoolData{
 		Pool:      *found,
 		Generated: time.Now(),
 	})
 }
 
-func (s *server) snapshot() []btransport.PoolSnapshot {
+func (s *sessionzServer) snapshot() []btransport.PoolSnapshot {
 	if s.provider == nil {
 		return nil
 	}
 	return s.provider.Snapshot()
 }
 
-func writeJSON(w http.ResponseWriter, v interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(v); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
-}
-
-func writeHTML(w http.ResponseWriter, tpl *template.Template, data interface{}) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	if err := tpl.Execute(w, data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
-}
-
-type indexData struct {
+type sessionzIndexData struct {
 	Pools       []btransport.PoolSnapshot
 	Diverter    btransport.DiverterSnapshot
 	Generated   time.Time
 	HasProvider bool
 }
 
-type poolData struct {
+type sessionzPoolData struct {
 	Pool      btransport.PoolSnapshot
 	Generated time.Time
 }
 
-var funcs = template.FuncMap{
-	"age": func(t time.Time) string {
+func sessionzFuncs() template.FuncMap {
+	m := commonFuncs()
+	m["age"] = func(t time.Time) string {
 		if t.IsZero() {
 			return "—"
 		}
-		return roundDuration(time.Since(t)).String()
-	},
-	"untilNow": func(t time.Time) string {
+		return roundDurationLong(time.Since(t)).String()
+	}
+	m["untilNow"] = func(t time.Time) string {
 		if t.IsZero() {
 			return "—"
 		}
 		d := time.Until(t)
 		if d < 0 {
-			return "expired " + roundDuration(-d).String() + " ago"
+			return "expired " + roundDurationLong(-d).String() + " ago"
 		}
-		return "in " + roundDuration(d).String()
-	},
-	"dur": func(d time.Duration) string {
+		return "in " + roundDurationLong(d).String()
+	}
+	m["dur"] = func(d time.Duration) string {
 		if d == 0 {
 			return "—"
 		}
-		return roundDuration(d).String()
-	},
-	"orDash": func(s string) string {
-		if s == "" {
-			return "—"
-		}
-		return s
-	},
-	"stateClass": func(state string) string {
+		return roundDurationLong(d).String()
+	}
+	m["stateClass"] = func(state string) string {
 		switch state {
 		case "Ready":
 			return "state-active"
@@ -215,20 +152,14 @@ var funcs = template.FuncMap{
 			return "state-closed"
 		}
 		return ""
-	},
-	"timestamp": func(t time.Time) string {
-		return t.Format(time.RFC3339)
-	},
-	"signed": func(n int) string {
+	}
+	m["signed"] = func(n int) string {
 		if n > 0 {
 			return "+" + strconv.Itoa(n)
 		}
 		return strconv.Itoa(n)
-	},
-	// clusterList renders a per-cluster response tally as a flat,
-	// sorted-by-count list: "[cluster-c1: 1350, cluster-c2: 412]". Order
-	// is stable (descending count, then alphabetical cluster id).
-	"reverseSlow": func(s []btransport.SlowVRpcEvent) []btransport.SlowVRpcEvent {
+	}
+	m["reverseSlow"] = func(s []btransport.SlowVRpcEvent) []btransport.SlowVRpcEvent {
 		// Operators want newest-first in a slow log — the most recent
 		// incident is the one they care about. Return a reversed copy
 		// rather than mutating the source.
@@ -237,28 +168,13 @@ var funcs = template.FuncMap{
 			out[i] = s[len(s)-1-i]
 		}
 		return out
-	},
-	"peerShort": func(p btransport.PeerInfoSnapshot) string {
-		// Compact one-cell render for the slow-vRPC table: AFE id (hex)
-		// + region/subzone is what an operator needs to spot a cohort
-		// of failures pinned to a single AFE. Returns "—" when the
-		// stream header hadn't been parsed at slow-vRPC capture time.
-		if p.ApplicationFrontendID == 0 && p.GoogleFrontendID == 0 {
-			return "—"
-		}
-		region := p.ApplicationFrontendRegion
-		if region == "" {
-			region = "?"
-		}
-		subzone := p.ApplicationFrontendSubzone
-		if subzone == "" {
-			subzone = "?"
-		}
-		return fmt.Sprintf("%x/%s/%s", p.ApplicationFrontendID, region, subzone)
-	},
-	"eventKindClass": func(k string) string {
-		// Color-code event severity so close/missed pop visually amongst
-		// the (usually less alarming) hb-alive / ctx-done entries.
+	}
+	// peerShort in sessionz's slow-vRPC log historically rendered "—"
+	// when the peer info was missing. The shared helper returns "" for
+	// that case; the template call site handles the placeholder inline
+	// via `{{else}}—{{end}}` so the visible behavior stays identical.
+	m["peerShort"] = peerShort
+	m["eventKindClass"] = func(k string) string {
 		switch k {
 		case "close":
 			return "evt-close"
@@ -272,9 +188,8 @@ var funcs = template.FuncMap{
 			return "evt-retry"
 		}
 		return ""
-	},
-	"latencyClass": func(d time.Duration) string {
-		// Color-code latency severity so spikes pop visually.
+	}
+	m["latencyClass"] = func(d time.Duration) string {
 		switch {
 		case d >= 5*time.Second:
 			return "lat-red"
@@ -284,17 +199,17 @@ var funcs = template.FuncMap{
 			return "lat-amber"
 		}
 		return ""
-	},
-	"clusterList": func(m map[string]int64) template.HTML {
-		if len(m) == 0 {
+	}
+	m["clusterList"] = func(mm map[string]int64) template.HTML {
+		if len(mm) == 0 {
 			return template.HTML("—")
 		}
 		type kv struct {
 			k string
 			v int64
 		}
-		pairs := make([]kv, 0, len(m))
-		for k, v := range m {
+		pairs := make([]kv, 0, len(mm))
+		for k, v := range mm {
 			pairs = append(pairs, kv{k, v})
 		}
 		sort.Slice(pairs, func(i, j int) bool {
@@ -316,18 +231,14 @@ var funcs = template.FuncMap{
 		}
 		b.WriteString("]")
 		return template.HTML(b.String())
-	},
-	// opaqueID renders an int64 field that the server uses as an opaque
-	// uint64 identifier (GFE / AFE id) as hex. The proto field is signed
-	// so very large IDs come back negative ("-5686685877648862677") which
-	// is technically the correct bit pattern but looks like a bug.
-	"opaqueID": func(n int64) string {
+	}
+	m["opaqueID"] = func(n int64) string {
 		if n == 0 {
 			return "—"
 		}
 		return fmt.Sprintf("0x%016x", uint64(n))
-	},
-	"scalingOutcome": func(ev btransport.ScalingEvent) string {
+	}
+	m["scalingOutcome"] = func(ev btransport.ScalingEvent) string {
 		switch {
 		case ev.Requested > 0 && ev.Launched > 0:
 			return strconv.Itoa(ev.Launched) + " launched"
@@ -340,19 +251,15 @@ var funcs = template.FuncMap{
 		default:
 			return "—"
 		}
-	},
-	// stateChips renders the per-state population summary as small colored
-	// inline chips ("5 Active · 1 Closing · 2 WaitServerClose"). Returns
-	// just the active count as plain text when the only state is Active.
-	"stateChips": func(m map[string]int) template.HTML {
-		if len(m) == 0 {
+	}
+	m["stateChips"] = func(mm map[string]int) template.HTML {
+		if len(mm) == 0 {
 			return template.HTML("—")
 		}
-		// Render in a stable canonical order so similar pools line up.
 		order := []string{"New", "Starting", "Ready", "Closing", "WaitServerClose", "Closed"}
 		var b strings.Builder
 		for _, k := range order {
-			v, ok := m[k]
+			v, ok := mm[k]
 			if !ok || v == 0 {
 				continue
 			}
@@ -379,17 +286,17 @@ var funcs = template.FuncMap{
 			b.WriteString(`</span>`)
 		}
 		return template.HTML(b.String())
-	},
-	"bucketMax": func(b []btransport.LifetimeBucketCount) int {
-		m := 0
+	}
+	m["bucketMax"] = func(b []btransport.LifetimeBucketCount) int {
+		mx := 0
 		for _, x := range b {
-			if x.Count > m {
-				m = x.Count
+			if x.Count > mx {
+				mx = x.Count
 			}
 		}
-		return m
-	},
-	"barWidth": func(count, max int) int {
+		return mx
+	}
+	m["barWidth"] = func(count, max int) int {
 		if max <= 0 {
 			return 0
 		}
@@ -398,38 +305,37 @@ var funcs = template.FuncMap{
 			return 2
 		}
 		return w
-	},
-	"actualRatio": func(sess, classic int64) string {
+	}
+	m["actualRatio"] = func(sess, classic int64) string {
 		total := sess + classic
 		if total == 0 {
 			return "—"
 		}
 		return strconv.FormatFloat(float64(sess)/float64(total), 'f', 2, 64)
-	},
-	"sumMap": func(m map[string]int64) int64 {
+	}
+	m["sumMap"] = func(mm map[string]int64) int64 {
 		var total int64
-		for _, v := range m {
+		for _, v := range mm {
 			total += v
 		}
 		return total
-	},
-	"closeReasonsShort": func(m map[string]int64) string {
-		if len(m) == 0 {
+	}
+	m["closeReasonsShort"] = func(mm map[string]int64) string {
+		if len(mm) == 0 {
 			return "—"
 		}
 		var total int64
-		for _, v := range m {
+		for _, v := range mm {
 			total += v
 		}
-		// Render as "N total" with the per-reason breakdown in the tooltip.
 		return strconv.FormatInt(total, 10) + " total"
-	},
-	"msgBreakdown": func(m map[string]int64) string {
-		if len(m) == 0 {
+	}
+	m["msgBreakdown"] = func(mm map[string]int64) string {
+		if len(mm) == 0 {
 			return ""
 		}
-		keys := make([]string, 0, len(m))
-		for k := range m {
+		keys := make([]string, 0, len(mm))
+		for k := range mm {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
@@ -440,14 +346,11 @@ var funcs = template.FuncMap{
 			}
 			b.WriteString(k)
 			b.WriteString(": ")
-			b.WriteString(strconv.FormatInt(m[k], 10))
+			b.WriteString(strconv.FormatInt(mm[k], 10))
 		}
 		return b.String()
-	},
-	// sparkline renders a tiny inline SVG line chart for a numeric series.
-	// width × height are pixels; the SVG auto-scales the Y axis to fit
-	// min/max of the data. Returns empty string if the series is too short.
-	"sparkline": func(width, height int, color string, values []float64) template.HTML {
+	}
+	m["sparkline"] = func(width, height int, color string, values []float64) template.HTML {
 		if len(values) < 2 {
 			return ""
 		}
@@ -485,39 +388,34 @@ var funcs = template.FuncMap{
 		}
 		b.WriteString(`"/></svg>`)
 		return template.HTML(b.String())
-	},
-	// extractSeries pulls a single numeric series out of TimeSeries samples.
-	// Used by the template to feed sparkline().
-	"okSeries": func(ts []btransport.TimeSeriesSample) []float64 {
+	}
+	m["okSeries"] = func(ts []btransport.TimeSeriesSample) []float64 {
 		out := make([]float64, len(ts))
 		for i, s := range ts {
 			out[i] = s.OkPerSec
 		}
 		return out
-	},
-	"errSeries": func(ts []btransport.TimeSeriesSample) []float64 {
+	}
+	m["errSeries"] = func(ts []btransport.TimeSeriesSample) []float64 {
 		out := make([]float64, len(ts))
 		for i, s := range ts {
 			out[i] = s.ErrPerSec
 		}
 		return out
-	},
-	"sessionsSeries": func(ts []btransport.TimeSeriesSample) []float64 {
+	}
+	m["sessionsSeries"] = func(ts []btransport.TimeSeriesSample) []float64 {
 		out := make([]float64, len(ts))
 		for i, s := range ts {
 			out[i] = float64(s.Sessions)
 		}
 		return out
-	},
-	// msgCell renders a count + a click-to-expand HTML5 <details> disclosure
-	// listing the per-type breakdown. Numbers stay tabular; the per-type rows
-	// only render after the user clicks the count.
-	"msgCell": func(total int64, m map[string]int64) template.HTML {
-		if len(m) == 0 {
+	}
+	m["msgCell"] = func(total int64, mm map[string]int64) template.HTML {
+		if len(mm) == 0 {
 			return template.HTML(strconv.FormatInt(total, 10))
 		}
-		keys := make([]string, 0, len(m))
-		for k := range m {
+		keys := make([]string, 0, len(mm))
+		for k := range mm {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
@@ -529,28 +427,16 @@ var funcs = template.FuncMap{
 			b.WriteString(`<div><span class="msgcell-k">`)
 			b.WriteString(template.HTMLEscapeString(k))
 			b.WriteString(`</span><span class="msgcell-v">`)
-			b.WriteString(strconv.FormatInt(m[k], 10))
+			b.WriteString(strconv.FormatInt(mm[k], 10))
 			b.WriteString(`</span></div>`)
 		}
 		b.WriteString(`</div></details>`)
 		return template.HTML(b.String())
-	},
-}
-
-func roundDuration(d time.Duration) time.Duration {
-	switch {
-	case d > time.Hour:
-		return d.Round(time.Minute)
-	case d > time.Minute:
-		return d.Round(time.Second)
-	case d > time.Second:
-		return d.Round(10 * time.Millisecond)
-	default:
-		return d.Round(time.Microsecond)
 	}
+	return m
 }
 
-const indexTplSrc = `<!doctype html>
+const sessionzIndexTplSrc = `<!doctype html>
 <html><head>
 <meta charset="utf-8">
 <title>bigtable sessionz</title>
@@ -618,7 +504,7 @@ session picks {{.Diverter.SessionPicks}} · classic picks {{.Diverter.ClassicPic
 </body></html>
 `
 
-const poolTplSrc = `<!doctype html>
+const sessionzPoolTplSrc = `<!doctype html>
 <html><head>
 <meta charset="utf-8">
 <title>bigtable sessionz · {{.Pool.Name}}</title>
@@ -841,7 +727,7 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 <td class="mono">{{.Session}}</td>
 <td class="num" title="per-session 1-indexed RPC id; small values indicate a fresh session">{{.RpcIDOnSession}}</td>
 <td class="num" title="age of the session at the time of this call">{{dur .SessionAge}}</td>
-<td class="mono" title="ApplicationFrontendId (hex) / region / subzone of the AFE this session was bound to at call time">{{peerShort .Peer}}</td>
+<td class="mono" title="ApplicationFrontendId (hex) / region / subzone of the AFE this session was bound to at call time">{{with (peerShort .Peer)}}{{.}}{{else}}—{{end}}</td>
 <td class="mono" title="TCP remote (AFE) addr this session's stream is bound to. Click to filter tcpz to the conn(s) with this remote.">{{if .RemoteAddr}}<a href="../tcpz/?remote={{.RemoteAddr | urlquery}}">{{.RemoteAddr}}</a>{{else}}—{{end}}</td>
 <td>{{if .Success}}OK{{else}}<span style="color:#922">{{.ErrCode}}</span>{{end}}</td>
 </tr>
@@ -903,6 +789,6 @@ Low <b>RpcID</b> + small <b>SessionAge</b> → fresh session warm-up cost.
 `
 
 var (
-	indexTpl = template.Must(template.New("index").Funcs(funcs).Parse(indexTplSrc))
-	poolTpl  = template.Must(template.New("pool").Funcs(funcs).Parse(poolTplSrc))
+	sessionzIndexTpl = template.Must(template.New("sessionz-index").Funcs(sessionzFuncs()).Parse(sessionzIndexTplSrc))
+	sessionzPoolTpl  = template.Must(template.New("sessionz-pool").Funcs(sessionzFuncs()).Parse(sessionzPoolTplSrc))
 )

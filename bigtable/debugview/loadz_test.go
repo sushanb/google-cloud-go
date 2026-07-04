@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package loadz
+package debugview
 
 import (
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -25,16 +24,7 @@ import (
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 )
 
-type fakeProvider struct {
-	pools []btransport.PoolSnapshot
-	lb    []btransport.LoadBalancingSnapshot
-}
-
-func (f fakeProvider) Snapshot() []btransport.PoolSnapshot                    { return f.pools }
-func (fakeProvider) Diverter() btransport.DiverterSnapshot                     { return btransport.DiverterSnapshot{} }
-func (f fakeProvider) LoadBalancingSnapshots() []btransport.LoadBalancingSnapshot { return f.lb }
-
-func sampleLB() []btransport.LoadBalancingSnapshot {
+func loadzSampleLB() []btransport.LoadBalancingSnapshot {
 	now := time.Now()
 	return []btransport.LoadBalancingSnapshot{
 		{
@@ -83,16 +73,8 @@ func sampleLB() []btransport.LoadBalancingSnapshot {
 	}
 }
 
-func get(t *testing.T, h http.Handler, target string) *httptest.ResponseRecorder {
-	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, target, nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	return rec
-}
-
-func TestIndex_HTML_RendersPickerAndAFEs(t *testing.T) {
-	h := HandlerFromProvider(fakeProvider{lb: sampleLB()})
+func TestLoadz_Index_HTML_RendersPickerAndAFEs(t *testing.T) {
+	h := newLoadzHandler(fakeSessionProvider{lb: loadzSampleLB()})
 	rec := get(t, h, "/")
 
 	if rec.Code != http.StatusOK {
@@ -113,15 +95,15 @@ func TestIndex_HTML_RendersPickerAndAFEs(t *testing.T) {
 	}
 }
 
-func TestIndex_JSON_RoundTrips(t *testing.T) {
-	h := HandlerFromProvider(fakeProvider{lb: sampleLB()})
+func TestLoadz_Index_JSON_RoundTrips(t *testing.T) {
+	h := newLoadzHandler(fakeSessionProvider{lb: loadzSampleLB()})
 	rec := get(t, h, "/?format=json")
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	var got struct {
-		Pools []PoolView `json:"pools"`
+		Pools []loadzPoolView `json:"pools"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -156,8 +138,8 @@ func TestIndex_JSON_RoundTrips(t *testing.T) {
 	}
 }
 
-func TestIndex_NilProvider(t *testing.T) {
-	h := HandlerFromProvider(nil)
+func TestLoadz_Index_NilProvider(t *testing.T) {
+	h := newLoadzHandler(nil)
 	rec := get(t, h, "/")
 
 	if rec.Code != http.StatusOK {
@@ -168,7 +150,7 @@ func TestIndex_NilProvider(t *testing.T) {
 	}
 }
 
-func TestGlossFor(t *testing.T) {
+func TestLoadz_GlossFor(t *testing.T) {
 	for name, want := range map[string]string{
 		"simple":         "Uniform random",
 		"least-inflight": "in-flight",

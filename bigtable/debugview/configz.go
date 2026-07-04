@@ -12,26 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package configz provides an HTTP debug page for the latest
-// GetClientConfiguration response cached by a *bigtable.Client — sister to
-// the sessionz package.
-//
-// Mount it under any path:
-//
-//	http.Handle("/debug/configz/", http.StripPrefix("/debug/configz",
-//	    configz.Handler(c)))
-//
-// Routes (relative to the mount point):
-//
-//	GET /              → HTML page: instance / app profile, last fetched
-//	                     timestamp, validity window, last error (if any),
-//	                     and the server's raw ClientConfiguration JSON.
-//	GET /?format=json  → just the JSON, suitable for `curl | jq`.
-//
-// The handler does no work until a request lands on it; the underlying
-// ClientConfigurationManager already caches the proto response under its
-// existing lock, so this adds no overhead to the polling loop.
-package configz
+// configz view — instance / app profile, last fetched timestamp,
+// validity window, last error (if any), and the server's raw
+// ClientConfiguration JSON.
+
+package debugview
 
 import (
 	"fmt"
@@ -44,44 +29,27 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
-// Handler returns an http.Handler that renders a debug page for the most
-// recent GetClientConfiguration response cached by c. The returned handler
-// is bound to c for its lifetime — close c and the handler will report a
-// "no config manager" page.
-func Handler(c *bigtable.Client) http.Handler {
-	return HandlerFromProvider(providerForClient(c))
-}
-
-// HandlerFromProvider is the same as Handler but accepts an arbitrary
-// ConfigDebugProvider — useful for tests and for adapters that want to
-// stitch state in from somewhere else.
-func HandlerFromProvider(p bigtable.ConfigDebugProvider) http.Handler {
+func newConfigzHandler(p bigtable.ConfigDebugProvider) http.Handler {
 	mux := http.NewServeMux()
-	srv := &server{provider: p}
+	srv := &configzServer{provider: p}
 	mux.HandleFunc("/", srv.handle)
 	return mux
 }
 
-func providerForClient(c *bigtable.Client) bigtable.ConfigDebugProvider {
-	if c == nil {
-		return nil
-	}
-	return c.ConfigDebug()
-}
-
-type server struct {
+type configzServer struct {
 	provider bigtable.ConfigDebugProvider
 }
 
-// marshaler is shared across requests — it only carries formatting options.
-var marshaler = protojson.MarshalOptions{
+// configzMarshaler is shared across requests — it only carries
+// formatting options.
+var configzMarshaler = protojson.MarshalOptions{
 	Multiline:       true,
 	Indent:          "  ",
 	UseProtoNames:   true,
 	EmitUnpopulated: false,
 }
 
-func (s *server) handle(w http.ResponseWriter, r *http.Request) {
+func (s *configzServer) handle(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" && r.URL.Path != "" {
 		http.NotFound(w, r)
 		return
@@ -95,7 +63,7 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 
 	var jsonStr string
 	if snap.Response != nil {
-		b, err := marshaler.Marshal(snap.Response)
+		b, err := configzMarshaler.Marshal(snap.Response)
 		if err != nil {
 			jsonStr = fmt.Sprintf("error marshaling proto: %v", err)
 		} else {
@@ -114,7 +82,7 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := pageTpl.Execute(w, pageData{
+	if err := configzTpl.Execute(w, configzPageData{
 		HasProvider: s.provider != nil,
 		Snapshot:    snap,
 		ConfigJSON:  jsonStr,
@@ -123,63 +91,42 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-type pageData struct {
+type configzPageData struct {
 	HasProvider bool
 	Snapshot    btransport.ConfigSnapshot
 	ConfigJSON  string
 }
 
-var funcs = template.FuncMap{
-	"ago": func(t time.Time) string {
+func configzFuncs() template.FuncMap {
+	m := commonFuncs()
+	m["ago"] = func(t time.Time) string {
 		if t.IsZero() {
 			return "—"
 		}
-		return roundDuration(time.Since(t)).String() + " ago"
-	},
-	"untilNow": func(t time.Time) string {
+		return roundDurationLong(time.Since(t)).String() + " ago"
+	}
+	m["untilNow"] = func(t time.Time) string {
 		if t.IsZero() {
 			return "—"
 		}
 		d := time.Until(t)
 		if d < 0 {
-			return "expired " + roundDuration(-d).String() + " ago"
+			return "expired " + roundDurationLong(-d).String() + " ago"
 		}
-		return "in " + roundDuration(d).String()
-	},
-	"orDash": func(s string) string {
-		if s == "" {
-			return "—"
-		}
-		return s
-	},
-	"timestamp": func(t time.Time) string {
-		if t.IsZero() {
-			return "—"
-		}
-		return t.Format(time.RFC3339)
-	},
-	"errString": func(e error) string {
+		return "in " + roundDurationLong(d).String()
+	}
+	m["errString"] = func(e error) string {
 		if e == nil {
 			return ""
 		}
 		return e.Error()
-	},
-}
-
-func roundDuration(d time.Duration) time.Duration {
-	switch {
-	case d > time.Hour:
-		return d.Round(time.Minute)
-	case d > time.Minute:
-		return d.Round(time.Second)
-	case d > time.Second:
-		return d.Round(10 * time.Millisecond)
-	default:
-		return d.Round(time.Microsecond)
 	}
+	return m
 }
 
-const pageTplSrc = `<!doctype html>
+var configzTpl = template.Must(template.New("configz").Funcs(configzFuncs()).Parse(configzTplSrc))
+
+const configzTplSrc = `<!doctype html>
 <html><head>
 <meta charset="utf-8">
 <title>bigtable configz</title>
@@ -253,5 +200,3 @@ a:hover{text-decoration:underline}
 <div class="foot"><a href="?format=json">JSON</a></div>
 </body></html>
 `
-
-var pageTpl = template.Must(template.New("configz").Funcs(funcs).Parse(pageTplSrc))
