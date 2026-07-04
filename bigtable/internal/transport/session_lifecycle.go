@@ -70,7 +70,7 @@ func (s *Session) ForceClose(req *spb.CloseSessionRequest) {
 	if req != nil && req.Description != "" {
 		desc = "session force closed: " + req.Description
 	}
-	s.cancelActiveRPCs(unavailable(closeReasonToCause(req), "%s", desc), nil)
+	s.cancelActiveRPCs(unavailable(closeReasonToCause(req), "%s", desc))
 	s.signalQuiescent()
 	s.notifyClosed(nil)
 }
@@ -363,7 +363,7 @@ func (s *Session) handleClose(err error) {
 	peer := s.peerInfoSummary()
 	s.recordEvent("close", "reason=%s age=%v in_flight=%d last_rpc_id=%d %s raw_err=%v",
 		reason, age, inFlight, lastRPC, peer, err)
-	s.cancelActiveRPCs(unavailable(err, "session closed: %v", err), nil)
+	s.cancelActiveRPCs(unavailable(err, "session closed: %v", err))
 	s.signalQuiescent()
 	s.notifyClosed(err)
 }

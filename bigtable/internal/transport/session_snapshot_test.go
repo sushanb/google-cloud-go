@@ -148,8 +148,12 @@ func TestPoolSnapshot_AggregatesSessions(t *testing.T) {
 	if snap.TotalSessions != 2 || snap.ReadyCount != 2 {
 		t.Errorf("Total/Ready = %d/%d, want 2/2", snap.TotalSessions, snap.ReadyCount)
 	}
-	if snap.InUseCount != 1 || snap.PendingCount != 1 {
-		t.Errorf("InUse/Pending = %d/%d, want 1/1", snap.InUseCount, snap.PendingCount)
+	// InUse counts sessions with outstanding > 0. Pending is the true
+	// pool-boundary queue depth (p.waitersCount), NOT sum-of-outstanding
+	// as it used to be — this test has no CheckoutSession waiters, so
+	// PendingCount must be 0 even though one session is in use.
+	if snap.InUseCount != 1 || snap.PendingCount != 0 {
+		t.Errorf("InUse/Pending = %d/%d, want 1/0", snap.InUseCount, snap.PendingCount)
 	}
 	if snap.PickerType == "" {
 		t.Errorf("PickerType empty; expected a reflected type name")

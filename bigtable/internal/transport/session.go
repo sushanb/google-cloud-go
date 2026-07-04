@@ -48,17 +48,25 @@ const (
 // status (so existing retry plumbing sees codes.Unavailable) while errors.Is
 // lets callers distinguish the underlying cause.
 var (
-	// ErrSessionNotActive is returned by Invoke when the session is not yet
-	// active or has begun shutting down.
+	// ErrSessionNotActive is returned by Invoke pre-Send when the session
+	// is not yet active or has begun shutting down. Errors carrying this
+	// cause are delivered tagged StateUncommitted (never left the client)
+	// so RetryingVRpc retries them regardless of Idempotent.
 	ErrSessionNotActive = errors.New("bigtable: session not active")
 	// ErrUnavailableHeartBeatMissed indicates the session was torn down because
 	// the server stopped sending heartbeats within the negotiated window.
+	// Delivered via cancelActiveRPCs and tagged StateTransportFailure.
 	ErrUnavailableHeartBeatMissed = errors.New("bigtable: session unavailable: server heartbeat missed")
-	// ErrUnavailableGoAway indicates the server sent a GOAWAY, which cancels
-	// every in-flight vRPC on the session.
+	// ErrUnavailableGoAway indicates the server sent GOAWAY. The session
+	// transitions to Closing (pool stops handing it out) but any in-flight
+	// vRPC keeps running — if the server sends the response before dropping
+	// the stream, the RPC completes cleanly (Java parity). Only if the
+	// stream actually terminates without a response does the RPC get failed
+	// via handleClose → cancelActiveRPCs (tagged StateTransportFailure).
 	ErrUnavailableGoAway = errors.New("bigtable: session unavailable: server sent GOAWAY")
 	// ErrUnavailableSessionError indicates the server reported a fatal
-	// session-level error (an ErrorResponse with rpc_id == 0).
+	// session-level error (an ErrorResponse with rpc_id == 0). Delivered
+	// via cancelActiveRPCs and tagged StateTransportFailure.
 	ErrUnavailableSessionError = errors.New("bigtable: session unavailable: server reported session error")
 )
 

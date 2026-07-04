@@ -136,7 +136,6 @@ func RetryingVRpc(opts RetryingOptions) Interceptor {
 				return nil, err
 			}
 
-
 			if !hasServerDelay {
 				delay = backoff
 				nextBackoff := float64(backoff) * opts.BackoffMultiplier
@@ -157,7 +156,6 @@ func RetryingVRpc(opts RetryingOptions) Interceptor {
 		return nil, lastErr
 	}
 }
-
 
 // shouldRetryDefault applies strict Java-parity retry classification.
 // Callers with a bespoke policy set RetryingOptions.ShouldRetry to bypass

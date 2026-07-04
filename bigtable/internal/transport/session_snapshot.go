@@ -514,6 +514,11 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 		SlowVRpcs:      p.snapshotSlowVRpcs(),
 		TimeSeries:     p.snapshotTimeSeries(),
 		AFEs:           p.sl.Snapshot(),
+		// True pool-boundary queue depth — same source as Stats().PendingCount.
+		// Previous implementation summed per-session Outstanding, which under
+		// multiPlexingLimit=1 equals InUseCount and made the debug UI show a
+		// wrong "pending" number that never reflected real waiter backlog.
+		PendingCount: int(p.waitersCount.Load()),
 	}
 
 	// Pool-level aggregates: combine cluster counts + latency samples
@@ -539,7 +544,6 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 		}
 		if s.Handle.Outstanding > 0 {
 			snap.InUseCount++
-			snap.PendingCount += int(s.Handle.Outstanding)
 		}
 		for k, v := range s.ClusterCounts {
 			aggregatedClusters[k] += v

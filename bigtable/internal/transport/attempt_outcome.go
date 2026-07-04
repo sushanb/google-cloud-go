@@ -27,8 +27,13 @@ import "errors"
 type AttemptState int
 
 const (
-	// StateServerResult is the zero value so bare errors from non-vRPC paths
-	// preserve today's code-based classification unless callers upgrade.
+	// StateServerResult is the zero value: any bare error from a code
+	// path that hasn't yet adopted tagErr (or an error introduced by a
+	// non-vRPC layer) classifies here. Under the strict Java-parity
+	// default (see shouldRetryDefault in retrying.go) StateServerResult
+	// does NOT retry unless the server explicitly attached RetryInfo or
+	// the caller set RetryingOptions.ShouldRetry to override the whole
+	// classifier. Callers that need a permissive fallback must opt in.
 	StateServerResult AttemptState = iota
 	// StateUncommitted means the attempt never reached the wire — encode
 	// failed, session was Closing, etc. Retry is safe regardless of
@@ -79,9 +84,11 @@ func tagErr(state AttemptState, err error) error {
 	return &vrpcErr{outcome: AttemptOutcome{State: state, Err: err}}
 }
 
-// ClassifyErr returns the outcome for any error. Errors that were never
-// wrapped fall through as StateServerResult so pre-existing callers that
-// return raw gRPC status errors keep their current retry semantics.
+// ClassifyErr returns the outcome for any error. Untagged errors fall
+// through as StateServerResult — which, under the current default, is
+// NOT retryable without server-attached RetryInfo. Callers that produce
+// errors on paths where retry is expected must tag with the appropriate
+// state via tagErr (see session_vrpc.go for the reference call sites).
 func ClassifyErr(err error) AttemptOutcome {
 	if err == nil {
 		return AttemptOutcome{}

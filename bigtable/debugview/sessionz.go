@@ -580,7 +580,7 @@ details.msgcell>summary:hover{color:#15498a}
 <span><b>Creation budget</b> {{.Pool.Throttler.InUse}} / {{.Pool.Throttler.Capacity}} (penalty {{dur .Pool.Throttler.PenaltyDuration}})</span>
 </div>
 <div class="summary">
-<span title="end-to-end wall-clock observed by SessionPoolImpl.Invoke — includes vrpcSem queue wait + network + decode + Backend"><b>TotalLatency</b> p50 {{dur .Pool.TotalLatencyP50}} · p95 {{dur .Pool.TotalLatencyP95}} · p99 {{dur .Pool.TotalLatencyP99}} <span class="mono">(n={{.Pool.TotalLatencyN}})</span></span>
+<span title="end-to-end wall-clock observed by SessionPoolImpl.Invoke — includes pool checkout wait + network + decode + Backend"><b>TotalLatency</b> p50 {{dur .Pool.TotalLatencyP50}} · p95 {{dur .Pool.TotalLatencyP95}} · p99 {{dur .Pool.TotalLatencyP99}} <span class="mono">(n={{.Pool.TotalLatencyN}})</span></span>
 <span title="java-parity ClientTransportLatency = (stream Send→Recv) − server-reported Backend; wire + AFE + client-decode overhead outside server processing"><b>TransportLatency</b> p50 {{dur .Pool.TransportLatencyP50}} · p95 {{dur .Pool.TransportLatencyP95}} · p99 {{dur .Pool.TransportLatencyP99}} <span class="mono">(n={{.Pool.TransportLatencyN}})</span></span>
 <span title="server-reported SessionRequestStats.BackendLatency — pure server processing time"><b>BackendLatency</b> p50 {{dur .Pool.LatencyP50}} · p95 {{dur .Pool.LatencyP95}} · p99 {{dur .Pool.LatencyP99}} <span class="mono">(n={{.Pool.LatencyN}})</span></span>
 {{if .Pool.TimeSeries}}
@@ -708,7 +708,7 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 <table>
 <thead><tr>
 <th>When</th><th>Method</th><th class="num">Latency</th>
-<th class="num">PoolWait</th><th class="num">SemWait</th><th class="num">Transport</th><th class="num">Backend</th>
+<th class="num">PoolWait</th><th class="num">Transport</th><th class="num">Backend</th>
 <th>Session</th><th class="num">RpcID</th><th class="num">SessionAge</th>
 <th>Peer (afe/region/subzone)</th>
 <th>Remote (→ tcpz)</th>
@@ -721,7 +721,6 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 <td class="mono">{{.Method}}</td>
 <td class="num {{latencyClass .Latency}}">{{dur .Latency}}</td>
 <td class="num" title="time inside CheckoutSession — waiting for an idle session at the pool boundary">{{dur .PoolWait}}</td>
-<td class="num" title="time spent in vrpcSem.Acquire — queue wait for the session's single in-flight slot">{{dur .SemWait}}</td>
 <td class="num" title="java-parity ClientTransportLatency = (stream Send→Recv) − Backend; wire + AFE + client-decode overhead outside server processing">{{dur .TransportLatency}}</td>
 <td class="num" title="server-reported BackendLatency">{{dur .BackendLatency}}</td>
 <td class="mono">{{.Session}}</td>
@@ -736,7 +735,6 @@ A spike in the &lt;1m bucket indicates churn (sessions dying young — usually G
 </table>
 <div style="font-size:.78em;color:#888;margin-top:.3em">
 <b>PoolWait</b> ≈ <b>Latency</b> → workers exceeded pool capacity; queued at the pool boundary waiting for an idle session.
-<b>SemWait</b> ≈ <b>Latency</b> → call was queued on the per-session semaphore (would indicate the pool-level checkout missed a busy session — should be rare with pool-queue checkout).
 <b>Transport</b> ≫ <b>Backend</b> → time was spent on the wire (network RTT / server queue), not in server processing.
 <b>Backend</b> close to <b>Latency</b> → server itself was slow.
 Low <b>RpcID</b> + small <b>SessionAge</b> → fresh session warm-up cost.

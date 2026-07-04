@@ -196,16 +196,10 @@ type SlowVRpcEvent struct {
 	Success bool
 	ErrCode string // grpc status code on failure, empty on success
 	// PoolWait is how long the caller spent inside CheckoutSession
-	// waiting for an idle session. After the pool-queue fix this is
-	// where saturation queue wait lives — SemWait should now be near
-	// zero because the pool only hands out idle sessions.
+	// waiting for an idle session. This is where saturation queue wait
+	// lives — the pool only hands out idle sessions, so per-session
+	// semaphore wait no longer exists.
 	PoolWait time.Duration
-	// SemWait is how long the call spent blocked in vrpcSem.Acquire
-	// — i.e. queue wait for the session's single in-flight slot.
-	// Should be ~0 with the pool-queue fix; non-zero only when a
-	// session was picked but immediately got another concurrent
-	// caller (rare with pool-level checkout).
-	SemWait time.Duration
 	// BackendLatency is the server-reported processing time
 	// (SessionRequestStats.BackendLatency); zero if not present.
 	BackendLatency time.Duration
@@ -766,10 +760,10 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 // CheckoutSession returns a session ready to serve one vRPC. With
 // multiPlexingLimit=1 the pool only hands out a session whose
 // outstanding count is 0. If every session is busy, the caller parks
-// on p.freeSignal until DecOutstanding wakes them — moving the queue
-// from inside the session's vrpcSem (artificial HOL blocking — random
-// picks stack on busy sessions even when idle ones exist) to the pool
-// boundary where the first freed session goes to the first waiter.
+// on p.freeSignal until DecOutstanding wakes them. Queueing lives at
+// the pool boundary (first freed session goes to the first waiter),
+// which superseded an earlier per-session semaphore scheme where random
+// picks stacked on busy sessions even when idle ones existed.
 func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, error) {
 	p.mu.Lock()
 	if !p.closed && len(p.sessions) == 0 {
@@ -992,6 +986,10 @@ func (p *SessionPoolImpl) OnStart(ctx context.Context) {}
 // OnActive is triggered when a background session finishes its open session req and becomes active.
 // The session is wrapped inside a SessionHandle and registered into the ready sessions list!
 func (p *SessionPoolImpl) OnActive(s *Session) {
+	// Callers hold this method's body under p.mu for the full duration.
+	// Keep new work here allocation-only / atomic-only — anything that
+	// blocks would deadlock the read loop and heartbeat scheduler that
+	// contend for p.mu. See SessionHooks doc: "hooks must not block."
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -1506,7 +1504,6 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 			Session:          sh.session.LogName(),
 			Success:          invokeErr == nil,
 			PoolWait:         poolWait,
-			SemWait:          result.SemWait,
 			BackendLatency:   backendDur,
 			TransportLatency: transportOverhead,
 			RpcIDOnSession:   result.RpcIDOnSession,

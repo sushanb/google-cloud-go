@@ -46,11 +46,6 @@ type InvokeResult struct {
 	ClusterInfo *spb.ClusterInformation
 	Stats       *spb.SessionRequestStats
 	SentAt      time.Time
-	// SemWait is how long the call spent blocked in vrpcSem.Acquire — i.e.
-	// queue wait for the session's single in-flight slot. Useful for
-	// diagnosing whether a slow vRPC was server-slow vs head-of-line-
-	// blocked behind other queued callers.
-	SemWait time.Duration
 	// RpcIDOnSession is the per-session monotonic id of this call
 	// (1, 2, 3, …). Distinguishes warm-up vRPCs (small id) from
 	// established-session vRPCs.
@@ -279,16 +274,13 @@ func (s *Session) deliver(rpc *vrpcImpl, res vrpcResult) {
 	}
 }
 
-// cancelActiveRPCs cancels the in-flight vRPC (if any) that matches filter
-// with the given error. With multiPlexingLimit=1 there is at most one such
-// vRPC. Clear-then-deliver so a racing handleVRPCResponse can't double-
-// deliver on the same slot.
-func (s *Session) cancelActiveRPCs(err error, filter func(rpcID int64) bool) {
+// cancelActiveRPCs cancels the in-flight vRPC (if any) with the given
+// error. With multiPlexingLimit=1 there is at most one such vRPC.
+// Clear-then-deliver so a racing handleVRPCResponse can't double-deliver
+// on the same slot.
+func (s *Session) cancelActiveRPCs(err error) {
 	rpc := s.activeRPC.Load()
 	if rpc == nil {
-		return
-	}
-	if filter != nil && !filter(rpc.id) {
 		return
 	}
 	if !s.activeRPC.CompareAndSwap(rpc, nil) {

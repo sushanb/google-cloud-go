@@ -451,7 +451,7 @@ func TestHandleErrorResponse_SessionFatalForcesClose(t *testing.T) {
 func TestHandleGoAway_PreservesInFlightRPC(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 
-	rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
+	rpc := &vrpcImpl{id: 1, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
 	s.activeRPC.Store(rpc)
 	s.handleGoAway(&spb.GoAwayResponse{Reason: "test"})
 	if got := s.State(); got != StateClosing {
@@ -466,6 +466,25 @@ func TestHandleGoAway_PreservesInFlightRPC(t *testing.T) {
 	default:
 		// expected: no cancellation delivered
 	}
+
+	// Now verify the whole point of the grace period: a response arriving
+	// AFTER the GOAWAY still completes the RPC successfully. This is the
+	// scenario the Java-parity change was made for — server sends the
+	// reply, then drops the stream. Client must not fail-fast.
+	s.handleVRPCResponse(&spb.VirtualRpcResponse{RpcId: 1, Payload: []byte("late-but-real")})
+	select {
+	case res := <-rpc.resultChan:
+		if res.err != nil {
+			t.Errorf("post-GOAWAY response delivered with err=%v; want success", res.err)
+		}
+		if got := string(res.resp.Payload); got != "late-but-real" {
+			t.Errorf("post-GOAWAY response payload = %q, want %q", got, "late-but-real")
+		}
+	default:
+		t.Error("post-GOAWAY response was not delivered — RPC would hang")
+	}
+	// activeRPC is cleared by Invoke's defer in the real path, not by
+	// handleVRPCResponse — so this test doesn't assert on that side.
 }
 
 func TestHandleSessionParameters_UpdatesIntervalAndDeadline(t *testing.T) {

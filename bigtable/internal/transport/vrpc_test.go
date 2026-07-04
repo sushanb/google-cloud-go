@@ -442,6 +442,48 @@ func TestRetryingVRpc_TransportFailureNonIdempotentNoRetry(t *testing.T) {
 	}
 }
 
+// TestRetryingVRpc_ServerResultNotRetriedByDefault verifies strict
+// Java parity for the ServerResult path: a server-explicit error is NOT
+// retried without server-attached RetryInfo, regardless of gRPC code.
+// The permissive pre-parity behavior (retry on Unavailable / Aborted /
+// Internal / ResourceExhausted / DeadlineExceeded) is gone; callers who
+// need it must set RetryingOptions.ShouldRetry.
+func TestRetryingVRpc_ServerResultNotRetriedByDefault(t *testing.T) {
+	cases := []struct {
+		name string
+		code codes.Code
+	}{
+		{"Unavailable", codes.Unavailable},
+		{"Aborted", codes.Aborted},
+		{"Internal", codes.Internal},
+		{"ResourceExhausted", codes.ResourceExhausted},
+		{"DeadlineExceeded", codes.DeadlineExceeded},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var attempts int
+			baseHandler := func(ctx context.Context, req interface{}) (interface{}, error) {
+				attempts++
+				return nil, tagErr(StateServerResult, status.Error(tc.code, "server said no"))
+			}
+			retryInterceptor := RetryingVRpc(RetryingOptions{
+				MaxAttempts:    5,
+				InitialBackoff: 1 * time.Millisecond,
+				Idempotent:     true, // even idempotent: ServerResult without RetryInfo never retries
+			})
+			ctx := WithVRpcMetadata(context.Background(), "TestMethod", 1)
+			_, err := retryInterceptor(ctx, "req", baseHandler)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if attempts != 1 {
+				t.Errorf("expected 1 attempt (bare ServerResult %s must not retry), got %d",
+					tc.name, attempts)
+			}
+		})
+	}
+}
+
 // TestRetryingVRpc_ServerDeadlineExceededNoRetryByDefault verifies Java
 // parity: a server-returned DEADLINE_EXCEEDED is NOT retried by default.
 // The server said "I gave up"; blindly retrying burns budget on ops the
