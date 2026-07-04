@@ -66,7 +66,6 @@ func sampleSnapshot() []btransport.PoolSnapshot {
 					},
 					Handle: btransport.SessionHandleSnapshot{
 						Outstanding:  3,
-						EwmaLatency:  17 * time.Millisecond,
 						LastActivity: time.Now().Add(-5 * time.Second),
 					},
 				},

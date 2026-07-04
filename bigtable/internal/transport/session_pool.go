@@ -35,8 +35,18 @@ import (
 type SessionPoolImpl struct {
 	mu                 sync.Mutex
 	sizer              *PoolSizer
-	picker             Picker
+	picker             AfePicker
+	// sl is the AFE-aware bucketing structure. It owns the idle-session
+	// queues per AFE and the per-AFE PeakEwma trackers the picker
+	// consumes. Kept in sync with the flat p.sessions slice below —
+	// OnActive registers into both; OnClose / prune remove from both.
+	// sl has its own lock (finer than p.mu); ordering rule: never take
+	// p.mu while holding sl.mu.
+	sl                 *sessionList
 	budget             SessionThrottler
+	// sessions is the flat cross-index used by snapshot / teardown /
+	// dead-sweep read paths. AFE-aware picking goes through sl above.
+	// Both are kept in sync in OnActive / OnClose / prune*.
 	sessions           []*SessionHandle
 	sessionCreatedAt   map[*SessionHandle]time.Time // Tracks when each SessionHandle was added to p.sessions
 	startingSessions   map[*Session]bool
@@ -660,13 +670,17 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 		freeSignal:         make(chan struct{}, 1),
 		poolCtx:            poolCtx,
 		poolCancel:         poolCancel,
+		sl:                 newSessionList(),
 	}
 
 	fetcher := func() *PoolStats {
 		return pool.Stats()
 	}
 	pool.sizer = NewPoolSizer(fetcher, min, max, 0.10)
-	pool.picker = NewLeastInFlightPicker(pool.sessions)
+	// Default to LeastInFlight (Java-parity default) with K-choice-2.
+	// UpdateConfig can switch to Simple / LeastLatency via the server's
+	// LoadBalancingOptions.
+	pool.picker = NewLeastInFlightAfePicker(defaultAfeRandomSubsetSize)
 	pool.budget = NewAdaptiveSessionThrottler(10, 10*time.Second)
 
 	return pool
@@ -693,17 +707,22 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 			return nil, errors.New("session pool is closed")
 		}
 
-		// Fast path: picker already filters non-Active sessions
-		// (LeastInFlightPicker.PickSession does the check), so most
-		// checkouts skip the O(N) dead-sweep entirely. The picker also
-		// applies a lastActivity tie-break so later-activated cohorts
-		// aren't starved by the "first idle wins" pattern that used to
-		// live inline here.
-		if idle := p.picker.PickSession(); idle != nil {
-			idle.IncOutstanding()
-			atomic.AddInt64(&idle.picks, 1)
-			p.mu.Unlock()
-			return idle, nil
+		// Fast path: two-tier pick — pool.picker chooses an AFE from the
+		// ready snapshot, then sessionList dequeues one idle session
+		// from that AFE. sessionList's queue only contains idle
+		// sessions, so we don't scan busy ones. The pool-lock we hold
+		// covers p.sessions + p.closed; sessionList uses its own inner
+		// lock (ordering: never take p.mu while holding sl.mu — here we
+		// call sl AFTER establishing !p.closed but the sl calls don't
+		// acquire p.mu, so ordering is trivially satisfied).
+		ready := p.sl.ReadyAfes()
+		if afe := p.picker.PickAfe(ready); afe != nil {
+			if idle := p.sl.Checkout(afe); idle != nil {
+				idle.IncOutstanding()
+				atomic.AddInt64(&idle.picks, 1)
+				p.mu.Unlock()
+				return idle, nil
+			}
 		}
 
 		// Slow path: picker returned nil. Sweep any dead handles now
@@ -751,9 +770,9 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 }
 
 // pruneDeadLocked removes the given handles from p.sessions (caller
-// holds p.mu). Records each close + lifetime, re-inits the picker, and
-// triggers a scale-up to fill the gap. Separate so CheckoutSession
-// stays readable.
+// holds p.mu) AND from the AFE-aware sessionList. Records each close +
+// lifetime and triggers a scale-up to fill the gap. Separate so
+// CheckoutSession stays readable.
 func (p *SessionPoolImpl) pruneDeadLocked(dead []*SessionHandle) {
 	for _, victim := range dead {
 		for i, sh := range p.sessions {
@@ -767,8 +786,8 @@ func (p *SessionPoolImpl) pruneDeadLocked(dead []*SessionHandle) {
 				break
 			}
 		}
+		p.sl.OnSessionClosed(victim)
 	}
-	p.picker = NewLeastInFlightPicker(p.sessions)
 	go p.PerformScaling(context.Background())
 }
 
@@ -840,7 +859,9 @@ func (p *SessionPoolImpl) Close() error {
 
 	// Record the closes up-front (with PoolClose as the fallback reason)
 	// so the debug counters reflect retirement immediately, even though the
-	// actual graceful Close on each session is still in flight.
+	// actual graceful Close on each session is still in flight. Also drop
+	// the handles from the AFE-aware sessionList so a concurrent picker
+	// racing with teardown never returns a retired session.
 	for _, sh := range snapshot {
 		if sh != nil && sh.session != nil {
 			if t, ok := createdAts[sh]; ok {
@@ -848,6 +869,7 @@ func (p *SessionPoolImpl) Close() error {
 			}
 			p.recordSessionClose(sh.session, "PoolClose")
 		}
+		p.sl.OnSessionClosed(sh)
 	}
 
 	// Phase 2: kick off graceful Close for every session with a bounded ctx
@@ -911,16 +933,14 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 	}
 
 	sh := NewSessionHandle(s)
-	// Wire DecOutstanding's "I'm now idle" notifier to the pool's
-	// wake-up channel so CheckoutSession waiters get unblocked the
-	// moment any session returns to outstanding == 0.
-	sh.SetFreeSignal(p.freeSignal)
 	p.sessions = append(p.sessions, sh)
 	p.sessionCreatedAt[sh] = time.Now()
 	p.sessionsOpened.Add(1)
 
-	// Re-initialize picker with updated sessions list
-	p.picker = NewLeastInFlightPicker(p.sessions)
+	// Register the newly-Active session in its AFE bucket. PeerInfo is
+	// guaranteed populated at this point — handleOpenSession parses it
+	// synchronously before firing onActive (see session_lifecycle.go).
+	p.sl.OnSessionStarted(sh)
 
 	// New session is immediately idle. Post a wake-up so a waiting
 	// worker can grab it without waiting out the 50ms safety timer.
@@ -957,8 +977,11 @@ func (p *SessionPoolImpl) OnClose(s *Session, err error) {
 		p.recordSessionClose(s, "")
 		delete(p.sessionCreatedAt, removed)
 		p.sessions = append(p.sessions[:idx], p.sessions[idx+1:]...)
-		// Re-initialize picker with updated active sessions
-		p.picker = NewLeastInFlightPicker(p.sessions)
+		// Drop the handle from its AFE bucket. sessionList tolerates
+		// double-close and force-close paths where OnSessionClosing
+		// never fired — it removes the handle from the idle queue if
+		// still present and decrements refCount.
+		p.sl.OnSessionClosed(removed)
 		// Trigger scale up evaluation asynchronously immediately!
 		go p.PerformScaling(context.Background())
 		return
@@ -982,15 +1005,20 @@ func (p *SessionPoolImpl) UpdateConfig(config *spb.SessionClientConfiguration_Se
 		lbo := config.LoadBalancingOptions
 		switch opt := lbo.LoadBalancingStrategy.(type) {
 		case *spb.LoadBalancingOptions_Random_:
-			p.picker = NewRandomPicker(p.sessions)
+			// Java's SimplePicker: uniform random over ready AFEs, then
+			// dequeue any idle session in that AFE.
+			p.picker = NewSimpleAfePicker()
 		case *spb.LoadBalancingOptions_LeastInFlight_:
-			p.picker = NewLeastInFlightPicker(p.sessions)
+			p.picker = NewLeastInFlightAfePicker(defaultAfeRandomSubsetSize)
 		case *spb.LoadBalancingOptions_PeakEwma_:
-			subsetSize := 2
-			if opt.PeakEwma != nil {
+			// LoadBalancingOptions_PeakEwma maps to the per-AFE
+			// least-latency picker (Java's LeastLatencyPicker); its
+			// RandomSubsetSize field caps the K-choice draw.
+			subsetSize := defaultAfeRandomSubsetSize
+			if opt.PeakEwma != nil && opt.PeakEwma.RandomSubsetSize > 0 {
 				subsetSize = int(opt.PeakEwma.RandomSubsetSize)
 			}
-			p.picker = NewPeakEwmaPicker(p.sessions, subsetSize)
+			p.picker = NewLeastLatencyAfePicker(subsetSize)
 		}
 	}
 	p.mu.Unlock()
@@ -1030,6 +1058,10 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 	// followed up with a stream EOF. ForceClose drives them to Closed so
 	// OnClose fires and the pool retires them.
 	p.sweepStuckSessions()
+	// GC empty AFE buckets whose lastConnected has aged past the retention
+	// window. Cheap (walks a small map) so running it every heartbeat
+	// tick — instead of a separate cadence — keeps the pool code simple.
+	p.sl.Prune(time.Now())
 
 	p.mu.Lock()
 	if p.closed || p.scalingInProgress {
@@ -1230,6 +1262,7 @@ func (p *SessionPoolImpl) pruneSessions(count int) int {
 
 	pruned := 0
 	var toClose []*Session
+	var prunedHandles []*SessionHandle
 	var active []*SessionHandle
 	for _, sh := range p.sessions {
 		createdAt, ok := p.sessionCreatedAt[sh]
@@ -1243,6 +1276,7 @@ func (p *SessionPoolImpl) pruneSessions(count int) int {
 				toClose = append(toClose, sh.session)
 			}
 			delete(p.sessionCreatedAt, sh)
+			prunedHandles = append(prunedHandles, sh)
 			pruned++
 		} else {
 			active = append(active, sh)
@@ -1250,7 +1284,9 @@ func (p *SessionPoolImpl) pruneSessions(count int) int {
 	}
 
 	p.sessions = active
-	p.picker = NewLeastInFlightPicker(p.sessions)
+	for _, sh := range prunedHandles {
+		p.sl.OnSessionClosed(sh)
+	}
 	p.mu.Unlock()
 
 	if len(toClose) == 0 {
@@ -1338,19 +1374,32 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 	// time. Without it the pool-queue fix would silently hide the
 	// wait from the slow-vRPC log.
 	start := checkoutStart
+	// Track invokeErr / backendDur / latency across the defer so the
+	// per-AFE PeakEwma update sees the actual outcome. The pool wakes
+	// a waiter centrally here (rather than from DecOutstanding) so a
+	// released session is guaranteed back in its AFE queue before the
+	// wake fires.
+	var (
+		invokeErr  error
+		backendDur time.Duration
+		latency    time.Duration
+	)
 	defer func() {
-		sh.DecOutstanding(time.Since(start))
+		sh.DecOutstanding()
+		p.sl.ReleaseToPool(sh)
+		p.sl.RecordVRpcOutcome(sh, latency, backendDur, invokeErr == nil)
+		p.signalFree()
 	}()
 
-	result, invokeErr := sh.session.Invoke(ctx, desc, req)
-	latency := time.Since(start)
+	var result InvokeResult
+	result, invokeErr = sh.session.Invoke(ctx, desc, req)
+	latency = time.Since(start)
 	// Feed the pool-level histograms so the debug UI's TotalLatency and
 	// BackendLatency "N=…" grow over the pool's lifetime instead of
 	// being capped at (active sessions × 256) by per-session ring
 	// buffers. BackendLatency only records when the server populated
 	// Stats — client-observed TotalLatency records for every call.
 	p.totalLatencyHist.record(latency)
-	var backendDur time.Duration
 	if result.Stats != nil && result.Stats.BackendLatency != nil {
 		backendDur = result.Stats.BackendLatency.AsDuration()
 		p.backendLatencyHist.record(backendDur)

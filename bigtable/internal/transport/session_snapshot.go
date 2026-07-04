@@ -150,9 +150,11 @@ type PeerInfoSnapshot struct {
 }
 
 // SessionHandleSnapshot captures the per-handle pool bookkeeping.
+// Per-session PeakEwma was moved to the per-AFE tracker on afeHandle
+// as part of the AFE-grouping refactor — surface those via the pool's
+// afez view instead.
 type SessionHandleSnapshot struct {
 	Outstanding  int64
-	EwmaLatency  time.Duration
 	LastActivity time.Time
 	Picks        int64
 }
@@ -373,13 +375,8 @@ func peerInfoToSnapshot(p *spb.PeerInfo) PeerInfoSnapshot {
 // Snapshot returns a snapshot of the per-handle pool bookkeeping using the
 // existing atomics — no lock taken.
 func (h *SessionHandle) Snapshot() SessionHandleSnapshot {
-	var ewma time.Duration
-	if h.ewma != nil {
-		ewma = time.Duration(h.ewma.Value())
-	}
 	return SessionHandleSnapshot{
 		Outstanding:  atomic.LoadInt64(&h.outstanding),
-		EwmaLatency:  ewma,
 		LastActivity: h.GetLastActivity(),
 		Picks:        atomic.LoadInt64(&h.picks),
 	}

@@ -47,8 +47,12 @@ func injectActiveSession(t *testing.T, p *SessionPoolImpl, name string, createdA
 	p.mu.Lock()
 	p.sessions = append(p.sessions, sh)
 	p.sessionCreatedAt[sh] = createdAt
-	p.picker = NewRandomPicker(p.sessions)
 	p.mu.Unlock()
+	// Register in the AFE-aware sessionList so CheckoutSession's two-tier
+	// pick can find it. injectActiveSession skips the handshake so
+	// PeerInfo stays nil — the handle lands in the AfeID=0 bucket, which
+	// is fine for pool-level tests that don't care about AFE fanout.
+	p.sl.OnSessionStarted(sh)
 	return sh
 }
 
