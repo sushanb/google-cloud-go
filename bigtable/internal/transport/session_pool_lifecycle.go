@@ -40,7 +40,7 @@ const waitServerCloseGrace = 30 * time.Second
 // session.uptime histogram. Sampling happens without the pool lock so
 // tracer work never blocks CheckoutSession / OnClose.
 func (p *SessionPoolImpl) sampleActiveUptimes(ctx context.Context) {
-	handles := p.sl.AllHandles()
+	handles := p.allHandles()
 	for _, sh := range handles {
 		if sh == nil || sh.session == nil {
 			continue
@@ -64,7 +64,7 @@ func (p *SessionPoolImpl) sweepStuckSessions() {
 	}
 	var victims []victim
 
-	for _, sh := range p.sl.AllHandles() {
+	for _, sh := range p.allHandles() {
 		if sh == nil || sh.session == nil {
 			continue
 		}
@@ -159,7 +159,7 @@ func (p *SessionPoolImpl) Close() error {
 	// Snapshot AFTER marking closed so any OnActive races have either
 	// (a) already added to sl, in which case we see them, or (b) will
 	// see p.closed and route straight to ForceClose without registering.
-	snapshot := p.sl.AllHandles()
+	snapshot := p.allHandles()
 
 	// Record the closes up-front (with PoolClose as the fallback reason)
 	// so the debug counters reflect retirement immediately, even though the
@@ -173,7 +173,7 @@ func (p *SessionPoolImpl) Close() error {
 			}
 			p.recordSessionClose(sh.session, "PoolClose")
 		}
-		p.sl.OnSessionClosed(sh)
+		p.removeSession(sh)
 	}
 
 	// Phase 2: kick off graceful Close for every session with a bounded ctx
@@ -253,7 +253,7 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 	// Register the newly-Active session in its AFE bucket. PeerInfo is
 	// guaranteed populated at this point — handleOpenSession parses it
 	// synchronously before firing onActive (see session_lifecycle.go).
-	p.sl.OnSessionStarted(sh)
+	p.registerActive(sh)
 
 	// New session is immediately idle. Post a wake-up so a waiting
 	// worker can grab it without waiting out the 50ms safety timer.
@@ -294,9 +294,9 @@ func (p *SessionPoolImpl) OnClosing(s *Session) {
 	// alive (in-flight vRPCs still complete via the session) until
 	// OnClose fires and drops the handle entirely. This also decrements
 	// sl.readyCount, freeing a slot in the scale-up budget.
-	p.sl.OnSessionClosing(removed)
+	p.markClosing(removed)
 
-	if p.sl.ReadyCount() < p.maxSessions {
+	if p.readyCount() < p.maxSessions {
 		go p.PerformScaling(p.poolCtx)
 	}
 }
@@ -321,7 +321,7 @@ func (p *SessionPoolImpl) OnClose(s *Session, err error) {
 	p.mu.Unlock()
 
 	if handle := s.poolHandle.Load(); handle != nil {
-		p.sl.OnSessionClosed(handle)
+		p.removeSession(handle)
 	}
 	// recordSessionClose is once-guarded via s.poolCloseRecorded — safe
 	// to call even when OnClosing already invoked it.

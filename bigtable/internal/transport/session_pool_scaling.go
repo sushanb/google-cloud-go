@@ -120,7 +120,7 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 	// GC empty AFE buckets whose lastConnected has aged past the retention
 	// window. Cheap (walks a small map) so running it every heartbeat
 	// tick — instead of a separate cadence — keeps the pool code simple.
-	p.sl.Prune(time.Now())
+	p.pruneAfes(time.Now())
 
 	p.mu.Lock()
 	if p.closed || p.scalingInProgress {
@@ -145,7 +145,7 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 	}
 	delta := decision.Delta
 
-	currentSessions := p.sl.ReadyCount()
+	currentSessions := p.readyCount()
 
 	// Only scale-up is actioned. Scale-down deltas are advisory — the
 	// pool shrinks passively via OnClose's replace-on-death gate (see
@@ -229,7 +229,7 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 		p.mu.Unlock()
 		return fmt.Errorf("session pool is closed")
 	}
-	if p.sl.ReadyCount() >= p.maxSessions {
+	if p.readyCount() >= p.maxSessions {
 		p.mu.Unlock()
 		return fmt.Errorf("session pool limit reached")
 	}

@@ -429,7 +429,7 @@ func (p *SessionPoolImpl) LoadBalancingSnapshot() LoadBalancingSnapshot {
 	return LoadBalancingSnapshot{
 		PoolName:   name,
 		PickerName: pickerName,
-		AFEs:       p.sl.Snapshot(),
+		AFEs:       p.afeSnapshot(),
 		PickCounts: countsInt64,
 		Recent:     p.snapshotPickHistory(),
 		CapturedAt: time.Now(),
@@ -462,7 +462,7 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 		pickerType = reflect.TypeOf(p.picker).Elem().Name()
 	}
 	p.mu.Unlock()
-	handles := p.sl.AllHandles()
+	handles := p.allHandles()
 
 	var throttler ThrottlerSnapshot
 	if p.budget != nil {
@@ -487,7 +487,7 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 		OpenRequest:    buildOpenRequestSnapshot(p.openSessionRequest, sessionType),
 		SlowVRpcs:      p.snapshotSlowVRpcs(),
 		TimeSeries:     p.snapshotTimeSeries(),
-		AFEs:           p.sl.Snapshot(),
+		AFEs:           p.afeSnapshot(),
 		// True pool-boundary queue depth — same source as Stats().PendingCount.
 		// Previous implementation summed per-session Outstanding, which under
 		// multiPlexingLimit=1 equals InUseCount and made the debug UI show a

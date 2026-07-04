@@ -56,8 +56,22 @@ type SessionPoolImpl struct {
 	// sl is the AFE-aware bucketing structure. It owns the idle-session
 	// queues per AFE and the per-AFE PeakEwma trackers the picker
 	// consumes. sl is the sole store of active SessionHandles now — no
-	// flat mirror. sl has its own lock (finer than p.mu); ordering
-	// rule: never take p.mu while holding sl.mu.
+	// flat mirror. sl has its own lock (finer than p.mu).
+	//
+	// Access rule: production code MUST NOT touch p.sl directly.
+	// Every pool-level use of sl goes through a wrapper method on
+	// SessionPoolImpl (registerActive / markClosing / removeSession /
+	// checkoutFromAfe / etc — see below). This gives us:
+	//   - single entry point per operation, so future locking changes
+	//     (e.g. combined ordering with p.mu, batched updates) live in
+	//     one place instead of spread across 20+ callsites;
+	//   - a compile-time affordance that sl is an internal detail of
+	//     the pool, not a peer collaborator. sl methods never call
+	//     back into SessionPoolImpl (no pool reference held), so the
+	//     "never take p.mu while holding sl.mu" ordering is preserved
+	//     by construction — not by a comment.
+	// Tests that exercise sl standalone (session_list_test.go) still
+	// call its methods directly; that is intentional.
 	sl     *sessionList
 	budget SessionThrottler
 	// startingSessions holds sessions dialed via createSession that have
@@ -141,6 +155,81 @@ func (p *SessionPoolImpl) SetPoolShortName(name string) {
 	p.poolShortName = strings.ReplaceAll(name, "/", "_")
 }
 
+// --- sessionList wrappers -------------------------------------------------
+//
+// Every pool-level use of sl goes through one of these methods. See the
+// comment on the sl field for why. All wrappers are trivial delegators
+// today; they exist so future locking work has a single place to live.
+
+// registerActive registers a newly-Active session in its AFE bucket.
+func (p *SessionPoolImpl) registerActive(sh *SessionHandle) {
+	p.sl.OnSessionStarted(sh)
+}
+
+// markClosing removes sh from its AFE's idle queue and decrements the
+// scale-up budget. Fires from OnClosing on the first out-of-Ready
+// transition. refCount stays alive until removeSession runs at end of
+// teardown.
+func (p *SessionPoolImpl) markClosing(sh *SessionHandle) {
+	p.sl.OnSessionClosing(sh)
+}
+
+// removeSession drops sh from sl entirely — decrements the AFE's
+// refCount and removes from handleToAfe. Fires from OnClose at
+// end-of-teardown, and from Pool.Close teardown (which bypasses
+// OnClosing).
+func (p *SessionPoolImpl) removeSession(sh *SessionHandle) {
+	p.sl.OnSessionClosed(sh)
+}
+
+// readyAfes returns the picker's input: snapshot of AFEs with at
+// least one idle session, plus per-AFE cost signals.
+func (p *SessionPoolImpl) readyAfes() []afeSnapshot {
+	return p.sl.ReadyAfes()
+}
+
+// checkoutFromAfe dequeues one idle session from the given AFE. Nil
+// if the AFE has no idle sessions (raced with another checkout).
+func (p *SessionPoolImpl) checkoutFromAfe(afe *afeHandle) *SessionHandle {
+	return p.sl.Checkout(afe)
+}
+
+// releaseSession returns a previously checked-out handle to its AFE's
+// idle queue.
+func (p *SessionPoolImpl) releaseSession(sh *SessionHandle) {
+	p.sl.ReleaseToPool(sh)
+}
+
+// recordVRpcOutcome updates the AFE's PeakEwma trackers with an OK
+// vRPC's e2e and backend latencies. Non-OK is a no-op (Java parity).
+func (p *SessionPoolImpl) recordVRpcOutcome(sh *SessionHandle, e2e, backend time.Duration, ok bool) {
+	p.sl.RecordVRpcOutcome(sh, e2e, backend, ok)
+}
+
+// readyCount returns the count of Ready-state handles — the scale-up
+// budget gate. O(1).
+func (p *SessionPoolImpl) readyCount() int {
+	return p.sl.ReadyCount()
+}
+
+// allHandles returns a snapshot of every registered handle (Ready +
+// Closing). Order not stable across calls.
+func (p *SessionPoolImpl) allHandles() []*SessionHandle {
+	return p.sl.AllHandles()
+}
+
+// pruneAfes GCs empty AFE buckets that have been idle past
+// afePruneMaxIdle. Called from the heartbeat.
+func (p *SessionPoolImpl) pruneAfes(now time.Time) {
+	p.sl.Prune(now)
+}
+
+// afeSnapshot returns a stable per-AFE view for the sessionz / afez
+// debug pages.
+func (p *SessionPoolImpl) afeSnapshot() []AfeSnapshotRow {
+	return p.sl.Snapshot()
+}
+
 // NewSessionPoolImpl creates a new SessionPoolImpl.
 func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx context.Context) (Stream, error), openSessionRequest *spb.OpenSessionRequest, md metadata.MD, sessionType SessionType) *SessionPoolImpl {
 	poolCtx, poolCancel := context.WithCancel(context.Background())
@@ -191,7 +280,7 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 	p.mu.Lock()
 	closed := p.closed
 	p.mu.Unlock()
-	if !closed && p.sl.ReadyCount() == 0 {
+	if !closed && p.readyCount() == 0 {
 		go p.PerformScaling(p.poolCtx)
 	}
 
@@ -217,12 +306,12 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		// from that AFE. sessionList uses its own lock; ordering rule
 		// (never take p.mu while holding sl.mu) holds trivially since
 		// we've released p.mu.
-		ready := p.sl.ReadyAfes()
+		ready := p.readyAfes()
 		pickerName := picker.Name()
 		afe, decision := picker.PickAfe(ready)
 		p.recordPickDecision(decision, pickerName)
 		if afe != nil {
-			if idle := p.sl.Checkout(afe); idle != nil {
+			if idle := p.checkoutFromAfe(afe); idle != nil {
 				idle.IncOutstanding()
 				atomic.AddInt64(&idle.picks, 1)
 				return idle, nil
@@ -236,7 +325,7 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		// handleClose). So the maxSessions gate here already reflects
 		// only live-or-starting sessions; a miss just means all live
 		// sessions are busy.
-		if p.sl.ReadyCount() < p.maxSessions {
+		if p.readyCount() < p.maxSessions {
 			go p.PerformScaling(p.poolCtx)
 		}
 
@@ -300,7 +389,7 @@ func (p *SessionPoolImpl) Stats() *PoolStats {
 
 	ready := 0
 	inUse := 0
-	for _, sh := range p.sl.AllHandles() {
+	for _, sh := range p.allHandles() {
 		if sh.session.State() == StateReady {
 			ready++
 		}
@@ -414,8 +503,8 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 	)
 	defer func() {
 		sh.DecOutstanding()
-		p.sl.ReleaseToPool(sh)
-		p.sl.RecordVRpcOutcome(sh, latency, backendDur, invokeErr == nil)
+		p.releaseSession(sh)
+		p.recordVRpcOutcome(sh, latency, backendDur, invokeErr == nil)
 		p.signalFree()
 	}()
 
