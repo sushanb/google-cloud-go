@@ -16,7 +16,6 @@ package internal
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -198,15 +197,13 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 			s.recordCluster(res.clusterInfo.GetClusterId())
 		}
 		if res.err != nil {
-			// GoAway sentinel is a transport-side cancellation of an in-flight
-			// vRPC (the session shut down mid-call), not a server response.
-			// Classify accordingly so idempotent retries fire and
-			// non-idempotent ones don't double-apply.
-			state := StateServerResult
-			if errors.Is(res.err, ErrUnavailableGoAway) {
-				state = StateTransportFailure
-			}
-			return result, tagErr(state, res.err)
+			// res.err arrives from two sources: cancelActiveRPCs (session
+			// died mid-call — always TransportFailure) and
+			// handleVRPCErrorResponse (real server ErrorResponse frame —
+			// always ServerResult). Both source sites now tag with the
+			// correct AttemptState via tagErr before writing to resultChan,
+			// so this path just forwards the tagged err as-is.
+			return result, res.err
 		}
 		if res.resp.RpcId != rpcID {
 			return result, tagErr(StateServerResult,
@@ -266,7 +263,9 @@ func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 	} else {
 		goErr = fmt.Errorf("unknown vRPC error (rpc_id=%d)", errResp.RpcId)
 	}
-	s.deliver(rpc, vrpcResult{err: goErr, clusterInfo: errResp.ClusterInfo})
+	// Real server ErrorResponse frame → ServerResult. Retry decision at
+	// the interceptor gates on the underlying gRPC code + any RetryInfo.
+	s.deliver(rpc, vrpcResult{err: tagErr(StateServerResult, goErr), clusterInfo: errResp.ClusterInfo})
 }
 
 // deliver writes a result onto the RPC's buffered (cap 1) channel. The
@@ -297,5 +296,9 @@ func (s *Session) cancelActiveRPCs(err error, filter func(rpcID int64) bool) {
 		// received a result. Nothing to cancel.
 		return
 	}
-	s.deliver(rpc, vrpcResult{err: err})
+	// Session-side cancellation: session died / GoAway / heartbeat missed
+	// / benign shutdown while an RPC was in-flight. Server may or may not
+	// have processed — TransportFailure classification lets idempotent ops
+	// retry and prevents non-idempotent ones from double-applying.
+	s.deliver(rpc, vrpcResult{err: tagErr(StateTransportFailure, err)})
 }

@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
@@ -160,19 +159,23 @@ func RetryingVRpc(opts RetryingOptions) Interceptor {
 }
 
 
-// shouldRetryDefault applies Java-parity retry classification. Callers with
-// a bespoke policy set RetryingOptions.ShouldRetry to bypass this entirely.
+// shouldRetryDefault applies strict Java-parity retry classification.
+// Callers with a bespoke policy set RetryingOptions.ShouldRetry to bypass
+// this entirely.
 //
 // Retry rules (see AttemptState doc for state semantics):
 //   - Uncommitted → always retry (server saw nothing).
 //   - TransportFailure → retry only if idempotent (server may have applied).
-//   - ServerResult → retry only if server attached RetryInfo, OR the code is
-//     in the narrowed always-retryable set below.
+//   - ServerResult → retry ONLY if the server attached RetryInfo (checked
+//     by the caller and passed in as serverPermitsRetry). A bare
+//     server-explicit error — even Unavailable / Aborted / DeadlineExceeded —
+//     is NOT retried without an explicit server go-ahead. This matches
+//     Java's RetryingVRpc: the server said something specific; the client
+//     doesn't second-guess it.
 //
-// The always-retryable ServerResult set intentionally OMITS DeadlineExceeded:
-// a server-returned deadline-exceeded means "I gave up", not "try again".
-// Java's client behaves the same way — see VRpc.VRpcResult.State handling in
-// google-cloud-java's RetryingVRpc.
+// Callers that need the pre-parity permissive behavior (retry on
+// {Aborted, Internal, ResourceExhausted, Unavailable} without RetryInfo)
+// set RetryingOptions.ShouldRetry.
 func shouldRetryDefault(err error, idempotent, serverPermitsRetry bool) bool {
 	if serverPermitsRetry {
 		return true
@@ -184,25 +187,9 @@ func shouldRetryDefault(err error, idempotent, serverPermitsRetry bool) bool {
 	case StateTransportFailure:
 		return idempotent
 	case StateServerResult:
-		s, ok := status.FromError(outcome.Err)
-		if !ok {
-			return false
-		}
-		return isServerResultRetryable(s.Code())
-	}
-	return false
-}
-
-// isServerResultRetryable is the narrowed default set for server-explicit
-// errors, matching Java's RetryingVRpc for the ServerResult path.
-// DeadlineExceeded is deliberately excluded.
-func isServerResultRetryable(code codes.Code) bool {
-	switch code {
-	case codes.Aborted, codes.Internal, codes.ResourceExhausted, codes.Unavailable:
-		return true
-	default:
 		return false
 	}
+	return false
 }
 
 type closedListenerShield struct {

@@ -102,7 +102,10 @@ func TestRetryingVRpc_SuccessOnRetry(t *testing.T) {
 		}
 
 		if attempts < 3 {
-			return nil, status.Error(codes.Unavailable, "service temporarily unavailable")
+			// TransportFailure matches what session_vrpc.go produces for a
+			// mid-stream Unavailable (session-side cancellation, GoAway,
+			// heartbeat miss). Idempotent=true gates the retry.
+			return nil, tagErr(StateTransportFailure, status.Error(codes.Unavailable, "service temporarily unavailable"))
 		}
 		return "success_resp", nil
 	}
@@ -112,6 +115,7 @@ func TestRetryingVRpc_SuccessOnRetry(t *testing.T) {
 		MaxAttempts:    5,
 		InitialBackoff: 1 * time.Millisecond,
 		Listener:       listener,
+		Idempotent:     true,
 	})
 
 	ctx := WithVRpcMetadata(context.Background(), "TestMethod", 1)
@@ -180,7 +184,10 @@ func TestRetryingVRpc_HonorServerRetryDelay(t *testing.T) {
 	baseHandler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		attempts++
 		if attempts == 1 {
-			// Return transient error with server-directed retry delay of 10ms
+			// Server-returned error carrying RetryInfo — permits retry
+			// regardless of state (Java parity: server explicitly said
+			// "try again in Nms"). Tag as ServerResult to match the real
+			// production path (handleVRPCErrorResponse).
 			st := status.New(codes.Unavailable, "overloaded")
 			stWithDetails, err := st.WithDetails(&errdetails.RetryInfo{
 				RetryDelay: durationpb.New(10 * time.Millisecond),
@@ -188,7 +195,7 @@ func TestRetryingVRpc_HonorServerRetryDelay(t *testing.T) {
 			if err != nil {
 				return nil, err
 			}
-			return nil, stWithDetails.Err()
+			return nil, tagErr(StateServerResult, stWithDetails.Err())
 		}
 		return "ok", nil
 	}
@@ -243,12 +250,13 @@ func TestRetryingVRpc_MaxAttemptsExceeded(t *testing.T) {
 	var attempts int
 	baseHandler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		attempts++
-		return nil, status.Error(codes.Unavailable, "temporary failure")
+		return nil, tagErr(StateTransportFailure, status.Error(codes.Unavailable, "temporary failure"))
 	}
 
 	retryInterceptor := RetryingVRpc(RetryingOptions{
 		MaxAttempts:    3,
 		InitialBackoff: 1 * time.Millisecond,
+		Idempotent:     true,
 	})
 
 	ctx := WithVRpcMetadata(context.Background(), "TestMethod", 1)
@@ -285,22 +293,22 @@ func TestRetryingVRpc_NonGrpcError(t *testing.T) {
 	}
 }
 
-// TestRetryingVRpc_SessionSentinelsAreRetried verifies that every session-level
-// "unavailable" sentinel produced by the unavailable() helper in session.go is
-// treated identically to a server-side codes.Unavailable error — i.e., the
-// retry interceptor extracts the status code via status.FromError and retries.
-// This is the contract that lets a heartbeat-missed teardown, a GOAWAY, a
-// fatal session error, or a not-yet-active session all recover through the
-// same retry path that catches server-side Unavailables.
+// TestRetryingVRpc_SessionSentinelsAreRetried verifies every session-level
+// sentinel produced by session_vrpc.go / session_lifecycle.go rides the
+// state-based retry path correctly. ErrSessionNotActive is Uncommitted
+// (short-circuits before Send). HeartBeatMissed / GoAway / SessionError
+// come via cancelActiveRPCs → TransportFailure. Both classifications
+// permit retry when Idempotent is true.
 func TestRetryingVRpc_SessionSentinelsAreRetried(t *testing.T) {
 	cases := []struct {
 		name     string
 		sentinel error
+		state    AttemptState
 	}{
-		{"ErrSessionNotActive", ErrSessionNotActive},
-		{"ErrUnavailableHeartBeatMissed", ErrUnavailableHeartBeatMissed},
-		{"ErrUnavailableGoAway", ErrUnavailableGoAway},
-		{"ErrUnavailableSessionError", ErrUnavailableSessionError},
+		{"ErrSessionNotActive", ErrSessionNotActive, StateUncommitted},
+		{"ErrUnavailableHeartBeatMissed", ErrUnavailableHeartBeatMissed, StateTransportFailure},
+		{"ErrUnavailableGoAway", ErrUnavailableGoAway, StateTransportFailure},
+		{"ErrUnavailableSessionError", ErrUnavailableSessionError, StateTransportFailure},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -308,13 +316,14 @@ func TestRetryingVRpc_SessionSentinelsAreRetried(t *testing.T) {
 			baseHandler := func(ctx context.Context, req interface{}) (interface{}, error) {
 				attempts++
 				if attempts < 3 {
-					return nil, unavailable(tc.sentinel, "simulated %s", tc.name)
+					return nil, tagErr(tc.state, unavailable(tc.sentinel, "simulated %s", tc.name))
 				}
 				return "ok", nil
 			}
 			retryInterceptor := RetryingVRpc(RetryingOptions{
 				MaxAttempts:    5,
 				InitialBackoff: 1 * time.Millisecond,
+				Idempotent:     true,
 			})
 			ctx := WithVRpcMetadata(context.Background(), "TestMethod", 1)
 			resp, err := retryInterceptor(ctx, "req", baseHandler)
