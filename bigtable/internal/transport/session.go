@@ -573,9 +573,10 @@ func (s *Session) PeerInfo() *spb.PeerInfo {
 // derived from PeerInfo.ApplicationFrontendId. The zero value is the
 // sentinel for "unknown" — used before PeerInfo is populated or when the
 // server did not send the bigtable-peer-info header. Java-parity: mirrors
-// the AutoValue AfeId in SessionList.java, which wraps the same
-// long/uint64 id.
-type afeID uint64
+// the AutoValue AfeId in SessionList.java, which wraps the same signed
+// 64-bit long. Underlying type matches the proto (int64) to avoid
+// sign-conversion surprises.
+type afeID int64
 
 // AfeID returns the AFE identifier for this session, or 0 if PeerInfo is
 // nil (header absent or session pre-Active). Stable for the session's
