@@ -30,6 +30,11 @@ type SessionDebugProvider interface {
 	Snapshot() []btransport.PoolSnapshot
 	// Diverter returns the client-wide session/classic split state.
 	Diverter() btransport.DiverterSnapshot
+	// LoadBalancingSnapshots returns one per-pool picker + pick-history
+	// snapshot for the loadz debug page. Heavier surface than Snapshot
+	// (includes the ring buffer of recent picks) — kept as a separate
+	// accessor so sessionz/afez callers don't pay for it.
+	LoadBalancingSnapshots() []btransport.LoadBalancingSnapshot
 }
 
 // SessionDebug returns a SessionDebugProvider for this Client. Returns nil
@@ -49,6 +54,10 @@ type sessionDebugAdapter struct {
 
 func (a sessionDebugAdapter) Snapshot() []btransport.PoolSnapshot {
 	return a.mgr.ManagerSnapshot()
+}
+
+func (a sessionDebugAdapter) LoadBalancingSnapshots() []btransport.LoadBalancingSnapshot {
+	return a.mgr.LoadBalancingSnapshots()
 }
 
 func (a sessionDebugAdapter) Diverter() btransport.DiverterSnapshot {

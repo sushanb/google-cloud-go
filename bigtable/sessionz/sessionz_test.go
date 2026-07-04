@@ -31,6 +31,7 @@ type fakeProvider struct {
 
 func (f fakeProvider) Snapshot() []btransport.PoolSnapshot { return f.pools }
 func (fakeProvider) Diverter() btransport.DiverterSnapshot { return btransport.DiverterSnapshot{} }
+func (fakeProvider) LoadBalancingSnapshots() []btransport.LoadBalancingSnapshot { return nil }
 
 func sampleSnapshot() []btransport.PoolSnapshot {
 	return []btransport.PoolSnapshot{

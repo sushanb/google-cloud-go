@@ -112,6 +112,18 @@ type SessionPoolImpl struct {
 	lifetimesMu sync.Mutex
 	lifetimes   []time.Duration
 
+	// pickHistoryMu / pickHistory is a ring buffer of the last N picker
+	// decisions from CheckoutSession. Powers the loadz debug page's
+	// "recent pick decisions" table so operators can trace picker
+	// reasoning without re-running the pick.
+	pickHistoryMu sync.Mutex
+	pickHistory   []PickHistoryEvent
+	// afePickCounts is a running per-AFE tally of successful picks over
+	// the pool's lifetime. loadz consumes it to compute actual-share vs.
+	// ideal-share tables. Keyed by afeID; a small map (single-digit AFEs
+	// typically).
+	afePickCounts map[afeID]int64
+
 	// backendLatencyHist / totalLatencyHist keep pool-wide latency
 	// percentiles over the pool's entire lifetime. The per-session ring
 	// buffers on Session cap at 256 samples each and are lost when a
@@ -558,6 +570,70 @@ func (p *SessionPoolImpl) slowThreshold() time.Duration {
 	return defaultSlowThreshold
 }
 
+// maxPickHistory caps the pick-decision ring buffer. Sized so that a
+// heavily-loaded pool (a few thousand picks/sec) retains a rolling
+// window of the last ~1s of decisions — enough to answer "why did the
+// picker choose that one?" without unbounded growth.
+const maxPickHistory = 500
+
+// PickHistoryEvent is one row in the pool's pick-decision log — the
+// per-CheckoutSession outcome of the AfePicker. Populated even for
+// no-candidate picks (Reason == "no-candidates") so loadz can show the
+// fallback frequency.
+type PickHistoryEvent struct {
+	At       time.Time
+	Decision PickDecision
+	// PickerName captures which picker was in force at the time. Useful
+	// when UpdateConfig swaps the picker mid-run; the buffer's older
+	// entries retain their original picker attribution.
+	PickerName string
+}
+
+// recordPickDecision appends a picker outcome to the ring buffer AND
+// increments the per-AFE pick counter for the winner. pickerName must be
+// supplied by the caller (CheckoutSession already holds p.mu when it
+// reads p.picker.Name(), so we avoid a second acquisition + re-entrant
+// deadlock here). Cheap enough to call from every CheckoutSession
+// without gating.
+func (p *SessionPoolImpl) recordPickDecision(d PickDecision, pickerName string) {
+	p.pickHistoryMu.Lock()
+	if len(p.pickHistory) >= maxPickHistory {
+		copy(p.pickHistory, p.pickHistory[1:])
+		p.pickHistory = p.pickHistory[:len(p.pickHistory)-1]
+	}
+	p.pickHistory = append(p.pickHistory, PickHistoryEvent{
+		At:         time.Now(),
+		Decision:   d,
+		PickerName: pickerName,
+	})
+	if d.Winner != 0 {
+		p.afePickCounts[d.Winner]++
+	}
+	p.pickHistoryMu.Unlock()
+}
+
+// snapshotPickHistory returns a copy of the pick-decision ring buffer,
+// newest-last. Safe to call concurrently with recordPickDecision.
+func (p *SessionPoolImpl) snapshotPickHistory() []PickHistoryEvent {
+	p.pickHistoryMu.Lock()
+	defer p.pickHistoryMu.Unlock()
+	out := make([]PickHistoryEvent, len(p.pickHistory))
+	copy(out, p.pickHistory)
+	return out
+}
+
+// snapshotAfePickCounts returns a copy of the per-AFE cumulative pick
+// counter map. Used by loadz to compute actual-share vs. ideal-share.
+func (p *SessionPoolImpl) snapshotAfePickCounts() map[afeID]int64 {
+	p.pickHistoryMu.Lock()
+	defer p.pickHistoryMu.Unlock()
+	out := make(map[afeID]int64, len(p.afePickCounts))
+	for k, v := range p.afePickCounts {
+		out[k] = v
+	}
+	return out
+}
+
 // maxScalingHistory caps the per-pool ring buffer length. Picked so that at
 // the default 1-second heartbeat interval the buffer covers the last ~16
 // minutes of activity — long enough to see a full provisioning episode but
@@ -671,6 +747,7 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 		poolCtx:            poolCtx,
 		poolCancel:         poolCancel,
 		sl:                 newSessionList(),
+		afePickCounts:      make(map[afeID]int64),
 	}
 
 	fetcher := func() *PoolStats {
@@ -716,7 +793,10 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		// call sl AFTER establishing !p.closed but the sl calls don't
 		// acquire p.mu, so ordering is trivially satisfied).
 		ready := p.sl.ReadyAfes()
-		if afe := p.picker.PickAfe(ready); afe != nil {
+		pickerName := p.picker.Name()
+		afe, decision := p.picker.PickAfe(ready)
+		p.recordPickDecision(decision, pickerName)
+		if afe != nil {
 			if idle := p.sl.Checkout(afe); idle != nil {
 				idle.IncOutstanding()
 				atomic.AddInt64(&idle.picks, 1)
