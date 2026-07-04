@@ -102,52 +102,6 @@ func TestSessionPool_Close_CompletesWithIdleSessions(t *testing.T) {
 	}
 }
 
-// TestSessionPool_PruneSessions_RespectsAgeGuard verifies pruneSessions skips
-// freshly-minted sessions (< minSessionAge) so we don't churn through new
-// sessions before they have a chance to absorb load.
-func TestSessionPool_PruneSessions_RespectsAgeGuard(t *testing.T) {
-	p := newTestPool(t, 1, 10)
-
-	// Freshly minted (createdAt = now): must be skipped by pruneSessions.
-	fresh := injectActiveSession(t, p, "fresh", time.Now())
-
-	p.pruneSessions(1)
-
-	p.mu.Lock()
-	stillThere := false
-	for _, sh := range p.sessions {
-		if sh == fresh {
-			stillThere = true
-			break
-		}
-	}
-	p.mu.Unlock()
-	if !stillThere {
-		t.Fatal("fresh session was pruned despite age-guard (must be skipped while < minSessionAge)")
-	}
-
-	// Time-travel: rewrite createdAt to a time well past minSessionAge so
-	// the next prune is allowed to take it.
-	p.mu.Lock()
-	p.sessionCreatedAt[fresh] = time.Now().Add(-time.Hour)
-	p.mu.Unlock()
-
-	p.pruneSessions(1)
-
-	p.mu.Lock()
-	stillThere = false
-	for _, sh := range p.sessions {
-		if sh == fresh {
-			stillThere = true
-			break
-		}
-	}
-	p.mu.Unlock()
-	if stillThere {
-		t.Error("aged session was not pruned after age-guard cleared")
-	}
-}
-
 // TestSessionPool_Close_BoundedByTimeout is skipped: constructing a stuck
 // session that ignores Close() requires real readLoop/Send plumbing that
 // blocks unrecoverably, which is hard to do safely in a unit test. The 30s
@@ -165,8 +119,8 @@ func TestPerformScaling_NoLongerPrunesOverprovisioned(t *testing.T) {
 	p := newTestPool(t, 1, 20)
 	// 10 idle sessions, none in-flight → sizer will compute
 	// desired ≈ minSessions (5-ish) and delta will be negative.
-	// Age them past minSessionAge so pruneSessions COULD kill them,
-	// making this a true test that PerformScaling declines to.
+	// PerformScaling must observe the negative delta and NOT shrink
+	// the pool — regression guard for the removed active-scale-down.
 	for i := 0; i < 10; i++ {
 		sh := injectActiveSession(t, p, "idle", time.Now().Add(-time.Hour))
 		_ = sh

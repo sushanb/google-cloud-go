@@ -280,8 +280,8 @@ type Session struct {
 
 	// closeReason is set exactly once via setCloseReason() at session
 	// teardown so SessionPoolImpl.OnClose can attribute the close to a
-	// category (Heartbeat / GoAway / Error / User / Downsize). Empty string
-	// when the close cause isn't classified.
+	// category (Heartbeat / GoAway / Error / User). Empty string when the
+	// close cause isn't classified.
 	closeReason atomic.Pointer[string]
 
 	// poolCloseRecorded is the once-flag the owning SessionPoolImpl

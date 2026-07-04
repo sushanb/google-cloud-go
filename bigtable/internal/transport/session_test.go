@@ -227,7 +227,6 @@ func TestCloseReasonToCause(t *testing.T) {
 		{"nil request maps to nil", nil, nil},
 		{"unset reason → nil", &spb.CloseSessionRequest{Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_UNSET}, nil},
 		{"user-initiated → nil", &spb.CloseSessionRequest{Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_USER}, nil},
-		{"downsize → nil", &spb.CloseSessionRequest{Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_DOWNSIZE}, nil},
 		{"missed heartbeat", &spb.CloseSessionRequest{Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_MISSED_HEARTBEAT}, ErrUnavailableHeartBeatMissed},
 		{"goaway", &spb.CloseSessionRequest{Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_GOAWAY}, ErrUnavailableGoAway},
 		{"error", &spb.CloseSessionRequest{Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR}, ErrUnavailableSessionError},

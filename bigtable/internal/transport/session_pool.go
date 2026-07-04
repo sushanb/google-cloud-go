@@ -667,15 +667,15 @@ func (p *SessionPoolImpl) bumpCloseReason(label string) {
 
 // recordSessionClose marks a session as retired exactly once and bumps
 // sessionsClosed + the close-reason histogram. Called from every removal
-// site (OnClose, CheckoutSession's dead-detect, pruneSessions, Pool.Close)
-// so the counter reflects pool-side retirements promptly even when the
+// site (OnClose, CheckoutSession's dead-detect, Pool.Close) so the
+// counter reflects pool-side retirements promptly even when the
 // underlying session's hooks.OnClose hasn't fired yet (e.g. the server
 // hasn't EOFed the stream). The once-flag lives on the Session so it
 // dedupes across paths.
 //
 // fallbackReason is used only when the session itself hasn't recorded a
-// reason yet — for example, pruneSessions hasn't sent CloseSession yet,
-// or CheckoutSession found a session in StateClosed via a race.
+// reason yet — e.g. CheckoutSession found a session in StateClosed via
+// a race and needs to attribute the retirement.
 func (p *SessionPoolImpl) recordSessionClose(s *Session, fallbackReason string) {
 	if s == nil {
 		return
@@ -1072,9 +1072,9 @@ func (p *SessionPoolImpl) OnClose(s *Session, err error) {
 		return
 	}
 	// idx == -1: handle was already removed by a proactive path
-	// (CheckoutSession dead-detect, pruneSessions, Pool.Close). That path
-	// already recorded the close; this is a no-op thanks to the once-flag,
-	// but we still call it so a path that ever forgets to record doesn't
+	// (CheckoutSession dead-detect, Pool.Close). That path already
+	// recorded the close; this is a no-op thanks to the once-flag, but
+	// we still call it so a path that ever forgets to record doesn't
 	// silently leak counts.
 	p.recordSessionClose(s, "")
 }
@@ -1326,77 +1326,6 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 
 	success = true
 	return nil
-}
-
-// pruneSessions removes up to count idle sessions from the pool and kicks
-// off graceful close on each. Returns the number actually pruned so the
-// scaling-history event can report what happened.
-func (p *SessionPoolImpl) pruneSessions(count int) int {
-	// Phase 1: under lock, select prune candidates and remove them from
-	// p.sessions immediately so concurrent CheckoutSession callers don't
-	// pick them. Skip sessions younger than 5s so we don't churn through
-	// newly-minted sessions before they have a chance to absorb load.
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return 0
-	}
-
-	now := time.Now()
-	const minSessionAge = 5 * time.Second
-
-	pruned := 0
-	var toClose []*Session
-	var prunedHandles []*SessionHandle
-	var active []*SessionHandle
-	for _, sh := range p.sessions {
-		createdAt, ok := p.sessionCreatedAt[sh]
-		tooYoung := !ok || now.Sub(createdAt) < minSessionAge
-		if pruned < count && atomic.LoadInt64(&sh.outstanding) == 0 && !tooYoung {
-			if sh.session != nil {
-				if ok {
-					p.recordLifetime(now.Sub(createdAt))
-				}
-				p.recordSessionClose(sh.session, "Downsize")
-				toClose = append(toClose, sh.session)
-			}
-			delete(p.sessionCreatedAt, sh)
-			prunedHandles = append(prunedHandles, sh)
-			pruned++
-		} else {
-			active = append(active, sh)
-		}
-	}
-
-	p.sessions = active
-	for _, sh := range prunedHandles {
-		p.sl.OnSessionClosed(sh)
-	}
-	p.mu.Unlock()
-
-	if len(toClose) == 0 {
-		return 0
-	}
-
-	// Phase 2: spawn graceful Close for every pruned session with a bounded
-	// 5s timeout, then wait so this call doesn't return until the closes
-	// finish (or the bounded ctx fires).
-	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	var wg sync.WaitGroup
-	for _, s := range toClose {
-		wg.Add(1)
-		go func(s *Session) {
-			defer wg.Done()
-			s.Close(closeCtx, &spb.CloseSessionRequest{
-				Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_DOWNSIZE,
-				Description: "prune session downsize",
-			})
-		}(s)
-	}
-	wg.Wait()
-	return pruned
 }
 
 // scalingReason summarizes why the sizer requested a scale delta given the
