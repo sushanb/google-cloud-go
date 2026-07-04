@@ -25,9 +25,9 @@ import (
 )
 
 // writeJSON is the shared JSON response helper used by every -z view. All
-// four responders (afez/flightz/loadz/sessionz) used byte-identical bodies
-// before the fold; channelz/configz inlined the same logic. Kept here so
-// tweaks (e.g. gzip, streaming) can land in one place.
+// responders (afez/loadz/sessionz) used byte-identical bodies before the
+// fold; channelz/configz inlined the same logic. Kept here so tweaks
+// (e.g. gzip, streaming) can land in one place.
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -48,9 +48,9 @@ func writeHTML(w http.ResponseWriter, tpl *template.Template, data interface{}) 
 }
 
 // roundDurationShort is the sub-second-first rounding rule used by
-// latency-oriented columns (afez / flightz / loadz EWMAs and ages).
-// Preserves microsecond resolution for sub-millisecond values and drops to
-// 10ms buckets once you're past a second.
+// latency-oriented columns (afez / loadz EWMAs and ages). Preserves
+// microsecond resolution for sub-millisecond values and drops to 10ms
+// buckets once you're past a second.
 func roundDurationShort(d time.Duration) time.Duration {
 	switch {
 	case d < 0:
@@ -82,31 +82,13 @@ func roundDurationLong(d time.Duration) time.Duration {
 	}
 }
 
-// ageOf returns now-sentAt clamped to 0 for a zero timestamp. Used by
-// flightz to compute per-vRPC "age".
-func ageOf(now, sentAt time.Time) time.Duration {
-	if sentAt.IsZero() {
-		return 0
-	}
-	return now.Sub(sentAt)
-}
-
-// remainingOf returns deadline-now clamped to 0 for a zero deadline.
-// Callers preserve the sign (negative == already expired).
-func remainingOf(now, deadline time.Time) time.Duration {
-	if deadline.IsZero() {
-		return 0
-	}
-	return deadline.Sub(now)
-}
-
 // peerShort renders the AFE routing tuple (id-in-hex / region / subzone)
-// used by flightz's Peer column and sessionz's slow-vRPC log Peer column.
+// used by sessionz's slow-vRPC log Peer column.
 //
-// Returns "" when the AFE header hasn't landed yet (flightz zero-check);
-// substitutes "?" for empty region / subzone (sessionz's readability
-// tweak). Callers who need a visible placeholder for the empty case
-// should inline `{{else}}—{{end}}` at their template call site.
+// Returns "" when the AFE header hasn't landed yet; substitutes "?" for
+// empty region / subzone (sessionz's readability tweak). Callers who
+// need a visible placeholder for the empty case should inline
+// `{{else}}—{{end}}` at their template call site.
 func peerShort(p btransport.PeerInfoSnapshot) string {
 	if p.ApplicationFrontendID == 0 && p.ApplicationFrontendRegion == "" && p.ApplicationFrontendSubzone == "" {
 		return ""

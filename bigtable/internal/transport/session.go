@@ -160,21 +160,13 @@ type vrpcResult struct {
 	err         error
 }
 
-// vrpcImpl tracks the state of an in-flight virtual RPC.
-//
-// sentAt / deadline / attempt are populated by Session.Invoke immediately
-// before the wire Send so the flightz debug page can render a live
-// snapshot of every in-flight vRPC without allocating or locking on the
-// hot path. All three values are already computed by Invoke to fill the
-// VirtualRpcRequest envelope; storing them here just re-uses those
-// stamps.
+// vrpcImpl tracks the state of an in-flight virtual RPC. Populated once
+// by Session.Invoke at construction, never mutated after — activeRPC.CAS
+// is the publication point.
 type vrpcImpl struct {
 	id         int64
 	method     string
 	resultChan chan vrpcResult
-	sentAt     time.Time // wall-clock stamp captured right before s.Send(sessionReq)
-	deadline   time.Time // ctx.Deadline() at Invoke entry; zero if the ctx has no deadline
-	attempt    int32     // VRpcAttempt(ctx) at Invoke entry (1 = first try, 2+ = retry)
 }
 
 // Session manages the lifecycle of a Bigtable Session and routes vRPCs over

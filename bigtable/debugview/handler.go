@@ -13,8 +13,8 @@
 // limitations under the License.
 
 // Package debugview mounts every Bigtable -z debug page (sessionz / afez /
-// flightz / loadz / channelz / configz / tcpz) behind a single
-// http.Handler. Serves a link index at "/" and each view at "/<view>/".
+// loadz / channelz / configz / tcpz) behind a single http.Handler. Serves
+// a link index at "/" and each view at "/<view>/".
 //
 // Typical wiring is one line:
 //
@@ -50,7 +50,6 @@ func Handler(c *bigtable.Client, s *bigtable.TCPStats) http.Handler {
 
 	mux.Handle("/sessionz/", http.StripPrefix("/sessionz", newSessionzHandler(sessionProv)))
 	mux.Handle("/afez/", http.StripPrefix("/afez", newAfezHandler(sessionProv)))
-	mux.Handle("/flightz/", http.StripPrefix("/flightz", newFlightzHandler(sessionProv)))
 	mux.Handle("/loadz/", http.StripPrefix("/loadz", newLoadzHandler(sessionProv)))
 	mux.Handle("/channelz/", http.StripPrefix("/channelz", newChannelzHandler(channelProv)))
 	mux.Handle("/configz/", http.StripPrefix("/configz", newConfigzHandler(configProv)))
@@ -116,7 +115,6 @@ li .desc{color:#666;font-size:.88em;margin-top:.15em}
 <ul>
 <li><a href="sessionz/">sessionz</a> <div class="desc">per-pool sessions, states, latency histograms, slow-vRPC log, scaling history.</div></li>
 <li><a href="afez/">afez</a> <div class="desc">per-AFE bucketing: refCount, idle, in-use, EWMAs, last-connected.</div></li>
-<li><a href="flightz/">flightz</a> <div class="desc">live in-flight vRPCs, oldest first (stuck-request forensics).</div></li>
 <li><a href="loadz/">loadz</a> <div class="desc">picker decision reasoning, actual-vs-ideal AFE fanout, K-choice trace.</div></li>
 <li><a href="channelz/">channelz</a> <div class="desc">gRPC channel pool state (classic + session).</div></li>
 <li><a href="configz/">configz</a> <div class="desc">server-driven client configuration (GetClientConfiguration).</div></li>
