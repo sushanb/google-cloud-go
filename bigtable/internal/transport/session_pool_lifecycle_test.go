@@ -157,11 +157,13 @@ func TestOnClose_StartingSessionBumpsFailedToStart(t *testing.T) {
 	}
 }
 
-func TestOnClose_ActiveSessionRemovedAndRecorded(t *testing.T) {
+// --- OnClosing ------------------------------------------------------------
+
+func TestOnClosing_RemovesFromSessionsAndRecordsLifetime(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	sh := injectActiveSession(t, p, "s1", time.Now().Add(-time.Second))
 
-	p.OnClose(sh.session, nil)
+	p.OnClosing(sh.session)
 
 	p.mu.Lock()
 	found := false
@@ -171,25 +173,100 @@ func TestOnClose_ActiveSessionRemovedAndRecorded(t *testing.T) {
 			break
 		}
 	}
+	_, stashed := p.closingHandles[sh.session]
 	p.mu.Unlock()
 	if found {
-		t.Error("session still in p.sessions after OnClose")
+		t.Error("session still in p.sessions after OnClosing")
 	}
-	if got := p.m.sessionsClosed.Load(); got != 1 {
-		t.Errorf("sessionsClosed = %d, want 1", got)
+	if !stashed {
+		t.Error("closingHandles missing entry after OnClosing — OnClose won't reach sl.OnSessionClosed")
 	}
 	if got := len(p.snapshotLifetimes()); got != 1 {
 		t.Errorf("lifetimes len = %d, want 1 (createdAt was set → recordLifetime should fire)", got)
 	}
 }
 
+func TestOnClosing_StartingSessionIsNoOp(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+	stream := newFakeStream()
+	s := NewSession("s-starting", stream, SessionHooks{OnClosing: p.OnClosing}, SessionTypeTable)
+	p.mu.Lock()
+	p.startingSessions[s] = true
+	p.mu.Unlock()
+
+	p.OnClosing(s)
+
+	p.mu.Lock()
+	_, stashed := p.closingHandles[s]
+	p.mu.Unlock()
+	if stashed {
+		t.Error("closingHandles populated for a starting-only session (should never reach OnClosing path)")
+	}
+}
+
+func TestOnClosing_ThenOnClose_DrainsHandle(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+	sh := injectActiveSession(t, p, "s1", time.Now().Add(-time.Second))
+
+	p.OnClosing(sh.session)
+	p.OnClose(sh.session, nil)
+
+	p.mu.Lock()
+	_, stashed := p.closingHandles[sh.session]
+	p.mu.Unlock()
+	if stashed {
+		t.Error("closingHandles still holds handle after OnClose — leak")
+	}
+	if got := p.m.sessionsClosed.Load(); got != 1 {
+		t.Errorf("sessionsClosed = %d, want 1", got)
+	}
+}
+
+func TestOnClosing_FiresBeforeOnClose_ViaSessionClose(t *testing.T) {
+	// End-to-end: driving Session.Close() must fire OnClosing (removing
+	// from p.sessions), and the eventual notifyClosed must fire OnClose.
+	p := newTestPool(t, 1, 10)
+	sh := injectActiveSession(t, p, "s1", time.Now().Add(-time.Second))
+
+	// Session.Close transitions to Closing and eventually the fakeStream
+	// close hooks flush through to notifyClosed. Use ForceClose so we
+	// don't wait on the server-side CloseSession round-trip.
+	sh.session.ForceClose(nil)
+
+	// Wait briefly for the async close path to complete.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		p.mu.Lock()
+		found := false
+		for _, cur := range p.sessions {
+			if cur == sh {
+				found = true
+				break
+			}
+		}
+		closed := p.m.sessionsClosed.Load()
+		p.mu.Unlock()
+		if !found && closed == 1 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	p.mu.Lock()
+	remaining := len(p.sessions)
+	closed := p.m.sessionsClosed.Load()
+	p.mu.Unlock()
+	t.Errorf("after ForceClose: len(sessions)=%d (want 0), sessionsClosed=%d (want 1)", remaining, closed)
+}
+
+// --- OnClose --------------------------------------------------------------
+
 func TestOnClose_IdxNotFoundStillRecords(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	// A session neither in p.sessions nor startingSessions — the "already
-	// proactively removed" path (CheckoutSession dead-detect or
-	// Pool.Close removed it). recordSessionClose should still fire so a
-	// hypothetical missed record elsewhere doesn't silently leak the
-	// count.
+	// proactively removed" path (OnClosing already ran, or a bare-metal
+	// caller invoked OnClose directly). recordSessionClose still fires so
+	// the ledger reflects reality.
 	stream := newFakeStream()
 	s := NewSession("s-ghost", stream, SessionHooks{}, SessionTypeTable)
 

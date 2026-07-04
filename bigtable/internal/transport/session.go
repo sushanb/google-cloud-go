@@ -129,10 +129,28 @@ type Stream interface {
 // lifecycle. Any field may be nil; the session calls only the non-nil hooks.
 // Hooks must not block; dispatch long work to a goroutine. This follows the
 // net/http/httptrace.ClientTrace pattern.
+//
+// Lifecycle ordering guarantees:
+//
+//	OnStart   → fires once when Session.Start is invoked.
+//	OnActive  → fires once at Starting → Ready transition (after PeerInfo
+//	             is populated).
+//	OnClosing → fires once when the session is FIRST known to be dying —
+//	             on the first successful transition out of Ready (any
+//	             non-Ready terminal-bound state). Java parity:
+//	             SessionImpl.onSessionClosing. Consumers use it to
+//	             remove the session from pool routing structures BEFORE
+//	             the actual close (potentially up to
+//	             waitServerCloseGrace seconds) completes.
+//	OnClose   → fires once at the end of teardown, after the stream has
+//	             actually closed. Always fires AFTER OnClosing (the
+//	             session guarantees the ordering via closingOnce +
+//	             closeOnce).
 type SessionHooks struct {
-	OnStart  func(ctx context.Context)
-	OnActive func(s *Session)
-	OnClose  func(s *Session, err error)
+	OnStart   func(ctx context.Context)
+	OnActive  func(s *Session)
+	OnClosing func(s *Session)
+	OnClose   func(s *Session, err error)
 }
 
 func (h SessionHooks) onStart(ctx context.Context) {
@@ -144,6 +162,12 @@ func (h SessionHooks) onStart(ctx context.Context) {
 func (h SessionHooks) onActive(s *Session) {
 	if h.OnActive != nil {
 		h.OnActive(s)
+	}
+}
+
+func (h SessionHooks) onClosing(s *Session) {
+	if h.OnClosing != nil {
+		h.OnClosing(s)
 	}
 }
 
@@ -202,6 +226,11 @@ type Session struct {
 	// time.Now().UnixNano(). Approximate ordering across transitions is
 	// enough for the debug UI.
 	lastStateChangeNano atomic.Int64
+	// closingOnce serializes hooks.OnClosing so it fires exactly once
+	// across the four transition sites that can drive a session out of
+	// Ready (Close, ForceClose, handleGoAway, handleClose). Java parity
+	// with onSessionClosing.
+	closingOnce sync.Once
 	// closeOnce serializes hooks.OnClose and tracer.recordClose so they
 	// fire exactly once even if multiple paths race to close the session.
 	closeOnce sync.Once

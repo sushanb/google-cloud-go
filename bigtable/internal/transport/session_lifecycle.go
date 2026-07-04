@@ -65,6 +65,10 @@ func (s *Session) ForceClose(req *spb.CloseSessionRequest) {
 		return
 	}
 
+	// ForceClose skips the Ready → Closing transition (goes straight to
+	// Closed), so this is our one chance to fire onClosing before onClose.
+	s.notifyClosing()
+
 	s.setCloseReason(closeReasonLabel(req))
 	desc := "session force closed"
 	if req != nil && req.Description != "" {
@@ -75,10 +79,24 @@ func (s *Session) ForceClose(req *spb.CloseSessionRequest) {
 	s.notifyClosed(nil)
 }
 
+// notifyClosing fires hooks.onClosing exactly once over the lifetime of a
+// Session. Called from every path that first transitions the session out of
+// Ready — handleGoAway, Close, ForceClose, handleClose. notifyClosed also
+// invokes it as a safety net so onClosing is guaranteed to precede
+// onClose even if some future path forgets to call it explicitly.
+func (s *Session) notifyClosing() {
+	s.closingOnce.Do(func() {
+		s.hooks.onClosing(s)
+	})
+}
+
 // notifyClosed fires tracer.recordClose and hooks.onClose exactly once over
-// the lifetime of a Session.
+// the lifetime of a Session. Ensures hooks.onClosing fires first (via the
+// closingOnce safety net) so the ordering contract onClosing → onClose
+// always holds.
 func (s *Session) notifyClosed(streamErr error) {
 	s.closeOnce.Do(func() {
+		s.notifyClosing()
 		s.tracer.recordClose(
 			context.Background(),
 			s.CloseReason(),
@@ -104,7 +122,12 @@ func (s *Session) notifyClosed(streamErr error) {
 func (s *Session) Close(ctx context.Context, req *spb.CloseSessionRequest) error {
 	// Allow being called from Closing too — handleGoAway already
 	// transitioned and now wants the drain + send + WaitServerClose dance.
-	s.transitionTo(StateClosing, isState(StateNew, StateStarting, StateReady))
+	if _, ok := s.transitionTo(StateClosing, isState(StateNew, StateStarting, StateReady)); ok {
+		// We drove the state change; fire onClosing on our goroutine.
+		// If handleGoAway got here first, it already fired — closingOnce
+		// makes this a no-op.
+		s.notifyClosing()
+	}
 	st := s.State()
 	if st != StateClosing {
 		// Already past Closing (WaitServerClose / Closed); nothing to do.
@@ -317,6 +340,12 @@ func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
 	if _, ok := s.transitionTo(StateClosing, notState(StateClosing, StateWaitServerClose, StateClosed)); !ok {
 		return
 	}
+	// Fire onClosing immediately so the pool can pull this session out of
+	// routing structures. Firing here (not just from Close's transitionTo
+	// below) matters because handleGoAway is the earliest point we know
+	// the session is dying — up to waitServerCloseGrace seconds before
+	// the actual stream close.
+	s.notifyClosing()
 	s.setCloseReason("GoAway")
 
 	s.debugf("received GOAWAY reason=%q description=%q",
@@ -349,6 +378,11 @@ func (s *Session) handleClose(err error) {
 	if _, ok := s.transitionTo(StateClosed, notState(StateClosed)); !ok {
 		return
 	}
+	// Ready → Closed can happen directly here (server EOFed without a
+	// prior GoAway or CloseSession). Guarantee onClosing fires before the
+	// notifyClosed below drives onClose. closingOnce makes this a no-op
+	// when handleGoAway or Close already fired earlier.
+	s.notifyClosing()
 	reason := streamEndReason(err)
 	s.setCloseReason(reason)
 	inFlight := 0

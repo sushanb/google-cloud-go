@@ -66,6 +66,11 @@ type SessionPoolImpl struct {
 	// Both are kept in sync in OnActive / OnClose / prune*.
 	sessions           []*SessionHandle
 	sessionCreatedAt   map[*SessionHandle]time.Time // Tracks when each SessionHandle was added to p.sessions
+	// closingHandles bridges Session → SessionHandle across the two-phase
+	// close (OnClosing → OnClose). OnClosing removes the handle from
+	// p.sessions but sl.OnSessionClosed still needs the handle later at
+	// OnClose time. Populated by OnClosing under p.mu; drained by OnClose.
+	closingHandles     map[*Session]*SessionHandle
 	startingSessions   map[*Session]bool
 	closed             bool
 	scalingInProgress  bool
@@ -154,6 +159,7 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 		metadata:           md,
 		startingSessions:   make(map[*Session]bool),
 		sessionCreatedAt:   make(map[*SessionHandle]time.Time),
+		closingHandles:     make(map[*Session]*SessionHandle),
 		sessionType:        sessionType,
 		waiters:            list.New(),
 		poolCtx:            poolCtx,
@@ -231,23 +237,14 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 			}
 		}
 
-		// Slow path: picker returned nil. Sweep any dead handles under
-		// the lock and trigger scale-up if under max. Sweeping only on
-		// misses trades a slightly stale p.sessions view for skipping
-		// the O(n) walk on every successful checkout.
+		// Slow path: picker returned nil. Java-parity — no dead-sweep
+		// needed. Dying sessions leave p.sessions the instant they
+		// transition out of Ready via OnClosing (fired from Session's
+		// notifyClosing at handleGoAway / Close / ForceClose /
+		// handleClose). So the maxSessions gate here already reflects
+		// only live-or-starting sessions; a miss just means all live
+		// sessions are busy.
 		p.mu.Lock()
-		var dead []*SessionHandle
-		for _, sh := range p.sessions {
-			if sh == nil || sh.session == nil {
-				continue
-			}
-			if sh.session.State() != StateReady {
-				dead = append(dead, sh)
-			}
-		}
-		if len(dead) > 0 {
-			p.pruneDeadLocked(dead)
-		}
 		needScale := len(p.sessions) < p.maxSessions
 		p.mu.Unlock()
 		if needScale {
@@ -289,28 +286,6 @@ func (p *SessionPoolImpl) removeWaiter(w *waiter) {
 		w.elem = nil
 	}
 	p.waitersMu.Unlock()
-}
-
-// pruneDeadLocked removes the given handles from p.sessions (caller
-// holds p.mu) AND from the AFE-aware sessionList. Records each close +
-// lifetime and triggers a scale-up to fill the gap. Separate so
-// CheckoutSession stays readable.
-func (p *SessionPoolImpl) pruneDeadLocked(dead []*SessionHandle) {
-	for _, victim := range dead {
-		for i, sh := range p.sessions {
-			if sh == victim {
-				if created, ok := p.sessionCreatedAt[victim]; ok {
-					p.recordLifetime(time.Since(created))
-				}
-				p.recordSessionClose(victim.session, "DeadOnPick")
-				delete(p.sessionCreatedAt, victim)
-				p.sessions = append(p.sessions[:i], p.sessions[i+1:]...)
-				break
-			}
-		}
-		p.sl.OnSessionClosed(victim)
-	}
-	go p.PerformScaling(context.Background())
 }
 
 // signalFree wakes exactly one parked CheckoutSession waiter — the

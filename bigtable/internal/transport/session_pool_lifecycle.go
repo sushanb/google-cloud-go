@@ -276,20 +276,26 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 	p.signalFree()
 }
 
-// OnClose removes the closed session from the active sessions list and updates the picker.
-func (p *SessionPoolImpl) OnClose(s *Session, err error) {
+// OnClosing is fired by the Session at the FIRST transition out of Ready
+// (handleGoAway, Close, ForceClose, handleClose — whichever wins). Java
+// parity: onSessionClosing. Removes the session from the pool's
+// operational structures immediately so:
+//   - the picker's AFE idle queue no longer sees it,
+//   - it no longer counts toward the scale-up gate,
+//   - PerformScaling gets a chance to replace it right away,
+//
+// even though the actual close may take up to waitServerCloseGrace to
+// complete. This is what lets CheckoutSession skip the per-miss dead-
+// sweep — dying sessions leave the pool's accounting the instant they
+// start dying, not at end-of-teardown.
+func (p *SessionPoolImpl) OnClosing(s *Session) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
+	// Still-starting sessions leave the pool via OnClose's bumpStartingClose
+	// path — they were never in p.sessions to remove.
 	if _, starting := p.startingSessions[s]; starting {
-		delete(p.startingSessions, s)
-		// A session that was never promoted to active still counts toward
-		// the close ledger — use a synthetic handle for the once-flag so
-		// duplicate OnClose calls don't double-count.
-		p.bumpStartingClose(s)
+		p.mu.Unlock()
 		return
 	}
-
 	idx := -1
 	for i, sh := range p.sessions {
 		if sh.session == s {
@@ -297,29 +303,59 @@ func (p *SessionPoolImpl) OnClose(s *Session, err error) {
 			break
 		}
 	}
-
-	if idx != -1 {
-		removed := p.sessions[idx]
-		if created, ok := p.sessionCreatedAt[removed]; ok {
-			p.recordLifetime(time.Since(created))
-		}
-		p.recordSessionClose(s, "")
-		delete(p.sessionCreatedAt, removed)
-		p.sessions = append(p.sessions[:idx], p.sessions[idx+1:]...)
-		// Drop the handle from its AFE bucket. sessionList tolerates
-		// double-close and force-close paths where OnSessionClosing
-		// never fired — it removes the handle from the idle queue if
-		// still present and decrements refCount.
-		p.sl.OnSessionClosed(removed)
-		// Trigger scale up evaluation asynchronously immediately!
-		go p.PerformScaling(context.Background())
+	if idx == -1 {
+		p.mu.Unlock()
 		return
 	}
-	// idx == -1: handle was already removed by a proactive path
-	// (CheckoutSession dead-detect, Pool.Close). That path already
-	// recorded the close; this is a no-op thanks to the once-flag, but
-	// we still call it so a path that ever forgets to record doesn't
-	// silently leak counts.
+	removed := p.sessions[idx]
+	if created, ok := p.sessionCreatedAt[removed]; ok {
+		p.recordLifetime(time.Since(created))
+	}
+	delete(p.sessionCreatedAt, removed)
+	p.sessions = append(p.sessions[:idx], p.sessions[idx+1:]...)
+	// Stash the handle for OnClose to finish sl teardown with.
+	p.closingHandles[s] = removed
+	needScale := len(p.sessions) < p.maxSessions
+	p.mu.Unlock()
+
+	// Remove from the AFE idle queue too. sessionList keeps refCount
+	// alive (in-flight vRPCs still complete via the session) until
+	// OnClose fires and drops the handle entirely.
+	p.sl.OnSessionClosing(removed)
+
+	if needScale {
+		go p.PerformScaling(p.poolCtx)
+	}
+}
+
+// OnClose fires at the end of teardown — the stream has actually
+// closed. By this point OnClosing has already removed the session
+// from p.sessions and the picker's idle queue. This callback
+// finalizes: drop the AFE handle from sl (refCount → 0, out of
+// handleToAfe) and record the close in the reason ledger. The bridge
+// from *Session back to *SessionHandle lives in p.closingHandles,
+// populated by OnClosing.
+func (p *SessionPoolImpl) OnClose(s *Session, err error) {
+	p.mu.Lock()
+	if _, starting := p.startingSessions[s]; starting {
+		delete(p.startingSessions, s)
+		p.mu.Unlock()
+		// A session that was never promoted to active still counts toward
+		// the close ledger — bumpStartingClose is the once-flag path.
+		p.bumpStartingClose(s)
+		return
+	}
+	handle, ok := p.closingHandles[s]
+	if ok {
+		delete(p.closingHandles, s)
+	}
+	p.mu.Unlock()
+
+	if handle != nil {
+		p.sl.OnSessionClosed(handle)
+	}
+	// recordSessionClose is once-guarded via s.poolCloseRecorded — safe
+	// to call even when OnClosing / a dead-sweep already invoked it.
 	p.recordSessionClose(s, "")
 }
 

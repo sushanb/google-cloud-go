@@ -37,9 +37,10 @@ func injectActiveSession(t testing.TB, p *SessionPoolImpl, name string, createdA
 	t.Helper()
 	stream := newFakeStream()
 	s := NewSession(name, stream, SessionHooks{
-		OnStart:  p.OnStart,
-		OnActive: p.OnActive,
-		OnClose:  p.OnClose,
+		OnStart:   p.OnStart,
+		OnActive:  p.OnActive,
+		OnClosing: p.OnClosing,
+		OnClose:   p.OnClose,
 	}, SessionTypeTable)
 	s.state.Store(int32(StateReady))
 
@@ -530,32 +531,3 @@ func TestPickerFromLoadBalancing_NilFallback(t *testing.T) {
 	}
 }
 
-func TestPruneDeadLocked_RemovesFromSessionsAndSL(t *testing.T) {
-	p := newTestPool(t, 1, 10)
-	sh := injectActiveSession(t, p, "s1", time.Now().Add(-time.Minute))
-	// Flip the session's state to something other than Ready so
-	// pruneDeadLocked treats it as dead.
-	sh.session.state.Store(int32(StateClosed))
-
-	p.mu.Lock()
-	p.pruneDeadLocked([]*SessionHandle{sh})
-	p.mu.Unlock()
-
-	p.mu.Lock()
-	stillIn := false
-	for _, cur := range p.sessions {
-		if cur == sh {
-			stillIn = true
-		}
-	}
-	p.mu.Unlock()
-	if stillIn {
-		t.Error("pruned session still present in p.sessions")
-	}
-	if got := p.snapshotCloseReasons()["DeadOnPick"]; got != 1 {
-		t.Errorf("DeadOnPick count = %d, want 1", got)
-	}
-	if got := len(p.snapshotLifetimes()); got != 1 {
-		t.Errorf("lifetimes len = %d, want 1 (createdAt was set)", got)
-	}
-}

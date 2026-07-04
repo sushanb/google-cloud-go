@@ -278,9 +278,10 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 
 	// Create and start new session wrapper passing pool pointer as the lifecycle hooks target.
 	s := NewSession(sessionName, stream, SessionHooks{
-		OnStart:  p.OnStart,
-		OnActive: p.OnActive,
-		OnClose:  p.OnClose,
+		OnStart:   p.OnStart,
+		OnActive:  p.OnActive,
+		OnClosing: p.OnClosing,
+		OnClose:   p.OnClose,
 	}, p.sessionType, WithSessionPoolName(p.poolName))
 	if hint := int(pickedChannel.Load()); hint >= 0 {
 		s.SetChannelIndex(hint)
