@@ -265,3 +265,160 @@ func TestRecordPickDecision_RingWrap(t *testing.T) {
 		}
 	}
 }
+
+// --- core pool setters + hot-path helpers (session_pool.go) ----------------
+
+func TestSetPoolID(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+	if p.poolID != 0 {
+		t.Errorf("initial poolID = %d, want 0", p.poolID)
+	}
+	p.SetPoolID(42)
+	if p.poolID != 42 {
+		t.Errorf("after SetPoolID(42), poolID = %d, want 42", p.poolID)
+	}
+}
+
+func TestSetPoolShortName_FlattensSlashes(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+	p.SetPoolShortName("projects/p/instances/i/tables/t")
+	want := "projects_p_instances_i_tables_t"
+	if p.poolShortName != want {
+		t.Errorf("poolShortName = %q, want %q (slashes must flatten to underscores)", p.poolShortName, want)
+	}
+}
+
+func TestSignalFree_NonBlockingWhenBufferFull(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+	// Drain first so we know starting state.
+	select {
+	case <-p.freeSignal:
+	default:
+	}
+	// First signal fills the cap-1 buffer.
+	p.signalFree()
+	// Second signal must be dropped, not block. Race the call against a
+	// timeout — signalFree not returning within a beat is the failure.
+	done := make(chan struct{})
+	go func() {
+		p.signalFree()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// expected
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("signalFree blocked with buffer full; should drop silently")
+	}
+	// Buffer should still hold exactly one wake-up.
+	select {
+	case <-p.freeSignal:
+	default:
+		t.Error("no wake-up available after two signalFree calls; first was lost")
+	}
+	select {
+	case <-p.freeSignal:
+		t.Error("second wake-up was somehow queued; buffer should have collapsed the duplicate")
+	default:
+	}
+}
+
+func TestStats_CountsReadyInUsePending(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+	// Two ready sessions; one has outstanding=1 (in-use), other is idle.
+	sh1 := injectActiveSession(t, p, "s1", time.Now())
+	sh2 := injectActiveSession(t, p, "s2", time.Now())
+	sh1.IncOutstanding()
+	_ = sh2 // idle
+
+	// Fake three parked waiters via waitersCount (the real path is inside
+	// CheckoutSession's select; we bracket it directly here).
+	p.waitersCount.Add(3)
+
+	st := p.Stats()
+	if st.ReadyCount != 2 {
+		t.Errorf("ReadyCount = %d, want 2", st.ReadyCount)
+	}
+	if st.InUseCount != 1 {
+		t.Errorf("InUseCount = %d, want 1", st.InUseCount)
+	}
+	if st.PendingCount != 3 {
+		t.Errorf("PendingCount = %d, want 3 (must be waitersCount, not sum of outstanding)", st.PendingCount)
+	}
+	if st.StartingCount != 0 {
+		t.Errorf("StartingCount = %d, want 0", st.StartingCount)
+	}
+}
+
+func TestUpdateConfig_SwapsPickerAndBounds(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+	// Default picker is LeastInFlight.
+	if got := p.picker.Name(); got != "least-inflight" {
+		t.Errorf("default picker = %q, want least-inflight", got)
+	}
+
+	// Switch to Random.
+	p.UpdateConfig(&spb.SessionClientConfiguration_SessionPoolConfiguration{
+		MinSessionCount: 4,
+		MaxSessionCount: 40,
+		LoadBalancingOptions: &spb.LoadBalancingOptions{
+			LoadBalancingStrategy: &spb.LoadBalancingOptions_Random_{
+				Random: &spb.LoadBalancingOptions_Random{},
+			},
+		},
+	})
+	if got := p.picker.Name(); got != "simple" {
+		t.Errorf("after Random swap, picker = %q, want simple", got)
+	}
+	if p.minSessions != 4 || p.maxSessions != 40 {
+		t.Errorf("min/max = %d/%d, want 4/40", p.minSessions, p.maxSessions)
+	}
+
+	// Switch to PeakEwma with an explicit subset size.
+	p.UpdateConfig(&spb.SessionClientConfiguration_SessionPoolConfiguration{
+		MinSessionCount: 1,
+		MaxSessionCount: 10,
+		LoadBalancingOptions: &spb.LoadBalancingOptions{
+			LoadBalancingStrategy: &spb.LoadBalancingOptions_PeakEwma_{
+				PeakEwma: &spb.LoadBalancingOptions_PeakEwma{RandomSubsetSize: 3},
+			},
+		},
+	})
+	if got := p.picker.Name(); got != "least-latency" {
+		t.Errorf("after PeakEwma swap, picker = %q, want least-latency", got)
+	}
+	// listenerFires counter bumps once per UpdateConfig.
+	if got := p.listenerFires.Load(); got != 2 {
+		t.Errorf("listenerFires = %d, want 2 (one per UpdateConfig)", got)
+	}
+}
+
+func TestPruneDeadLocked_RemovesFromSessionsAndSL(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+	sh := injectActiveSession(t, p, "s1", time.Now().Add(-time.Minute))
+	// Flip the session's state to something other than Ready so
+	// pruneDeadLocked treats it as dead.
+	sh.session.state.Store(int32(StateClosed))
+
+	p.mu.Lock()
+	p.pruneDeadLocked([]*SessionHandle{sh})
+	p.mu.Unlock()
+
+	p.mu.Lock()
+	stillIn := false
+	for _, cur := range p.sessions {
+		if cur == sh {
+			stillIn = true
+		}
+	}
+	p.mu.Unlock()
+	if stillIn {
+		t.Error("pruned session still present in p.sessions")
+	}
+	if got := p.snapshotCloseReasons()["DeadOnPick"]; got != 1 {
+		t.Errorf("DeadOnPick count = %d, want 1", got)
+	}
+	if got := len(p.snapshotLifetimes()); got != 1 {
+		t.Errorf("lifetimes len = %d, want 1 (createdAt was set)", got)
+	}
+}
