@@ -77,13 +77,13 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 	startTime := time.Now()
 
 	if st := State(s.state.Load()); st != StateReady {
-		return InvokeResult{}, tagErr(StateUncommitted,
+		return result, tagErr(StateUncommitted,
 			unavailable(ErrSessionNotActive, "session is not active (state: %v)", st))
 	}
 
 	reqBytes, err := desc.Encode(req)
 	if err != nil {
-		return InvokeResult{}, tagErr(StateUncommitted, fmt.Errorf("encode vRPC request: %w", err))
+		return result, tagErr(StateUncommitted, fmt.Errorf("encode vRPC request: %w", err))
 	}
 
 	rpcID := s.nextRPCID.Add(1)
@@ -97,46 +97,82 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 	// Claim the single in-flight slot. See method doc — a losing CAS is
 	// a caller-side serialization bug, not a runtime backoff condition.
 	if !s.activeRPC.CompareAndSwap(nil, rpc) {
-		return InvokeResult{}, tagErr(StateUncommitted,
+		return result, tagErr(StateUncommitted,
 			unavailable(ErrSessionNotActive,
 				"concurrent Invoke on session %q: multiPlexingLimit=1 violated", s.logName))
 	}
-	defer func() {
-		s.activeRPC.CompareAndSwap(rpc, nil)
-		// Order matters: clear the slot first, THEN check state. Close()
-		// transitions to StateClosing first and only then observes
-		// activeRPC — so at least one side signals. signalQuiescent is
-		// once-guarded, so a double-signal is harmless.
-		if State(s.state.Load()) == StateClosing {
-			s.signalQuiescent()
-		}
-	}()
+	defer s.releaseSlot(rpc)
 
 	// Reset the heartbeat deadline whenever we send an outbound frame: the
 	// server's keepalive clock is implicitly reset by our activity.
 	s.resetHeartbeatDeadline()
 
-	attempt := int64(VRpcAttempt(ctx))
-	if attempt == 0 {
-		// Calls bypassing the retry interceptor have no attempt set in the
-		// context; treat them as the first attempt.
-		attempt = 1
-	}
+	attempt := currentAttempt(ctx)
 	if attempt > 1 {
-		s.retries.Add(1)
-		// Capture WHY this is a retry — the previous attempt's error
-		// was stashed in ctx by RetryingVRpc. Without this the
-		// per-session Retries counter is opaque ("we retried, but
-		// why?"); with it sessionz surfaces a "retry" event tagged
-		// with the prior gRPC code + message.
-		if prev := PrevAttemptErr(ctx); prev != nil {
-			prevCode := status.Code(prev).String()
-			s.debugf("retry attempt=%d method=%s prev_code=%s prev_err=%v",
-				attempt, desc.Method(), prevCode, prev)
-			s.recordEvent("retry", "attempt=%d method=%s prev_code=%s prev_err=%v",
-				attempt, desc.Method(), prevCode, prev)
-		}
+		s.noteRetryAttempt(ctx, desc.Method(), attempt)
 	}
+	sessionReq := buildInvokeRequest(rpcID, reqBytes, attempt, startTime, ctx)
+
+	// Capture SentAt immediately before the frame is handed to Send so
+	// downstream metrics can compute client-side blocking latency as
+	// (SentAt - attemptStart) without double-counting encode/setup overhead.
+	result.SentAt = time.Now()
+	if err := s.Send(sessionReq); err != nil {
+		return result, tagErr(StateTransportFailure, fmt.Errorf("send vRPC request: %w", err))
+	}
+
+	err = s.awaitInvokeResult(ctx, rpc, desc, &result)
+	return result, err
+}
+
+// releaseSlot clears the active-RPC slot and signals quiescence when the
+// session is closing. Runs from Invoke's defer; safe to call after any
+// completion path (success, error, cancel, panic).
+//
+// Order matters: clear the slot first, THEN check state. Close()
+// transitions to StateClosing first and only then observes activeRPC —
+// so at least one side signals. signalQuiescent is once-guarded, so a
+// double-signal is harmless.
+func (s *Session) releaseSlot(rpc *vrpcImpl) {
+	s.activeRPC.CompareAndSwap(rpc, nil)
+	if State(s.state.Load()) == StateClosing {
+		s.signalQuiescent()
+	}
+}
+
+// currentAttempt reads the retry-interceptor's attempt tag from ctx. Calls
+// that bypass RetryingVRpc have no tag; treat them as attempt 1.
+func currentAttempt(ctx context.Context) int64 {
+	if a := int64(VRpcAttempt(ctx)); a > 0 {
+		return a
+	}
+	return 1
+}
+
+// noteRetryAttempt bumps the per-session retries counter and — if the
+// retry interceptor stashed the prior attempt's error on ctx — emits a
+// debug + sessionz event tagged with the prior gRPC code so operators
+// can trace WHY the retry fired without cross-referencing logs.
+func (s *Session) noteRetryAttempt(ctx context.Context, method string, attempt int64) {
+	s.retries.Add(1)
+	prev := PrevAttemptErr(ctx)
+	if prev == nil {
+		return
+	}
+	prevCode := status.Code(prev).String()
+	s.debugf("retry attempt=%d method=%s prev_code=%s prev_err=%v",
+		attempt, method, prevCode, prev)
+	s.recordEvent("retry", "attempt=%d method=%s prev_code=%s prev_err=%v",
+		attempt, method, prevCode, prev)
+}
+
+// buildInvokeRequest constructs the wire-level SessionRequest envelope
+// for a single vRPC attempt. Pure — no I/O, no side effects. The
+// VirtualRpc.Deadline field carries the remaining budget as a duration
+// so the server measures from receive time rather than an absolute wall
+// clock. Omitted when ctx has no deadline or the budget is already
+// non-positive (the client-side ctx.Done branch will fire immediately).
+func buildInvokeRequest(rpcID int64, reqBytes []byte, attempt int64, startTime time.Time, ctx context.Context) *spb.SessionRequest {
 	virtRpc := &spb.VirtualRpcRequest{
 		RpcId:   rpcID,
 		Payload: reqBytes,
@@ -145,67 +181,67 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 			AttemptStart:  timestamppb.New(startTime),
 		},
 	}
-	ctxDeadline, hasDeadline := ctx.Deadline()
-	if hasDeadline {
-		if remaining := time.Until(ctxDeadline); remaining > 0 {
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 {
 			virtRpc.Deadline = durationpb.New(remaining)
 		}
 	}
-	sessionReq := &spb.SessionRequest{
-		Payload: &spb.SessionRequest_VirtualRpc{
-			VirtualRpc: virtRpc,
-		},
+	return &spb.SessionRequest{
+		Payload: &spb.SessionRequest_VirtualRpc{VirtualRpc: virtRpc},
 	}
-	// Capture SentAt immediately before the frame is handed to Send so
-	// downstream metrics can compute client-side blocking latency as
-	// (SentAt - attemptStart) without double-counting encode/setup overhead.
-	sentAt := time.Now()
-	result.SentAt = sentAt
-	if err := s.Send(sessionReq); err != nil {
-		return result, tagErr(StateTransportFailure, fmt.Errorf("send vRPC request: %w", err))
-	}
+}
 
+// awaitInvokeResult blocks until either ctx cancels or the server
+// delivers a result on rpc.resultChan. Populates the tail of result
+// (TransportLatency, ClusterInfo, Stats, Response) and returns a
+// fully-tagged error on failure. res.err from resultChan is already
+// tagged by the source site (handleVRPCErrorResponse tags ServerResult;
+// cancelActiveRPCs tags TransportFailure), so this path forwards it
+// verbatim.
+func (s *Session) awaitInvokeResult(ctx context.Context, rpc *vrpcImpl, desc VRpcDescriptor, result *InvokeResult) error {
 	select {
 	case <-ctx.Done():
-		stillActive := s.activeRPC.Load() == rpc
-		sessState := State(s.state.Load())
-		waited := time.Since(sentAt)
-		peer := s.peerInfoSummary()
-		s.debugf("vRPC %s rpc_id=%d ctx.Done waited=%v err=%v session_state=%v still_in_flight=%v %s",
-			desc.Method(), rpcID, waited, ctx.Err(), sessState, stillActive, peer)
-		s.recordEvent("ctx-done", "method=%s rpc_id=%d waited=%v err=%v session_state=%v still_in_flight=%v %s",
-			desc.Method(), rpcID, waited, ctx.Err(), sessState, stillActive, peer)
-		return result, tagErr(StateTransportFailure, ctx.Err())
+		s.recordCtxDone(ctx, rpc, desc.Method(), result.SentAt)
+		return tagErr(StateTransportFailure, ctx.Err())
 	case res := <-rpc.resultChan:
-		result.TransportLatency = time.Since(sentAt)
+		result.TransportLatency = time.Since(result.SentAt)
 		result.ClusterInfo = res.clusterInfo
 		if res.clusterInfo != nil {
 			s.recordCluster(res.clusterInfo.GetClusterId())
 		}
 		if res.err != nil {
-			// res.err arrives from two sources: cancelActiveRPCs (session
-			// died mid-call — always TransportFailure) and
-			// handleVRPCErrorResponse (real server ErrorResponse frame —
-			// always ServerResult). Both source sites now tag with the
-			// correct AttemptState via tagErr before writing to resultChan,
-			// so this path just forwards the tagged err as-is.
-			return result, res.err
+			return res.err
 		}
-		if res.resp.RpcId != rpcID {
-			return result, tagErr(StateServerResult,
-				fmt.Errorf("internal: response RpcId %d does not match request RpcId %d", res.resp.RpcId, rpcID))
+		if res.resp.RpcId != rpc.id {
+			return tagErr(StateServerResult,
+				fmt.Errorf("internal: response RpcId %d does not match request RpcId %d", res.resp.RpcId, rpc.id))
 		}
 		respMsg, decodeErr := desc.Decode(res.resp.Payload)
 		if decodeErr != nil {
-			return result, tagErr(StateServerResult, fmt.Errorf("decode vRPC response: %w", decodeErr))
+			return tagErr(StateServerResult, fmt.Errorf("decode vRPC response: %w", decodeErr))
 		}
 		result.Response = respMsg
 		result.Stats = res.resp.Stats
 		if res.resp.Stats != nil && res.resp.Stats.BackendLatency != nil {
 			s.recordLatency(res.resp.Stats.BackendLatency.AsDuration())
 		}
-		return result, nil
+		return nil
 	}
+}
+
+// recordCtxDone emits the debug + sessionz event for a ctx cancellation
+// or deadline fire while a vRPC was in flight. Captures whether the RPC
+// was still holding the slot at cancel time — useful for spotting races
+// between our cancel and a late server response.
+func (s *Session) recordCtxDone(ctx context.Context, rpc *vrpcImpl, method string, sentAt time.Time) {
+	stillActive := s.activeRPC.Load() == rpc
+	sessState := State(s.state.Load())
+	waited := time.Since(sentAt)
+	peer := s.peerInfoSummary()
+	s.debugf("vRPC %s rpc_id=%d ctx.Done waited=%v err=%v session_state=%v still_in_flight=%v %s",
+		method, rpc.id, waited, ctx.Err(), sessState, stillActive, peer)
+	s.recordEvent("ctx-done", "method=%s rpc_id=%d waited=%v err=%v session_state=%v still_in_flight=%v %s",
+		method, rpc.id, waited, ctx.Err(), sessState, stillActive, peer)
 }
 
 // handleVRPCResponse delivers a server VirtualRpcResponse to the waiting
