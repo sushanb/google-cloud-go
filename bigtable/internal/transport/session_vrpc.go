@@ -16,6 +16,7 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -82,12 +83,13 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 	startTime := time.Now()
 
 	if st := State(s.state.Load()); st != StateReady {
-		return InvokeResult{}, unavailable(ErrSessionNotActive, "session is not active (state: %v)", st)
+		return InvokeResult{}, tagErr(StateUncommitted,
+			unavailable(ErrSessionNotActive, "session is not active (state: %v)", st))
 	}
 
 	reqBytes, err := desc.Encode(req)
 	if err != nil {
-		return InvokeResult{}, fmt.Errorf("encode vRPC request: %w", err)
+		return InvokeResult{}, tagErr(StateUncommitted, fmt.Errorf("encode vRPC request: %w", err))
 	}
 
 	rpcID := s.nextRPCID.Add(1)
@@ -101,8 +103,9 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 	// Claim the single in-flight slot. See method doc — a losing CAS is
 	// a caller-side serialization bug, not a runtime backoff condition.
 	if !s.activeRPC.CompareAndSwap(nil, rpc) {
-		return InvokeResult{}, unavailable(ErrSessionNotActive,
-			"concurrent Invoke on session %q: multiPlexingLimit=1 violated", s.logName)
+		return InvokeResult{}, tagErr(StateUncommitted,
+			unavailable(ErrSessionNotActive,
+				"concurrent Invoke on session %q: multiPlexingLimit=1 violated", s.logName))
 	}
 	defer func() {
 		s.activeRPC.CompareAndSwap(rpc, nil)
@@ -174,7 +177,7 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 	}
 	rpc.attempt = int32(attempt)
 	if err := s.Send(sessionReq); err != nil {
-		return result, fmt.Errorf("send vRPC request: %w", err)
+		return result, tagErr(StateTransportFailure, fmt.Errorf("send vRPC request: %w", err))
 	}
 
 	select {
@@ -187,7 +190,7 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 			desc.Method(), rpcID, waited, ctx.Err(), sessState, stillActive, peer)
 		s.recordEvent("ctx-done", "method=%s rpc_id=%d waited=%v err=%v session_state=%v still_in_flight=%v %s",
 			desc.Method(), rpcID, waited, ctx.Err(), sessState, stillActive, peer)
-		return result, ctx.Err()
+		return result, tagErr(StateTransportFailure, ctx.Err())
 	case res := <-rpc.resultChan:
 		result.TransportLatency = time.Since(sentAt)
 		result.ClusterInfo = res.clusterInfo
@@ -195,14 +198,23 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 			s.recordCluster(res.clusterInfo.GetClusterId())
 		}
 		if res.err != nil {
-			return result, res.err
+			// GoAway sentinel is a transport-side cancellation of an in-flight
+			// vRPC (the session shut down mid-call), not a server response.
+			// Classify accordingly so idempotent retries fire and
+			// non-idempotent ones don't double-apply.
+			state := StateServerResult
+			if errors.Is(res.err, ErrUnavailableGoAway) {
+				state = StateTransportFailure
+			}
+			return result, tagErr(state, res.err)
 		}
 		if res.resp.RpcId != rpcID {
-			return result, fmt.Errorf("internal: response RpcId %d does not match request RpcId %d", res.resp.RpcId, rpcID)
+			return result, tagErr(StateServerResult,
+				fmt.Errorf("internal: response RpcId %d does not match request RpcId %d", res.resp.RpcId, rpcID))
 		}
 		respMsg, decodeErr := desc.Decode(res.resp.Payload)
 		if decodeErr != nil {
-			return result, fmt.Errorf("decode vRPC response: %w", decodeErr)
+			return result, tagErr(StateServerResult, fmt.Errorf("decode vRPC response: %w", decodeErr))
 		}
 		result.Response = respMsg
 		result.Stats = res.resp.Stats

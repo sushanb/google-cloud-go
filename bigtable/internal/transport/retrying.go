@@ -31,12 +31,16 @@ type RetryingOptions struct {
 	MaxBackoff        time.Duration
 	BackoffMultiplier float64
 	Listener          VRpcListener
-	// ShouldRetry, if non-nil, overrides the default codes-based check.
-	// Callers use it to allow narrowly-defined safe retries for otherwise
-	// non-retryable operations — e.g. a non-idempotent mutation can still
-	// retry on errors that guarantee the request never reached the server.
-	// The default (when nil) retries on Aborted / DeadlineExceeded / Internal
-	// / ResourceExhausted / Unavailable.
+	// Idempotent tells the interceptor whether TransportFailure attempts
+	// (frame handed to the wire, no server response observed) are safe to
+	// retry. Reads set this true; non-idempotent Apply sets it false.
+	// Uncommitted attempts (never left the client) retry regardless.
+	// Ignored if ShouldRetry is non-nil.
+	Idempotent bool
+	// ShouldRetry, if non-nil, overrides the default state-based check
+	// entirely. Callers with unusual retry policies use it; the default
+	// (nil) applies Java-parity classification via AttemptState +
+	// Idempotent + server-provided RetryInfo.
 	ShouldRetry func(error) bool
 }
 
@@ -107,29 +111,30 @@ func RetryingVRpc(opts RetryingOptions) Interceptor {
 			hasServerDelay := false
 
 			s, hasStatus := status.FromError(err)
-			if opts.ShouldRetry != nil {
-				if !opts.ShouldRetry(err) {
-					return nil, err
-				}
-			} else {
-				if !hasStatus {
-					return nil, err
-				}
-				if !isRetryableCode(s.Code()) {
-					return nil, err
-				}
-			}
-
+			// Server RetryInfo is checked first so a server-directed delay
+			// permits retry even for otherwise-non-retryable outcomes
+			// (e.g. server DEADLINE_EXCEEDED that the server explicitly
+			// says is safe to retry).
+			serverPermitsRetry := false
 			if hasStatus {
 				for _, detail := range s.Details() {
 					if retryInfo, ok := detail.(*errdetails.RetryInfo); ok {
 						if retryInfo.GetRetryDelay().IsValid() {
 							delay = retryInfo.GetRetryDelay().AsDuration()
 							hasServerDelay = true
+							serverPermitsRetry = true
 							break
 						}
 					}
 				}
+			}
+
+			if opts.ShouldRetry != nil {
+				if !opts.ShouldRetry(err) {
+					return nil, err
+				}
+			} else if !shouldRetryDefault(err, opts.Idempotent, serverPermitsRetry) {
+				return nil, err
 			}
 
 
@@ -155,9 +160,45 @@ func RetryingVRpc(opts RetryingOptions) Interceptor {
 }
 
 
-func isRetryableCode(code codes.Code) bool {
+// shouldRetryDefault applies Java-parity retry classification. Callers with
+// a bespoke policy set RetryingOptions.ShouldRetry to bypass this entirely.
+//
+// Retry rules (see AttemptState doc for state semantics):
+//   - Uncommitted → always retry (server saw nothing).
+//   - TransportFailure → retry only if idempotent (server may have applied).
+//   - ServerResult → retry only if server attached RetryInfo, OR the code is
+//     in the narrowed always-retryable set below.
+//
+// The always-retryable ServerResult set intentionally OMITS DeadlineExceeded:
+// a server-returned deadline-exceeded means "I gave up", not "try again".
+// Java's client behaves the same way — see VRpc.VRpcResult.State handling in
+// google-cloud-java's RetryingVRpc.
+func shouldRetryDefault(err error, idempotent, serverPermitsRetry bool) bool {
+	if serverPermitsRetry {
+		return true
+	}
+	outcome := ClassifyErr(err)
+	switch outcome.State {
+	case StateUncommitted:
+		return true
+	case StateTransportFailure:
+		return idempotent
+	case StateServerResult:
+		s, ok := status.FromError(outcome.Err)
+		if !ok {
+			return false
+		}
+		return isServerResultRetryable(s.Code())
+	}
+	return false
+}
+
+// isServerResultRetryable is the narrowed default set for server-explicit
+// errors, matching Java's RetryingVRpc for the ServerResult path.
+// DeadlineExceeded is deliberately excluded.
+func isServerResultRetryable(code codes.Code) bool {
 	switch code {
-	case codes.Aborted, codes.DeadlineExceeded, codes.Internal, codes.ResourceExhausted, codes.Unavailable:
+	case codes.Aborted, codes.Internal, codes.ResourceExhausted, codes.Unavailable:
 		return true
 	default:
 		return false

@@ -193,6 +193,7 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 		MaxBackoff:        32 * time.Second,
 		BackoffMultiplier: 1.5,
 		Listener:          sessionMetricsListener{},
+		Idempotent:        true, // reads are always idempotent
 	})
 
 	args := btransport.ReadRowArgs{
@@ -275,27 +276,19 @@ func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts 
 		mt.setCurrOpStatus(statusCode)
 	}()
 
-	// Non-idempotent mutations (SetCell with ServerTime) cannot blindly retry —
-	// a retry of an already-applied mutation would create duplicate cells with
-	// different server-assigned timestamps. They CAN safely retry on errors
-	// that prove the request never reached the server: ErrSessionNotActive
-	// (Invoke short-circuits before Send) and ErrUnavailableGoAway (the server
-	// explicitly reports the rpc id as not-admitted).
-	var shouldRetry func(error) bool
-	if !mutationsAreRetryable(m.ops) {
-		shouldRetry = func(err error) bool {
-			return errors.Is(err, btransport.ErrSessionNotActive) ||
-				errors.Is(err, btransport.ErrUnavailableGoAway)
-		}
-	}
-
+	// Non-idempotent mutations (SetCell with ServerTime) cannot retry on
+	// TransportFailure — a retry of an already-applied mutation would create
+	// duplicate cells with different server-assigned timestamps. Uncommitted
+	// attempts (ErrSessionNotActive from a Closing session, encode failure)
+	// still retry regardless of Idempotent, so short-circuited attempts
+	// that never reached the server are covered automatically.
 	retryInterceptor := btransport.RetryingVRpc(btransport.RetryingOptions{
 		MaxAttempts:       10,
 		InitialBackoff:    10 * time.Millisecond,
 		MaxBackoff:        32 * time.Second,
 		BackoffMultiplier: 1.5,
 		Listener:          sessionMetricsListener{},
-		ShouldRetry:       shouldRetry,
+		Idempotent:        mutationsAreRetryable(m.ops),
 	})
 
 	args := btransport.MutateRowArgs{

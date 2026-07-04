@@ -345,3 +345,157 @@ func TestRetryingVRpc_SessionSentinelsAreRetried(t *testing.T) {
 		})
 	}
 }
+
+// TestRetryingVRpc_UncommittedAlwaysRetries verifies that an attempt tagged
+// as StateUncommitted retries even when Idempotent is false. Uncommitted
+// means the request never reached the wire; a retry cannot double-apply.
+func TestRetryingVRpc_UncommittedAlwaysRetries(t *testing.T) {
+	var attempts int
+	baseHandler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		attempts++
+		if attempts < 3 {
+			return nil, tagErr(StateUncommitted, status.Error(codes.Unavailable, "session closing before Send"))
+		}
+		return "ok", nil
+	}
+
+	retryInterceptor := RetryingVRpc(RetryingOptions{
+		MaxAttempts:    5,
+		InitialBackoff: 1 * time.Millisecond,
+		Idempotent:     false, // non-idempotent: uncommitted still retries
+	})
+
+	ctx := WithVRpcMetadata(context.Background(), "TestMethod", 1)
+	resp, err := retryInterceptor(ctx, "req", baseHandler)
+	if err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+	if resp.(string) != "ok" {
+		t.Errorf("expected 'ok', got %v", resp)
+	}
+	if attempts != 3 {
+		t.Errorf("expected 3 attempts, got %d", attempts)
+	}
+}
+
+// TestRetryingVRpc_TransportFailureIdempotent verifies that TransportFailure
+// retries for an idempotent op (reads).
+func TestRetryingVRpc_TransportFailureIdempotent(t *testing.T) {
+	var attempts int
+	baseHandler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		attempts++
+		if attempts < 3 {
+			return nil, tagErr(StateTransportFailure, status.Error(codes.Unavailable, "send failed"))
+		}
+		return "ok", nil
+	}
+
+	retryInterceptor := RetryingVRpc(RetryingOptions{
+		MaxAttempts:    5,
+		InitialBackoff: 1 * time.Millisecond,
+		Idempotent:     true,
+	})
+
+	ctx := WithVRpcMetadata(context.Background(), "TestMethod", 1)
+	_, err := retryInterceptor(ctx, "req", baseHandler)
+	if err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+	if attempts != 3 {
+		t.Errorf("expected 3 attempts, got %d", attempts)
+	}
+}
+
+// TestRetryingVRpc_TransportFailureNonIdempotentNoRetry verifies that a
+// TransportFailure on a non-idempotent op (Apply of a ServerTime mutation)
+// does NOT retry — the server may have already applied the mutation, and
+// a retry would create a duplicate cell.
+func TestRetryingVRpc_TransportFailureNonIdempotentNoRetry(t *testing.T) {
+	var attempts int
+	baseHandler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		attempts++
+		return nil, tagErr(StateTransportFailure, status.Error(codes.Unavailable, "wire error"))
+	}
+
+	retryInterceptor := RetryingVRpc(RetryingOptions{
+		MaxAttempts:    5,
+		InitialBackoff: 1 * time.Millisecond,
+		Idempotent:     false,
+	})
+
+	ctx := WithVRpcMetadata(context.Background(), "TestMethod", 1)
+	_, err := retryInterceptor(ctx, "req", baseHandler)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if attempts != 1 {
+		t.Errorf("expected exactly 1 attempt (no retry for non-idempotent TransportFailure), got %d", attempts)
+	}
+}
+
+// TestRetryingVRpc_ServerDeadlineExceededNoRetryByDefault verifies Java
+// parity: a server-returned DEADLINE_EXCEEDED is NOT retried by default.
+// The server said "I gave up"; blindly retrying burns budget on ops the
+// server already discarded.
+func TestRetryingVRpc_ServerDeadlineExceededNoRetryByDefault(t *testing.T) {
+	var attempts int
+	baseHandler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		attempts++
+		return nil, tagErr(StateServerResult, status.Error(codes.DeadlineExceeded, "server timed out"))
+	}
+
+	retryInterceptor := RetryingVRpc(RetryingOptions{
+		MaxAttempts:    5,
+		InitialBackoff: 1 * time.Millisecond,
+		Idempotent:     true, // even idempotent: server DEADLINE_EXCEEDED still no retry
+	})
+
+	ctx := WithVRpcMetadata(context.Background(), "TestMethod", 1)
+	_, err := retryInterceptor(ctx, "req", baseHandler)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if attempts != 1 {
+		t.Errorf("expected 1 attempt (server DEADLINE_EXCEEDED not retried), got %d", attempts)
+	}
+}
+
+// TestRetryingVRpc_ServerDeadlineExceededRetriesWithRetryInfo verifies the
+// escape hatch: if the server explicitly attaches RetryInfo, the client
+// honors it — even for DEADLINE_EXCEEDED — because the server has stated
+// the retry is safe and given a specific backoff.
+func TestRetryingVRpc_ServerDeadlineExceededRetriesWithRetryInfo(t *testing.T) {
+	var attempts int
+	baseHandler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		attempts++
+		if attempts == 1 {
+			st := status.New(codes.DeadlineExceeded, "overloaded, retry later")
+			stWithDetails, derr := st.WithDetails(&errdetails.RetryInfo{
+				RetryDelay: durationpb.New(1 * time.Millisecond),
+			})
+			if derr != nil {
+				return nil, derr
+			}
+			return nil, tagErr(StateServerResult, stWithDetails.Err())
+		}
+		return "ok", nil
+	}
+
+	retryInterceptor := RetryingVRpc(RetryingOptions{
+		MaxAttempts:    3,
+		InitialBackoff: 1 * time.Millisecond,
+		Idempotent:     true,
+	})
+
+	ctx := WithVRpcMetadata(context.Background(), "TestMethod", 1)
+	resp, err := retryInterceptor(ctx, "req", baseHandler)
+	if err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+	if resp.(string) != "ok" {
+		t.Errorf("expected 'ok', got %v", resp)
+	}
+	if attempts != 2 {
+		t.Errorf("expected 2 attempts, got %d", attempts)
+	}
+}
