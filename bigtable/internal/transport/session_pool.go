@@ -65,12 +65,6 @@ type SessionPoolImpl struct {
 	// dead-sweep read paths. AFE-aware picking goes through sl above.
 	// Both are kept in sync in OnActive / OnClose / prune*.
 	sessions           []*SessionHandle
-	sessionCreatedAt   map[*SessionHandle]time.Time // Tracks when each SessionHandle was added to p.sessions
-	// closingHandles bridges Session → SessionHandle across the two-phase
-	// close (OnClosing → OnClose). OnClosing removes the handle from
-	// p.sessions but sl.OnSessionClosed still needs the handle later at
-	// OnClose time. Populated by OnClosing under p.mu; drained by OnClose.
-	closingHandles     map[*Session]*SessionHandle
 	startingSessions   map[*Session]bool
 	closed             bool
 	scalingInProgress  bool
@@ -158,8 +152,6 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 		openSessionRequest: openSessionRequest,
 		metadata:           md,
 		startingSessions:   make(map[*Session]bool),
-		sessionCreatedAt:   make(map[*SessionHandle]time.Time),
-		closingHandles:     make(map[*Session]*SessionHandle),
 		sessionType:        sessionType,
 		waiters:            list.New(),
 		poolCtx:            poolCtx,

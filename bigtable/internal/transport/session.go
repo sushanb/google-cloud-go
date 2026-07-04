@@ -245,6 +245,15 @@ type Session struct {
 	// on id before delivering".
 	activeRPC atomic.Pointer[vrpcImpl]
 
+	// poolHandle is the back-ref to this session's SessionHandle,
+	// stored once by SessionPoolImpl.OnActive right after the handle
+	// is minted. OnClose reads it to hand the handle to
+	// sl.OnSessionClosed without a per-pool bookkeeping map. Zero
+	// (nil) for sessions never promoted from starting → active (their
+	// OnClose path takes bumpStartingClose instead) or for
+	// tests that bypass the pool.
+	poolHandle atomic.Pointer[SessionHandle]
+
 	// heartbeatIntervalNano is the server-negotiated keep-alive
 	// interval (in ns). Stored atomically because handleSessionParameters
 	// mutates it from the readLoop while the vRPC hot path reads it via

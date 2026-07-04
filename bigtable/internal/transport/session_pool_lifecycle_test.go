@@ -173,13 +173,14 @@ func TestOnClosing_RemovesFromSessionsAndRecordsLifetime(t *testing.T) {
 			break
 		}
 	}
-	_, stashed := p.closingHandles[sh.session]
 	p.mu.Unlock()
 	if found {
 		t.Error("session still in p.sessions after OnClosing")
 	}
-	if !stashed {
-		t.Error("closingHandles missing entry after OnClosing — OnClose won't reach sl.OnSessionClosed")
+	// poolHandle survives OnClosing — OnClose reads it to hand off to
+	// sl.OnSessionClosed. Cleared only when the Session itself is GC'd.
+	if got := sh.session.poolHandle.Load(); got != sh {
+		t.Errorf("session.poolHandle = %p, want %p (OnClose needs it for sl teardown)", got, sh)
 	}
 	if got := len(p.snapshotLifetimes()); got != 1 {
 		t.Errorf("lifetimes len = %d, want 1 (createdAt was set → recordLifetime should fire)", got)
@@ -196,27 +197,20 @@ func TestOnClosing_StartingSessionIsNoOp(t *testing.T) {
 
 	p.OnClosing(s)
 
-	p.mu.Lock()
-	_, stashed := p.closingHandles[s]
-	p.mu.Unlock()
-	if stashed {
-		t.Error("closingHandles populated for a starting-only session (should never reach OnClosing path)")
+	// A starting-only session was never promoted via OnActive, so
+	// poolHandle should still be nil.
+	if got := s.poolHandle.Load(); got != nil {
+		t.Errorf("session.poolHandle = %p, want nil for starting-only session", got)
 	}
 }
 
-func TestOnClosing_ThenOnClose_DrainsHandle(t *testing.T) {
+func TestOnClosing_ThenOnClose_UsesPoolHandle(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	sh := injectActiveSession(t, p, "s1", time.Now().Add(-time.Second))
 
 	p.OnClosing(sh.session)
 	p.OnClose(sh.session, nil)
 
-	p.mu.Lock()
-	_, stashed := p.closingHandles[sh.session]
-	p.mu.Unlock()
-	if stashed {
-		t.Error("closingHandles still holds handle after OnClose — leak")
-	}
 	if got := p.m.sessionsClosed.Load(); got != 1 {
 		t.Errorf("sessionsClosed = %d, want 1", got)
 	}

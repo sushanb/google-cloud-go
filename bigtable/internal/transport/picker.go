@@ -29,6 +29,12 @@ type SessionHandle struct {
 	outstanding  int64
 	lastActivity int64 // UnixNano timestamp of the last completed call
 	picks        int64 // Number of times the picker has picked this handle.
+	// createdAt is the wall-clock time this handle joined the pool
+	// (from OnActive). Read by recordLifetime and Pool.Close to bucket
+	// per-session lifetimes into the ring buffer. Zero for
+	// test-constructed handles that never went through OnActive — code
+	// paths that consume this must handle the zero-time case.
+	createdAt time.Time
 }
 
 // Picks returns the number of times this handle has been picked by the pool's
@@ -37,9 +43,12 @@ func (h *SessionHandle) Picks() int64 {
 	return atomic.LoadInt64(&h.picks)
 }
 
-// NewSessionHandle creates a new SessionHandle wrapping a Session.
-func NewSessionHandle(session *Session) *SessionHandle {
-	return &SessionHandle{session: session}
+// NewSessionHandle creates a new SessionHandle wrapping a Session. The
+// createdAt stamp is used by the pool's lifetime histogram; pass
+// time.Now() from OnActive, or the zero time from tests that don't
+// care about lifetime accounting.
+func NewSessionHandle(session *Session, createdAt time.Time) *SessionHandle {
+	return &SessionHandle{session: session, createdAt: createdAt}
 }
 
 // IncOutstanding increments outstanding calls.

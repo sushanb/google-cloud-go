@@ -163,16 +163,7 @@ func (p *SessionPoolImpl) Close() error {
 	}
 	p.closed = true
 	snapshot := p.sessions
-	// Capture per-handle createdAt so we can record lifetimes after the map
-	// is reset below.
-	createdAts := make(map[*SessionHandle]time.Time, len(snapshot))
-	for _, sh := range snapshot {
-		if t, ok := p.sessionCreatedAt[sh]; ok {
-			createdAts[sh] = t
-		}
-	}
 	p.sessions = nil
-	p.sessionCreatedAt = make(map[*SessionHandle]time.Time)
 	p.mu.Unlock()
 
 	// Record the closes up-front (with PoolClose as the fallback reason)
@@ -182,8 +173,8 @@ func (p *SessionPoolImpl) Close() error {
 	// racing with teardown never returns a retired session.
 	for _, sh := range snapshot {
 		if sh != nil && sh.session != nil {
-			if t, ok := createdAts[sh]; ok {
-				p.recordLifetime(time.Since(t))
+			if !sh.createdAt.IsZero() {
+				p.recordLifetime(time.Since(sh.createdAt))
 			}
 			p.recordSessionClose(sh.session, "PoolClose")
 		}
@@ -261,9 +252,9 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 		}
 	}
 
-	sh := NewSessionHandle(s)
+	sh := NewSessionHandle(s, time.Now())
 	p.sessions = append(p.sessions, sh)
-	p.sessionCreatedAt[sh] = time.Now()
+	s.poolHandle.Store(sh)
 	p.m.sessionsOpened.Add(1)
 
 	// Register the newly-Active session in its AFE bucket. PeerInfo is
@@ -308,13 +299,10 @@ func (p *SessionPoolImpl) OnClosing(s *Session) {
 		return
 	}
 	removed := p.sessions[idx]
-	if created, ok := p.sessionCreatedAt[removed]; ok {
-		p.recordLifetime(time.Since(created))
+	if !removed.createdAt.IsZero() {
+		p.recordLifetime(time.Since(removed.createdAt))
 	}
-	delete(p.sessionCreatedAt, removed)
 	p.sessions = append(p.sessions[:idx], p.sessions[idx+1:]...)
-	// Stash the handle for OnClose to finish sl teardown with.
-	p.closingHandles[s] = removed
 	needScale := len(p.sessions) < p.maxSessions
 	p.mu.Unlock()
 
@@ -332,9 +320,9 @@ func (p *SessionPoolImpl) OnClosing(s *Session) {
 // closed. By this point OnClosing has already removed the session
 // from p.sessions and the picker's idle queue. This callback
 // finalizes: drop the AFE handle from sl (refCount → 0, out of
-// handleToAfe) and record the close in the reason ledger. The bridge
-// from *Session back to *SessionHandle lives in p.closingHandles,
-// populated by OnClosing.
+// handleToAfe) and record the close in the reason ledger. The
+// *Session → *SessionHandle back-ref is Session.poolHandle, set
+// once in OnActive.
 func (p *SessionPoolImpl) OnClose(s *Session, err error) {
 	p.mu.Lock()
 	if _, starting := p.startingSessions[s]; starting {
@@ -345,17 +333,13 @@ func (p *SessionPoolImpl) OnClose(s *Session, err error) {
 		p.bumpStartingClose(s)
 		return
 	}
-	handle, ok := p.closingHandles[s]
-	if ok {
-		delete(p.closingHandles, s)
-	}
 	p.mu.Unlock()
 
-	if handle != nil {
+	if handle := s.poolHandle.Load(); handle != nil {
 		p.sl.OnSessionClosed(handle)
 	}
 	// recordSessionClose is once-guarded via s.poolCloseRecorded — safe
-	// to call even when OnClosing / a dead-sweep already invoked it.
+	// to call even when OnClosing already invoked it.
 	p.recordSessionClose(s, "")
 }
 

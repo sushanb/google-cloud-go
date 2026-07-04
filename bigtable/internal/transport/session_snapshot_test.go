@@ -16,6 +16,7 @@ package internal
 
 import (
 	"testing"
+	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
@@ -116,7 +117,7 @@ func TestSession_Snapshot_NilPeer(t *testing.T) {
 
 func TestSessionHandle_Snapshot(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
-	h := NewSessionHandle(s)
+	h := NewSessionHandle(s, time.Time{})
 	h.IncOutstanding()
 	h.IncOutstanding()
 
@@ -134,7 +135,7 @@ func TestPoolSnapshot_AggregatesSessions(t *testing.T) {
 		stream := newFakeStream()
 		s := NewSession("s", stream, SessionHooks{}, SessionTypeTable)
 		s.state.Store(int32(StateReady))
-		sh := NewSessionHandle(s)
+		sh := NewSessionHandle(s, time.Time{})
 		pool.sessions = append(pool.sessions, sh)
 	}
 	pool.sessions[0].IncOutstanding()

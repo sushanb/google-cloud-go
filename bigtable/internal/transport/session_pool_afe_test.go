@@ -38,10 +38,10 @@ func injectActiveOnAfe(t *testing.T, p *SessionPoolImpl, name string, afe afeID)
 	// OnSessionStarted, matching production's sync-PeerInfo invariant.
 	s.peerInfo.Store(&spb.PeerInfo{ApplicationFrontendId: int64(afe)})
 
-	sh := NewSessionHandle(s)
+	sh := NewSessionHandle(s, time.Now())
+	s.poolHandle.Store(sh)
 	p.mu.Lock()
 	p.sessions = append(p.sessions, sh)
-	p.sessionCreatedAt[sh] = time.Now()
 	p.mu.Unlock()
 	p.sl.OnSessionStarted(sh)
 	return sh

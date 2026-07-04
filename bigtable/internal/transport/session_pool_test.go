@@ -44,10 +44,10 @@ func injectActiveSession(t testing.TB, p *SessionPoolImpl, name string, createdA
 	}, SessionTypeTable)
 	s.state.Store(int32(StateReady))
 
-	sh := NewSessionHandle(s)
+	sh := NewSessionHandle(s, createdAt)
+	s.poolHandle.Store(sh)
 	p.mu.Lock()
 	p.sessions = append(p.sessions, sh)
-	p.sessionCreatedAt[sh] = createdAt
 	p.mu.Unlock()
 	// Register in the AFE-aware sessionList so CheckoutSession's two-tier
 	// pick can find it. injectActiveSession skips the handshake so
