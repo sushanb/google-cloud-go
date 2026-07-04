@@ -441,7 +441,14 @@ func TestHandleErrorResponse_SessionFatalForcesClose(t *testing.T) {
 	}
 }
 
-func TestHandleGoAway_CancelsInFlightRPC(t *testing.T) {
+// TestHandleGoAway_PreservesInFlightRPC verifies Java-parity behavior:
+// GOAWAY transitions the session to Closing (so the pool stops handing
+// this session out for new work) but does NOT cancel the in-flight RPC.
+// If the server sends its response before dropping the stream, the RPC
+// still completes cleanly — critical for non-idempotent Apply on server
+// graceful drains, which previously fail-fasted with Unavailable even
+// when the server was about to return success.
+func TestHandleGoAway_PreservesInFlightRPC(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 
 	rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
@@ -450,16 +457,14 @@ func TestHandleGoAway_CancelsInFlightRPC(t *testing.T) {
 	if got := s.State(); got != StateClosing {
 		t.Errorf("state = %v, want StateClosing", got)
 	}
-	if s.activeRPC.Load() != nil {
-		t.Error("in-flight RPC should have been cleared from slot")
+	if s.activeRPC.Load() != rpc {
+		t.Error("in-flight RPC should remain in slot; GOAWAY must not cancel it")
 	}
 	select {
 	case res := <-rpc.resultChan:
-		if !errors.Is(res.err, ErrUnavailableGoAway) {
-			t.Errorf("cancelled cause = %v, want ErrUnavailableGoAway", res.err)
-		}
+		t.Errorf("in-flight RPC was cancelled (err=%v) but GOAWAY should let it complete", res.err)
 	default:
-		t.Error("in-flight RPC not cancelled")
+		// expected: no cancellation delivered
 	}
 }
 

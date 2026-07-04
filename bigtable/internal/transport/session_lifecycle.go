@@ -292,14 +292,25 @@ func (s *Session) handleSessionRefreshConfig(cfg *spb.SessionRefreshConfig) {
 }
 
 // handleGoAway processes a server-initiated GoAway:
-//  1. Transitions to StateClosing (no backwards motion from terminal states).
+//  1. Transitions to StateClosing so pool.CheckoutSession stops handing
+//     this session out for new work (matches Java's onSessionGoAway
+//     which marks the session as no longer eligible for new picks).
 //  2. Stamps "GoAway" as the close reason so it survives the eventual
 //     handleClose stamp.
-//  3. Cancels every in-flight RPC — once the server has sent GOAWAY we
-//     never treat any pending vRPC as admitted.
+//  3. Does NOT cancel the in-flight RPC. Java parity: SessionImpl's
+//     handleGoAwayResponse just transitions state and leaves currentRpc
+//     alone — if the server sends the response before dropping the
+//     stream, the RPC completes successfully. Only when the stream
+//     actually terminates does the RPC get failed with TRANSPORT_FAILURE
+//     (via handleClose → cancelActiveRPCs). This grace period matters
+//     most for non-idempotent Apply on server graceful drains: previously
+//     GoAway made the client fail-fast even when the server was about to
+//     send success.
 //  4. Spawns a goroutine that drives the session through Closing →
-//     WaitServerClose → Closed via s.Close, so the lifecycle completes even
-//     when the server forgets to follow up with a stream EOF.
+//     WaitServerClose → Closed via s.Close. s.Close already drains the
+//     in-flight RPC (waits on s.quiescent, or ForceCloses after its 30s
+//     ctx) before sending CloseSession, so the RPC gets its chance
+//     without needing extra scheduling here.
 //
 // A late-arriving GOAWAY from an already terminal session is ignored.
 func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
@@ -310,8 +321,6 @@ func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
 
 	s.debugf("received GOAWAY reason=%q description=%q",
 		goAway.GetReason(), goAway.GetDescription())
-
-	s.cancelActiveRPCs(unavailable(ErrUnavailableGoAway, "server sent GOAWAY"), nil)
 
 	// Drive the lifecycle to completion off the readLoop. s.Close
 	// sends CloseSession, transitions to WaitServerClose, and then the
