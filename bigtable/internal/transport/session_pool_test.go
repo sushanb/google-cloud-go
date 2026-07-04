@@ -393,6 +393,82 @@ func TestUpdateConfig_SwapsPickerAndBounds(t *testing.T) {
 	}
 }
 
+// TestUpdateConfig_HonorsRandomSubsetSize is a regression guard against the
+// bug where UpdateConfig's LeastInFlight branch ignored its own
+// RandomSubsetSize (only PeakEwma read it). Server-driven K must reach the
+// picker for both K-choice strategies.
+func TestUpdateConfig_HonorsRandomSubsetSize(t *testing.T) {
+	cases := []struct {
+		name string
+		lbo  *spb.LoadBalancingOptions
+		want int
+	}{
+		{
+			name: "LeastInFlight with K=5",
+			lbo: &spb.LoadBalancingOptions{
+				LoadBalancingStrategy: &spb.LoadBalancingOptions_LeastInFlight_{
+					LeastInFlight: &spb.LoadBalancingOptions_LeastInFlight{RandomSubsetSize: 5},
+				},
+			},
+			want: 5,
+		},
+		{
+			name: "PeakEwma with K=7",
+			lbo: &spb.LoadBalancingOptions{
+				LoadBalancingStrategy: &spb.LoadBalancingOptions_PeakEwma_{
+					PeakEwma: &spb.LoadBalancingOptions_PeakEwma{RandomSubsetSize: 7},
+				},
+			},
+			want: 7,
+		},
+		{
+			name: "LeastInFlight with omitted K falls back to default",
+			lbo: &spb.LoadBalancingOptions{
+				LoadBalancingStrategy: &spb.LoadBalancingOptions_LeastInFlight_{
+					LeastInFlight: &spb.LoadBalancingOptions_LeastInFlight{}, // K=0 → fallback
+				},
+			},
+			want: defaultAfeRandomSubsetSize,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newTestPool(t, 1, 10)
+			p.UpdateConfig(&spb.SessionClientConfiguration_SessionPoolConfiguration{
+				MinSessionCount:      1,
+				MaxSessionCount:      10,
+				LoadBalancingOptions: tc.lbo,
+			})
+			var gotK int
+			switch pk := p.picker.(type) {
+			case *LeastInFlightAfePicker:
+				gotK = pk.RandomSubsetSize
+			case *LeastLatencyAfePicker:
+				gotK = pk.RandomSubsetSize
+			default:
+				t.Fatalf("unexpected picker type %T", p.picker)
+			}
+			if gotK != tc.want {
+				t.Errorf("picker RandomSubsetSize = %d, want %d", gotK, tc.want)
+			}
+		})
+	}
+}
+
+// TestPickerFromLoadBalancing_NilFallback verifies the constructor's
+// bootstrap path — a nil LoadBalancingOptions gives Java's default
+// (LeastInFlight with K=defaultAfeRandomSubsetSize).
+func TestPickerFromLoadBalancing_NilFallback(t *testing.T) {
+	picker := pickerFromLoadBalancing(nil)
+	li, ok := picker.(*LeastInFlightAfePicker)
+	if !ok {
+		t.Fatalf("nil LBO → %T, want *LeastInFlightAfePicker", picker)
+	}
+	if li.RandomSubsetSize != defaultAfeRandomSubsetSize {
+		t.Errorf("K = %d, want %d", li.RandomSubsetSize, defaultAfeRandomSubsetSize)
+	}
+}
+
 func TestPruneDeadLocked_RemovesFromSessionsAndSL(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	sh := injectActiveSession(t, p, "s1", time.Now().Add(-time.Minute))

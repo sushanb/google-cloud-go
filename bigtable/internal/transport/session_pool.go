@@ -148,10 +148,14 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 		return pool.Stats()
 	}
 	pool.sizer = NewPoolSizer(fetcher, min, max, 0.10)
-	// Default to LeastInFlight (Java-parity default) with K-choice-2.
-	// UpdateConfig can switch to Simple / LeastLatency via the server's
-	// LoadBalancingOptions.
-	pool.picker = NewLeastInFlightAfePicker(defaultAfeRandomSubsetSize)
+	// Bootstrap picker with the "no config yet" fallback (Java-parity
+	// LeastInFlight, K=defaultAfeRandomSubsetSize). Every real caller
+	// wires the pool through ClientConfigurationManager.AddSessionPoolListener,
+	// which fires UpdateConfig synchronously on registration — so the
+	// hardcoded default only ever runs in test setups that skip that
+	// wiring. Single source of truth for the LBO → picker mapping lives
+	// in pickerFromLoadBalancing.
+	pool.picker = pickerFromLoadBalancing(nil)
 	pool.budget = NewAdaptiveSessionThrottler(10, 10*time.Second)
 
 	return pool
@@ -311,29 +315,53 @@ func (p *SessionPoolImpl) UpdateConfig(config *spb.SessionClientConfiguration_Se
 	p.maxSessions = int(config.MaxSessionCount)
 
 	if config.LoadBalancingOptions != nil {
-		lbo := config.LoadBalancingOptions
-		switch opt := lbo.LoadBalancingStrategy.(type) {
-		case *spb.LoadBalancingOptions_Random_:
-			// Java's SimplePicker: uniform random over ready AFEs, then
-			// dequeue any idle session in that AFE.
-			p.picker = NewSimpleAfePicker()
-		case *spb.LoadBalancingOptions_LeastInFlight_:
-			p.picker = NewLeastInFlightAfePicker(defaultAfeRandomSubsetSize)
-		case *spb.LoadBalancingOptions_PeakEwma_:
-			// LoadBalancingOptions_PeakEwma maps to the per-AFE
-			// least-latency picker (Java's LeastLatencyPicker); its
-			// RandomSubsetSize field caps the K-choice draw.
-			subsetSize := defaultAfeRandomSubsetSize
-			if opt.PeakEwma != nil && opt.PeakEwma.RandomSubsetSize > 0 {
-				subsetSize = int(opt.PeakEwma.RandomSubsetSize)
-			}
-			p.picker = NewLeastLatencyAfePicker(subsetSize)
-		}
+		p.picker = pickerFromLoadBalancing(config.LoadBalancingOptions)
 	}
 	p.mu.Unlock()
 
 	// Dynamically update sizer thresholds E2E!
 	p.sizer.UpdateConfig(config)
+}
+
+// pickerFromLoadBalancing builds an AfePicker from server-driven
+// LoadBalancingOptions. A nil lbo returns Java's default
+// (LeastInFlight with K=defaultAfeRandomSubsetSize) so bootstrap
+// paths (NewSessionPoolImpl before UpdateConfig fires, unit tests
+// that skip the config wiring) get a working picker.
+//
+// Single source of truth for the LBO → picker mapping — the previous
+// implementation duplicated this switch between NewSessionPoolImpl
+// and UpdateConfig, and drifted: the LeastInFlight branch of
+// UpdateConfig ignored its own RandomSubsetSize field even though the
+// PeakEwma branch honored it. That inconsistency is fixed here — every
+// picker that takes a K-choice size reads the corresponding
+// RandomSubsetSize from the oneof, with the shared default fallback
+// when the server omits it (value ≤ 0).
+func pickerFromLoadBalancing(lbo *spb.LoadBalancingOptions) AfePicker {
+	if lbo == nil {
+		return NewLeastInFlightAfePicker(defaultAfeRandomSubsetSize)
+	}
+	switch opt := lbo.LoadBalancingStrategy.(type) {
+	case *spb.LoadBalancingOptions_Random_:
+		// Java's SimplePicker: uniform random over ready AFEs, then
+		// dequeue any idle session in that AFE. No K knob.
+		return NewSimpleAfePicker()
+	case *spb.LoadBalancingOptions_LeastInFlight_:
+		k := defaultAfeRandomSubsetSize
+		if opt.LeastInFlight != nil && opt.LeastInFlight.RandomSubsetSize > 0 {
+			k = int(opt.LeastInFlight.RandomSubsetSize)
+		}
+		return NewLeastInFlightAfePicker(k)
+	case *spb.LoadBalancingOptions_PeakEwma_:
+		// PeakEwma maps to Java's LeastLatencyPicker.
+		k := defaultAfeRandomSubsetSize
+		if opt.PeakEwma != nil && opt.PeakEwma.RandomSubsetSize > 0 {
+			k = int(opt.PeakEwma.RandomSubsetSize)
+		}
+		return NewLeastLatencyAfePicker(k)
+	default:
+		return NewLeastInFlightAfePicker(defaultAfeRandomSubsetSize)
+	}
 }
 
 // Invoke checks out a session from the pool, executes a single virtual RPC
