@@ -145,9 +145,7 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 	}
 	delta := decision.Delta
 
-	p.mu.Lock()
-	currentSessions := len(p.sessions)
-	p.mu.Unlock()
+	currentSessions := p.sl.ReadyCount()
 
 	// Only scale-up is actioned. Scale-down deltas are advisory — the
 	// pool shrinks passively via OnClose's replace-on-death gate (see
@@ -231,7 +229,7 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 		p.mu.Unlock()
 		return fmt.Errorf("session pool is closed")
 	}
-	if len(p.sessions) >= p.maxSessions {
+	if p.sl.ReadyCount() >= p.maxSessions {
 		p.mu.Unlock()
 		return fmt.Errorf("session pool limit reached")
 	}

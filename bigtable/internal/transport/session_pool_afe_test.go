@@ -40,9 +40,6 @@ func injectActiveOnAfe(t *testing.T, p *SessionPoolImpl, name string, afe afeID)
 
 	sh := NewSessionHandle(s, time.Now())
 	s.poolHandle.Store(sh)
-	p.mu.Lock()
-	p.sessions = append(p.sessions, sh)
-	p.mu.Unlock()
 	p.sl.OnSessionStarted(sh)
 	return sh
 }

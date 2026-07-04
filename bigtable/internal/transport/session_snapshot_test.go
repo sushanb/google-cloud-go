@@ -131,16 +131,19 @@ func TestPoolSnapshot_AggregatesSessions(t *testing.T) {
 	pool := NewSessionPoolImpl("test:read", 1, 5, nil, nil, nil, SessionTypeTable)
 
 	// Two active sessions, one with traffic.
+	handles := make([]*SessionHandle, 0, 2)
 	for i := 0; i < 2; i++ {
 		stream := newFakeStream()
 		s := NewSession("s", stream, SessionHooks{}, SessionTypeTable)
 		s.state.Store(int32(StateReady))
 		sh := NewSessionHandle(s, time.Time{})
-		pool.sessions = append(pool.sessions, sh)
+		s.poolHandle.Store(sh)
+		pool.sl.OnSessionStarted(sh)
+		handles = append(handles, sh)
 	}
-	pool.sessions[0].IncOutstanding()
-	pool.sessions[0].session.okRpcs.Store(10)
-	pool.sessions[1].session.errorRpcs.Store(3)
+	handles[0].IncOutstanding()
+	handles[0].session.okRpcs.Store(10)
+	handles[1].session.errorRpcs.Store(3)
 
 	snap := pool.PoolSnapshot()
 	if snap.Name != "test:read" {
@@ -162,7 +165,14 @@ func TestPoolSnapshot_AggregatesSessions(t *testing.T) {
 	if len(snap.Sessions) != 2 {
 		t.Fatalf("Sessions len = %d, want 2", len(snap.Sessions))
 	}
-	if snap.Sessions[0].OkRpcs != 10 || snap.Sessions[1].ErrorRpcs != 3 {
-		t.Errorf("counts not propagated: %+v", snap.Sessions)
+	// AllHandles snapshots via map iteration — order is not stable.
+	// Assert on totals across the whole set instead of per-index.
+	var okTotal, errTotal int64
+	for _, s := range snap.Sessions {
+		okTotal += s.OkRpcs
+		errTotal += s.ErrorRpcs
+	}
+	if okTotal != 10 || errTotal != 3 {
+		t.Errorf("counts not propagated: okTotal=%d, errTotal=%d, want 10/3; snap=%+v", okTotal, errTotal, snap.Sessions)
 	}
 }

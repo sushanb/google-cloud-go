@@ -101,12 +101,12 @@ func TestBumpStartingClose_UsesFailedToStart(t *testing.T) {
 func TestOnActive_DuplicateSessionSkipped(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	sh := injectActiveSession(t, p, "s1", time.Now())
-	before := len(p.sessions)
-	// Firing OnActive for a session already in p.sessions must not
-	// double-register.
+	before := p.sl.ReadyCount()
+	// Firing OnActive for a session already registered must not
+	// double-register (poolHandle dup-check catches it).
 	p.OnActive(sh.session)
-	if got := len(p.sessions); got != before {
-		t.Errorf("p.sessions len = %d, want %d (duplicate register)", got, before)
+	if got := p.sl.ReadyCount(); got != before {
+		t.Errorf("sl.ReadyCount = %d, want %d (duplicate register)", got, before)
 	}
 }
 
@@ -137,7 +137,7 @@ func TestOnActive_SignalsFree(t *testing.T) {
 
 func TestOnClose_StartingSessionBumpsFailedToStart(t *testing.T) {
 	p := newTestPool(t, 1, 10)
-	// Session in startingSessions but not in p.sessions.
+	// Session in startingSessions but never promoted (no poolHandle).
 	stream := newFakeStream()
 	s := NewSession("s-starting", stream, SessionHooks{OnClose: p.OnClose}, SessionTypeTable)
 	p.mu.Lock()
@@ -159,26 +159,20 @@ func TestOnClose_StartingSessionBumpsFailedToStart(t *testing.T) {
 
 // --- OnClosing ------------------------------------------------------------
 
-func TestOnClosing_RemovesFromSessionsAndRecordsLifetime(t *testing.T) {
+func TestOnClosing_DropsFromReadyCountAndRecordsLifetime(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	sh := injectActiveSession(t, p, "s1", time.Now().Add(-time.Second))
+	if p.sl.ReadyCount() != 1 {
+		t.Fatalf("ReadyCount before OnClosing = %d, want 1", p.sl.ReadyCount())
+	}
 
 	p.OnClosing(sh.session)
 
-	p.mu.Lock()
-	found := false
-	for _, cur := range p.sessions {
-		if cur == sh {
-			found = true
-			break
-		}
-	}
-	p.mu.Unlock()
-	if found {
-		t.Error("session still in p.sessions after OnClosing")
+	if got := p.sl.ReadyCount(); got != 0 {
+		t.Errorf("ReadyCount after OnClosing = %d, want 0 (dying sessions must free the budget)", got)
 	}
 	// poolHandle survives OnClosing — OnClose reads it to hand off to
-	// sl.OnSessionClosed. Cleared only when the Session itself is GC'd.
+	// sl.OnSessionClosed.
 	if got := sh.session.poolHandle.Load(); got != sh {
 		t.Errorf("session.poolHandle = %p, want %p (OnClose needs it for sl teardown)", got, sh)
 	}
@@ -217,8 +211,9 @@ func TestOnClosing_ThenOnClose_UsesPoolHandle(t *testing.T) {
 }
 
 func TestOnClosing_FiresBeforeOnClose_ViaSessionClose(t *testing.T) {
-	// End-to-end: driving Session.Close() must fire OnClosing (removing
-	// from p.sessions), and the eventual notifyClosed must fire OnClose.
+	// End-to-end: driving Session.ForceClose() must fire OnClosing
+	// (dropping the session from sl.ReadyCount) and the eventual
+	// notifyClosed must fire OnClose.
 	p := newTestPool(t, 1, 10)
 	sh := injectActiveSession(t, p, "s1", time.Now().Add(-time.Second))
 
@@ -230,34 +225,21 @@ func TestOnClosing_FiresBeforeOnClose_ViaSessionClose(t *testing.T) {
 	// Wait briefly for the async close path to complete.
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		p.mu.Lock()
-		found := false
-		for _, cur := range p.sessions {
-			if cur == sh {
-				found = true
-				break
-			}
-		}
-		closed := p.m.sessionsClosed.Load()
-		p.mu.Unlock()
-		if !found && closed == 1 {
+		if p.sl.ReadyCount() == 0 && p.m.sessionsClosed.Load() == 1 {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	p.mu.Lock()
-	remaining := len(p.sessions)
-	closed := p.m.sessionsClosed.Load()
-	p.mu.Unlock()
-	t.Errorf("after ForceClose: len(sessions)=%d (want 0), sessionsClosed=%d (want 1)", remaining, closed)
+	t.Errorf("after ForceClose: sl.ReadyCount=%d (want 0), sessionsClosed=%d (want 1)",
+		p.sl.ReadyCount(), p.m.sessionsClosed.Load())
 }
 
 // --- OnClose --------------------------------------------------------------
 
 func TestOnClose_IdxNotFoundStillRecords(t *testing.T) {
 	p := newTestPool(t, 1, 10)
-	// A session neither in p.sessions nor startingSessions — the "already
+	// A session neither in sl nor startingSessions — the "already
 	// proactively removed" path (OnClosing already ran, or a bare-metal
 	// caller invoked OnClose directly). recordSessionClose still fires so
 	// the ledger reflects reality.

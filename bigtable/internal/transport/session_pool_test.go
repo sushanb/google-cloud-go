@@ -30,9 +30,13 @@ func stubPoolStreamFactory(_ context.Context) (Stream, error) {
 }
 
 // injectActiveSession builds a fakeStream-backed Session in StateReady,
-// wraps it in a SessionHandle, and pushes it into pool.sessions (registering
-// the createdAt time). This bypasses the real Start/handshake path so tests
-// can exercise pool-level logic in milliseconds.
+// wraps it in a SessionHandle, and registers it with the pool's
+// sessionList. Bypasses the real Start/handshake path so tests can
+// exercise pool-level logic in milliseconds. Since sl is now the sole
+// store of active handles, this mirrors OnActive's minimum required
+// state: poolHandle stamp + sl.OnSessionStarted. PeerInfo stays nil,
+// so the handle lands in the AfeID=0 bucket — fine for pool-level
+// tests that don't care about AFE fanout.
 func injectActiveSession(t testing.TB, p *SessionPoolImpl, name string, createdAt time.Time) *SessionHandle {
 	t.Helper()
 	stream := newFakeStream()
@@ -46,13 +50,6 @@ func injectActiveSession(t testing.TB, p *SessionPoolImpl, name string, createdA
 
 	sh := NewSessionHandle(s, createdAt)
 	s.poolHandle.Store(sh)
-	p.mu.Lock()
-	p.sessions = append(p.sessions, sh)
-	p.mu.Unlock()
-	// Register in the AFE-aware sessionList so CheckoutSession's two-tier
-	// pick can find it. injectActiveSession skips the handshake so
-	// PeerInfo stays nil — the handle lands in the AfeID=0 bucket, which
-	// is fine for pool-level tests that don't care about AFE fanout.
 	p.sl.OnSessionStarted(sh)
 	return sh
 }
@@ -127,12 +124,9 @@ func TestPerformScaling_NoLongerPrunesOverprovisioned(t *testing.T) {
 		_ = sh
 	}
 
-	before := len(p.sessions)
+	before := p.sl.ReadyCount()
 	p.PerformScaling(context.Background())
-
-	p.mu.Lock()
-	after := len(p.sessions)
-	p.mu.Unlock()
+	after := p.sl.ReadyCount()
 
 	if after != before {
 		t.Errorf("PerformScaling pruned sessions: before=%d after=%d — scale-down must be advisory, not proactive", before, after)

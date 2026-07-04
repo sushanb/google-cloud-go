@@ -40,21 +40,15 @@ const waitServerCloseGrace = 30 * time.Second
 // session.uptime histogram. Sampling happens without the pool lock so
 // tracer work never blocks CheckoutSession / OnClose.
 func (p *SessionPoolImpl) sampleActiveUptimes(ctx context.Context) {
-	p.mu.Lock()
-	active := make([]*Session, 0, len(p.sessions))
-	for _, sh := range p.sessions {
+	handles := p.sl.AllHandles()
+	for _, sh := range handles {
 		if sh == nil || sh.session == nil {
 			continue
 		}
 		if State(sh.session.state.Load()) != StateReady {
 			continue
 		}
-		active = append(active, sh.session)
-	}
-	p.mu.Unlock()
-
-	for _, s := range active {
-		s.SampleUptime(ctx)
+		sh.session.SampleUptime(ctx)
 	}
 }
 
@@ -70,8 +64,7 @@ func (p *SessionPoolImpl) sweepStuckSessions() {
 	}
 	var victims []victim
 
-	p.mu.Lock()
-	for _, sh := range p.sessions {
+	for _, sh := range p.sl.AllHandles() {
 		if sh == nil || sh.session == nil {
 			continue
 		}
@@ -81,7 +74,6 @@ func (p *SessionPoolImpl) sweepStuckSessions() {
 			victims = append(victims, victim{sess: sh.session, stuckFor: since})
 		}
 	}
-	p.mu.Unlock()
 
 	for _, v := range victims {
 		btopt.Debugf(nil, "POOL %s sweepStuckSessions: force-closing %s stuck in WaitServerClose for %v",
@@ -130,9 +122,9 @@ func (p *SessionPoolImpl) recordSessionClose(s *Session, fallbackReason string) 
 }
 
 // bumpStartingClose is the recordSessionClose variant for sessions that
-// died before reaching active state — they're held in startingSessions, not
-// p.sessions, so OnClose's idx-not-found branch is the only signal we get.
-// Wraps the same once-flag for consistency.
+// died before reaching active state — they're held in startingSessions
+// and never got a poolHandle stamp, so OnClose's starting-branch is the
+// only signal we get. Wraps the same once-flag for consistency.
 func (p *SessionPoolImpl) bumpStartingClose(s *Session) {
 	p.recordSessionClose(s, "FailedToStart")
 }
@@ -162,9 +154,12 @@ func (p *SessionPoolImpl) Close() error {
 		return nil
 	}
 	p.closed = true
-	snapshot := p.sessions
-	p.sessions = nil
 	p.mu.Unlock()
+
+	// Snapshot AFTER marking closed so any OnActive races have either
+	// (a) already added to sl, in which case we see them, or (b) will
+	// see p.closed and route straight to ForceClose without registering.
+	snapshot := p.sl.AllHandles()
 
 	// Record the closes up-front (with PoolClose as the fallback reason)
 	// so the debug counters reflect retirement immediately, even though the
@@ -245,15 +240,13 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 		return
 	}
 
-	// Ensure we do not duplicate register the same session!
-	for _, sh := range p.sessions {
-		if sh.session == s {
-			return
-		}
+	// Dup-check via the once-set poolHandle. If OnActive already ran for
+	// this session, poolHandle is non-nil and we exit idempotently.
+	if s.poolHandle.Load() != nil {
+		return
 	}
 
 	sh := NewSessionHandle(s, time.Now())
-	p.sessions = append(p.sessions, sh)
 	s.poolHandle.Store(sh)
 	p.m.sessionsOpened.Add(1)
 
@@ -280,45 +273,37 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 // sweep — dying sessions leave the pool's accounting the instant they
 // start dying, not at end-of-teardown.
 func (p *SessionPoolImpl) OnClosing(s *Session) {
+	// Still-starting sessions leave the pool via OnClose's
+	// bumpStartingClose path — they were never promoted to Active, so
+	// s.poolHandle was never stored.
 	p.mu.Lock()
-	// Still-starting sessions leave the pool via OnClose's bumpStartingClose
-	// path — they were never in p.sessions to remove.
-	if _, starting := p.startingSessions[s]; starting {
-		p.mu.Unlock()
+	_, starting := p.startingSessions[s]
+	p.mu.Unlock()
+	if starting {
 		return
 	}
-	idx := -1
-	for i, sh := range p.sessions {
-		if sh.session == s {
-			idx = i
-			break
-		}
-	}
-	if idx == -1 {
-		p.mu.Unlock()
+	removed := s.poolHandle.Load()
+	if removed == nil {
 		return
 	}
-	removed := p.sessions[idx]
 	if !removed.createdAt.IsZero() {
 		p.recordLifetime(time.Since(removed.createdAt))
 	}
-	p.sessions = append(p.sessions[:idx], p.sessions[idx+1:]...)
-	needScale := len(p.sessions) < p.maxSessions
-	p.mu.Unlock()
 
 	// Remove from the AFE idle queue too. sessionList keeps refCount
 	// alive (in-flight vRPCs still complete via the session) until
-	// OnClose fires and drops the handle entirely.
+	// OnClose fires and drops the handle entirely. This also decrements
+	// sl.readyCount, freeing a slot in the scale-up budget.
 	p.sl.OnSessionClosing(removed)
 
-	if needScale {
+	if p.sl.ReadyCount() < p.maxSessions {
 		go p.PerformScaling(p.poolCtx)
 	}
 }
 
 // OnClose fires at the end of teardown — the stream has actually
-// closed. By this point OnClosing has already removed the session
-// from p.sessions and the picker's idle queue. This callback
+// closed. By this point OnClosing has already dropped the session
+// from sl.readyCount and the picker's idle queue. This callback
 // finalizes: drop the AFE handle from sl (refCount → 0, out of
 // handleToAfe) and record the close in the reason ledger. The
 // *Session → *SessionHandle back-ref is Session.poolHandle, set

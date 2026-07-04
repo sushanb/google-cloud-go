@@ -275,11 +275,11 @@ type TimeSeriesSample struct {
 }
 
 func (p *SessionPoolImpl) recordTimeSeries() {
-	p.mu.Lock()
-	totalSessions := len(p.sessions)
+	handles := p.sl.AllHandles()
+	totalSessions := len(handles)
 	inUse := 0
 	var okTotal, errTotal int64
-	for _, sh := range p.sessions {
+	for _, sh := range handles {
 		if sh == nil || sh.session == nil {
 			continue
 		}
@@ -289,7 +289,6 @@ func (p *SessionPoolImpl) recordTimeSeries() {
 		okTotal += sh.session.okRpcs.Load()
 		errTotal += sh.session.errorRpcs.Load()
 	}
-	p.mu.Unlock()
 	// Pending = pool-boundary queue depth (waiters parked in
 	// CheckoutSession), same source as Stats().PendingCount. The previous
 	// implementation summed outstanding across sessions, which with

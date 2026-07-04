@@ -55,16 +55,16 @@ type SessionPoolImpl struct {
 	picker AfePicker
 	// sl is the AFE-aware bucketing structure. It owns the idle-session
 	// queues per AFE and the per-AFE PeakEwma trackers the picker
-	// consumes. Kept in sync with the flat p.sessions slice below —
-	// OnActive registers into both; OnClose / prune remove from both.
-	// sl has its own lock (finer than p.mu); ordering rule: never take
-	// p.mu while holding sl.mu.
+	// consumes. sl is the sole store of active SessionHandles now — no
+	// flat mirror. sl has its own lock (finer than p.mu); ordering
+	// rule: never take p.mu while holding sl.mu.
 	sl     *sessionList
 	budget SessionThrottler
-	// sessions is the flat cross-index used by snapshot / teardown /
-	// dead-sweep read paths. AFE-aware picking goes through sl above.
-	// Both are kept in sync in OnActive / OnClose / prune*.
-	sessions           []*SessionHandle
+	// startingSessions holds sessions dialed via createSession that have
+	// not yet reached OnActive. Cleared in OnActive (promotion) or in
+	// OnClose (failed start → bumpStartingClose). Registered active
+	// sessions live in sl (sessionList) — the pool no longer carries a
+	// separate flat slice.
 	startingSessions   map[*Session]bool
 	closed             bool
 	scalingInProgress  bool
@@ -189,9 +189,9 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 	// gates on its own in-progress flag so a duplicate goroutine here
 	// exits immediately.
 	p.mu.Lock()
-	empty := !p.closed && len(p.sessions) == 0
+	closed := p.closed
 	p.mu.Unlock()
-	if empty {
+	if !closed && p.sl.ReadyCount() == 0 {
 		go p.PerformScaling(p.poolCtx)
 	}
 
@@ -230,16 +230,13 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		}
 
 		// Slow path: picker returned nil. Java-parity — no dead-sweep
-		// needed. Dying sessions leave p.sessions the instant they
+		// needed. Dying sessions leave sl.readyCount the instant they
 		// transition out of Ready via OnClosing (fired from Session's
 		// notifyClosing at handleGoAway / Close / ForceClose /
 		// handleClose). So the maxSessions gate here already reflects
 		// only live-or-starting sessions; a miss just means all live
 		// sessions are busy.
-		p.mu.Lock()
-		needScale := len(p.sessions) < p.maxSessions
-		p.mu.Unlock()
-		if needScale {
+		if p.sl.ReadyCount() < p.maxSessions {
 			go p.PerformScaling(p.poolCtx)
 		}
 
@@ -303,7 +300,7 @@ func (p *SessionPoolImpl) Stats() *PoolStats {
 
 	ready := 0
 	inUse := 0
-	for _, sh := range p.sessions {
+	for _, sh := range p.sl.AllHandles() {
 		if sh.session.State() == StateReady {
 			ready++
 		}

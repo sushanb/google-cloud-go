@@ -461,9 +461,8 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 	if p.picker != nil {
 		pickerType = reflect.TypeOf(p.picker).Elem().Name()
 	}
-	handles := make([]*SessionHandle, len(p.sessions))
-	copy(handles, p.sessions)
 	p.mu.Unlock()
+	handles := p.sl.AllHandles()
 
 	var throttler ThrottlerSnapshot
 	if p.budget != nil {

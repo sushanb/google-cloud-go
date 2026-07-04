@@ -83,6 +83,12 @@ type sessionList struct {
 	afeHandles    map[afeID]*afeHandle
 	afesWithReady []*afeHandle              // subset with len(sessions) > 0
 	handleToAfe   map[*SessionHandle]*afeHandle
+	// readyCount is the count of handles currently marked
+	// inExpectedCount — i.e. registered via OnSessionStarted and not yet
+	// dropped via OnSessionClosing/OnSessionClosed. Direct replacement
+	// for the old len(SessionPoolImpl.sessions) that gated scale-up.
+	// Guarded by mu.
+	readyCount int
 }
 
 // newSessionList returns an empty sessionList ready for use.
@@ -126,6 +132,8 @@ func (sl *sessionList) OnSessionStarted(sh *SessionHandle) {
 		sl.afesWithReady = append(sl.afesWithReady, afe)
 	}
 	sl.handleToAfe[sh] = afe
+	sh.inExpectedCount = true
+	sl.readyCount++
 }
 
 // Checkout dequeues one idle session from the given AFE. Returns nil if
@@ -179,6 +187,10 @@ func (sl *sessionList) OnSessionClosing(sh *SessionHandle) {
 	}
 	sl.mu.Lock()
 	defer sl.mu.Unlock()
+	if sh.inExpectedCount {
+		sh.inExpectedCount = false
+		sl.readyCount--
+	}
 	afe := sl.handleToAfe[sh]
 	if afe == nil {
 		return
@@ -198,6 +210,10 @@ func (sl *sessionList) OnSessionClosed(sh *SessionHandle) {
 	}
 	sl.mu.Lock()
 	defer sl.mu.Unlock()
+	if sh.inExpectedCount {
+		sh.inExpectedCount = false
+		sl.readyCount--
+	}
 	afe := sl.handleToAfe[sh]
 	if afe == nil {
 		return
@@ -263,6 +279,35 @@ func (sl *sessionList) ReadyAfes() []afeSnapshot {
 		})
 	}
 	return out
+}
+
+// AllHandles returns a snapshot of every SessionHandle currently
+// registered — Ready sessions AND sessions past OnSessionClosing but
+// still awaiting OnSessionClosed. Order is not stable (map iteration).
+// Callers that need order should sort by sh.createdAt after receiving.
+// Cheap: single lock acquisition, no per-entry work beyond the slice
+// grow.
+func (sl *sessionList) AllHandles() []*SessionHandle {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	if len(sl.handleToAfe) == 0 {
+		return nil
+	}
+	out := make([]*SessionHandle, 0, len(sl.handleToAfe))
+	for sh := range sl.handleToAfe {
+		out = append(out, sh)
+	}
+	return out
+}
+
+// ReadyCount returns the count of handles currently marked
+// inExpectedCount — the "count that gates scale-up." Equivalent to the
+// old len(SessionPoolImpl.sessions) after OnSessionClosing had removed
+// dying sessions. O(1).
+func (sl *sessionList) ReadyCount() int {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	return sl.readyCount
 }
 
 // Snapshot returns a stable, human-readable view of every AFE bucket

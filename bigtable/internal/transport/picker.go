@@ -35,6 +35,13 @@ type SessionHandle struct {
 	// test-constructed handles that never went through OnActive — code
 	// paths that consume this must handle the zero-time case.
 	createdAt time.Time
+	// inExpectedCount tracks whether this handle currently counts toward
+	// sessionList.readyCount (the scale-up budget). Set true in
+	// sl.OnSessionStarted, cleared by whichever of sl.OnSessionClosing /
+	// sl.OnSessionClosed fires first. Guarded by owning sessionList.mu;
+	// do not touch outside sl methods. Java-parity: SessionList.java's
+	// inExpectedCount field.
+	inExpectedCount bool
 }
 
 // Picks returns the number of times this handle has been picked by the pool's
