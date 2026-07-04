@@ -62,12 +62,7 @@ func RetryingVRpc(opts RetryingOptions) Interceptor {
 	return func(ctx context.Context, req interface{}, next Handler) (interface{}, error) {
 		var attempt int32
 		backoff := opts.InitialBackoff
-
-		var shieldedListener *closedListenerShield
-		if opts.Listener != nil {
-			shieldedListener = &closedListenerShield{listener: opts.Listener}
-			defer shieldedListener.Close()
-		}
+		listener := opts.Listener // may be nil
 
 		var lastErr error
 
@@ -86,14 +81,14 @@ func RetryingVRpc(opts RetryingOptions) Interceptor {
 				attemptCtx = WithPrevAttemptErr(attemptCtx, lastErr)
 			}
 
-			if shieldedListener != nil {
-				shieldedListener.OnAttemptStart(attemptCtx)
+			if listener != nil {
+				listener.OnAttemptStart(attemptCtx)
 			}
 
 			res, err := next(attemptCtx, req)
 
-			if shieldedListener != nil {
-				shieldedListener.OnAttemptComplete(attemptCtx, err)
+			if listener != nil {
+				listener.OnAttemptComplete(attemptCtx, err)
 			}
 
 			if err == nil {
@@ -190,27 +185,3 @@ func shouldRetryDefault(err error, idempotent, serverPermitsRetry bool) bool {
 	return false
 }
 
-type closedListenerShield struct {
-	listener VRpcListener
-	closed   int32
-}
-
-func (s *closedListenerShield) Close() {
-	atomic.StoreInt32(&s.closed, 1)
-}
-
-func (s *closedListenerShield) isClosed() bool {
-	return atomic.LoadInt32(&s.closed) == 1
-}
-
-func (s *closedListenerShield) OnAttemptStart(ctx context.Context) {
-	if !s.isClosed() && s.listener != nil {
-		s.listener.OnAttemptStart(ctx)
-	}
-}
-
-func (s *closedListenerShield) OnAttemptComplete(ctx context.Context, err error) {
-	if !s.isClosed() && s.listener != nil {
-		s.listener.OnAttemptComplete(ctx, err)
-	}
-}
