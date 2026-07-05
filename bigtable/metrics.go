@@ -140,31 +140,6 @@ var (
 		2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0,
 	}
 
-	// attemptLatencies2BucketBounds matches java-bigtable's
-	// AGGREGATION_WITH_MILLIS_HISTOGRAM (see Constants.java Buckets) —
-	// linear 0→3ms by 0.1ms then coarse. Deliberately duplicated instead
-	// of using the shared bucketBounds because that set jumps from 0 to
-	// 1ms in a single bucket, which collapses every sub-ms sample (common
-	// on DirectPath / in-region traffic) into a single p50/p90/p99 point
-	// and hides real latency movement below 1ms. The java-bigtable
-	// comment explicitly says these match
-	// bigtable.googleapis.com/frontend_server/handler_latencies so the
-	// client-side dashboard aligns with the server-side one.
-	attemptLatencies2BucketBounds = []float64{
-		// Linear 0 → 3ms by 0.1ms (31 boundaries): fine-grained sub-ms.
-		0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
-		1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9,
-		2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 3.0,
-		// Coarse 4ms → 80ms.
-		4.0, 5.0, 6.0, 8.0, 10.0, 13.0, 16.0, 20.0, 25.0, 30.0, 40.0, 50.0, 65.0, 80.0,
-		// Coarse 100ms → 900ms.
-		100.0, 130.0, 160.0, 200.0, 250.0, 300.0, 400.0, 500.0, 650.0, 800.0, 900.0,
-		// Coarse 1s → 50s.
-		1000.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0, 10000.0, 20000.0, 50000.0,
-		// Long tail: 100s → 5000s (~83 min).
-		100000.0, 200000.0, 500000.0, 1000000.0, 2000000.0, 5000000.0,
-	}
-
 	// All the built-in metrics have same attributes except 'tag', 'status' and 'streaming'
 	// These attributes need to be added to only few of the metrics
 	metricsDetails = map[string]metricInfo{
@@ -422,15 +397,14 @@ func (tf *builtinMetricsTracerFactory) createInstruments(meter metric.Meter) err
 
 	// Create attempt_latencies2 — same latency value as attempt_latencies,
 	// broken out with transport_type/region/zone/subzone attributes sourced
-	// from the bigtable-peer-info sideband metadata. Uses the java-parity
-	// AGGREGATION_WITH_MILLIS_HISTOGRAM bucketing (fine sub-ms + coarse
-	// tail) instead of the shared bucketBounds so DirectPath sub-ms
-	// samples don't all collapse into a single [0,1)ms bucket.
+	// from the bigtable-peer-info sideband metadata. Uses the shared
+	// java-parity FineGrainLatencyBounds so sub-ms DirectPath samples
+	// don't collapse into a single [0,1)ms bucket.
 	tf.attemptLatencies2, err = meter.Float64Histogram(
 		metricNameAttemptLatencies2,
 		metric.WithDescription("Client observed latency per RPC attempt, labeled by transport type and AFE location."),
 		metric.WithUnit(metricUnitMS),
-		metric.WithExplicitBucketBoundaries(attemptLatencies2BucketBounds...),
+		metric.WithExplicitBucketBoundaries(btransport.FineGrainLatencyBounds...),
 	)
 	if err != nil {
 		return err

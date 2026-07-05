@@ -41,15 +41,10 @@ var (
 	sessionMetricsErr  error
 )
 
-// transportLatencyBucketBounds matches java-bigtable's
-// AGGREGATION_WITH_MILLIS_HISTOGRAM (Constants.java Buckets) — linear
-// 0→3ms by 0.1ms then coarse to 5000s. Same set the outer bigtable
-// package uses for attempt_latencies2 (kept as attemptLatencies2BucketBounds
-// there); duplicated here because internal/transport can't import from
-// its parent package. Without explicit bounds, OTel's default set
-// ([0, 5, 10, 25, …]ms) collapses every sub-ms wire sample — which is
-// the common case for DirectPath — into a single bucket.
-var transportLatencyBucketBounds = []float64{
+// FineGrainLatencyBounds matches java-bigtable's
+// AGGREGATION_WITH_MILLIS_HISTOGRAM: fine sub-ms + coarse tail. Shared
+// by transport_latencies and attempt_latencies2.
+var FineGrainLatencyBounds = []float64{
 	// Linear 0 → 3ms by 0.1ms (31 boundaries): fine-grained sub-ms.
 	0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
 	1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9,
@@ -105,7 +100,7 @@ func InitializeSessionMetrics(meterProvider metric.MeterProvider) error {
 			"transport_latencies",
 			metric.WithDescription("The latency measured from e2e latencies minus node latencies."),
 			metric.WithUnit("ms"),
-			metric.WithExplicitBucketBoundaries(transportLatencyBucketBounds...),
+			metric.WithExplicitBucketBoundaries(FineGrainLatencyBounds...),
 		); err != nil {
 			sessionMetricsErr = fmt.Errorf("create transport_latencies histogram: %w", err)
 			return
