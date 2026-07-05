@@ -50,7 +50,7 @@ func sessionzSampleSnapshot() []btransport.PoolSnapshot {
 					HeartbeatInterval: 10 * time.Second,
 					NextHeartbeat:     time.Now().Add(20 * time.Second),
 					Peer: btransport.PeerInfoSnapshot{
-						TransportType:              "TRANSPORT_TYPE_SESSION_DIRECT_ACCESS",
+						TransportType:              "session_directpath",
 						GoogleFrontendID:           12345,
 						ApplicationFrontendID:      67890,
 						ApplicationFrontendRegion:  "us-central1",
@@ -124,7 +124,7 @@ func TestSessionz_Pool_HTML_RendersSessions(t *testing.T) {
 		"my-table:read",
 		"session-read-1", "session-read-2",
 		"Ready", "Starting",
-		"TRANSPORT_TYPE_SESSION_DIRECT_ACCESS",
+		"session_directpath",
 		"us-central1", "us-central1-b1",
 		"42", // OK count
 	}

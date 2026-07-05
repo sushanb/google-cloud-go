@@ -417,7 +417,7 @@ func (s *Session) peerInfoSummary() string {
 		p.GetApplicationFrontendRegion(),
 		p.GetApplicationFrontendSubzone(),
 		p.GetGoogleFrontendId(),
-		p.GetTransportType())
+		transportTypeName(p.GetTransportType()))
 }
 
 const latencyWindow = 256

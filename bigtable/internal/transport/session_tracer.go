@@ -159,9 +159,7 @@ func (t *sessionTracer) snapshot() tracerSnapshot {
 		transportType: "unknown",
 	}
 	if t.peerInfo != nil {
-		if tt := t.peerInfo.GetTransportType().String(); tt != "" {
-			snap.transportType = tt
-		}
+		snap.transportType = transportTypeName(t.peerInfo.GetTransportType())
 		snap.afeLocation = t.peerInfo.GetApplicationFrontendSubzone()
 	}
 	return snap

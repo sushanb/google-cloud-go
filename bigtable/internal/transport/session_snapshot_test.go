@@ -94,8 +94,8 @@ func TestSession_Snapshot_BasicFields(t *testing.T) {
 	if snap.Peer.ApplicationFrontendRegion != "us-central1" {
 		t.Errorf("Peer.ApplicationFrontendRegion = %q, want us-central1", snap.Peer.ApplicationFrontendRegion)
 	}
-	if snap.Peer.TransportType != "TRANSPORT_TYPE_SESSION_DIRECT_ACCESS" {
-		t.Errorf("Peer.TransportType = %q, want TRANSPORT_TYPE_SESSION_DIRECT_ACCESS", snap.Peer.TransportType)
+	if snap.Peer.TransportType != "session_directpath" {
+		t.Errorf("Peer.TransportType = %q, want session_directpath", snap.Peer.TransportType)
 	}
 	if snap.SessionType != "table" {
 		t.Errorf("SessionType = %q, want table", snap.SessionType)
@@ -106,7 +106,7 @@ func TestSession_Snapshot_NilPeer(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 	snap := s.Snapshot()
 	// Nil peer is reported as the zero PeerInfoSnapshot so the UI can render
-	// a dash; we deliberately do NOT synthesize "TRANSPORT_TYPE_UNKNOWN" here.
+	// a dash; we deliberately do NOT synthesize "unknown" here.
 	if snap.Peer.TransportType != "" {
 		t.Errorf("nil peer TransportType = %q, want empty string", snap.Peer.TransportType)
 	}

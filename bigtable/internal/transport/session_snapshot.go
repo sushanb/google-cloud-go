@@ -400,11 +400,36 @@ func peerInfoToSnapshot(p *spb.PeerInfo) PeerInfoSnapshot {
 		return PeerInfoSnapshot{}
 	}
 	return PeerInfoSnapshot{
-		TransportType:              p.GetTransportType().String(),
+		TransportType:              transportTypeName(p.GetTransportType()),
 		GoogleFrontendID:           p.GetGoogleFrontendId(),
 		ApplicationFrontendID:      p.GetApplicationFrontendId(),
 		ApplicationFrontendRegion:  p.GetApplicationFrontendRegion(),
 		ApplicationFrontendSubzone: p.GetApplicationFrontendSubzone(),
+	}
+}
+
+// transportTypeName maps the PeerInfo transport type enum to the short
+// label used in metric attributes and debug UIs (e.g. "cloudpath",
+// "session_directpath"). Prefer this over .String(), which yields the
+// verbose "TRANSPORT_TYPE_…" proto enum names.
+func transportTypeName(tt spb.PeerInfo_TransportType) string {
+	switch tt {
+	case spb.PeerInfo_TRANSPORT_TYPE_EXTERNAL:
+		return "external"
+	case spb.PeerInfo_TRANSPORT_TYPE_CLOUD_PATH:
+		return "cloudpath"
+	case spb.PeerInfo_TRANSPORT_TYPE_DIRECT_ACCESS:
+		return "directpath"
+	case spb.PeerInfo_TRANSPORT_TYPE_SESSION_EXTERNAL:
+		return "session_external"
+	case spb.PeerInfo_TRANSPORT_TYPE_SESSION_CLOUD_PATH:
+		return "session_cloudpath"
+	case spb.PeerInfo_TRANSPORT_TYPE_SESSION_DIRECT_ACCESS:
+		return "session_directpath"
+	case spb.PeerInfo_TRANSPORT_TYPE_SESSION_UNKNOWN:
+		return "session_unknown"
+	default:
+		return "unknown"
 	}
 }
 
