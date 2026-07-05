@@ -179,15 +179,14 @@ func TestConnRegistry_ConcurrentDialsAndSnapshots(t *testing.T) {
 
 	reg := NewConnRegistry()
 	done := make(chan struct{})
-	// Dialer goroutine.
+	// conns is populated by the dialer goroutine and read by the main
+	// test after <-done, which provides the happens-before edge. Held
+	// open across the Len() assertion so the registry entries survive
+	// long enough to be observed — closing before the assertion races
+	// registry deregistration and flakes Len()==0 under load.
+	var conns []net.Conn
 	go func() {
 		defer close(done)
-		var conns []net.Conn
-		defer func() {
-			for _, c := range conns {
-				c.Close()
-			}
-		}()
 		for i := 0; i < 20; i++ {
 			c, err := reg.Dial(context.Background(), ln.Addr().String())
 			if err != nil {
@@ -206,5 +205,8 @@ func TestConnRegistry_ConcurrentDialsAndSnapshots(t *testing.T) {
 	<-done
 	if reg.Len() == 0 {
 		t.Error("Len() = 0 after 20 dials, expected registered conns")
+	}
+	for _, c := range conns {
+		c.Close()
 	}
 }
