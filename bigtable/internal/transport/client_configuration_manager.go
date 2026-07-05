@@ -16,6 +16,7 @@ package internal
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math/rand"
 	"sync"
@@ -489,6 +490,24 @@ func (m *ClientConfigurationManager) poll(ctx context.Context) {
 			delay := time.Duration(rand.Intn(1<<i)) * time.Second
 			select {
 			case <-ctx.Done():
+				// Ctx expired during retry backoff — the err from the
+				// most recent attempt is real (typically DeadlineExceeded
+				// on a channel that never got READY). Record it before
+				// returning so debugtagsz + configz's Poll history
+				// surface the failure instead of it silently vanishing.
+				recordDebugTag(tagClientConfigPollCtxExpired)
+				if err != nil {
+					m.mu.Lock()
+					m.lastErr = err
+					m.lastErrAt = time.Now()
+					m.recordPoll(PollEvent{
+						At:        pollStart,
+						Duration:  time.Since(pollStart),
+						Err:       fmt.Sprintf("ctx expired mid-retry: %v", err),
+						ConfigSeq: m.configSeq,
+					})
+					m.mu.Unlock()
+				}
 				return
 			case <-time.After(delay):
 			}

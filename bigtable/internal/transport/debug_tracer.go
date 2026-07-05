@@ -154,7 +154,8 @@ const (
 	tagSessionPoolPickLostRace      = "session_pool_pick_lost_race"
 
 	// Client configuration polling.
-	tagClientConfigPollFailed = "client_config_poll_failed"
+	tagClientConfigPollFailed     = "client_config_poll_failed"
+	tagClientConfigPollCtxExpired = "client_config_poll_ctx_expired"
 )
 
 var (
