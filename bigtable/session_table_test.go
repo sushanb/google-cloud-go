@@ -252,9 +252,13 @@ func (e *sessionUnavailableErr) GRPCStatus() *status.Status { return status.New(
 func TestSessionTable_Apply_ServerTimeMutationNotRetried(t *testing.T) {
 	// Generic Unavailable (no safe-sentinel cause) must bubble up after a
 	// single attempt for non-idempotent mutations — retrying could create
-	// duplicate cells with different server-assigned timestamps.
+	// duplicate cells with different server-assigned timestamps. Tag as
+	// StateTransportFailure to mirror the shape production emits; the
+	// classifier must still say "not retryable" because ServerTime
+	// mutations are non-idempotent.
 	writePool := &fakeInvoker{
-		err: status.Error(codes.Unavailable, "transient"),
+		err: btransport.TagErr(btransport.StateTransportFailure,
+			status.Error(codes.Unavailable, "transient")),
 	}
 	st := newSessionTestTable(t, nil, writePool)
 
@@ -286,8 +290,14 @@ func TestSessionTable_Apply_ServerTimeMutationRetriesOnSafeSentinels(t *testing.
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Production Session.Invoke tags these sentinels as
+			// StateUncommitted (the frame never reached the server); the
+			// RetryingVRpc default classifier keys off that tag, so the
+			// fake must produce the same shape or the retry loop stops
+			// after one attempt (see attempt_outcome.go).
 			writePool := &fakeInvoker{
-				err: &sessionUnavailableErr{sentinel: tc.sentinel, msg: "session sentinel: " + tc.name},
+				err: btransport.TagErr(btransport.StateUncommitted,
+					&sessionUnavailableErr{sentinel: tc.sentinel, msg: "session sentinel: " + tc.name}),
 			}
 			st := newSessionTestTable(t, nil, writePool)
 
@@ -307,8 +317,14 @@ func TestSessionTable_Apply_ServerTimeMutationRetriesOnSafeSentinels(t *testing.
 }
 
 func TestSessionTable_Apply_TimestampedMutationRetries(t *testing.T) {
+	// Production Session.Invoke tags a transient-transport Unavailable as
+	// StateTransportFailure; RetryingVRpc's default classifier retries
+	// that state iff Idempotent is true (Timestamp mutations qualify).
+	// The fake has to reproduce the tag or the classifier defaults to
+	// StateServerResult and stops after one attempt.
 	writePool := &fakeInvoker{
-		err: status.Error(codes.Unavailable, "transient"),
+		err: btransport.TagErr(btransport.StateTransportFailure,
+			status.Error(codes.Unavailable, "transient")),
 	}
 	st := newSessionTestTable(t, nil, writePool)
 

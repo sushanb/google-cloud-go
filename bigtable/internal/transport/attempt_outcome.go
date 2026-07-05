@@ -84,6 +84,18 @@ func tagErr(state AttemptState, err error) error {
 	return &vrpcErr{outcome: AttemptOutcome{State: state, Err: err}}
 }
 
+// TagErr wraps err with the given AttemptState so callers outside this
+// package can produce errors that carry the same classifier hint the
+// real transport attaches. Intended for test doubles / fakes that stand
+// in for a Session or a SessionPool: production errors from Session.Invoke
+// are always tagged (see session_vrpc.go, session_pool.go), so a test's
+// fake Invoker must tag its errors the same way for the RetryingVRpc
+// interceptor's default classification to see them.
+//
+// Returns nil for nil err. Wraps unwrap()-transparently — errors.Is and
+// status.FromError continue to see the underlying err.
+func TagErr(state AttemptState, err error) error { return tagErr(state, err) }
+
 // ClassifyErr returns the outcome for any error. Untagged errors fall
 // through as StateServerResult — which, under the current default, is
 // NOT retryable without server-attached RetryInfo. Callers that produce
