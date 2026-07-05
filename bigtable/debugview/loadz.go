@@ -170,6 +170,37 @@ func buildLoadzPoolView(snap btransport.LoadBalancingSnapshot, now time.Time) lo
 	}
 	sort.Slice(afeRows, func(i, j int) bool { return afeRows[i].AfeID < afeRows[j].AfeID })
 
+	// Reconcile: snap.PickCounts is a growing tally keyed by every AFE ID
+	// the picker has ever selected; snap.AFEs is only the AFE handles that
+	// survived afePruneMaxIdle GC (and excludes the sentinel ID 0 used for
+	// pre-PeerInfo picks). Without this synthetic bucket, actual% doesn't
+	// sum to 100% and the discrepancy silently swallows picks that went
+	// to buckets no longer in the live view.
+	liveIDs := make(map[int64]struct{}, len(snap.AFEs))
+	for _, a := range snap.AFEs {
+		liveIDs[a.ID] = struct{}{}
+	}
+	var otherPicks int64
+	for id, n := range snap.PickCounts {
+		if _, ok := liveIDs[id]; !ok {
+			otherPicks += n
+		}
+	}
+	if otherPicks > 0 {
+		actual := 0.0
+		if total > 0 {
+			actual = 100.0 * float64(otherPicks) / float64(total)
+		}
+		afeRows = append(afeRows, loadzAfeRow{
+			AfeID:          -1, // sentinel — hex template renders as "pruned/sentinel"
+			AfeIDHex:       "pruned/sentinel",
+			Picks:          otherPicks,
+			ActualSharePct: actual,
+			IdealSharePct:  0,
+			SkewPP:         actual,
+		})
+	}
+
 	// Recent picks are stored oldest-first in the ring buffer; render
 	// newest-first so the top of the table is the freshest.
 	pickRows := make([]loadzPickRow, 0, len(snap.Recent))
@@ -288,8 +319,14 @@ func loadzFuncs() template.FuncMap {
 		return fmt.Sprintf("%.3f", v)
 	}
 	m["hex"] = func(v int64) string {
-		if v == 0 {
+		switch v {
+		case 0:
 			return "unknown"
+		case -1:
+			// Synthetic sentinel used by buildLoadzPoolView to surface picks
+			// attributed to AFE IDs no longer in snap.AFEs (pruned handles or
+			// the pre-PeerInfo sentinel bucket 0).
+			return "pruned/sentinel"
 		}
 		return fmt.Sprintf("0x%x", uint64(v))
 	}
