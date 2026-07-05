@@ -442,8 +442,160 @@ func formatPct(v float64) string {
 type tcpzRow struct {
 	btransport.TCPInfoSnapshot
 	Sev      string // rowClass string ("row-crit", …)
+	SevRank  int    // 0..3 matching sevOK..sevCrit; used for group-worst rollups
 	Why      string // joined why list, e.g. "Loss+backoff+lost"
 	Interest bool   // sev > sevOK — the "N interesting" count uses this
+}
+
+// anomalyChip captures one non-zero "interesting counter" to render as
+// a small colored badge on the one-line per-conn row. Emitting only
+// non-zero counters keeps the row scannable — healthy conns are near-empty.
+type anomalyChip struct {
+	Label string // e.g. "retr", "dsack", "ECN"
+	Value string // formatted count / duration
+	Sev   string // "warn" | "crit"
+}
+
+// anomalies returns the per-conn interesting-counter chips in a stable
+// order. Values that are zero (the healthy case) are omitted.
+func (r tcpzRow) Anomalies() []anomalyChip {
+	var out []anomalyChip
+	add := func(label string, v uint32, sev string) {
+		if v == 0 {
+			return
+		}
+		out = append(out, anomalyChip{Label: label, Value: fmt.Sprintf("%d", v), Sev: sev})
+	}
+	addDur := func(label string, d time.Duration, sev string) {
+		if d == 0 {
+			return
+		}
+		out = append(out, anomalyChip{Label: label, Value: d.String(), Sev: sev})
+	}
+	if r.Backoff > 0 {
+		add("bkoff", r.Backoff, "crit")
+	}
+	add("retr", r.Retransmits, "warn")
+	if r.Retransmits == 0 && r.TotalRetrans > 0 {
+		add("past-retr", r.TotalRetrans, "warn")
+	}
+	add("lost", r.Lost, "warn")
+	add("dsack", r.DsackDups, "warn")
+	add("ECN", r.DeliveredCE, "warn")
+	add("reord", r.ReordSeen, "warn")
+	add("probes", r.Probes, "warn")
+	addDur("rwndLim", r.RwndLimited, "warn")
+	addDur("sndLim", r.SndbufLimited, "warn")
+	if r.NotsentBytes > 0 {
+		out = append(out, anomalyChip{Label: "notsent", Value: fmt.Sprintf("%dB", r.NotsentBytes), Sev: "warn"})
+	}
+	return out
+}
+
+// peerGroup aggregates every conn to the same RemoteAddr into one
+// rendered card. The default view groups by remote so operators can tell
+// "one AFE is misbehaving" apart from "one conn is misbehaving." Fields
+// on the group are worst-case rollups across its conns.
+type peerGroup struct {
+	Remote     string
+	Conns      []tcpzRow
+	WorstSev   string        // "row-crit" | "row-warn" | "row-note" | "row-ok"
+	N          int           // len(Conns) after filters
+	NHidden    int           // conns filtered out (e.g. only=hot); dimmed count in the summary
+	SumDelRate uint64        // Σ DeliveryRate — current outbound bandwidth to this remote
+	SumAvgOut  float64       // Σ lifetime BytesAcked/age (bytes/sec)
+	SumAvgIn   float64       // Σ lifetime BytesReceived/age (bytes/sec)
+	MaxRTT     time.Duration // worst smoothed RTT in the group
+	MaxRtxPct  float64       // worst retrans ratio in the group
+	OldestAge  time.Duration // oldest conn's age — proxy for "how long this pool has been open"
+	Interest   int           // count of conns with sev > sevOK
+}
+
+// buildPeerGroups groups rows by RemoteAddr, sorted by group severity
+// desc (crit → warn → note → ok) then by oldest age. Within a group,
+// conns are severity-desc then dial-order (newest first). Empty rows
+// slice → nil groups.
+func buildPeerGroups(rows []tcpzRow, hiddenByRemote map[string]int) []*peerGroup {
+	if len(rows) == 0 {
+		return nil
+	}
+	byRemote := make(map[string]*peerGroup)
+	order := make([]string, 0, len(rows))
+	for _, r := range rows {
+		g, ok := byRemote[r.RemoteAddr]
+		if !ok {
+			g = &peerGroup{Remote: r.RemoteAddr}
+			byRemote[r.RemoteAddr] = g
+			order = append(order, r.RemoteAddr)
+		}
+		g.Conns = append(g.Conns, r)
+		g.N++
+		if r.Interest {
+			g.Interest++
+		}
+		if r.Err == "" {
+			g.SumDelRate += r.DeliveryRate
+			g.SumAvgOut += avgRateBps(r.BytesAcked, r.DialedAt)
+			g.SumAvgIn += avgRateBps(r.BytesReceived, r.DialedAt)
+			if r.RTT > g.MaxRTT {
+				g.MaxRTT = r.RTT
+			}
+			if r.RetransRatioPct > g.MaxRtxPct {
+				g.MaxRtxPct = r.RetransRatioPct
+			}
+		}
+		if !r.DialedAt.IsZero() {
+			if age := time.Since(r.DialedAt); age > g.OldestAge {
+				g.OldestAge = age
+			}
+		}
+	}
+	// Finalize: pick worst-sev + hidden count, sort conns within each.
+	groups := make([]*peerGroup, 0, len(order))
+	for _, remote := range order {
+		g := byRemote[remote]
+		worst := 0
+		for _, c := range g.Conns {
+			if c.SevRank > worst {
+				worst = c.SevRank
+			}
+		}
+		g.WorstSev = sevClassByRank(worst)
+		g.NHidden = hiddenByRemote[remote]
+		sort.SliceStable(g.Conns, func(i, j int) bool {
+			if g.Conns[i].SevRank != g.Conns[j].SevRank {
+				return g.Conns[i].SevRank > g.Conns[j].SevRank
+			}
+			return g.Conns[i].DialedAt.After(g.Conns[j].DialedAt)
+		})
+		groups = append(groups, g)
+	}
+	sort.SliceStable(groups, func(i, j int) bool {
+		ri := sevRank(groups[i].WorstSev)
+		rj := sevRank(groups[j].WorstSev)
+		if ri != rj {
+			return ri > rj
+		}
+		if groups[i].Interest != groups[j].Interest {
+			return groups[i].Interest > groups[j].Interest
+		}
+		return groups[i].OldestAge > groups[j].OldestAge
+	})
+	return groups
+}
+
+// sevClassByRank maps a numeric severity rank back to the row-class
+// string. Inverse of sevRank; used by peerGroup.WorstSev.
+func sevClassByRank(rank int) string {
+	switch rank {
+	case 3:
+		return "row-crit"
+	case 2:
+		return "row-warn"
+	case 1:
+		return "row-note"
+	}
+	return "row-ok"
 }
 
 // tcpzColDef describes one column of the tcpz table: header label,
@@ -633,6 +785,8 @@ func (s *tcpzServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	all := q.Get("all") == "1"
 	onlyHot := q.Get("only") == "hot"
+	flat := q.Get("flat") == "1"
+	expandAll := q.Get("expand") == "all"
 	remoteFilter := q.Get("remote")
 	sortKey, sortDir := parseSort(q)
 
@@ -672,6 +826,10 @@ func (s *tcpzServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	rows := make([]tcpzRow, 0, len(raw))
 	interesting := 0
 	dropped := 0
+	// hiddenByRemote tracks conns dropped by ?only=hot per remote, so
+	// each group can show "N shown · M hidden" without under-representing
+	// active-but-quiet peers.
+	hiddenByRemote := map[string]int{}
 	for _, snap := range raw {
 		sev, why := classify(snap)
 		if sev > sevOK {
@@ -679,17 +837,20 @@ func (s *tcpzServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 		}
 		if onlyHot && sev < sevWarn {
 			dropped++
+			hiddenByRemote[snap.RemoteAddr]++
 			continue
 		}
 		rows = append(rows, tcpzRow{
 			TCPInfoSnapshot: snap,
 			Sev:             sev.rowClass(),
+			SevRank:         int(sev),
 			Why:             strings.Join(why, "+"),
 			Interest:        sev > sevOK,
 		})
 	}
 
 	sortRows(rows, sortKey, sortDir)
+	groups := buildPeerGroups(rows, hiddenByRemote)
 
 	// Histograms cover the pre-filter live snapshot (raw) plus every
 	// remembered dead conn, so the summary reflects the fleet — the "only
@@ -703,6 +864,11 @@ func (s *tcpzServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	if onlyHot {
 		baseParams.Set("only", "hot")
+	}
+	if flat {
+		// Sort links must round-trip the flat toggle; otherwise clicking
+		// a column header jumps back to the grouped default view.
+		baseParams.Set("flat", "1")
 	}
 	headers := make([]tcpzHeaderCell, len(tcpzCols))
 	for i, c := range tcpzCols {
@@ -733,38 +899,50 @@ func (s *tcpzServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	data := struct {
 		Rows        []tcpzRow
+		Groups      []*peerGroup
 		Cols        []tcpzColDef
 		Headers     []tcpzHeaderCell
 		HistPanels  []*histPanel
 		Count       int
+		GroupCount  int
 		Total       int
 		Hidden      int
 		Interesting int
 		Dropped     int
 		ShowAll     bool
 		OnlyHot     bool
+		Flat        bool
+		ExpandAll   bool
 		SortKey     string
 		SortDir     string
 		SortByDial  bool
 		Generated   time.Time
 	}{
 		Rows:        rows,
+		Groups:      groups,
 		Cols:        tcpzCols,
 		Headers:     headers,
 		HistPanels:  histPanels,
 		Count:       len(rows),
+		GroupCount:  len(groups),
 		Total:       total,
 		Hidden:      hidden,
 		Interesting: interesting,
 		Dropped:     dropped,
 		ShowAll:     all,
 		OnlyHot:     onlyHot,
+		Flat:        flat,
+		ExpandAll:   expandAll,
 		SortKey:     sortKey,
 		SortDir:     sortDir,
 		SortByDial:  sortKey == "dial",
 		Generated:   time.Now(),
 	}
-	if err := tcpzTpl.Execute(w, data); err != nil {
+	tpl := tcpzTpl
+	if flat {
+		tpl = tcpzFlatTpl
+	}
+	if err := tpl.Execute(w, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -1018,6 +1196,22 @@ func tcpzFuncs() template.FuncMap {
 			}
 			return template.HTML(buf.String()), nil
 		},
+		// bpsF: format a float64 bytes/sec (aggregate) with the same
+		// scale suffix as the per-conn "rate" func. Zero → dash.
+		"bpsF": func(v float64) string {
+			if v <= 0 {
+				return "—"
+			}
+			return formatBytesPerSec(v)
+		},
+		// ageDur: pretty-print a positive duration; used by peer-group
+		// summaries where we've already computed age with time.Since.
+		"ageDur": func(d time.Duration) string {
+			if d <= 0 {
+				return "—"
+			}
+			return d.Round(time.Second).String()
+		},
 	}
 }
 
@@ -1036,9 +1230,12 @@ func init() {
 	}
 }
 
-var tcpzTpl = template.Must(template.New("tcpz").Funcs(tcpzFuncsCached).Parse(tcpzTplSrc))
+// tcpzFlatTpl renders the classic wide-table view (?flat=1). Kept as an
+// escape hatch for muscle-memory bookmarks; the default is the grouped
+// card view (tcpzTpl below).
+var tcpzFlatTpl = template.Must(template.New("tcpz-flat").Funcs(tcpzFuncsCached).Parse(tcpzFlatTplSrc))
 
-const tcpzTplSrc = `<!doctype html>
+const tcpzFlatTplSrc = `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -1103,10 +1300,11 @@ a.col-sort .arr { color: #d95700; margin-left: 2px; }
 <body>
 <h1>tcpz — {{.Count}} conn{{if ne .Count 1}}s{{end}}{{if .Interesting}} · <span style="color:#b32222">{{.Interesting}} interesting</span>{{end}}{{if .Hidden}} <span style="color:#888;font-weight:400;font-size:.85em">({{.Hidden}} :443 hidden)</span>{{end}}{{if .Dropped}} <span style="color:#888;font-weight:400;font-size:.85em">({{.Dropped}} healthy hidden)</span>{{end}}</h1>
 <div class="meta">Snapshot at {{.Generated.Format "15:04:05.000"}} · auto-refresh 2s · <a href="?format=json{{if .ShowAll}}&amp;all=1{{end}}">JSON</a>
-{{if .ShowAll}} · <a href="?">hide :443 (default)</a>{{else if .Hidden}} · <a href="?all=1">show all ({{.Total}})</a>{{end}}
-{{if .OnlyHot}} · <a href="?{{if .ShowAll}}all=1{{end}}">show healthy too</a>{{else}} · <a href="?only=hot{{if .ShowAll}}&amp;all=1{{end}}">only hot</a>{{end}}
-· sort: {{if eq .SortKey "sev"}}<b>severity</b>{{else}}<a href="?{{if .ShowAll}}all=1&amp;{{end}}{{if .OnlyHot}}only=hot&amp;{{end}}sort=sev">severity</a>{{end}}
-| {{if eq .SortKey "dial"}}<b>dial order</b>{{else}}<a href="?{{if .ShowAll}}all=1&amp;{{end}}{{if .OnlyHot}}only=hot&amp;{{end}}sort=dial">dial order</a>{{end}}
+ · <a href="?{{if .ShowAll}}all=1{{end}}{{if .OnlyHot}}{{if .ShowAll}}&amp;{{end}}only=hot{{end}}">grouped view</a>
+{{if .ShowAll}} · <a href="?flat=1">hide :443 (default)</a>{{else if .Hidden}} · <a href="?flat=1&amp;all=1">show all ({{.Total}})</a>{{end}}
+{{if .OnlyHot}} · <a href="?flat=1{{if .ShowAll}}&amp;all=1{{end}}">show healthy too</a>{{else}} · <a href="?flat=1&amp;only=hot{{if .ShowAll}}&amp;all=1{{end}}">only hot</a>{{end}}
+· sort: {{if eq .SortKey "sev"}}<b>severity</b>{{else}}<a href="?flat=1&amp;{{if .ShowAll}}all=1&amp;{{end}}{{if .OnlyHot}}only=hot&amp;{{end}}sort=sev">severity</a>{{end}}
+| {{if eq .SortKey "dial"}}<b>dial order</b>{{else}}<a href="?flat=1&amp;{{if .ShowAll}}all=1&amp;{{end}}{{if .OnlyHot}}only=hot&amp;{{end}}sort=dial">dial order</a>{{end}}
 {{if and (ne .SortKey "sev") (ne .SortKey "dial")}} | column: <b>{{.SortKey}} {{if eq .SortDir "asc"}}↑{{else}}↓{{end}}</b>{{end}}
 </div>
 <div class="legend">Row color:
@@ -1152,6 +1350,266 @@ a.col-sort .arr { color: #d95700; margin-left: 2px; }
 {{end}}
 </tbody>
 </table>
+{{end}}
+</body>
+</html>
+`
+
+// tcpzTpl is the default grouped view: one card per remote peer, with
+// a one-line summary per conn expandable to six field cards
+// (Traffic / Latency / Loss / Window / RTO / Idle). Designed so a
+// healthy fleet is a wall of green with tiny numbers, and one hot conn
+// turns its whole card orange with the specific counter that flagged
+// it visible without expanding anything.
+var tcpzTpl = template.Must(template.New("tcpz-grouped").Funcs(tcpzFuncsCached).Parse(tcpzTplSrc))
+
+const tcpzTplSrc = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>tcpz — {{.GroupCount}} peer{{if ne .GroupCount 1}}s{{end}}{{if .Interesting}} · {{.Interesting}} hot{{end}}</title>
+<meta http-equiv="refresh" content="2">
+<style>
+body { font: 13px/1.4 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; margin: 1em; color: #222; background: #fafbfc; }
+h1 { font-size: 1.15em; margin: 0 0 .3em 0; }
+.meta { color: #666; margin-bottom: .5em; }
+.meta a { color: #2f5f9f; text-decoration: none; }
+.meta a:hover { text-decoration: underline; }
+.legend { color: #666; margin-bottom: .8em; font-size: 12px; }
+.legend .sw { display: inline-block; width: .85em; height: .85em; vertical-align: -1px; border-radius: 2px; border: 1px solid #ccc; margin-right: 3px; }
+.legend .sw.crit { background: #fdecea; border-color: #f2c2bd; }
+.legend .sw.warn { background: #fff5e0; border-color: #ecd9a3; }
+.legend .sw.note { background: #eef4fb; border-color: #cddceb; }
+.legend .sw.ok   { background: #eefaf0; border-color: #cfe9d3; }
+
+/* Peer group card */
+.grp { border: 1px solid #dfe3e8; border-radius: 6px; background: #fff; margin: 0 0 .8em 0; overflow: hidden; box-shadow: 0 1px 0 rgba(0,0,0,.03); }
+.grp.row-crit { border-color: #f2c2bd; background: #fef7f5; }
+.grp.row-warn { border-color: #ecd9a3; background: #fefbf1; }
+.grp.row-note { border-color: #cddceb; background: #f6f9fd; }
+.grp-hdr { display: flex; align-items: center; gap: .7em; padding: .55em .8em; border-bottom: 1px solid #eee; background: rgba(0,0,0,.015); }
+.grp.row-crit .grp-hdr { background: #fbe3df; border-bottom-color: #f2c2bd; }
+.grp.row-warn .grp-hdr { background: #fbeecd; border-bottom-color: #ecd9a3; }
+.grp.row-note .grp-hdr { background: #e6eefa; border-bottom-color: #cddceb; }
+.grp-remote { font-family: SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; font-weight: 600; color: #333; }
+.grp-stats { color: #555; font-size: 12px; font-variant-numeric: tabular-nums; margin-left: auto; }
+.grp-stats b { color: #222; font-weight: 600; }
+.grp-count { color: #444; font-size: 12px; }
+.grp-count .hot { color: #b32222; font-weight: 600; }
+.grp-count .hidden { color: #888; }
+
+/* Chip: state / CA / anomaly. Consistent shape across all rows. */
+.chip { display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 11px; font-variant-numeric: tabular-nums; border: 1px solid #ccc; background: #f6f6f6; color: #444; }
+.chip.state-ESTABLISHED { background: #eefaf0; border-color: #cfe9d3; color: #197a1f; }
+.chip.state-CLOSE_WAIT, .chip.state-FIN_WAIT1, .chip.state-FIN_WAIT2, .chip.state-CLOSING, .chip.state-LAST_ACK, .chip.state-TIME_WAIT { background: #fbeecd; border-color: #ecd9a3; color: #a04500; }
+.chip.ca-Open { background: #eefaf0; border-color: #cfe9d3; color: #197a1f; }
+.chip.ca-Disorder { background: #fbeecd; border-color: #ecd9a3; color: #a04500; }
+.chip.ca-CWR, .chip.ca-Recovery { background: #fbe3df; border-color: #f2c2bd; color: #b32222; }
+.chip.ca-Loss { background: #fbe3df; border-color: #f2c2bd; color: #b32222; font-weight: 700; }
+.chip.anom-warn { background: #fbeecd; border-color: #ecd9a3; color: #a04500; font-weight: 600; }
+.chip.anom-crit { background: #fbe3df; border-color: #f2c2bd; color: #b32222; font-weight: 700; }
+
+/* Per-conn one-line summary; details for the expanded field cards. */
+details.conn { border-top: 1px solid #eee; }
+details.conn:first-of-type { border-top: none; }
+details.conn > summary { list-style: none; cursor: pointer; padding: .45em .8em; display: flex; align-items: center; gap: .6em; font-size: 12.5px; }
+details.conn > summary::-webkit-details-marker { display: none; }
+details.conn > summary::before { content: "▶"; color: #999; font-size: 10px; width: 10px; }
+details.conn[open] > summary::before { content: "▼"; }
+details.conn > summary:hover { background: rgba(0,0,0,.02); }
+.conn-id { font-family: SFMono-Regular, Menlo, Consolas, monospace; color: #555; min-width: 130px; }
+.conn-tp { font-family: SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; color: #333; margin-left: auto; }
+.conn-tp .up { color: #197a1f; }
+.conn-tp .dn { color: #2f5f9f; }
+.conn-why { color: #a04500; font-size: 11px; font-family: SFMono-Regular, Menlo, Consolas, monospace; }
+details.conn.row-crit > summary { background: rgba(179,34,34,.05); }
+details.conn.row-crit .conn-why { color: #b32222; }
+
+/* Field cards inside an expanded conn */
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: .5em; padding: .5em .8em .8em .8em; background: rgba(0,0,0,.02); }
+.card { background: #fff; border: 1px solid #e2e6ea; border-radius: 4px; padding: .45em .6em; font-size: 12px; }
+.card h4 { margin: 0 0 .3em 0; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #666; font-weight: 600; }
+.card dl { display: grid; grid-template-columns: 1fr auto; gap: 1px 8px; margin: 0; font-variant-numeric: tabular-nums; }
+.card dt { color: #555; }
+.card dd { margin: 0; color: #222; text-align: right; font-family: SFMono-Regular, Menlo, Consolas, monospace; }
+.card dd .hot { color: #a04500; font-weight: 600; }
+.card dd .hot.crit { color: #b32222; font-weight: 700; }
+.card dd.warn { color: #a04500; font-weight: 600; }
+.card dd.crit { color: #b32222; font-weight: 700; }
+.card.err-card { border-color: #f2c2bd; background: #fef7f5; grid-column: 1 / -1; }
+
+/* Reuse the histogram panels verbatim from the flat view */
+.hist-grid { display: flex; gap: 1em; flex-wrap: wrap; margin: .4em 0 1em 0; }
+.hist-panel { flex: 1 1 320px; min-width: 280px; border: 1px solid #e2e6ea; border-radius: 4px; padding: .5em .7em; background: #fff; }
+.hist-title { font-weight: 600; margin-bottom: .1em; font-size: 12px; }
+.hist-summary { color: #666; font-size: 11px; font-variant-numeric: tabular-nums; margin-bottom: .35em; }
+.hist-row { display: grid; grid-template-columns: 82px 1fr 60px; gap: 6px; align-items: center; font-size: 11px; font-variant-numeric: tabular-nums; line-height: 1.35; }
+.hist-lbl { color: #555; font-family: SFMono-Regular, Menlo, Consolas, monospace; text-align: right; }
+.hist-track { position: relative; height: 10px; background: #f0f0f0; border-radius: 2px; overflow: hidden; }
+.hist-bar-live { position: absolute; top: 0; bottom: 0; left: 0; background: #4a7fbf; }
+.hist-bar-dead { position: absolute; top: 0; bottom: 0; background: #b8763f; opacity: .85; }
+.hist-cnt { color: #444; font-family: SFMono-Regular, Menlo, Consolas, monospace; }
+.hist-cnt .dead { color: #a04500; }
+.hist-legend { color: #666; font-size: 11px; margin-top: .4em; }
+.hist-legend .sw { display: inline-block; width: .75em; height: .75em; vertical-align: -1px; border-radius: 2px; margin: 0 3px 0 6px; }
+.hist-legend .sw.live { background: #4a7fbf; }
+.hist-legend .sw.dead { background: #b8763f; }
+
+.empty { color: #888; margin: 2em 0; }
+</style>
+</head>
+<body>
+<h1>tcpz — {{.GroupCount}} peer{{if ne .GroupCount 1}}s{{end}} · {{.Count}} conn{{if ne .Count 1}}s{{end}}{{if .Interesting}} · <span style="color:#b32222">{{.Interesting}} interesting</span>{{end}}{{if .Hidden}} <span style="color:#888;font-weight:400;font-size:.85em">({{.Hidden}} :443 hidden)</span>{{end}}{{if .Dropped}} <span style="color:#888;font-weight:400;font-size:.85em">({{.Dropped}} healthy hidden)</span>{{end}}</h1>
+<div class="meta">Snapshot at {{.Generated.Format "15:04:05.000"}} · auto-refresh 2s
+ · <a href="?format=json{{if .ShowAll}}&amp;all=1{{end}}">JSON</a>
+{{if .ShowAll}} · <a href="?">hide :443 (default)</a>{{else if .Hidden}} · <a href="?all=1">show all ({{.Total}})</a>{{end}}
+{{if .OnlyHot}} · <a href="?{{if .ShowAll}}all=1{{end}}">show healthy too</a>{{else}} · <a href="?only=hot{{if .ShowAll}}&amp;all=1{{end}}">only hot</a>{{end}}
+{{if .ExpandAll}} · <a href="?{{if .ShowAll}}all=1{{end}}{{if .OnlyHot}}{{if .ShowAll}}&amp;{{end}}only=hot{{end}}">collapse all</a>{{else}} · <a href="?expand=all{{if .ShowAll}}&amp;all=1{{end}}{{if .OnlyHot}}&amp;only=hot{{end}}">expand all</a>{{end}}
+ · <a href="?flat=1{{if .ShowAll}}&amp;all=1{{end}}{{if .OnlyHot}}&amp;only=hot{{end}}">flat view (raw table)</a>
+</div>
+<div class="legend">Card color by worst conn in the peer group:
+<span class="sw crit"></span>Loss / backoff (RTO-driven)
+<span class="sw warn"></span>retrans / DSACK / ECN / reorder
+<span class="sw note"></span>non-ESTABLISHED / unreadable
+<span class="sw ok"></span>healthy
+· <span class="chip anom-warn">retr:3</span>/<span class="chip anom-crit">bkoff:2</span> chips on a conn row = non-zero counters worth investigating (zeros stay hidden).
+</div>
+{{if .HistPanels}}
+<div class="hist-grid">
+{{range $panel := .HistPanels}}
+<div class="hist-panel">
+<div class="hist-title">{{$panel.Title}}</div>
+<div class="hist-summary">{{$panel.Summary}}</div>
+{{range $panel.Bars}}
+<div class="hist-row">
+<span class="hist-lbl">{{.Label}}</span>
+<span class="hist-track">
+{{if .LivePct}}<span class="hist-bar-live" style="width:{{.LivePct}}%"></span>{{end}}
+{{if .DeadPct}}<span class="hist-bar-dead" style="left:{{.LivePct}}%;width:{{.DeadPct}}%"></span>{{end}}
+</span>
+<span class="hist-cnt">{{.Live}}{{if $panel.HasDead}} / <span class="dead">{{.Dead}}</span>{{end}}</span>
+</div>
+{{end}}
+{{if $panel.HasDead}}<div class="hist-legend"><span class="sw live"></span>live<span class="sw dead"></span>dead</div>{{end}}
+</div>
+{{end}}
+</div>
+{{end}}
+{{if not .Groups}}
+<div class="empty">No conns registered. Either the client uses DirectPath (xDS bypasses the standard dialer, so nothing is captured), no traffic has been dialed yet, {{if .OnlyHot}}every conn is healthy (try <a href="?">without ?only=hot</a>), {{end}}or bigtable.TCPStats was never passed into the Client's options.</div>
+{{else}}
+{{range $g := .Groups}}
+<div class="grp {{$g.WorstSev}}">
+  <div class="grp-hdr">
+    <span class="grp-remote">{{$g.Remote}}</span>
+    <span class="grp-count">{{$g.N}} conn{{if ne $g.N 1}}s{{end}}{{if $g.Interest}} · <span class="hot">{{$g.Interest}} hot</span>{{end}}{{if $g.NHidden}} · <span class="hidden">{{$g.NHidden}} hidden</span>{{end}}</span>
+    <span class="grp-stats">
+      {{if $g.SumDelRate}}now <b>{{rate $g.SumDelRate}}</b>{{end}}
+      {{if $g.SumAvgOut}} · avg out <b>{{bpsF $g.SumAvgOut}}</b>{{end}}
+      {{if $g.SumAvgIn}} · in <b>{{bpsF $g.SumAvgIn}}</b>{{end}}
+      {{if $g.MaxRTT}} · worst RTT <b>{{$g.MaxRTT}}</b>{{end}}
+      {{if $g.MaxRtxPct}} · worst rtx <b>{{pct $g.MaxRtxPct}}</b>{{end}}
+      {{if $g.OldestAge}} · oldest <b>{{ageDur $g.OldestAge}}</b>{{end}}
+    </span>
+  </div>
+  {{range $r := $g.Conns}}
+  <details class="conn {{$r.Sev}}"{{if $.ExpandAll}} open{{end}}>
+    <summary>
+      <span class="conn-id">{{ago $r.DialedAt}} · {{$r.LocalAddr}}</span>
+      <span class="chip state-{{or $r.State "UNKNOWN"}}">{{or $r.State "—"}}</span>
+      {{if $r.CAState}}{{if ne $r.CAState "Open"}}<span class="chip ca-{{$r.CAState}}">{{$r.CAState}}</span>{{end}}{{end}}
+      {{range $a := $r.Anomalies}}<span class="chip anom-{{$a.Sev}}">{{$a.Label}}:{{$a.Value}}</span>{{end}}
+      {{if $r.Why}}<span class="conn-why">{{$r.Why}}</span>{{end}}
+      <span class="conn-tp">
+        {{if $r.DeliveryRate}}<span class="up">↑{{rate $r.DeliveryRate}}</span>{{else}}<span style="color:#aaa">idle</span>{{end}}
+      </span>
+    </summary>
+    <div class="cards">
+      <div class="card">
+        <h4>Traffic</h4>
+        <dl>
+          <dt>DelRate</dt><dd>{{rate $r.DeliveryRate}}</dd>
+          <dt>AvgOut</dt><dd>{{avgRate $r.BytesAcked $r.DialedAt}}</dd>
+          <dt>AvgIn</dt><dd>{{avgRate $r.BytesReceived $r.DialedAt}}</dd>
+          <dt>Sent</dt><dd>{{bytes $r.BytesSent}}</dd>
+          <dt>Recv</dt><dd>{{bytes $r.BytesReceived}}</dd>
+          <dt>NotSent</dt><dd>{{num $r.NotsentBytes}}</dd>
+          <dt>Pacing</dt><dd>{{rate $r.PacingRate}}</dd>
+        </dl>
+      </div>
+      <div class="card">
+        <h4>Latency</h4>
+        <dl>
+          <dt>RTT</dt><dd>{{dur $r.RTT}}</dd>
+          <dt>RTTVar</dt><dd>{{dur $r.RTTVar}}</dd>
+          <dt>MinRTT</dt><dd>{{dur $r.MinRTT}}</dd>
+          <dt>RTO</dt><dd>{{dur $r.RTO}}</dd>
+          <dt>ATO</dt><dd>{{dur $r.ATO}}</dd>
+          <dt>LastRecv</dt><dd>{{dur $r.LastDataRecv}}</dd>
+          <dt>LastSent</dt><dd>{{dur $r.LastDataSent}}</dd>
+        </dl>
+      </div>
+      <div class="card">
+        <h4>Loss / retrans</h4>
+        <dl>
+          <dt>Retr</dt><dd>{{hotNum $r.Retransmits}}</dd>
+          <dt>TotalRetr</dt><dd>{{hotNum $r.TotalRetrans}}</dd>
+          <dt>RtxRate</dt><dd>{{hotPct $r.RetransRatioPct}}</dd>
+          <dt>BytesRetrans</dt><dd>{{hotBytes $r.BytesRetrans}}</dd>
+          <dt>Lost</dt><dd>{{hotNum $r.Lost}}</dd>
+          <dt>SACKd</dt><dd>{{num $r.Sacked}}</dd>
+          <dt>DSACK</dt><dd>{{hotNum $r.DsackDups}}</dd>
+          <dt>ReordS</dt><dd>{{hotNum $r.ReordSeen}}</dd>
+          <dt>ECN</dt><dd>{{hotNum $r.DeliveredCE}}</dd>
+        </dl>
+      </div>
+      <div class="card">
+        <h4>Window / MSS</h4>
+        <dl>
+          <dt>CWnd</dt><dd>{{num $r.SndCwnd}}</dd>
+          <dt>SSTh</dt><dd>{{num $r.SndSsthresh}}</dd>
+          <dt>SndWnd</dt><dd>{{win $r.SndWnd}}</dd>
+          <dt>RcvWnd</dt><dd>{{win $r.RcvWnd}}</dd>
+          <dt>Unacked</dt><dd>{{num $r.Unacked}}</dd>
+          <dt>MSS</dt><dd>{{num $r.MSS}}</dd>
+          <dt>PMTU</dt><dd>{{pmtu $r.PMTU}}</dd>
+        </dl>
+      </div>
+      <div class="card">
+        <h4>RTO / probes</h4>
+        <dl>
+          <dt>Backoff</dt><dd>{{critNum $r.Backoff}}</dd>
+          <dt>Probes</dt><dd>{{hotNum $r.Probes}}</dd>
+          <dt>TotalRTO</dt><dd>{{hotNum $r.TotalRTO}}</dd>
+          <dt>RTOrecov</dt><dd>{{num $r.TotalRTORecoveries}}</dd>
+          <dt>RTOtime</dt><dd>{{dur $r.TotalRTOTime}}</dd>
+          <dt>Rehash</dt><dd>{{hotNum $r.Rehash}}</dd>
+          <dt>RcvOoO</dt><dd>{{num $r.RcvOooPack}}</dd>
+        </dl>
+      </div>
+      <div class="card">
+        <h4>Blocking / segs</h4>
+        <dl>
+          <dt>RwndLim</dt><dd>{{hotDur $r.RwndLimited}}</dd>
+          <dt>SndBufLim</dt><dd>{{hotDur $r.SndbufLimited}}</dd>
+          <dt>BusyTime</dt><dd>{{dur $r.BusyTime}}</dd>
+          <dt>SegsOut</dt><dd>{{num $r.SegsOut}}</dd>
+          <dt>SegsIn</dt><dd>{{num $r.SegsIn}}</dd>
+          <dt>DataSegsOut</dt><dd>{{num $r.DataSegsOut}}</dd>
+          <dt>DataSegsIn</dt><dd>{{num $r.DataSegsIn}}</dd>
+        </dl>
+      </div>
+      {{if $r.Err}}
+      <div class="card err-card">
+        <h4>Err</h4>
+        <div>{{$r.Err}}</div>
+      </div>
+      {{end}}
+    </div>
+  </details>
+  {{end}}
+</div>
+{{end}}
 {{end}}
 </body>
 </html>

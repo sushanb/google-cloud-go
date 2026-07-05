@@ -297,21 +297,33 @@ func TestTcpz_SortRows_sevPromotesInteresting(t *testing.T) {
 }
 
 // TestTcpz_ColumnSortLinksRender is a smoke test that the rendered
-// HTML contains a sortable header link for at least one column.
-// Catches template-level regressions (e.g. .Href accidentally always
-// empty).
+// HTML wires the escape-hatch flat view (which still exposes sortable
+// columns). The grouped default view sorts by severity implicitly and
+// doesn't render sort chrome, so we check `?flat=1` explicitly.
 func TestTcpz_ColumnSortLinksRender(t *testing.T) {
 	h := newTcpzHandler(bigtable.NewTCPStats())
+
+	// Grouped default: must at least advertise the flat-view escape hatch.
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rr.Code != http.StatusOK {
-		t.Fatalf("HTTP %d, want 200", rr.Code)
+		t.Fatalf("grouped view HTTP %d, want 200", rr.Code)
+	}
+	if body := rr.Body.String(); !strings.Contains(body, "flat=1") {
+		t.Errorf("grouped view missing flat-view switcher; body:\n%s", body)
+	}
+
+	// Flat view: must contain the sort meta-bar links (page has no rows
+	// with no data, so the header sort links aren't rendered, but the
+	// meta-bar sort=sev/sort=dial links always are).
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/?flat=1", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("flat view HTTP %d, want 200", rr.Code)
 	}
 	body := rr.Body.String()
-	// With no rows the table is skipped; the page must still contain
-	// the sort meta-bar links.
 	if !strings.Contains(body, "sort=sev") && !strings.Contains(body, "sort=dial") {
-		t.Errorf("meta bar missing sort links; body:\n%s", body)
+		t.Errorf("flat view meta bar missing sort links; body:\n%s", body)
 	}
 }
 
