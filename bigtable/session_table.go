@@ -220,6 +220,17 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 			if result.Stats != nil && result.Stats.BackendLatency != nil {
 				mt.currOp.currAttempt.setServerLatency(convertToMs(result.Stats.GetBackendLatency().AsDuration()))
 			}
+			// Stamp transport labels for attempt_latencies2 from the
+			// serving session's peer info. Classic (unary) RPCs get
+			// these via extractPeerInfo in recordAttemptCompletion; the
+			// session path has no per-attempt header so we source them
+			// from the bound Session's parsed PeerInfo instead.
+			if result.PeerInfo != nil {
+				mt.currOp.currAttempt.transportType = btransport.TransportTypeName(result.PeerInfo.GetTransportType())
+				mt.currOp.currAttempt.transportRegion = result.PeerInfo.GetApplicationFrontendRegion()
+				mt.currOp.currAttempt.transportZone = result.PeerInfo.GetApplicationFrontendZone()
+				mt.currOp.currAttempt.transportSubZone = result.PeerInfo.GetApplicationFrontendSubzone()
+			}
 		}
 		if err != nil {
 			return nil, err
@@ -314,6 +325,17 @@ func (t *SessionTable) Apply(ctx context.Context, row string, m *Mutation, opts 
 			// payload when the server populated it on the success frame.
 			if result.Stats != nil && result.Stats.BackendLatency != nil {
 				mt.currOp.currAttempt.setServerLatency(convertToMs(result.Stats.GetBackendLatency().AsDuration()))
+			}
+			// Stamp transport labels for attempt_latencies2 from the
+			// serving session's peer info. Classic (unary) RPCs get
+			// these via extractPeerInfo in recordAttemptCompletion; the
+			// session path has no per-attempt header so we source them
+			// from the bound Session's parsed PeerInfo instead.
+			if result.PeerInfo != nil {
+				mt.currOp.currAttempt.transportType = btransport.TransportTypeName(result.PeerInfo.GetTransportType())
+				mt.currOp.currAttempt.transportRegion = result.PeerInfo.GetApplicationFrontendRegion()
+				mt.currOp.currAttempt.transportZone = result.PeerInfo.GetApplicationFrontendZone()
+				mt.currOp.currAttempt.transportSubZone = result.PeerInfo.GetApplicationFrontendSubzone()
 			}
 		}
 		if err != nil {

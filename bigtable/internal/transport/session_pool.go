@@ -516,6 +516,11 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 
 	var result InvokeResult
 	result, invokeErr = sh.session.Invoke(ctx, desc, req)
+	// Bind the serving session's PeerInfo to the result so callers can
+	// stamp per-attempt transport labels (attempt_latencies2) without
+	// reaching back through the pool. The PeerInfo pointer is set once at
+	// session-open and never mutated, so this is a shared read.
+	result.PeerInfo = sh.session.PeerInfo()
 	latency = time.Since(start)
 	// Feed the pool-level histograms so the debug UI's TotalLatency and
 	// BackendLatency "N=…" grow over the pool's lifetime instead of

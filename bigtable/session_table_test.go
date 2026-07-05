@@ -44,6 +44,7 @@ type fakeInvoker struct {
 	clusterInfo *btpb.ClusterInformation
 	stats       *btpb.SessionRequestStats
 	sentAt      time.Time
+	peerInfo    *btpb.PeerInfo
 	err         error
 	// onCall, if non-nil, runs synchronously before the canned response is
 	// returned. Useful for capturing the per-attempt ctx (and for stamping
@@ -65,6 +66,7 @@ func (f *fakeInvoker) Invoke(ctx context.Context, desc btransport.VRpcDescriptor
 		ClusterInfo: f.clusterInfo,
 		Stats:       f.stats,
 		SentAt:      f.sentAt,
+		PeerInfo:    f.peerInfo,
 	}, f.err
 }
 
@@ -523,6 +525,56 @@ func TestSessionTable_ClientBlockingLatencyFromSentAt(t *testing.T) {
 	got := mt.currOp.currAttempt.clientBlockingLatency
 	if math.Abs(got-wantMs) > 0.5 {
 		t.Errorf("attempt clientBlockingLatency = %v ms, want ≈%v ms (must be (SentAt - attemptStart) in ms)", got, wantMs)
+	}
+}
+
+func TestSessionTable_TransportLabelsFromPeerInfo(t *testing.T) {
+	peerInfo := &btpb.PeerInfo{
+		TransportType:              btpb.PeerInfo_TRANSPORT_TYPE_SESSION_DIRECT_ACCESS,
+		ApplicationFrontendRegion:  "us-central1",
+		ApplicationFrontendZone:    "us-central1-b",
+		ApplicationFrontendSubzone: "us-central1-b1",
+	}
+	readPool := &fakeInvoker{
+		resp:     &btpb.SessionReadRowResponse{Row: &btpb.Row{Key: []byte("row1")}},
+		peerInfo: peerInfo,
+		sentAt:   time.Now(),
+	}
+	var capturedCtx context.Context
+	var captureMu sync.Mutex
+	readPool.onCall = func(ctx context.Context) {
+		captureMu.Lock()
+		defer captureMu.Unlock()
+		capturedCtx = ctx
+		if mt := metricsTracerFromContext(ctx); mt != nil {
+			mt.currOp.currAttempt.setStartTime(time.Now())
+		}
+	}
+
+	st := newSessionTestTable(t, readPool, nil)
+	if _, err := st.ReadRow(context.Background(), "row1"); err != nil {
+		t.Fatalf("ReadRow: %v", err)
+	}
+
+	captureMu.Lock()
+	defer captureMu.Unlock()
+	mt := metricsTracerFromContext(capturedCtx)
+	if mt == nil {
+		t.Fatal("no metricsTracer on attempt ctx")
+	}
+	a := mt.currOp.currAttempt
+	// TransportType uses the short java-parity label, not the enum name.
+	if a.transportType != "session_directpath" {
+		t.Errorf("transportType = %q, want session_directpath", a.transportType)
+	}
+	if a.transportRegion != "us-central1" {
+		t.Errorf("transportRegion = %q, want us-central1", a.transportRegion)
+	}
+	if a.transportZone != "us-central1-b" {
+		t.Errorf("transportZone = %q, want us-central1-b", a.transportZone)
+	}
+	if a.transportSubZone != "us-central1-b1" {
+		t.Errorf("transportSubZone = %q, want us-central1-b1", a.transportSubZone)
 	}
 }
 

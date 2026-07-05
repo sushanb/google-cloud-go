@@ -46,6 +46,14 @@ type InvokeResult struct {
 	ClusterInfo *spb.ClusterInformation
 	Stats       *spb.SessionRequestStats
 	SentAt      time.Time
+	// PeerInfo is the serving session's parsed peer info (from the
+	// bigtable-peer-info header the server sent on session open). Bound to
+	// the session, not this specific vRPC — every InvokeResult on the same
+	// session carries the same pointer. Populated by SessionPoolImpl.Invoke;
+	// nil when the pool bypassed a session (checkout failure). Feeds the
+	// outer metrics tracer's transport_type / transport_region /
+	// transport_zone / transport_subzone attributes on attempt_latencies2.
+	PeerInfo *spb.PeerInfo
 	// RpcIDOnSession is the per-session monotonic id of this call
 	// (1, 2, 3, …). Distinguishes warm-up vRPCs (small id) from
 	// established-session vRPCs.
