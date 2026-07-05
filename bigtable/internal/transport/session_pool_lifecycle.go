@@ -355,3 +355,25 @@ func (p *SessionPoolImpl) StartHeartbeat(ctx context.Context, interval time.Dura
 		}
 	}()
 }
+
+// StartAfePrune begins the background AFE-handle GC loop. Runs on its
+// own afePruneMaxIdle cadence (java-parity: SessionPoolImpl in Java uses
+// the same SESSION_LIST_PRUNE_INTERVAL for both the horizon and the
+// scheduling tick) — deliberately OFF the 1-sec heartbeat so the sl.mu
+// held during the map walk can't contend with serving-path Checkouts
+// even under pathological AFE-count growth.
+func (p *SessionPoolImpl) StartAfePrune(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(afePruneMaxIdle)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				p.pruneAfes(time.Now())
+			}
+		}
+	}()
+}

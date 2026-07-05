@@ -117,10 +117,10 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 	// followed up with a stream EOF. ForceClose drives them to Closed so
 	// OnClose fires and the pool retires them.
 	p.sweepStuckSessions()
-	// GC empty AFE buckets whose lastConnected has aged past the retention
-	// window. Cheap (walks a small map) so running it every heartbeat
-	// tick — instead of a separate cadence — keeps the pool code simple.
-	p.pruneAfes(time.Now())
+	// AFE prune runs on its own timer (see StartHeartbeat) at
+	// afePruneMaxIdle cadence for java-parity — kept OFF the 1-sec
+	// heartbeat so the sl.mu it holds during map-walk can't contend with
+	// serving-path Checkouts even under pathological AFE-count growth.
 
 	p.mu.Lock()
 	if p.closed || p.scalingInProgress {

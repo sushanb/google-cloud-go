@@ -427,6 +427,10 @@ func (m *SessionManager) GetOrCreateSessionPool(
 	// m.mu to avoid blocking concurrent GetOrCreateSessionPool calls for other
 	// keys.
 	pool.StartHeartbeat(backgroundCtx, 1*time.Second)
+	// AFE-handle GC runs on its own slow cadence (java-parity 10 min) —
+	// kept off the 1-sec heartbeat so sl.mu held during the map walk
+	// never contends with serving-path Checkouts.
+	pool.StartAfePrune(backgroundCtx)
 	pool.PerformScaling(backgroundCtx)
 	return pool
 }
