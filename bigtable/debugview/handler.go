@@ -54,6 +54,9 @@ func Handler(c *bigtable.Client, s *bigtable.TCPStats) http.Handler {
 	mux.Handle("/channelz/", http.StripPrefix("/channelz", newChannelzHandler(channelProv)))
 	mux.Handle("/configz/", http.StripPrefix("/configz", newConfigzHandler(configProv)))
 	mux.Handle("/tcpz/", http.StripPrefix("/tcpz", newTcpzHandler(s)))
+	// debugtagsz reads a process-global tracer, no per-Client wiring
+	// needed — mounts even when Client is nil.
+	mux.Handle("/debugtagsz/", http.StripPrefix("/debugtagsz", newDebugtagszHandler()))
 
 	// Index page lives at the root. Anything else that lands here (a
 	// mis-typed sub-path) 404s cleanly rather than serving the index.
@@ -119,6 +122,7 @@ li .desc{color:#666;font-size:.88em;margin-top:.15em}
 <li><a href="channelz/">channelz</a> <div class="desc">gRPC channel pool state (classic + session).</div></li>
 <li><a href="configz/">configz</a> <div class="desc">server-driven client configuration (GetClientConfiguration).</div></li>
 <li><a href="tcpz/">tcpz</a> <div class="desc">per-connection TCP_INFO (RTT, retrans, PMTU) — requires bigtable.TCPStats.</div></li>
+<li><a href="debugtagsz/">debugtagsz</a> <div class="desc">counters for "shouldn't happen" events in the session pool / vRPC dispatch / config poll — wrong-state transitions, dropped GOAWAYs, orphaned responses, watchdog kills.</div></li>
 </ul>
 </body></html>
 `

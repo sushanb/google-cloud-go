@@ -76,8 +76,10 @@ package internal
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	btopt "cloud.google.com/go/bigtable/internal/option"
 	"go.opentelemetry.io/otel/attribute"
@@ -163,16 +165,37 @@ var (
 	// silent by default. Set via setDebugTagLevelFloor.
 	debugTagLevelFloor atomic.Int32
 
-	// debugTagCountsMu guards debugTagCounts. Contention is negligible —
-	// emissions on cold paths only, and readers (tests / future
-	// debugview page) are rare.
+	// debugTagCountsMu guards debugTagStats. Contention is negligible —
+	// emissions on cold paths only, and readers (tests / debugview page)
+	// are rare.
 	debugTagCountsMu sync.RWMutex
-	// debugTagCounts is the in-process view of every tag's count since
-	// process start. Kept alongside the OTel counter so tests and any
-	// future debugview page can read counts without an OTel exporter
-	// hooked up.
-	debugTagCounts = map[string]*atomic.Int64{}
+	// debugTagStats is the in-process view of every tag seen since
+	// process start: count + first-seen + last-seen. Kept alongside the
+	// OTel counter so tests and the /debugtagsz/ page can read state
+	// without an OTel exporter wired up. `firstSeen` is stamped once at
+	// first emission; `lastSeen` updates on every emission.
+	debugTagStats = map[string]*tagStat{}
 )
+
+// tagStat holds the per-tag counters + timestamps behind debugTagStats.
+// All fields are atomics so the emission hot path stays lock-free once
+// the tag's entry exists in the map (map lookup under RLock, then atomic
+// bumps).
+type tagStat struct {
+	count     atomic.Int64 // total emissions since process start
+	firstSeen atomic.Int64 // unix-nano of first emission; write-once
+	lastSeen  atomic.Int64 // unix-nano of most-recent emission
+}
+
+// DebugTagSnapshot is one row of the DebugTags output — a single tag's
+// count plus the timestamps of its first and most-recent emissions.
+// Exported for consumption by the debugview /debugtagsz/ page.
+type DebugTagSnapshot struct {
+	Name      string
+	Count     int64
+	FirstSeen time.Time
+	LastSeen  time.Time
+}
 
 func init() {
 	debugTagLevelFloor.Store(int32(lvl.Warn))
@@ -255,36 +278,63 @@ func assertDebugTagf(expr bool, name, format string, args ...interface{}) bool {
 	return false
 }
 
-// bumpDebugTagCountLocked increments the in-memory count for `name`,
-// creating the counter under the write lock if this is the name's first
-// emission. Split from recordDebugTagAt so the hot path (existing name,
-// read lock hit) stays a single atomic add.
+// bumpDebugTagCountLocked increments the in-memory count for `name` and
+// stamps the emission timestamps. First-emission case creates the entry
+// under the write lock; subsequent emissions hit the RLock fast path
+// and only touch atomics on the stat.
 func bumpDebugTagCountLocked(name string) {
+	now := time.Now().UnixNano()
 	debugTagCountsMu.RLock()
-	c, ok := debugTagCounts[name]
+	s, ok := debugTagStats[name]
 	debugTagCountsMu.RUnlock()
 	if ok {
-		c.Add(1)
+		s.count.Add(1)
+		s.lastSeen.Store(now)
 		return
 	}
 	debugTagCountsMu.Lock()
-	if c, ok = debugTagCounts[name]; !ok {
-		c = new(atomic.Int64)
-		debugTagCounts[name] = c
+	if s, ok = debugTagStats[name]; !ok {
+		s = &tagStat{}
+		s.firstSeen.Store(now)
+		debugTagStats[name] = s
 	}
-	c.Add(1)
+	s.count.Add(1)
+	s.lastSeen.Store(now)
 	debugTagCountsMu.Unlock()
 }
 
-// snapshotDebugTagCounts returns a snapshot copy of every tag seen since
-// process start. Intended for tests and a future debugview page —
-// production consumers should read the OTel counter instead.
+// DebugTags returns a snapshot of every tag emitted since process
+// start, sorted by LastSeen descending (most-recently-fired first).
+// The number of distinct tags is bounded by the catalog above (~17
+// entries today), so callers can render or serialize the whole slice
+// without paging.
+func DebugTags() []DebugTagSnapshot {
+	debugTagCountsMu.RLock()
+	defer debugTagCountsMu.RUnlock()
+	out := make([]DebugTagSnapshot, 0, len(debugTagStats))
+	for name, s := range debugTagStats {
+		out = append(out, DebugTagSnapshot{
+			Name:      name,
+			Count:     s.count.Load(),
+			FirstSeen: time.Unix(0, s.firstSeen.Load()),
+			LastSeen:  time.Unix(0, s.lastSeen.Load()),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].LastSeen.After(out[j].LastSeen)
+	})
+	return out
+}
+
+// snapshotDebugTagCounts returns a bare name→count map. Kept as a
+// convenience for tests that only care about counts; new callers should
+// use DebugTags for the richer view.
 func snapshotDebugTagCounts() map[string]int64 {
 	debugTagCountsMu.RLock()
 	defer debugTagCountsMu.RUnlock()
-	out := make(map[string]int64, len(debugTagCounts))
-	for name, c := range debugTagCounts {
-		out[name] = c.Load()
+	out := make(map[string]int64, len(debugTagStats))
+	for name, s := range debugTagStats {
+		out[name] = s.count.Load()
 	}
 	return out
 }
@@ -295,6 +345,6 @@ func snapshotDebugTagCounts() map[string]int64 {
 // the transport tree can reuse it. Never call outside tests.
 func resetDebugTagCountsForTest() {
 	debugTagCountsMu.Lock()
-	debugTagCounts = map[string]*atomic.Int64{}
+	debugTagStats = map[string]*tagStat{}
 	debugTagCountsMu.Unlock()
 }

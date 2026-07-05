@@ -17,6 +17,7 @@ package internal
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 // TestDebugTag_RecordCounts verifies the in-memory counter tracks every
@@ -94,6 +95,72 @@ func TestDebugTag_AssertPassAndFail(t *testing.T) {
 	for _, name := range []string{"assert_fail_f", "assert_fail"} {
 		if got[name] != 1 {
 			t.Errorf("%s: got %d, want 1", name, got[name])
+		}
+	}
+}
+
+// TestDebugTag_FirstAndLastSeen verifies that FirstSeen is stamped
+// exactly once at first emission and LastSeen advances with every
+// subsequent emission. Uses a short sleep between the two record calls
+// so timestamps land in distinct nanoseconds even on fast machines.
+func TestDebugTag_FirstAndLastSeen(t *testing.T) {
+	resetDebugTagCountsForTest()
+
+	recordDebugTag("first_last_tag")
+	firstPass := DebugTags()
+	if len(firstPass) != 1 {
+		t.Fatalf("DebugTags length = %d, want 1", len(firstPass))
+	}
+	first := firstPass[0]
+	if first.Name != "first_last_tag" {
+		t.Errorf("Name = %q, want %q", first.Name, "first_last_tag")
+	}
+	if first.Count != 1 || first.FirstSeen.IsZero() || first.LastSeen.IsZero() {
+		t.Errorf("first snapshot missing fields: %+v", first)
+	}
+	if !first.FirstSeen.Equal(first.LastSeen) {
+		t.Errorf("first-emission FirstSeen != LastSeen: %v vs %v", first.FirstSeen, first.LastSeen)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	recordDebugTag("first_last_tag")
+	second := DebugTags()[0]
+	if second.Count != 2 {
+		t.Errorf("Count after 2 emissions = %d, want 2", second.Count)
+	}
+	if !second.FirstSeen.Equal(first.FirstSeen) {
+		t.Errorf("FirstSeen changed after re-emission: was %v, now %v", first.FirstSeen, second.FirstSeen)
+	}
+	if !second.LastSeen.After(first.LastSeen) {
+		t.Errorf("LastSeen did not advance: %v -> %v", first.LastSeen, second.LastSeen)
+	}
+}
+
+// TestDebugTag_SortedByLastSeen verifies DebugTags returns entries
+// sorted by LastSeen descending — the debugview page depends on this
+// ordering to surface just-fired tags at the top.
+func TestDebugTag_SortedByLastSeen(t *testing.T) {
+	resetDebugTagCountsForTest()
+
+	recordDebugTag("sorted_older")
+	time.Sleep(2 * time.Millisecond)
+	recordDebugTag("sorted_newer")
+	time.Sleep(2 * time.Millisecond)
+	recordDebugTag("sorted_middle")
+	// Emit "sorted_older" again to keep its Count > 1 but leave its
+	// LastSeen stale — no, actually the point of the test is order; skip.
+
+	snaps := DebugTags()
+	if len(snaps) < 3 {
+		t.Fatalf("want 3 snapshots, got %d: %+v", len(snaps), snaps)
+	}
+	if snaps[0].Name != "sorted_middle" {
+		t.Errorf("top row = %q, want %q (most-recently emitted)", snaps[0].Name, "sorted_middle")
+	}
+	// The other two entries should follow in reverse-time order.
+	for i := 1; i < len(snaps); i++ {
+		if snaps[i-1].LastSeen.Before(snaps[i].LastSeen) {
+			t.Errorf("out-of-order at index %d: %v then %v", i, snaps[i-1].LastSeen, snaps[i].LastSeen)
 		}
 	}
 }
