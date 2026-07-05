@@ -17,11 +17,15 @@ limitations under the License.
 package bigtable
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"testing"
 
+	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+	"go.opentelemetry.io/otel/attribute"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestExtractServerLatency(t *testing.T) {
@@ -180,5 +184,144 @@ func TestExtractLocation(t *testing.T) {
 				t.Errorf("error got: %v, want: %v", gotErr, test.wantError)
 			}
 		})
+	}
+}
+
+func TestExtractPeerInfo(t *testing.T) {
+	expectedPeerInfo := &btpb.PeerInfo{
+		TransportType: btpb.PeerInfo_TRANSPORT_TYPE_CLOUD_PATH,
+	}
+	protoBytes, err := proto.Marshal(expectedPeerInfo)
+	if err != nil {
+		t.Fatalf("marshal peer info: %v", err)
+	}
+	// Server sends URL-safe base64; unpadded (RawURL) is the wire shape,
+	// but URLEncoding (padded) must also decode — see extractPeerInfo.
+	validRawURL := base64.RawURLEncoding.EncodeToString(protoBytes)
+	validURLPadded := base64.URLEncoding.EncodeToString(protoBytes)
+	invalidBase64 := "invalid-base64-data-$$$"
+	invalidProtoBase64 := base64.RawURLEncoding.EncodeToString([]byte("not-a-protobuf"))
+
+	tests := []struct {
+		desc      string
+		headerMD  metadata.MD
+		trailerMD metadata.MD
+		want      *btpb.PeerInfo
+		wantErr   bool
+	}{
+		{
+			desc:      "No peer info in header or trailer",
+			headerMD:  metadata.MD{},
+			trailerMD: metadata.MD{},
+			want:      nil,
+			wantErr:   false,
+		},
+		{
+			desc:      "Peer info in header (raw url, unpadded)",
+			headerMD:  metadata.MD{peerInfoMDKey: []string{validRawURL}},
+			trailerMD: metadata.MD{},
+			want:      expectedPeerInfo,
+			wantErr:   false,
+		},
+		{
+			desc:      "Peer info in header (url, padded)",
+			headerMD:  metadata.MD{peerInfoMDKey: []string{validURLPadded}},
+			trailerMD: metadata.MD{},
+			want:      expectedPeerInfo,
+			wantErr:   false,
+		},
+		{
+			desc:      "Peer info in trailer",
+			headerMD:  metadata.MD{},
+			trailerMD: metadata.MD{peerInfoMDKey: []string{validRawURL}},
+			want:      expectedPeerInfo,
+			wantErr:   false,
+		},
+		{
+			desc:      "Header wins over trailer",
+			headerMD:  metadata.MD{peerInfoMDKey: []string{validRawURL}},
+			trailerMD: metadata.MD{peerInfoMDKey: []string{"garbage"}},
+			want:      expectedPeerInfo,
+			wantErr:   false,
+		},
+		{
+			desc:      "Invalid base64",
+			headerMD:  metadata.MD{peerInfoMDKey: []string{invalidBase64}},
+			trailerMD: metadata.MD{},
+			want:      nil,
+			wantErr:   true,
+		},
+		{
+			desc:      "Invalid protobuf",
+			headerMD:  metadata.MD{peerInfoMDKey: []string{invalidProtoBase64}},
+			trailerMD: metadata.MD{},
+			want:      nil,
+			wantErr:   true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			got, err := extractPeerInfo(test.headerMD, test.trailerMD)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("extractPeerInfo() err = %v, wantErr %v", err, test.wantErr)
+			}
+			if !proto.Equal(got, test.want) {
+				t.Errorf("extractPeerInfo() got = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestToOtelMetricAttrsAttemptLatencies2(t *testing.T) {
+	tracer := &builtinMetricsTracer{
+		method:      metricMethodPrefix + "ReadRows",
+		tableName:   "test-table",
+		isStreaming: true,
+		clientAttributes: []attribute.KeyValue{
+			attribute.String(monitoredResLabelKeyProject, "test-project"),
+		},
+		currOp: opTracer{
+			status: "UNAVAILABLE",
+			currAttempt: attemptTracer{
+				status:           "OK",
+				clusterID:        "test-cluster",
+				zoneID:           "test-zone",
+				transportType:    "cloudpath",
+				transportRegion:  "us-central1",
+				transportZone:    "us-central1-b",
+				transportSubZone: "sub-1",
+			},
+		},
+	}
+
+	attrSet, err := tracer.toOtelMetricAttrs(metricNameAttemptLatencies2)
+	if err != nil {
+		t.Fatalf("toOtelMetricAttrs: %v", err)
+	}
+	want := map[attribute.Key]attribute.Value{
+		metricLabelKeyMethod:             attribute.StringValue("Bigtable.ReadRows"),
+		monitoredResLabelKeyTable:        attribute.StringValue("test-table"),
+		monitoredResLabelKeyCluster:      attribute.StringValue("test-cluster"),
+		monitoredResLabelKeyZone:         attribute.StringValue("test-zone"),
+		monitoredResLabelKeyProject:      attribute.StringValue("test-project"),
+		metricLabelKeyStatus:             attribute.StringValue("OK"),
+		metricLabelKeyStreamingOperation: attribute.BoolValue(true),
+		metricTransportType:              attribute.StringValue("cloudpath"),
+		metricTransportRegion:            attribute.StringValue("us-central1"),
+		metricTransportZone:              attribute.StringValue("us-central1-b"),
+		metricTransportSubZone:           attribute.StringValue("sub-1"),
+	}
+	for key, expected := range want {
+		val, ok := attrSet.Value(key)
+		if !ok {
+			t.Errorf("missing attribute %v", key)
+			continue
+		}
+		if val != expected {
+			t.Errorf("attr[%v] = %v, want %v", key, val.Emit(), expected.Emit())
+		}
+	}
+	if attrSet.Len() != len(want) {
+		t.Errorf("attr count = %d, want %d", attrSet.Len(), len(want))
 	}
 }

@@ -29,6 +29,7 @@ import (
 	"strings"
 
 	"cloud.google.com/go/bigtable/internal"
+	btransport "cloud.google.com/go/bigtable/internal/transport"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -64,9 +65,17 @@ const (
 	metricLabelKeyClientName         = "client_name"
 	metricLabelKeyClientUID          = "client_uid"
 
+	// Peer-info-derived attributes (attempt_latencies2 only). Populated from
+	// the bigtable-peer-info sideband metadata via extractPeerInfo.
+	metricTransportType    = "transport_type"
+	metricTransportRegion  = "transport_region"
+	metricTransportSubZone = "transport_subzone"
+	metricTransportZone    = "transport_zone"
+
 	// Metric names
 	metricNameOperationLatencies      = "operation_latencies"
 	metricNameAttemptLatencies        = "attempt_latencies"
+	metricNameAttemptLatencies2       = "attempt_latencies2"
 	metricNameServerLatencies         = "server_latencies"
 	metricNameAppBlockingLatencies    = "application_latencies"
 	metricNameClientBlockingLatencies = "throttling_latencies"
@@ -78,7 +87,7 @@ const (
 	// Metric units
 	metricUnitMS    = "ms"
 	metricUnitCount = "1"
-	maxAttrsLen     = 12 // Monitored resource labels +  Metric labels
+	maxAttrsLen     = 16 // Monitored resource labels + Metric labels (incl. 4 transport labels on attempt_latencies2)
 )
 
 type contextKey string
@@ -145,6 +154,17 @@ var (
 			additionalAttrs: []string{
 				metricLabelKeyStatus,
 				metricLabelKeyStreamingOperation,
+			},
+			recordedPerAttempt: true,
+		},
+		metricNameAttemptLatencies2: {
+			additionalAttrs: []string{
+				metricLabelKeyStatus,
+				metricLabelKeyStreamingOperation,
+				metricTransportType,
+				metricTransportRegion,
+				metricTransportSubZone,
+				metricTransportZone,
 			},
 			recordedPerAttempt: true,
 		},
@@ -232,6 +252,7 @@ type builtinMetricsTracerFactory struct {
 	operationLatencies      metric.Float64Histogram
 	serverLatencies         metric.Float64Histogram
 	attemptLatencies        metric.Float64Histogram
+	attemptLatencies2       metric.Float64Histogram
 	firstRespLatencies      metric.Float64Histogram
 	appBlockingLatencies    metric.Float64Histogram
 	clientBlockingLatencies metric.Float64Histogram
@@ -374,6 +395,19 @@ func (tf *builtinMetricsTracerFactory) createInstruments(meter metric.Meter) err
 		return err
 	}
 
+	// Create attempt_latencies2 — same latency value as attempt_latencies,
+	// broken out with transport_type/region/zone/subzone attributes sourced
+	// from the bigtable-peer-info sideband metadata.
+	tf.attemptLatencies2, err = meter.Float64Histogram(
+		metricNameAttemptLatencies2,
+		metric.WithDescription("Client observed latency per RPC attempt, labeled by transport type and AFE location."),
+		metric.WithUnit(metricUnitMS),
+		metric.WithExplicitBucketBoundaries(bucketBounds...),
+	)
+	if err != nil {
+		return err
+	}
+
 	// Create server_latencies
 	tf.serverLatencies, err = meter.Float64Histogram(
 		metricNameServerLatencies,
@@ -461,6 +495,7 @@ type builtinMetricsTracer struct {
 	instrumentOperationLatencies      metric.Float64Histogram
 	instrumentServerLatencies         metric.Float64Histogram
 	instrumentAttemptLatencies        metric.Float64Histogram
+	instrumentAttemptLatencies2       metric.Float64Histogram
 	instrumentFirstRespLatencies      metric.Float64Histogram
 	instrumentAppBlockingLatencies    metric.Float64Histogram
 	instrumentClientBlockingLatencies metric.Float64Histogram
@@ -527,6 +562,14 @@ type attemptTracer struct {
 	startTime time.Time
 	clusterID string
 	zoneID    string
+
+	// Peer-info-derived attributes (feed attempt_latencies2 only). Populated
+	// from the bigtable-peer-info sideband metadata; empty when the server
+	// didn't emit the header (older servers, or PeerInfo feature flag off).
+	transportType    string
+	transportRegion  string
+	transportZone    string
+	transportSubZone string
 
 	// gRPC status code
 	status string
@@ -600,6 +643,7 @@ func (tf *builtinMetricsTracerFactory) createBuiltinMetricsTracer(ctx context.Co
 		instrumentOperationLatencies:      tf.operationLatencies,
 		instrumentServerLatencies:         tf.serverLatencies,
 		instrumentAttemptLatencies:        tf.attemptLatencies,
+		instrumentAttemptLatencies2:       tf.attemptLatencies2,
 		instrumentFirstRespLatencies:      tf.firstRespLatencies,
 		instrumentAppBlockingLatencies:    tf.appBlockingLatencies,
 		instrumentClientBlockingLatencies: tf.clientBlockingLatencies,
@@ -660,6 +704,14 @@ func (mt *builtinMetricsTracer) toOtelMetricAttrs(metricName string) (attribute.
 			attrKeyValues = append(attrKeyValues, attribute.String(metricLabelKeyStatus, status))
 		case metricLabelKeyStreamingOperation:
 			attrKeyValues = append(attrKeyValues, attribute.Bool(metricLabelKeyStreamingOperation, mt.isStreaming))
+		case metricTransportType:
+			attrKeyValues = append(attrKeyValues, attribute.String(metricTransportType, mt.currOp.currAttempt.transportType))
+		case metricTransportRegion:
+			attrKeyValues = append(attrKeyValues, attribute.String(metricTransportRegion, mt.currOp.currAttempt.transportRegion))
+		case metricTransportSubZone:
+			attrKeyValues = append(attrKeyValues, attribute.String(metricTransportSubZone, mt.currOp.currAttempt.transportSubZone))
+		case metricTransportZone:
+			attrKeyValues = append(attrKeyValues, attribute.String(metricTransportZone, mt.currOp.currAttempt.transportZone))
 		default:
 			return attribute.Set{}, fmt.Errorf("unknown additional attribute: %v", attrKey)
 		}
@@ -753,7 +805,16 @@ func (mt *builtinMetricsTracer) recordAttemptCompletion(attemptHeaderMD, attempT
 		}
 	}
 
-
+	// Extract transport labels from the bigtable-peer-info sideband metadata
+	// (populated by the server when the PeerInfo feature flag is negotiated
+	// on). Feeds the attempt_latencies2 metric only; other metrics stay on
+	// the classic label set. No-op when the header is absent.
+	if peerInfo, _ := extractPeerInfo(attemptHeaderMD, attempTrailerMD); peerInfo != nil {
+		mt.currOp.currAttempt.transportType = btransport.TransportTypeName(peerInfo.GetTransportType())
+		mt.currOp.currAttempt.transportRegion = peerInfo.GetApplicationFrontendRegion()
+		mt.currOp.currAttempt.transportZone = peerInfo.GetApplicationFrontendZone()
+		mt.currOp.currAttempt.transportSubZone = peerInfo.GetApplicationFrontendSubzone()
+	}
 
 	// Calculate elapsed time
 	elapsedTime := convertToMs(time.Since(mt.currOp.currAttempt.startTime))
@@ -761,6 +822,13 @@ func (mt *builtinMetricsTracer) recordAttemptCompletion(attemptHeaderMD, attempT
 	// Record attempt_latencies
 	attemptLatAttrs, _ := mt.toOtelMetricAttrs(metricNameAttemptLatencies)
 	mt.instrumentAttemptLatencies.Record(mt.ctx, elapsedTime, metric.WithAttributeSet(attemptLatAttrs))
+
+	// Record attempt_latencies2 — same value, but broken out by transport
+	// labels from the peer-info sideband metadata.
+	if mt.instrumentAttemptLatencies2 != nil {
+		attemptLat2Attrs, _ := mt.toOtelMetricAttrs(metricNameAttemptLatencies2)
+		mt.instrumentAttemptLatencies2.Record(mt.ctx, elapsedTime, metric.WithAttributeSet(attemptLat2Attrs))
+	}
 
 	// Record client_blocking_latencies
 	clientBlockingLatAttrs, _ := mt.toOtelMetricAttrs(metricNameClientBlockingLatencies)

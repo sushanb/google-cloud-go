@@ -238,6 +238,7 @@ func TestNewBuiltinMetricsTracerFactory(t *testing.T) {
 
 	wantMetricNamesStdout := []string{
 		metricNameAttemptLatencies, metricNameAttemptLatencies,
+		metricNameAttemptLatencies2, metricNameAttemptLatencies2,
 		metricNameFirstRespLatencies,
 		metricNameConnErrCount, metricNameConnErrCount,
 		metricNameOperationLatencies,
@@ -372,6 +373,7 @@ func TestNewBuiltinMetricsTracerFactory(t *testing.T) {
 			gotNonNilInstruments := gotClient.metricsTracerFactory.operationLatencies != nil &&
 				gotClient.metricsTracerFactory.serverLatencies != nil &&
 				gotClient.metricsTracerFactory.attemptLatencies != nil &&
+				gotClient.metricsTracerFactory.attemptLatencies2 != nil &&
 				gotClient.metricsTracerFactory.appBlockingLatencies != nil &&
 				gotClient.metricsTracerFactory.firstRespLatencies != nil &&
 				gotClient.metricsTracerFactory.retryCount != nil &&
