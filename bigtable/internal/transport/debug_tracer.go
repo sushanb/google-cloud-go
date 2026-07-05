@@ -107,10 +107,16 @@ var lvl = struct {
 	Error: 2,
 }
 
-// debug_tags is the OTel counter that mirrors java-bigtable's
-// ClientDebugTagCount metric name. Keeping the name identical lets
-// cross-language dashboards join Go and Java clients on the tag column.
-const debugTagCounterName = "bigtable.googleapis.com/internal/client/debug_tags"
+// debugTagCounterName is the OTel instrument name. It is deliberately
+// SHORT — the Cloud Monitoring exporter prepends the
+// `bigtable.googleapis.com/internal/client/` namespace itself, so
+// using the fully-qualified name here would double-prefix (and
+// normalize dots to slashes in the second half), producing e.g.
+// `bigtable.googleapis.com/internal/client/bigtable/googleapis/com/internal/client/debug_tags`
+// which Cloud Monitoring rejects as an unknown type. The exported
+// name matches java-bigtable's ClientDebugTagCount so cross-language
+// dashboards can join.
+const debugTagCounterName = "debug_tags"
 
 // debugTagAttrKey is the single OTel attribute under which the tag
 // string travels. Bounded cardinality — each tag is a literal constant
