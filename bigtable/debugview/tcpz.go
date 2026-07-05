@@ -54,6 +54,13 @@ func (s *tcpzServer) snapshot() []btransport.TCPInfoSnapshot {
 	return s.stats.Snapshot()
 }
 
+func (s *tcpzServer) deadConns() []btransport.DeadConnInfo {
+	if s.stats == nil {
+		return nil
+	}
+	return s.stats.DeadConns()
+}
+
 // tcpzSeverity ranks conns by how much the kernel's TCP_INFO says is
 // wrong with them. Ordering is exploited by the sort (higher first) and
 // by the row-color CSS classes below.
@@ -142,6 +149,294 @@ func (s tcpzSeverity) rowClass() string {
 	return "row-ok"
 }
 
+// durBucket / pctBucket define a single bucket in a histogram: any value
+// with v < Max lands here. The final bucket in a table uses Max == 0 as
+// "no upper bound" — the ">X" catch-all. Keeping the sentinel as a plain
+// zero avoids threading a bool per bucket.
+type durBucket struct {
+	Max   time.Duration
+	Label string
+}
+
+type pctBucket struct {
+	Max   float64
+	Label string
+}
+
+// Bucket tables tuned for the shapes we actually see on prod bigtable
+// dials: sub-ms RTT, near-zero retrans rates, minutes-to-hours conn
+// lifetimes. Log-ish spacing so a single hot outlier doesn't collapse
+// every other bar into a hairline.
+var rttHistBuckets = []durBucket{
+	{200 * time.Microsecond, "<200µs"},
+	{500 * time.Microsecond, "200µs-500µs"},
+	{time.Millisecond, "500µs-1ms"},
+	{2 * time.Millisecond, "1-2ms"},
+	{5 * time.Millisecond, "2-5ms"},
+	{10 * time.Millisecond, "5-10ms"},
+	{25 * time.Millisecond, "10-25ms"},
+	{50 * time.Millisecond, "25-50ms"},
+	{100 * time.Millisecond, "50-100ms"},
+	{500 * time.Millisecond, "100-500ms"},
+	{0, ">500ms"},
+}
+
+var retransHistBuckets = []pctBucket{
+	{0.0000001, "0%"}, // exact-zero bucket; any positive value falls past this
+	{0.01, "0-0.01%"},
+	{0.05, "0.01-0.05%"},
+	{0.1, "0.05-0.1%"},
+	{0.5, "0.1-0.5%"},
+	{1, "0.5-1%"},
+	{5, "1-5%"},
+	{0, ">5%"},
+}
+
+var ageHistBuckets = []durBucket{
+	{5 * time.Second, "<5s"},
+	{30 * time.Second, "5-30s"},
+	{time.Minute, "30s-1m"},
+	{5 * time.Minute, "1-5m"},
+	{15 * time.Minute, "5-15m"},
+	{time.Hour, "15m-1h"},
+	{6 * time.Hour, "1-6h"},
+	{24 * time.Hour, "6-24h"},
+	{0, ">24h"},
+}
+
+// histBar is one row of a rendered histogram: label + up to two stacked
+// bars (live/dead) + count(s). LivePct/DeadPct are 0-100 widths relative
+// to the panel's tallest bucket so the visual peak always saturates.
+type histBar struct {
+	Label   string
+	Live    int
+	Dead    int // only populated for the age panel
+	LivePct int
+	DeadPct int
+}
+
+// histPanel is one rendered histogram panel above the tcpz table.
+// Summary is a "n=… p50=… max=…" one-liner shown under the title.
+type histPanel struct {
+	Title   string
+	Bars    []histBar
+	Summary string
+	HasDead bool // renders the small "live/dead" legend swatch under the panel
+}
+
+// bucketizeDur returns per-bucket counts for a slice of durations. Zero
+// values are counted (they land in the first bucket, matching the "<200µs"
+// / "<5s" semantics).
+func bucketizeDur(values []time.Duration, buckets []durBucket) []int {
+	counts := make([]int, len(buckets))
+	for _, v := range values {
+		for i, b := range buckets {
+			if b.Max == 0 || v < b.Max {
+				counts[i]++
+				break
+			}
+		}
+	}
+	return counts
+}
+
+// bucketizePct is the retrans-ratio companion to bucketizeDur. The first
+// bucket has an epsilon Max so exact-zero conns get their own bar (they
+// dominate healthy fleets and would otherwise saturate everything else).
+func bucketizePct(values []float64, buckets []pctBucket) []int {
+	counts := make([]int, len(buckets))
+	for _, v := range values {
+		for i, b := range buckets {
+			if b.Max == 0 || v < b.Max {
+				counts[i]++
+				break
+			}
+		}
+	}
+	return counts
+}
+
+// makeHistPanel converts raw live/dead bucket counts into the rendered
+// panel struct. Bar widths are normalized against the tallest single
+// (live+dead) bar in the panel so the peak always fills the track. Empty
+// panels return nil so the template can hide them cleanly.
+func makeHistPanel(title, summary string, labels []string, live, dead []int) *histPanel {
+	if len(live) != len(labels) {
+		return nil
+	}
+	max := 0
+	for i := range labels {
+		total := live[i]
+		if dead != nil {
+			total += dead[i]
+		}
+		if total > max {
+			max = total
+		}
+	}
+	if max == 0 {
+		return nil
+	}
+	bars := make([]histBar, len(labels))
+	for i, lbl := range labels {
+		b := histBar{Label: lbl, Live: live[i]}
+		b.LivePct = live[i] * 100 / max
+		if dead != nil {
+			b.Dead = dead[i]
+			b.DeadPct = dead[i] * 100 / max
+		}
+		bars[i] = b
+	}
+	return &histPanel{Title: title, Bars: bars, Summary: summary, HasDead: dead != nil}
+}
+
+// percentileDur returns the 0..100 percentile of a duration slice using
+// nearest-rank. Non-mutating (sorts a copy). Empty slice → 0.
+func percentileDur(values []time.Duration, p int) time.Duration {
+	if len(values) == 0 {
+		return 0
+	}
+	sorted := append([]time.Duration(nil), values...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	idx := (p * (len(sorted) - 1)) / 100
+	return sorted[idx]
+}
+
+// percentilePct is the float64 analogue of percentileDur.
+func percentilePct(values []float64, p int) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sorted := append([]float64(nil), values...)
+	sort.Float64s(sorted)
+	idx := (p * (len(sorted) - 1)) / 100
+	return sorted[idx]
+}
+
+// bucketLabels extracts the .Label field from a bucket table so
+// makeHistPanel doesn't need two type-specific overloads.
+func durBucketLabels(bs []durBucket) []string {
+	out := make([]string, len(bs))
+	for i, b := range bs {
+		out[i] = b.Label
+	}
+	return out
+}
+func pctBucketLabels(bs []pctBucket) []string {
+	out := make([]string, len(bs))
+	for i, b := range bs {
+		out[i] = b.Label
+	}
+	return out
+}
+
+// buildHistPanels computes the three summary panels shown above the tcpz
+// table. Called once per HTML render (skipped for JSON responses).
+//
+//   - RTT: live conns only, kernel-reported smoothed RTT.
+//   - Retrans ratio: live conns only, BytesRetrans/BytesSent from the
+//     precomputed RetransRatioPct.
+//   - Age: live conns' age-so-far AND dead conns' age-at-death, stacked
+//     in the same buckets — dead is what the user asked for (how long
+//     conns lived before dying); live is the companion (what's alive now).
+func buildHistPanels(live []btransport.TCPInfoSnapshot, dead []btransport.DeadConnInfo) []*histPanel {
+	now := time.Now()
+
+	var rtts []time.Duration
+	var retrans []float64
+	var liveAges []time.Duration
+	for _, s := range live {
+		if s.Err != "" {
+			continue
+		}
+		if s.RTT > 0 {
+			rtts = append(rtts, s.RTT)
+		}
+		if s.BytesSent > 0 {
+			retrans = append(retrans, s.RetransRatioPct)
+		}
+		if !s.DialedAt.IsZero() {
+			liveAges = append(liveAges, now.Sub(s.DialedAt))
+		}
+	}
+	deadAges := make([]time.Duration, 0, len(dead))
+	for _, d := range dead {
+		if d.DialedAt.IsZero() || d.DiedAt.IsZero() {
+			continue
+		}
+		deadAges = append(deadAges, d.DiedAt.Sub(d.DialedAt))
+	}
+
+	var panels []*histPanel
+
+	if len(rtts) > 0 {
+		counts := bucketizeDur(rtts, rttHistBuckets)
+		summary := fmt.Sprintf("n=%d · p50=%s · p90=%s · max=%s",
+			len(rtts),
+			roundRTTShort(percentileDur(rtts, 50)),
+			roundRTTShort(percentileDur(rtts, 90)),
+			roundRTTShort(percentileDur(rtts, 100)))
+		panels = append(panels, makeHistPanel("RTT", summary, durBucketLabels(rttHistBuckets), counts, nil))
+	}
+	if len(retrans) > 0 {
+		counts := bucketizePct(retrans, retransHistBuckets)
+		summary := fmt.Sprintf("n=%d · p50=%s · p90=%s · max=%s",
+			len(retrans),
+			formatPct(percentilePct(retrans, 50)),
+			formatPct(percentilePct(retrans, 90)),
+			formatPct(percentilePct(retrans, 100)))
+		panels = append(panels, makeHistPanel("Retrans ratio", summary, pctBucketLabels(retransHistBuckets), counts, nil))
+	}
+	if len(liveAges)+len(deadAges) > 0 {
+		liveCounts := bucketizeDur(liveAges, ageHistBuckets)
+		deadCounts := bucketizeDur(deadAges, ageHistBuckets)
+		var maxLifetime time.Duration
+		if len(deadAges) > 0 {
+			maxLifetime = percentileDur(deadAges, 100)
+		}
+		summary := fmt.Sprintf("live=%d · dead=%d", len(liveAges), len(deadAges))
+		if len(deadAges) > 0 {
+			summary += fmt.Sprintf(" · dead p50=%s max=%s",
+				roundDurationShort(percentileDur(deadAges, 50)),
+				roundDurationShort(maxLifetime))
+		}
+		panels = append(panels, makeHistPanel("Conn age", summary, durBucketLabels(ageHistBuckets), liveCounts, deadCounts))
+	}
+	return panels
+}
+
+// roundRTTShort renders sub-ms and sub-second RTT durations with sensible
+// precision for the histogram summary line. time.Duration.String() is too
+// verbose ("1.234567ms") and roundDurationShort is tuned for minutes+.
+func roundRTTShort(d time.Duration) string {
+	if d <= 0 {
+		return "—"
+	}
+	switch {
+	case d < time.Microsecond:
+		return fmt.Sprintf("%dns", d.Nanoseconds())
+	case d < time.Millisecond:
+		return fmt.Sprintf("%.0fµs", float64(d)/float64(time.Microsecond))
+	case d < time.Second:
+		return fmt.Sprintf("%.2fms", float64(d)/float64(time.Millisecond))
+	default:
+		return fmt.Sprintf("%.2fs", d.Seconds())
+	}
+}
+
+// formatPct renders a small percent value compactly for histogram
+// summaries — mirrors the "pct" template func but returns a plain string
+// (no HTML wrapping).
+func formatPct(v float64) string {
+	if v == 0 {
+		return "0%"
+	}
+	if v < 0.01 {
+		return "<0.01%"
+	}
+	return fmt.Sprintf("%.2f%%", v)
+}
+
 // tcpzRow bundles a snapshot with its precomputed severity so the
 // template doesn't have to re-classify on every template action.
 type tcpzRow struct {
@@ -186,6 +481,8 @@ var tcpzCols = []tcpzColDef{
 	{Key: "pmtu", Label: "PMTU", Class: "num", Title: "Path MTU (bytes). <1500 = tunneling/VPN in path. Watch for PMTU black holes: silent drops if ICMP frag-needed replies are filtered.", Body: `{{pmtu .PMTU}}`, Cmp: cmpU32(func(s btransport.TCPInfoSnapshot) uint32 { return s.PMTU }), Desc: false},
 	{Key: "cwnd", Label: "CWnd", Class: "num", Title: "Send congestion window in MSS units.", Body: `{{num .SndCwnd}}`, Cmp: cmpU32(func(s btransport.TCPInfoSnapshot) uint32 { return s.SndCwnd }), Desc: true},
 	{Key: "ssth", Label: "SSTh", Class: "num", Title: "Slow-start threshold in MSS units. When cwnd &lt; ssthresh we're in slow-start (often after a loss event).", Body: `{{num .SndSsthresh}}`, Cmp: cmpU32(func(s btransport.TCPInfoSnapshot) uint32 { return s.SndSsthresh }), Desc: true},
+	{Key: "sndwnd", Label: "SndWnd", Class: "num", Title: "Peer's advertised receive window (bytes) — the ceiling on what we can put in flight. Small = the peer is throttling us.", Body: `{{win .SndWnd}}`, Cmp: cmpU32(func(s btransport.TCPInfoSnapshot) uint32 { return s.SndWnd }), Desc: true},
+	{Key: "rcvwnd", Label: "RcvWnd", Class: "num", Title: "Our advertised receive window (bytes) — the ceiling the peer can push at us. Shrinking = we're a slow reader.", Body: `{{win .RcvWnd}}`, Cmp: cmpU32(func(s btransport.TCPInfoSnapshot) uint32 { return s.RcvWnd }), Desc: true},
 	{Key: "retr", Label: "Retr", Class: "num", Title: "Recent retransmits (kernel counter).", Body: `{{hotNum .Retransmits}}`, Cmp: cmpU32(func(s btransport.TCPInfoSnapshot) uint32 { return s.Retransmits }), Desc: true},
 	{Key: "totalretr", Label: "TotalRetr", Class: "num", Title: "Total retransmits since conn open — high count means path is lossy.", Body: `{{hotNum .TotalRetrans}}`, Cmp: cmpU32(func(s btransport.TCPInfoSnapshot) uint32 { return s.TotalRetrans }), Desc: true},
 	{Key: "rtxrate", Label: "RtxRate", Class: "num", Title: "Retransmit ratio: bytes retransmitted / bytes sent. The 'actual loss rate' this conn observed.", Body: `{{hotPct .RetransRatioPct}}`, Cmp: cmpF64(func(s btransport.TCPInfoSnapshot) float64 { return s.RetransRatioPct }), Desc: true},
@@ -195,10 +492,15 @@ var tcpzCols = []tcpzColDef{
 	{Key: "dsack", Label: "DSACK", Class: "num", Title: "Duplicate-SACK count — number of SPURIOUS retransmits (we resent bytes the receiver actually got). High DSACK relative to TotalRetr = timing false-positives, not real loss.", Body: `{{hotNum .DsackDups}}`, Cmp: cmpU32(func(s btransport.TCPInfoSnapshot) uint32 { return s.DsackDups }), Desc: true},
 	{Key: "reord", Label: "ReordS", Class: "num", Title: "Times reordering was observed. Reordering can trigger fast-retransmit even without loss.", Body: `{{hotNum .ReordSeen}}`, Cmp: cmpU32(func(s btransport.TCPInfoSnapshot) uint32 { return s.ReordSeen }), Desc: true},
 	{Key: "ecn", Label: "ECN", Class: "num", Title: "Packets delivered with ECN Congestion-Experienced marks. Non-zero = a router is signaling congestion before dropping.", Body: `{{hotNum .DeliveredCE}}`, Cmp: cmpU32(func(s btransport.TCPInfoSnapshot) uint32 { return s.DeliveredCE }), Desc: true},
-	{Key: "sent", Label: "Sent", Class: "num", Title: "Total bytes sent (data).", Body: `{{bytes .BytesSent}}`, Cmp: cmpU64(func(s btransport.TCPInfoSnapshot) uint64 { return s.BytesSent }), Desc: true},
+	{Key: "sent", Label: "Sent", Class: "num", Title: "Total data bytes SENT (outbound cumulative).", Body: `{{bytes .BytesSent}}`, Cmp: cmpU64(func(s btransport.TCPInfoSnapshot) uint64 { return s.BytesSent }), Desc: true},
+	{Key: "recv", Label: "Recv", Class: "num", Title: "Total data bytes RECEIVED (inbound cumulative).", Body: `{{bytes .BytesReceived}}`, Cmp: cmpU64(func(s btransport.TCPInfoSnapshot) uint64 { return s.BytesReceived }), Desc: true},
 	{Key: "retrans", Label: "Retrans", Class: "num", Title: "Total bytes retransmitted (data).", Body: `{{hotBytes .BytesRetrans}}`, Cmp: cmpU64(func(s btransport.TCPInfoSnapshot) uint64 { return s.BytesRetrans }), Desc: true},
-	{Key: "delrate", Label: "DelRate", Class: "num", Title: "Recent delivery rate (BBR estimate).", Body: `{{rate .DeliveryRate}}`, Cmp: cmpU64(func(s btransport.TCPInfoSnapshot) uint64 { return s.DeliveryRate }), Desc: true},
+	{Key: "delrate", Label: "DelRate", Class: "num", Title: "Recent outbound delivery rate — kernel's BBR estimate (bytes/sec) of the rate ACKs are flowing back. Best 'current bandwidth OUT' signal we have.", Body: `{{rate .DeliveryRate}}`, Cmp: cmpU64(func(s btransport.TCPInfoSnapshot) uint64 { return s.DeliveryRate }), Desc: true},
+	{Key: "avgout", Label: "AvgOut", Class: "num", Title: "Lifetime OUTBOUND throughput: BytesAcked ÷ conn age. Complements DelRate (instantaneous, kernel-windowed) — steady traffic makes them converge, bursty traffic makes AvgOut lag.", Body: `{{avgRate .BytesAcked .DialedAt}}`, Cmp: cmpF64(func(s btransport.TCPInfoSnapshot) float64 { return avgRateBps(s.BytesAcked, s.DialedAt) }), Desc: true},
+	{Key: "avgin", Label: "AvgIn", Class: "num", Title: "Lifetime INBOUND throughput: BytesReceived ÷ conn age. TCP_INFO has no windowed inbound-rate field, so lifetime avg is the cheapest honest answer — a windowed value would require diffing snapshots per conn.", Body: `{{avgRate .BytesReceived .DialedAt}}`, Cmp: cmpF64(func(s btransport.TCPInfoSnapshot) float64 { return avgRateBps(s.BytesReceived, s.DialedAt) }), Desc: true},
 	{Key: "notsent", Label: "NotSent", Class: "num", Title: "Bytes buffered but not yet on wire. High = we're app-limited or CPU-limited, not network-limited.", Body: `{{num .NotsentBytes}}`, Cmp: cmpU32(func(s btransport.TCPInfoSnapshot) uint32 { return s.NotsentBytes }), Desc: true},
+	{Key: "rwndlim", Label: "RwndLim", Class: "num", Title: "Cumulative time the sender was blocked by the peer's receive window. Non-zero = flow control cost real wall clock; the peer is a slow reader.", Body: `{{hotDur .RwndLimited}}`, Cmp: cmpDur(func(s btransport.TCPInfoSnapshot) time.Duration { return s.RwndLimited }), Desc: true},
+	{Key: "sndbuflim", Label: "SndBufLim", Class: "num", Title: "Cumulative time blocked by our own SO_SNDBUF. Non-zero = our local send buffer is undersized for the bandwidth-delay product.", Body: `{{hotDur .SndbufLimited}}`, Cmp: cmpDur(func(s btransport.TCPInfoSnapshot) time.Duration { return s.SndbufLimited }), Desc: true},
 	{Key: "lastrecv", Label: "LastRecv", Title: "Time since the socket last received data.", Body: `{{dur .LastDataRecv}}`, Cmp: cmpDur(func(s btransport.TCPInfoSnapshot) time.Duration { return s.LastDataRecv }), Desc: true},
 	{Key: "lastsent", Label: "LastSent", Title: "Time since the socket last sent data.", Body: `{{dur .LastDataSent}}`, Cmp: cmpDur(func(s btransport.TCPInfoSnapshot) time.Duration { return s.LastDataSent }), Desc: true},
 	{Key: "", Label: "Err", Class: "err", Title: "Populated when TCP_INFO couldn't be read on a live fd (e.g. non-Linux OS).", Body: `{{.Err}}`},
@@ -269,6 +571,38 @@ func cmpDur(get func(btransport.TCPInfoSnapshot) time.Duration) func(a, b btrans
 		return 0
 	}
 }
+// avgRateBps returns lifetime throughput in bytes/sec (BytesAcked ÷
+// age). Zero when the conn hasn't ACKed data yet, isn't dialed, or
+// age is non-positive. Used both by the display func and the column
+// comparator so sort order matches the rendered value.
+func avgRateBps(bytesAcked uint64, dialedAt time.Time) float64 {
+	if bytesAcked == 0 || dialedAt.IsZero() {
+		return 0
+	}
+	age := time.Since(dialedAt).Seconds()
+	if age <= 0 {
+		return 0
+	}
+	return float64(bytesAcked) / age
+}
+
+// formatBytesPerSec renders a bytes/sec value with a scale suffix.
+// Shared by the "rate" (kernel-reported DeliveryRate) and "avgRate"
+// (BytesAcked ÷ age) template funcs so both columns format identically.
+func formatBytesPerSec(v float64) string {
+	if v <= 0 {
+		return "—"
+	}
+	switch {
+	case v >= 1<<20:
+		return fmt.Sprintf("%.1f MB/s", v/(1<<20))
+	case v >= 1<<10:
+		return fmt.Sprintf("%.1f KB/s", v/(1<<10))
+	default:
+		return fmt.Sprintf("%.0f B/s", v)
+	}
+}
+
 func cmpTime(get func(btransport.TCPInfoSnapshot) time.Time) func(a, b btransport.TCPInfoSnapshot) int {
 	return func(a, b btransport.TCPInfoSnapshot) int {
 		x, y := get(a), get(b)
@@ -357,6 +691,12 @@ func (s *tcpzServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 	sortRows(rows, sortKey, sortDir)
 
+	// Histograms cover the pre-filter live snapshot (raw) plus every
+	// remembered dead conn, so the summary reflects the fleet — the "only
+	// hot" / :443-hidden table filters shouldn't be able to hide a hot
+	// cluster from the distribution.
+	histPanels := buildHistPanels(raw, s.deadConns())
+
 	baseParams := url.Values{}
 	if all {
 		baseParams.Set("all", "1")
@@ -395,6 +735,7 @@ func (s *tcpzServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 		Rows        []tcpzRow
 		Cols        []tcpzColDef
 		Headers     []tcpzHeaderCell
+		HistPanels  []*histPanel
 		Count       int
 		Total       int
 		Hidden      int
@@ -410,6 +751,7 @@ func (s *tcpzServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 		Rows:        rows,
 		Cols:        tcpzCols,
 		Headers:     headers,
+		HistPanels:  histPanels,
 		Count:       len(rows),
 		Total:       total,
 		Hidden:      hidden,
@@ -576,15 +918,10 @@ func tcpzFuncs() template.FuncMap {
 			if v == 0 {
 				return "—"
 			}
-			f := float64(v)
-			switch {
-			case f >= 1<<20:
-				return fmt.Sprintf("%.1f MB/s", f/(1<<20))
-			case f >= 1<<10:
-				return fmt.Sprintf("%.1f KB/s", f/(1<<10))
-			default:
-				return fmt.Sprintf("%.0f B/s", f)
-			}
+			return formatBytesPerSec(float64(v))
+		},
+		"avgRate": func(bytesAcked uint64, dialedAt time.Time) string {
+			return formatBytesPerSec(avgRateBps(bytesAcked, dialedAt))
 		},
 		"bytes": func(v uint64) string {
 			if v == 0 {
@@ -607,6 +944,26 @@ func tcpzFuncs() template.FuncMap {
 				return template.HTML("—")
 			}
 			return template.HTML(fmt.Sprintf(`<b class="hot">%d</b>`, v))
+		},
+		"hotDur": func(d time.Duration) template.HTML {
+			if d == 0 {
+				return template.HTML("—")
+			}
+			return template.HTML(fmt.Sprintf(`<b class="hot">%s</b>`, d.String()))
+		},
+		"win": func(v uint32) string {
+			if v == 0 {
+				return "—"
+			}
+			f := float64(v)
+			switch {
+			case f >= 1<<20:
+				return fmt.Sprintf("%.1f MiB", f/(1<<20))
+			case f >= 1<<10:
+				return fmt.Sprintf("%.1f KiB", f/(1<<10))
+			default:
+				return fmt.Sprintf("%d B", v)
+			}
 		},
 		"critNum": func(v uint32) template.HTML {
 			if v == 0 {
@@ -726,6 +1083,21 @@ a.col-sort .arr { color: #d95700; margin-left: 2px; }
 .ca-CWR { color: #a04500; font-weight: 600; }
 .ca-Recovery { color: #b32222; font-weight: 600; }
 .ca-Loss { color: #b32222; font-weight: 700; }
+.hist-grid { display: flex; gap: 1em; flex-wrap: wrap; margin: .4em 0 1em 0; }
+.hist-panel { flex: 1 1 320px; min-width: 280px; border: 1px solid #e8e8e8; border-radius: 3px; padding: .5em .7em; background: #fafafa; }
+.hist-title { font-weight: 600; margin-bottom: .1em; font-size: 12px; }
+.hist-summary { color: #666; font-size: 11px; font-variant-numeric: tabular-nums; margin-bottom: .35em; }
+.hist-row { display: grid; grid-template-columns: 82px 1fr 60px; gap: 6px; align-items: center; font-size: 11px; font-variant-numeric: tabular-nums; line-height: 1.35; }
+.hist-lbl { color: #555; font-family: SFMono-Regular, Menlo, Consolas, monospace; text-align: right; }
+.hist-track { position: relative; height: 10px; background: #eee; border-radius: 2px; overflow: hidden; }
+.hist-bar-live { position: absolute; top: 0; bottom: 0; left: 0; background: #4a7fbf; }
+.hist-bar-dead { position: absolute; top: 0; bottom: 0; background: #b8763f; opacity: .85; }
+.hist-cnt { color: #444; font-family: SFMono-Regular, Menlo, Consolas, monospace; }
+.hist-cnt .dead { color: #a04500; }
+.hist-legend { color: #666; font-size: 11px; margin-top: .4em; }
+.hist-legend .sw { display: inline-block; width: .75em; height: .75em; vertical-align: -1px; border-radius: 2px; margin: 0 3px 0 6px; }
+.hist-legend .sw.live { background: #4a7fbf; }
+.hist-legend .sw.dead { background: #b8763f; }
 </style>
 </head>
 <body>
@@ -744,6 +1116,27 @@ a.col-sort .arr { color: #d95700; margin-left: 2px; }
 <span class="sw ok"></span>healthy
 · <b class="hot">bold orange</b> = the specific counter that flagged the row.
 </div>
+{{if .HistPanels}}
+<div class="hist-grid">
+{{range $panel := .HistPanels}}
+<div class="hist-panel">
+<div class="hist-title">{{$panel.Title}}</div>
+<div class="hist-summary">{{$panel.Summary}}</div>
+{{range $panel.Bars}}
+<div class="hist-row">
+<span class="hist-lbl">{{.Label}}</span>
+<span class="hist-track">
+{{if .LivePct}}<span class="hist-bar-live" style="width:{{.LivePct}}%"></span>{{end}}
+{{if .DeadPct}}<span class="hist-bar-dead" style="left:{{.LivePct}}%;width:{{.DeadPct}}%"></span>{{end}}
+</span>
+<span class="hist-cnt">{{.Live}}{{if $panel.HasDead}} / <span class="dead">{{.Dead}}</span>{{end}}</span>
+</div>
+{{end}}
+{{if $panel.HasDead}}<div class="hist-legend"><span class="sw live"></span>live<span class="sw dead"></span>dead</div>{{end}}
+</div>
+{{end}}
+</div>
+{{end}}
 {{if not .Rows}}
 <div class="empty">No conns registered. Either the client uses DirectPath (xDS bypasses the standard dialer, so nothing is captured), no traffic has been dialed yet, {{if .OnlyHot}}every conn is healthy (try <a href="?">without ?only=hot</a>), {{end}}or bigtable.TCPStats was never passed into the Client's options.</div>
 {{else}}

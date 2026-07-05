@@ -65,3 +65,9 @@ func (t *TCPStats) Snapshot() []btransport.TCPInfoSnapshot {
 // Len returns the number of currently-registered conns (including any
 // closed-but-not-yet-pruned ones). Useful for a "conns=N" summary.
 func (t *TCPStats) Len() int { return t.reg.Len() }
+
+// DeadConns returns the recently-departed conns the registry still
+// remembers, oldest death first. Used by tcpz to plot conn-lifetime
+// distributions that include already-closed conns. Bounded — very old
+// deaths eventually fall off the ring.
+func (t *TCPStats) DeadConns() []btransport.DeadConnInfo { return t.reg.DeadConns() }

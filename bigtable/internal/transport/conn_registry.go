@@ -22,17 +22,31 @@ import (
 	"time"
 )
 
+// graveyardCap bounds how many recently-dead conn records the registry
+// keeps for the tcpz age-distribution histogram. Sized so a chatty client
+// that recycles conns aggressively still has a representative sample.
+const graveyardCap = 512
+
 // ConnRegistry tracks every *net.TCPConn returned by a custom gRPC dialer
 // so tcpz can render live TCP_INFO for each. The registry never wraps the
 // returned conn — gRPC receives the raw *net.TCPConn unchanged, so nothing
 // in the RPC hot path traverses ConnRegistry code. Registry state is
 // touched only on dial (rare) and Snapshot (only when someone renders
 // tcpz). Dead entries are pruned lazily during Snapshot when getsockopt
-// reports the fd is gone.
+// reports the fd is gone; their (dial, death) times survive in a bounded
+// ring so lifetime distributions include departed conns.
 type ConnRegistry struct {
 	mu    sync.RWMutex
 	seq   uint64 // monotonic id so keys are unique across identical addr pairs
 	conns map[uint64]*trackedConn
+
+	// graveyard is a ring of the most-recent graveyardCap deaths. graveIdx
+	// points at the next slot to write; graveFull says whether we've wrapped.
+	// Kept under the same mu as conns — writes only happen inside Snapshot,
+	// which already re-acquires the write lock for pruning.
+	graveyard []DeadConnInfo
+	graveIdx  int
+	graveFull bool
 }
 
 // trackedConn holds one dial's outputs plus a strong ref to the conn so we
@@ -173,12 +187,26 @@ type TCPInfoSnapshot struct {
 	Err string
 }
 
+// DeadConnInfo is what the registry remembers about a pruned conn: the
+// endpoints plus dial and death times. Lifetime = DiedAt.Sub(DialedAt) is
+// the value tcpz plots for the "how long did conns live?" histogram.
+// DiedAt is when Snapshot noticed the death (the getsockopt returned
+// EBADF/ENOTCONN/ErrClosed) — approximate but within one Snapshot cadence
+// of actual close.
+type DeadConnInfo struct {
+	RemoteAddr string
+	LocalAddr  string
+	DialedAt   time.Time
+	DiedAt     time.Time
+}
+
 // Snapshot reads TCP_INFO for every registered conn and returns the
 // results, oldest dial first. Dead entries (readTCPInfo returned an
 // isDeadConn error) are removed from the registry before returning so a
-// gRPC-closed conn doesn't linger indefinitely. All syscalls happen
-// outside the registry lock so a slow syscall can't block dials or other
-// snapshots.
+// gRPC-closed conn doesn't linger indefinitely; their (dial, death) pair
+// is copied into the graveyard ring for post-mortem age analysis. All
+// syscalls happen outside the registry lock so a slow syscall can't block
+// dials or other snapshots.
 func (r *ConnRegistry) Snapshot() []TCPInfoSnapshot {
 	r.mu.RLock()
 	keys := make([]uint64, 0, len(r.conns))
@@ -209,11 +237,61 @@ func (r *ConnRegistry) Snapshot() []TCPInfoSnapshot {
 		out = append(out, snap)
 	}
 	if len(dead) > 0 {
+		now := time.Now()
 		r.mu.Lock()
 		for _, k := range dead {
+			tc, ok := r.conns[k]
+			if !ok {
+				continue
+			}
+			r.recordDeathLocked(DeadConnInfo{
+				RemoteAddr: tc.remoteAddr,
+				LocalAddr:  tc.localAddr,
+				DialedAt:   tc.dialedAt,
+				DiedAt:     now,
+			})
 			delete(r.conns, k)
 		}
 		r.mu.Unlock()
+	}
+	return out
+}
+
+// recordDeathLocked appends to the graveyard ring. Caller MUST hold
+// r.mu.Lock().
+func (r *ConnRegistry) recordDeathLocked(d DeadConnInfo) {
+	if r.graveyard == nil {
+		r.graveyard = make([]DeadConnInfo, graveyardCap)
+	}
+	r.graveyard[r.graveIdx] = d
+	r.graveIdx++
+	if r.graveIdx >= graveyardCap {
+		r.graveIdx = 0
+		r.graveFull = true
+	}
+}
+
+// DeadConns returns a copy of the graveyard, oldest death first. Bounded
+// at graveyardCap; older deaths are silently dropped as new ones arrive.
+// Empty slice when nothing has died yet.
+func (r *ConnRegistry) DeadConns() []DeadConnInfo {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.graveyard == nil {
+		return nil
+	}
+	var n int
+	if r.graveFull {
+		n = graveyardCap
+	} else {
+		n = r.graveIdx
+	}
+	out := make([]DeadConnInfo, 0, n)
+	if r.graveFull {
+		out = append(out, r.graveyard[r.graveIdx:]...)
+		out = append(out, r.graveyard[:r.graveIdx]...)
+	} else {
+		out = append(out, r.graveyard[:r.graveIdx]...)
 	}
 	return out
 }
