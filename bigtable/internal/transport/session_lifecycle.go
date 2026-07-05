@@ -585,7 +585,7 @@ func (s *Session) peerInfoExtracter(peerInfoData []string) {
 	s.peerInfo.Store(&peerInfo)
 	s.tracer.setPeerInfo(&peerInfo)
 	s.debugf("parsed PeerInfo: transport_type=%s afe=%s",
-		transportTypeName(peerInfo.GetTransportType()), peerInfo.GetApplicationFrontendSubzone())
+		TransportTypeName(peerInfo.GetTransportType()), peerInfo.GetApplicationFrontendSubzone())
 }
 
 // closeReasonLabel maps a CloseSessionRequest reason to a short human-

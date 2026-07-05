@@ -400,7 +400,7 @@ func peerInfoToSnapshot(p *spb.PeerInfo) PeerInfoSnapshot {
 		return PeerInfoSnapshot{}
 	}
 	return PeerInfoSnapshot{
-		TransportType:              transportTypeName(p.GetTransportType()),
+		TransportType:              TransportTypeName(p.GetTransportType()),
 		GoogleFrontendID:           p.GetGoogleFrontendId(),
 		ApplicationFrontendID:      p.GetApplicationFrontendId(),
 		ApplicationFrontendRegion:  p.GetApplicationFrontendRegion(),
@@ -408,11 +408,13 @@ func peerInfoToSnapshot(p *spb.PeerInfo) PeerInfoSnapshot {
 	}
 }
 
-// transportTypeName maps the PeerInfo transport type enum to the short
+// TransportTypeName maps the PeerInfo transport type enum to the short
 // label used in metric attributes and debug UIs (e.g. "cloudpath",
 // "session_directpath"). Prefer this over .String(), which yields the
-// verbose "TRANSPORT_TYPE_…" proto enum names.
-func transportTypeName(tt spb.PeerInfo_TransportType) string {
+// verbose "TRANSPORT_TYPE_…" proto enum names. Exported so the outer
+// bigtable package can share the same mapping (attempt_latencies2's
+// transport_type attribute) without duplicating the switch.
+func TransportTypeName(tt spb.PeerInfo_TransportType) string {
 	switch tt {
 	case spb.PeerInfo_TRANSPORT_TYPE_EXTERNAL:
 		return "external"
