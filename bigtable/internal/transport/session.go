@@ -501,6 +501,11 @@ func (s *Session) ChannelIndex() int {
 // paths race) are ignored so the OnClose callback sees a stable value.
 func (s *Session) setCloseReason(reason string) {
 	if reason == "" {
+		// Every teardown path is supposed to name a reason so the
+		// close-reasons dashboard bucket makes sense; an empty call
+		// means someone forgot to plumb a label. The counter surfaces
+		// this without changing behavior.
+		recordDebugTag(tagSessionCloseNoReason)
 		return
 	}
 	s.closeReason.CompareAndSwap(nil, &reason)

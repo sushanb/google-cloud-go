@@ -86,6 +86,10 @@ func InitializeSessionMetrics(meterProvider metric.MeterProvider) error {
 			sessionMetricsErr = fmt.Errorf("create transport_latencies histogram: %w", err)
 			return
 		}
+		if err = registerDebugTagCounter(meter); err != nil {
+			sessionMetricsErr = err
+			return
+		}
 	})
 	return sessionMetricsErr
 }

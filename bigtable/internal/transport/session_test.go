@@ -961,10 +961,13 @@ func TestStart_HandshakeAndClose(t *testing.T) {
 	}
 
 	stream.recv <- recvOp{err: fmt.Errorf("server EOF")}
-	waitFor(t, time.Second, func() bool { return s.State() == StateClosed }, "StateClosed after EOF")
-	if _, _, closed := listener.counts(); closed != 1 {
-		t.Errorf("OnClose fired %d times, want 1", closed)
-	}
+	// Wait for BOTH the state transition and the OnClose hook — they're
+	// sequenced inside handleClose but not atomic, so a check on state
+	// alone races the hook fire.
+	waitFor(t, time.Second, func() bool {
+		_, _, closed := listener.counts()
+		return s.State() == StateClosed && closed == 1
+	}, "StateClosed + OnClose after EOF")
 }
 
 func TestStart_RejectsIfNotNew(t *testing.T) {

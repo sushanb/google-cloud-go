@@ -213,6 +213,13 @@ func (s *Session) awaitInvokeResult(ctx context.Context, rpc *vrpcImpl, desc VRp
 			return res.err
 		}
 		if res.resp.RpcId != rpc.id {
+			// This is a bookkeeping bug: deliver() only publishes into
+			// resultChan for the matching activeRPC, so a mismatch here
+			// means state got out from under us. Counter separate from
+			// handleVRPC*'s id-mismatch tag so we can distinguish "wrong
+			// response reached deliver" from "wrong response dropped
+			// earlier."
+			recordDebugTagAt(lvl.Error, tagSessionVRPCIDMismatch)
 			return tagErr(StateServerResult,
 				fmt.Errorf("internal: response RpcId %d does not match request RpcId %d", res.resp.RpcId, rpc.id))
 		}
@@ -247,9 +254,23 @@ func (s *Session) recordCtxDone(ctx context.Context, rpc *vrpcImpl, method strin
 // handleVRPCResponse delivers a server VirtualRpcResponse to the waiting
 // Invoke caller, if any.
 func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
+	// A vRPC response is only expected while the session is Ready or
+	// Closing (drain window). Any other state means either a bug in
+	// state tracking or a server retransmit after teardown — drop.
+	st := s.State()
+	if !assertDebugTagf(st == StateReady || st == StateClosing, tagSessionVRPCResponseWrongState,
+		"vRPC response for rpc_id=%d arrived in state %s", resp.RpcId, st) {
+		return
+	}
 	rpc := s.activeRPC.Load()
-	if rpc == nil || rpc.id != resp.RpcId {
-		s.debugf("dropping VirtualRpcResponse for unknown rpc_id=%d", resp.RpcId)
+	if rpc == nil {
+		recordDebugTag(tagSessionVRPCUnknownID)
+		s.debugf("dropping VirtualRpcResponse for rpc_id=%d — no in-flight RPC tracked", resp.RpcId)
+		return
+	}
+	if rpc.id != resp.RpcId {
+		recordDebugTag(tagSessionVRPCIDMismatch)
+		s.debugf("dropping VirtualRpcResponse rpc_id=%d != in-flight rpc_id=%d", resp.RpcId, rpc.id)
 		return
 	}
 	s.okRpcs.Add(1)
@@ -259,9 +280,20 @@ func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
 // handleVRPCErrorResponse routes per-vRPC errors to the waiting caller.
 // Session-level errors (rpc_id == 0) are handled in handleSessionResponse.
 func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
+	st := s.State()
+	if !assertDebugTagf(st == StateReady || st == StateClosing, tagSessionVRPCResponseWrongState,
+		"vRPC error for rpc_id=%d arrived in state %s", errResp.RpcId, st) {
+		return
+	}
 	rpc := s.activeRPC.Load()
-	if rpc == nil || rpc.id != errResp.RpcId {
-		s.debugf("dropping ErrorResponse for unknown rpc_id=%d", errResp.RpcId)
+	if rpc == nil {
+		recordDebugTag(tagSessionVRPCErrorUnknownID)
+		s.debugf("dropping ErrorResponse for rpc_id=%d — no in-flight RPC tracked", errResp.RpcId)
+		return
+	}
+	if rpc.id != errResp.RpcId {
+		recordDebugTag(tagSessionVRPCIDMismatch)
+		s.debugf("dropping ErrorResponse rpc_id=%d != in-flight rpc_id=%d", errResp.RpcId, rpc.id)
 		return
 	}
 	s.errorRpcs.Add(1)

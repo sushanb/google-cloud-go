@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
@@ -61,8 +62,14 @@ func (s *Session) Start(ctx context.Context, req *spb.OpenSessionRequest) error 
 // every in-flight RPC. It is safe to call multiple times; only the first call
 // fires the tracer.recordClose and hooks.onClose callbacks.
 func (s *Session) ForceClose(req *spb.CloseSessionRequest) {
-	if _, ok := s.transitionTo(StateClosed, notState(StateClosed)); !ok {
+	prev, ok := s.transitionTo(StateClosed, notState(StateClosed))
+	if !ok {
 		return
+	}
+	if prev == StateNew {
+		// Force-closing a NEW session means the pool decided to tear us
+		// down before Start ran — a bookkeeping oddity worth flagging.
+		recordDebugTag(tagSessionForceCloseNeverStarted)
 	}
 
 	// ForceClose skips the Ready → Closing transition (goes straight to
@@ -241,6 +248,7 @@ func (s *Session) handleSessionResponse(resp *spb.SessionResponse) {
 	case *spb.SessionResponse_SessionRefreshConfig:
 		s.handleSessionRefreshConfig(p.SessionRefreshConfig)
 	default:
+		recordDebugTag(tagSessionUnknownResponse)
 		s.debugf("received SessionResponse with unknown payload type %T", p)
 		return
 	}
@@ -256,7 +264,13 @@ func (s *Session) handleSessionResponse(resp *spb.SessionResponse) {
 // sees a session whose PeerInfo (and therefore AfeID) is populated. This
 // matches Java's onHeaders synchrony.
 func (s *Session) handleOpenSession(_ *spb.OpenSessionResponse) {
-	if _, ok := s.transitionTo(StateReady, isState(StateStarting)); !ok {
+	if prev, ok := s.transitionTo(StateReady, isState(StateStarting)); !ok {
+		// Server confirmed OpenSession while we were in a state that
+		// couldn't accept it (already Ready, Closing, or Closed).
+		// Either the server sent a duplicate confirmation or we raced
+		// with a local teardown — both are bookkeeping oddities.
+		recordDebugTag(tagSessionOpenWrongState)
+		s.debugf("handleOpenSession in wrong state %s (want Starting)", prev)
 		return
 	}
 	if md, err := s.stream.Header(); err == nil {
@@ -337,7 +351,20 @@ func (s *Session) handleSessionRefreshConfig(cfg *spb.SessionRefreshConfig) {
 //
 // A late-arriving GOAWAY from an already terminal session is ignored.
 func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
+	// Sanity-check state BEFORE attempting the transition: GOAWAY landing
+	// on a NEW session is a protocol oddity (server shouldn't send GOAWAY
+	// before the session is Started). The current predicate below would
+	// silently accept it; the assert makes it observable.
+	preState := s.State()
+	if !assertDebugTagf(preState >= StateStarting, tagSessionGoawayBeforeStart,
+		"GOAWAY arrived while session was in %s (want >= Starting)", preState) {
+		return
+	}
 	if _, ok := s.transitionTo(StateClosing, notState(StateClosing, StateWaitServerClose, StateClosed)); !ok {
+		// Session is already terminal (Closing, WaitServerClose, or
+		// Closed). A late GOAWAY here just races our local teardown —
+		// observable but harmless.
+		recordDebugTag(tagSessionGoawayAfterClose)
 		return
 	}
 	// Fire onClosing immediately so the pool can pull this session out of
@@ -385,6 +412,13 @@ func (s *Session) handleClose(err error) {
 	s.notifyClosing()
 	reason := streamEndReason(err)
 	s.setCloseReason(reason)
+	// After setCloseReason (CompareAndSwap-once), the *final* reason may
+	// be an earlier stamp (GoAway / MissedHeartbeat / Error) or the
+	// streamEndReason we just computed. Only flag as abnormal when the
+	// final reason is a StreamEnd category that isn't a clean shutdown.
+	if isAbnormalCloseReason(s.CloseReason()) {
+		recordDebugTag(tagSessionAbnormalClose)
+	}
 	inFlight := 0
 	if s.activeRPC.Load() != nil {
 		inFlight = 1
@@ -440,6 +474,23 @@ func streamEndReason(err error) string {
 		return "StreamEnd:" + st.Code().String()
 	}
 	return "StreamEnd:Other"
+}
+
+// isAbnormalCloseReason returns true when the recorded close reason
+// looks like something we did NOT initiate cleanly. Clean paths:
+// EOF (server graceful), Canceled (client teardown / ctx cancel), and
+// the explicit client-initiated reasons stamped by handleGoAway /
+// heartBeatLoop / handleErrorResponse. Anything else — a StreamEnd
+// tagged with a transport-failure code, or the bare "StreamEnd" that
+// indicates Recv returned nil (which shouldn't happen) — is abnormal
+// and worth flagging.
+func isAbnormalCloseReason(reason string) bool {
+	switch reason {
+	case "StreamEnd:EOF", "StreamEnd:Canceled",
+		"GoAway", "MissedHeartbeat", "Error", "":
+		return false
+	}
+	return strings.HasPrefix(reason, "StreamEnd")
 }
 
 // resetHeartbeatDeadline pushes out the watchdog to (3 * heartbeatInterval)
@@ -499,6 +550,7 @@ func (s *Session) heartBeatLoop(ctx context.Context) {
 			// active > 0 and deadline elapsed — half-dead stream (no frames
 			// arriving while we have in-flight work). Log before ForceClose
 			// so we have a definitive marker even if downstream cancel races.
+			recordDebugTag(tagSessionHeartbeatMissed)
 			s.debugf("heartbeat MISSED — forcing close in_flight=%d last_frame_age=%v interval=%v",
 				active, lastFrameAge, interval)
 			s.recordEvent("hb-missed", "in_flight=%d last_frame_age=%v interval=%v",

@@ -316,6 +316,12 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 				atomic.AddInt64(&idle.picks, 1)
 				return idle, nil
 			}
+			// Picker said this AFE had a ready session but by the time
+			// we tried to check one out it was gone — a lost race
+			// against another CheckoutSession or an OnClosing eviction.
+			// Legitimate under concurrency; the counter tells us how
+			// often it's actually hurting throughput.
+			recordDebugTag(tagSessionPoolPickLostRace)
 		}
 
 		// Slow path: picker returned nil. Java-parity — no dead-sweep

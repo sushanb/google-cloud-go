@@ -185,6 +185,10 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 		go func() {
 			defer wg.Done()
 			if err := p.createSession(ctx); err != nil {
+				// A scale-up attempt failed — the pool wanted `delta`
+				// more sessions and got fewer. Every failure is a tag
+				// so the count IS the "scale-ups we lost" gauge.
+				recordDebugTag(tagSessionPoolCreateFailed)
 				btopt.Debugf(nil, "POOL %s PerformScaling createSession failed: %v", p.poolName, err)
 			} else {
 				launched.Add(1)

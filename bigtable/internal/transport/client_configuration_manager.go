@@ -496,6 +496,10 @@ func (m *ClientConfigurationManager) poll(ctx context.Context) {
 	}
 
 	if err != nil {
+		// One tag per exhausted-retry poll failure. Not per-attempt —
+		// intermediate retries are noisy and already visible in the
+		// per-attempt log lines above.
+		recordDebugTag(tagClientConfigPollFailed)
 		btopt.Debugf(m.logger, "bigtable: failed to poll client configuration: %v", err)
 		m.mu.Lock()
 		m.lastErr = err

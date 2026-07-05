@@ -76,6 +76,10 @@ func (p *SessionPoolImpl) sweepStuckSessions() {
 	}
 
 	for _, v := range victims {
+		// One tag per swept victim — the count IS the "stuck sessions
+		// per minute" gauge. Server that responsibly EOFed the stream
+		// after our CloseSession never triggers this.
+		recordDebugTag(tagSessionPoolStuckSessionSwept)
 		btopt.Debugf(nil, "POOL %s sweepStuckSessions: force-closing %s stuck in WaitServerClose for %v",
 			p.poolName, v.sess.LogName(), v.stuckFor.Round(time.Second))
 		v.sess.ForceClose(&spb.CloseSessionRequest{
@@ -201,6 +205,13 @@ func (p *SessionPoolImpl) Close() error {
 	// fire — Session.Close itself selects on its ctx and ForceCloses on
 	// expiry, so the WaitGroup will unblock either way).
 	wg.Wait()
+	if closeCtx.Err() != nil {
+		// Wait unblocked because the 30s bound expired — at least one
+		// session's graceful drain didn't complete and got ForceClosed
+		// as a result. Meaningfully different signal from a clean pool
+		// teardown, so it gets its own tag.
+		recordDebugTag(tagSessionPoolDrainTimeout)
+	}
 
 	// Phase 4: cancel poolCtx to bring down any lingering session goroutines
 	// (readLoop/heartBeatLoop supervisors) that were started from this pool.
