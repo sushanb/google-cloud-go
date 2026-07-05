@@ -48,7 +48,6 @@ type Client struct {
 	retryOption                gax.CallOption
 	executeQueryRetryOption    gax.CallOption
 	featureFlagsMD             metadata.MD // Pre-computed feature flags metadata to be sent with each request.
-	configManager              *btransport.ClientConfigurationManager
 	sessionMgr                 *SessionManager
 	diverter                   *btransport.Diverter
 	config                     ClientConfig
@@ -217,21 +216,14 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 	}
 	c.backgroundCtx, c.backgroundCancel = context.WithCancel(context.Background())
 
+	// configMD carries the resource-prefix + request-params headers on
+	// every GetClientConfiguration poll — built here (not in SessionManager)
+	// because it references Client-scoped helpers. SessionManager consumes
+	// it when it constructs its internal configManager.
 	configMD := metadata.Join(metadata.Pairs(
 		resourcePrefixHeader, c.fullInstanceName(),
 		requestParamsHeader, c.reqParamsHeaderValInstance(),
 	), c.featureFlagsMD)
-
-	configManager := btransport.NewClientConfigurationManager(btClient, c.fullInstanceName(), config.AppProfile, configMD, nil)
-	configManager.Start(ctx)
-	c.configManager = configManager
-
-	// Pump server-driven SessionLoad into the Diverter so the classic/session
-	// traffic split honors the control plane's choice. NewDiverter(1.0) above
-	// is the bootstrap default; the first successful poll replaces it.
-	configManager.AddSessionLoadListener(func(load float64) {
-		c.diverter.SetSessionLoad(load)
-	})
 
 	c.sessionMgr = NewSessionManager(
 		config.EnableSessionPool,
@@ -239,7 +231,10 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		disableRetryInfo,
 		directAccessMD,
 		c.diverter,
-		configManager,
+		sessionClient,
+		c.fullInstanceName(),
+		config.AppProfile,
+		configMD,
 		c.backgroundCtx,
 		config.SessionPoolMin,
 		config.SessionPoolMax,
@@ -253,12 +248,13 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 // Close closes the Client.
 //
 // Shutdown order:
-//  1. SessionManager.Close — drain in-flight session work and stop new acquisitions.
-//  2. ClientConfigurationManager.Close — stop polling so it cannot fire UpdateConfig
-//     against pools that are about to be torn down.
-//  3. backgroundCancel — release any goroutines tied to the client's background ctx.
-//  4. metricsTracerFactory.shutdown — flush metrics now that no further RPCs will run.
-//  5. classicPool.Close — finally tear down the underlying connection pool.
+//  1. SessionManager.Close — stops the internal ClientConfigurationManager
+//     first (so no UpdateConfig fires against pools about to be torn
+//     down), then drains in-flight session work and closes the session
+//     channel pool.
+//  2. backgroundCancel — release any goroutines tied to the client's background ctx.
+//  3. metricsTracerFactory.shutdown — flush metrics now that no further RPCs will run.
+//  4. classicPool.Close — finally tear down the underlying connection pool.
 func (c *Client) Close() error {
 	fmt.Printf("Closing the client for project %s and instance %s\n", c.project, c.instance)
 	var errs []error
@@ -266,9 +262,6 @@ func (c *Client) Close() error {
 		if err := c.sessionMgr.Close(); err != nil {
 			errs = append(errs, err)
 		}
-	}
-	if c.configManager != nil {
-		c.configManager.Close()
 	}
 	if c.backgroundCancel != nil {
 		c.backgroundCancel()

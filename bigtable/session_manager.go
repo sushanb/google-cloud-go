@@ -59,14 +59,28 @@ type SessionManager struct {
 	channelPool       managedChannelPool
 }
 
-// NewSessionManager creates a new SessionManager.
+// NewSessionManager creates a new SessionManager. When
+// `enableSessionPool` is true, it owns and drives the
+// ClientConfigurationManager — polling GetClientConfiguration over the
+// session channel pool (`sessionClient`), starting it against
+// `backgroundCtx`, and wiring the SessionLoad → Diverter feedback
+// loop. When `enableSessionPool` is false, no config polling happens
+// (there'd be nothing to configure); callers of ConfigManager get nil
+// back.
+//
+// `sessionClient` MUST have been built against the same channel pool
+// passed as `channelPool` — session pool sessions and config polls
+// then share transport, matching the planned NewSessionClient design.
 func NewSessionManager(
 	enableSessionPool bool,
 	metricsEnabled bool,
 	disableRetryInfo bool,
 	featureFlagsMD metadata.MD,
 	diverter *btransport.Diverter,
-	configManager *btransport.ClientConfigurationManager,
+	sessionClient btpb.BigtableClient,
+	instanceName string,
+	appProfile string,
+	configMD metadata.MD,
 	backgroundCtx context.Context,
 	minSessions int,
 	maxSessions int,
@@ -76,19 +90,42 @@ func NewSessionManager(
 	if metricsEnabled && meterProvider != nil {
 		_ = btransport.InitializeSessionMetrics(meterProvider)
 	}
-	return &SessionManager{
+	m := &SessionManager{
 		enableSessionPool: enableSessionPool,
 		metricsEnabled:    metricsEnabled,
 		disableRetryInfo:  disableRetryInfo,
 		featureFlagsMD:    featureFlagsMD,
 		diverter:          diverter,
-		configManager:     configManager,
 		backgroundCtx:     backgroundCtx,
 		sessionPools:      make(map[string]*managedPool),
 		minSessions:       minSessions,
 		maxSessions:       maxSessions,
 		channelPool:       channelPool,
 	}
+	// Only spin up config polling when a session pool exists to consume
+	// its updates. `sessionClient == nil` is a belt-and-braces guard: we
+	// require both a truthy flag AND a real stub so a caller that
+	// mis-wires won't panic on a nil poll.
+	if enableSessionPool && sessionClient != nil {
+		m.configManager = btransport.NewClientConfigurationManager(
+			sessionClient, instanceName, appProfile, configMD, nil,
+		)
+		m.configManager.Start(backgroundCtx)
+		// SessionLoad drives the classic/session traffic split via the
+		// Diverter. The listener used to live in NewClient; moved here
+		// because the config manager it consumes now lives here too.
+		m.configManager.AddSessionLoadListener(func(load float64) {
+			diverter.SetSessionLoad(load)
+		})
+	}
+	return m
+}
+
+// ConfigManager returns the internal ClientConfigurationManager for
+// external debug consumers (ConfigDebug). Nil when session pool is
+// disabled — callers must handle that.
+func (m *SessionManager) ConfigManager() *btransport.ClientConfigurationManager {
+	return m.configManager
 }
 
 // channelChannelPool returns the SessionManager's underlying
@@ -160,10 +197,21 @@ func (m *SessionManager) LoadBalancingSnapshots() []btransport.LoadBalancingSnap
 	return out
 }
 
-// Close closes all session pools managed by the SessionManager.
+// Close tears down everything the SessionManager owns, in the order
+// that keeps late callbacks from firing against half-dead pools:
+//
+//  1. Stop config polling (configManager.Close) — blocks until any
+//     in-flight poll and its listener callbacks return. After this no
+//     UpdateConfig fires, so the SessionPool teardown below cannot
+//     race a late server-driven config update.
+//  2. Close every session pool (per-pool listeners already detached).
+//  3. Close the underlying channel pool.
 func (m *SessionManager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.configManager != nil {
+		m.configManager.Close()
+	}
 	for _, mp := range m.sessionPools {
 		if mp.unregister != nil {
 			mp.unregister()

@@ -69,7 +69,10 @@ func TestSessionManager_GetOrCreateSessionPool_MarshalErrorReturnsClassicFallbac
 		true,  // disableRetryInfo
 		nil,   // featureFlagsMD
 		diverter,
-		nil, // configManager
+		nil, // sessionClient (nil skips config manager construction)
+		"",  // instanceName
+		"",  // appProfile
+		nil, // configMD
 		context.Background(),
 		1, 10,
 		nil, // meterProvider

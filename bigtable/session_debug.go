@@ -81,13 +81,18 @@ type ConfigDebugProvider interface {
 }
 
 // ConfigDebug returns a ConfigDebugProvider for this Client. Returns nil
-// when the client was constructed without a configuration manager (i.e.
-// before NewClientWithConfig wired one up).
+// when session pool is disabled (no configuration manager is constructed
+// in that mode — nothing to configure) or when NewClientWithConfig hasn't
+// wired the SessionManager yet.
 func (c *Client) ConfigDebug() ConfigDebugProvider {
-	if c.configManager == nil {
+	if c.sessionMgr == nil {
 		return nil
 	}
-	return configDebugAdapter{mgr: c.configManager}
+	mgr := c.sessionMgr.ConfigManager()
+	if mgr == nil {
+		return nil
+	}
+	return configDebugAdapter{mgr: mgr}
 }
 
 type configDebugAdapter struct {
