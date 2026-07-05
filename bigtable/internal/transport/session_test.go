@@ -891,8 +891,6 @@ func TestSessionAfeID(t *testing.T) {
 // --- peerInfoExtracter -------------------------------------------------------
 
 func TestPeerInfoExtracter_ParsesValidHeader(t *testing.T) {
-	s := newTestSession(t, newFakeStream(), SessionHooks{})
-
 	pi := &spb.PeerInfo{
 		ApplicationFrontendSubzone: "us-central1-a",
 		TransportType:              spb.PeerInfo_TRANSPORT_TYPE_DIRECT_ACCESS,
@@ -901,19 +899,31 @@ func TestPeerInfoExtracter_ParsesValidHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proto.Marshal: %v", err)
 	}
-	encoded := base64.RawURLEncoding.EncodeToString(raw)
-
-	s.peerInfoExtracter([]string{encoded})
-
-	got := s.PeerInfo()
-	if got == nil {
-		t.Fatal("PeerInfo nil after extraction")
+	// Server uses URL-safe base64. Java's Base64.getUrlEncoder() emits
+	// padded output; RawURLEncoding emits unpadded. Extracter must
+	// accept both — the padded case is what live traffic sends.
+	cases := []struct {
+		name    string
+		encoded string
+	}{
+		{"raw_url_unpadded", base64.RawURLEncoding.EncodeToString(raw)},
+		{"url_padded", base64.URLEncoding.EncodeToString(raw)},
 	}
-	if got.GetApplicationFrontendSubzone() != "us-central1-a" {
-		t.Errorf("AFE = %q, want us-central1-a", got.GetApplicationFrontendSubzone())
-	}
-	if got.GetTransportType() != spb.PeerInfo_TRANSPORT_TYPE_DIRECT_ACCESS {
-		t.Errorf("TransportType = %v, want DIRECT_ACCESS", got.GetTransportType())
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestSession(t, newFakeStream(), SessionHooks{})
+			s.peerInfoExtracter([]string{tc.encoded})
+			got := s.PeerInfo()
+			if got == nil {
+				t.Fatal("PeerInfo nil after extraction")
+			}
+			if got.GetApplicationFrontendSubzone() != "us-central1-a" {
+				t.Errorf("AFE = %q, want us-central1-a", got.GetApplicationFrontendSubzone())
+			}
+			if got.GetTransportType() != spb.PeerInfo_TRANSPORT_TYPE_DIRECT_ACCESS {
+				t.Errorf("TransportType = %v, want DIRECT_ACCESS", got.GetTransportType())
+			}
+		})
 	}
 }
 

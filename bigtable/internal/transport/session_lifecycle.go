@@ -565,29 +565,16 @@ func (s *Session) heartBeatLoop(ctx context.Context) {
 }
 
 // peerInfoExtracter parses the base64-encoded peer info header and caches
-// the decoded PeerInfo on the session.
+// the decoded PeerInfo on the session. Server emits URL-safe base64
+// (matches java-bigtable's Base64.getUrlDecoder()); trailing '=' padding
+// is stripped so a single RawURLEncoding decoder handles both shapes.
 func (s *Session) peerInfoExtracter(peerInfoData []string) {
 	if len(peerInfoData) == 0 {
 		return
 	}
-	encodings := []*base64.Encoding{
-		base64.RawURLEncoding,
-		base64.StdEncoding,
-		base64.RawStdEncoding,
-	}
-	var decoded []byte
-	var lastErr error
-	for _, enc := range encodings {
-		d, err := enc.DecodeString(peerInfoData[0])
-		if err == nil {
-			decoded = d
-			lastErr = nil
-			break
-		}
-		lastErr = err
-	}
-	if lastErr != nil {
-		s.debugf("decode base64 PeerInfo failed: %v", lastErr)
+	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(peerInfoData[0], "="))
+	if err != nil {
+		s.debugf("decode base64 PeerInfo failed: %v", err)
 		return
 	}
 	var peerInfo spb.PeerInfo
