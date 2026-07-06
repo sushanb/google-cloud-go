@@ -42,6 +42,7 @@ import (
 	"net/http"
 	"time"
 
+	"cloud.google.com/go/bigtable"
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"cloud.google.com/go/bigtable/debugview"
 	"cloud.google.com/go/bigtable/internal/metrics"
@@ -86,12 +87,20 @@ func main() {
 
 	fullInstance := fmt.Sprintf("projects/%s/instances/%s", *project, *instance)
 
+	// TCP stats collector — installed via a grpc.WithContextDialer
+	// interceptor at dial time. Since this SessionClient builds its own
+	// channel pool, we plumb tcpStats.ClientOption() into the pool's
+	// dialOpts. debugview.Handler then renders /tcpz/ against the same
+	// collector.
+	tcpStats := bigtable.NewTCPStats()
+
 	// gRPC dial options — standard Bigtable data-plane options. In
 	// production you'd add credentials, user-agent, keepalive, etc.
 	dialOpts := []option.ClientOption{
 		option.WithEndpoint(*endpoint),
 		option.WithGRPCConnectionPool(*poolSize),
 		internaloption.EnableDirectPath(false), // this demo skips DirectPath
+		tcpStats.ClientOption(),                // wire TCP stats collector
 	}
 
 	dial := func() (*btransport.BigtableConn, error) {
@@ -156,18 +165,20 @@ func main() {
 	// (compile-time-checked in debugview/handler_iface_test.go), so
 	// no adapter is needed. Same shape as passing *bigtable.Client.
 	//
-	// tcpStats is nil here; pass a real *bigtable.TCPStats to populate
-	// /debug/tcpz/.
+	// tcpStats is the same collector we wired into dialOpts above —
+	// /debug/tcpz/ renders the per-conn TCP_INFO for every conn the
+	// session pool opened.
 	//
 	// -------------------------------------------------------------------
 	mux := http.NewServeMux()
 	mux.Handle("/debug/", http.StripPrefix("/debug",
-		debugview.Handler(sc, nil)))
+		debugview.Handler(sc, tcpStats)))
 
 	addr := fmt.Sprintf(":%d", *port)
 	log.Printf("sessionclientz-demo listening on http://localhost%s/debug/", addr)
 	log.Printf("  channelz shows one pool (Role=session).")
 	log.Printf("  sessionz Diverter block is empty (no classic/session split in a session-only client).")
+	log.Printf("  tcpz shows one row per open TCP conn (RTT, retrans, PMTU, ...).")
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("http.ListenAndServe: %v", err)
 	}
