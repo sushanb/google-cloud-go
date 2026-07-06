@@ -195,18 +195,6 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 	}
 	btClient := btpb.NewBigtableClient(classicManaged.pool)
 
-	var sessionManaged managedChannelPool
-	var sessionStub btpb.BigtableClient
-	if config.EnableSessionPool {
-		var sessionErr error
-		sessionManaged, sessionErr = createAndStartManagedChannelPool(ctx, project, instance, config, metricsTracerFactory, o, directPathOptions, directAccessMD, clientCreationTimestamp, enableBigtableConnPool)
-		if sessionErr != nil {
-			classicManaged.Close()
-			return nil, fmt.Errorf("failed to create dedicated session pool: %w", sessionErr)
-		}
-		sessionStub = btpb.NewBigtableClient(sessionManaged.pool)
-	}
-
 	c := &Client{
 		classicPool:             classicManaged,
 		client:                  btClient,
@@ -224,33 +212,22 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 	}
 	c.backgroundCtx, c.backgroundCancel = context.WithCancel(context.Background())
 
-	// SessionClient owns the session channel pool, the gRPC stub built
-	// on top of it, and the ClientConfigurationManager. Only constructed
-	// when EnableSessionPool is set; nil sessionImpl means the shim
-	// bypasses to classic-only routing.
+	// SessionClient owns the session channel pool, the gRPC stub, the
+	// metrics factory, and the ClientConfigurationManager end-to-end.
+	// Only constructed when EnableSessionPool is set; nil sessionImpl
+	// means the shim bypasses to classic-only routing.
+	//
+	// The diverter listener is registered post-construction — SessionClient
+	// itself has no notion of a classic path to divert away from; that's
+	// this Client's concern.
 	if config.EnableSessionPool {
-		configMD := metadata.Join(metadata.Pairs(
-			resourcePrefixHeader, c.fullInstanceName(),
-			requestParamsHeader, c.reqParamsHeaderValInstance(),
-		), c.featureFlagsMD)
-		c.sessionImpl = session.NewSessionClient(
-			sessionManaged,
-			sessionStub,
-			metricsTracerFactory,
-			session.Config{
-				Project:             project,
-				Instance:            instance,
-				AppProfile:          config.AppProfile,
-				FeatureFlagsMD:      directAccessMD,
-				ConfigMD:            configMD,
-				MetricsEnabled:      metricsTracerFactory.Enabled,
-				DisableRetryInfo:    disableRetryInfo,
-				MinSessions:         config.SessionPoolMin,
-				MaxSessions:         config.SessionPoolMax,
-				SessionLoadListener: c.diverter.SetSessionLoad,
-				BackgroundCtx:       c.backgroundCtx,
-			},
-		)
+		sc, sessionErr := session.NewSessionClient(ctx, project, instance, config.AppProfile, config.MetricsProvider, o...)
+		if sessionErr != nil {
+			classicManaged.Close()
+			return nil, fmt.Errorf("failed to create session client: %w", sessionErr)
+		}
+		sc.AddSessionLoadListener(c.diverter.SetSessionLoad)
+		c.sessionImpl = sc
 	}
 
 	return c, nil

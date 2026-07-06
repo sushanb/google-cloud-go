@@ -103,6 +103,14 @@ type SessionClient interface {
 	ChannelDebug() btransport.ChannelDebugProvider
 	ConfigDebug() btransport.ConfigDebugProvider
 
+	// AddSessionLoadListener registers a listener invoked every time
+	// the server-driven ClientConfigurationManager reports a new
+	// session-load ratio (0.0 = classic-only, 1.0 = session-only).
+	// Returns an unregister thunk. Used by mixed-mode bigtable.Client
+	// to feed its Diverter; standalone SessionClient callers can
+	// ignore this method.
+	AddSessionLoadListener(func(load float64)) func()
+
 	// Close closes the underlying channel pool. SessionTableApi
 	// instances previously vended become unusable.
 	Close() error

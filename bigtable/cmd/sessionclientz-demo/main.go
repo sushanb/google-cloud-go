@@ -20,7 +20,7 @@
 //
 // Not a supported public API: this lives inside the bigtable module
 // specifically so it can import cloud.google.com/go/bigtable/internal/*.
-// The eventual public bigtable.SessionClient wrapper is what external
+// The eventual public bigtable.NewSessionClient wrapper is what external
 // callers will use; this demo is the internal-module equivalent.
 //
 // Usage:
@@ -45,14 +45,9 @@ import (
 	"cloud.google.com/go/bigtable"
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"cloud.google.com/go/bigtable/debugview"
-	"cloud.google.com/go/bigtable/internal/metrics"
-	btopt "cloud.google.com/go/bigtable/internal/option"
 	"cloud.google.com/go/bigtable/internal/session"
-	btransport "cloud.google.com/go/bigtable/internal/transport"
 
 	"google.golang.org/api/option"
-	"google.golang.org/api/option/internaloption"
-	gtransport "google.golang.org/api/transport/grpc"
 )
 
 var (
@@ -73,102 +68,38 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// -------------------------------------------------------------------
-	// 1. Build the four inputs session.NewSessionClient needs.
-	// -------------------------------------------------------------------
-	//
-	//   sc := session.NewSessionClient(pool, stub, factory, cfg)
-	//
-	// pool    — btransport.ChannelPool (interface, satisfied by *BigtableChannelPool)
-	// stub    — btpb.BigtableClient (built by btpb.NewBigtableClient on the pool)
-	// factory — *metrics.Factory (NoopMetricsProvider disables telemetry)
-	// cfg     — session.Config (project/instance/app-profile + BackgroundCtx)
-	// -------------------------------------------------------------------
-
-	fullInstance := fmt.Sprintf("projects/%s/instances/%s", *project, *instance)
-
-	// TCP stats collector — installed via a grpc.WithContextDialer
-	// interceptor at dial time. Since this SessionClient builds its own
-	// channel pool, we plumb tcpStats.ClientOption() into the pool's
-	// dialOpts. debugview.Handler then renders /tcpz/ against the same
-	// collector.
+	// TCP stats collector — installed via grpc.WithContextDialer at dial
+	// time. Passed both into the SessionClient's dial opts (so its pool
+	// gets captured) and into debugview.Handler (so /tcpz/ can render).
 	tcpStats := bigtable.NewTCPStats()
 
-	// gRPC dial options — standard Bigtable data-plane options. In
-	// production you'd add credentials, user-agent, keepalive, etc.
 	dialOpts := []option.ClientOption{
 		option.WithEndpoint(*endpoint),
 		option.WithGRPCConnectionPool(*poolSize),
-		internaloption.EnableDirectPath(false), // this demo skips DirectPath
-		tcpStats.ClientOption(),                // wire TCP stats collector
+		tcpStats.ClientOption(),
 	}
 
-	dial := func() (*btransport.BigtableConn, error) {
-		grpcConn, err := gtransport.Dial(ctx, dialOpts...)
-		if err != nil {
-			return nil, err
-		}
-		return btransport.NewBigtableConn(grpcConn), nil
-	}
-
-	// A single ChannelPrimer shared for both the pool's connection
-	// factory and (unused here) the DirectAccessChecker — keeps the
-	// exact PingAndWarm invocation in one place.
-	primer := btransport.NewPingAndWarmChannelPrimer(fullInstance, *appProf, nil)
-
-	pool, err := btransport.NewBigtableChannelPool(
-		ctx,
-		*poolSize,
-		btopt.BigtableLoadBalancingStrategy(),
-		dial,
-		time.Now(),
-		btransport.WithInstanceName(fullInstance),   // for channelz identity
-		btransport.WithAppProfile(*appProf),         // for channelz identity
-		btransport.WithChannelPrimer(primer),        // PingAndWarm on each new conn
-		btransport.WithDirectAccessChecker(          // required, even when off
-			btransport.NewDisabledDirectAccessChecker(nil, nil)),
-	)
+	// -------------------------------------------------------------------
+	// One-line SessionClient construction. Builds the channel pool, the
+	// gRPC stub, the metrics factory, and the ClientConfigurationManager
+	// internally. Pass nil MetricsProvider for default (enabled) metrics;
+	// bigtable.NoopMetricsProvider{} to disable.
+	// -------------------------------------------------------------------
+	sc, err := session.NewSessionClient(ctx, *project, *instance, *appProf, nil, dialOpts...)
 	if err != nil {
-		log.Fatalf("NewBigtableChannelPool: %v", err)
+		log.Fatalf("session.NewSessionClient: %v", err)
 	}
-	defer pool.Close()
-
-	stub := btpb.NewBigtableClient(pool)
-
-	factory, err := metrics.NewFactory(ctx, *project, *instance, *appProf,
-		metrics.NoopMetricsProvider{}) // demo — no metrics export
-	if err != nil {
-		log.Fatalf("metrics.NewFactory: %v", err)
-	}
-
-	sc := session.NewSessionClient(pool, stub, factory, session.Config{
-		Project:       *project,
-		Instance:      *instance,
-		AppProfile:    *appProf,
-		BackgroundCtx: ctx, // cancel with the main ctx so background loops unwind
-	})
 	defer sc.Close()
 
-	// -------------------------------------------------------------------
-	// 2. Drive some traffic so sessionz has something to show.
-	// -------------------------------------------------------------------
+	// Drive some traffic so sessionz / loadz have live data to render.
 	tbl := sc.OpenSessionTable(*table)
 	defer tbl.Close()
-
 	go driveTraffic(ctx, tbl)
 
 	// -------------------------------------------------------------------
-	// 3. Mount debugview.Handler against the SessionClient directly.
-	// -------------------------------------------------------------------
-	//
-	// This is the one-line ask — sc satisfies debugview.DebugProviders
-	// (compile-time-checked in debugview/handler_iface_test.go), so
-	// no adapter is needed. Same shape as passing *bigtable.Client.
-	//
-	// tcpStats is the same collector we wired into dialOpts above —
-	// /debug/tcpz/ renders the per-conn TCP_INFO for every conn the
-	// session pool opened.
-	//
+	// Mount debugview.Handler against the SessionClient directly. sc
+	// satisfies debugview.DebugProviders (compile-time-checked in
+	// debugview/handler_iface_test.go) — no adapter needed.
 	// -------------------------------------------------------------------
 	mux := http.NewServeMux()
 	mux.Handle("/debug/", http.StripPrefix("/debug",

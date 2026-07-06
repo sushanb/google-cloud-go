@@ -16,6 +16,7 @@ package session
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"sort"
@@ -26,8 +27,12 @@ import (
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"cloud.google.com/go/bigtable/internal/metrics"
+	btopt "cloud.google.com/go/bigtable/internal/option"
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 	otelmetric "go.opentelemetry.io/otel/metric"
+	"google.golang.org/api/option"
+	"google.golang.org/api/option/internaloption"
+	gtransport "google.golang.org/api/transport/grpc"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
@@ -45,6 +50,17 @@ const (
 	defaultMinSessions = 10
 	defaultMaxSessions = 100
 )
+
+// defaultChannelPoolSize matches bigtable.defaultBigtableConnPoolSize
+// (10) — the fallback used when neither the caller-supplied
+// option.WithGRPCConnectionPool nor an internaloption resolver produces
+// a size.
+const defaultChannelPoolSize = 10
+
+// featureFlagsHeaderKey mirrors the bigtable package constant of the
+// same name — duplicated because internal/session can't import
+// bigtable (import cycle).
+const featureFlagsHeaderKey = "bigtable-features"
 
 // ChannelPool is the narrow surface sessionClient needs from the
 // managed channel pool it owns. Satisfied by
@@ -103,24 +119,146 @@ type managedPool struct {
 // sessionClient is the internal implementation of the SessionClient
 // interface. Owns the channel pool + gRPC stub + configuration
 // manager, and vends per-resource SessionTableApi instances.
+//
+// The channel pool + stub + metrics factory are OWNED — Close() closes
+// all three. backgroundCancel unwinds every per-pool goroutine parented
+// on the internally-created background ctx.
 type sessionClient struct {
-	cfg            Config
-	channelPool    ChannelPool
-	stub           btpb.BigtableClient
-	metricsFactory *metrics.Factory
-	configManager  *btransport.ClientConfigurationManager
+	cfg              Config
+	channelPool      ChannelPool
+	stub             btpb.BigtableClient
+	metricsFactory   *metrics.Factory
+	configManager    *btransport.ClientConfigurationManager
+	backgroundCancel context.CancelFunc // release when Close() runs
 
 	poolsMu    sync.Mutex
 	pools      map[string]*managedPool
 	nextPoolID atomic.Uint64
 }
 
-// NewSessionClient constructs a sessionClient. The channel pool is
-// OWNED — closing sessionClient closes the pool. The stub is expected
-// to have been built against the same channel pool. metricsFactory
-// may be nil to disable per-attempt metrics; the SessionClient still
-// works but sessionTable will skip tracer construction.
-func NewSessionClient(channelPool ChannelPool, stub btpb.BigtableClient, metricsFactory *metrics.Factory, cfg Config) SessionClient {
+// NewSessionClient constructs a standalone SessionClient. It owns the
+// underlying channel pool, gRPC stub, metrics factory, and background
+// goroutines end-to-end — Close() unwinds all four.
+//
+// The metricsProvider argument mirrors bigtable.ClientConfig.MetricsProvider
+// (nil = built-in metrics enabled, NoopMetricsProvider{} = disabled).
+// opts are the standard google.api option.ClientOption values passed to
+// gtransport.Dial — endpoint, credentials, gRPC connection pool size,
+// etc.
+//
+// Pool sizing (MinSessions/MaxSessions) uses internal defaults (10/100);
+// override at runtime by responding to the server-driven
+// SessionClientConfiguration polls, which reshape live pools via
+// SessionPoolImpl.UpdateConfig.
+//
+// The load-balancing hook for a mixed-mode setup lives at
+// AddSessionLoadListener — call it after construction if you're
+// composing this SessionClient with a bigtable.Client Diverter.
+func NewSessionClient(
+	ctx context.Context,
+	project, instance, appProfile string,
+	metricsProvider metrics.MetricsProvider,
+	opts ...option.ClientOption,
+) (SessionClient, error) {
+	factory, err := metrics.NewFactory(ctx, project, instance, appProfile, metricsProvider)
+	if err != nil {
+		return nil, fmt.Errorf("session.NewSessionClient: metrics.NewFactory: %w", err)
+	}
+
+	// Feature-flag metadata carried on every Prime + GetClientConfiguration
+	// invocation. Mirrors bigtable.createFeatureFlagsMD(true, false, true) —
+	// duplicated to avoid an import cycle back into the bigtable package.
+	directAccessMD := buildFeatureFlagsMD(factory.Enabled, false /* disableRetryInfo */, true /* enableDirectAccess */)
+
+	// Resolve pool size from opts. Falls back to the default when the
+	// caller neither set option.WithGRPCConnectionPool nor provided an
+	// internaloption-aware resolver.
+	poolSize := resolveConnPoolSize(opts, defaultChannelPoolSize)
+
+	fullInstance := fmt.Sprintf("projects/%s/instances/%s", project, instance)
+
+	dial := func() (*btransport.BigtableConn, error) {
+		grpcConn, dialErr := gtransport.Dial(ctx, opts...)
+		if dialErr != nil {
+			return nil, dialErr
+		}
+		return btransport.NewBigtableConn(grpcConn), nil
+	}
+
+	// Direct-access dialer for the compatibility checker only — layers
+	// DirectPath enablement + ALTS hard-bound tokens on top of the
+	// caller's opts. The pool itself still uses the plain `dial` above
+	// (standard path); only the DAC's PingAndWarm probe uses this.
+	daDialOpts := append(append([]option.ClientOption{}, opts...),
+		internaloption.EnableDirectPath(true),
+		internaloption.EnableDirectPathXds(),
+		internaloption.AllowHardBoundTokens("ALTS"))
+	daDial := func() (*btransport.BigtableConn, error) {
+		grpcConn, dialErr := gtransport.Dial(ctx, daDialOpts...)
+		if dialErr != nil {
+			return nil, dialErr
+		}
+		return btransport.NewBigtableConn(grpcConn), nil
+	}
+
+	// No ChannelPrimer on the pool — session-based clients warm channels
+	// via their own OpenSession bidi streams (once a session pool opens
+	// on first ReadRow/MutateRow, its sessions do the warming). The
+	// DirectAccessChecker still needs a primer for its startup probe —
+	// inlined so it doesn't get mistaken for a pool-priming primer.
+	// Placeholder until getClientConfigDirectAccessChecker (fed by
+	// GetClientConfiguration) lands.
+	pool, err := btransport.NewBigtableChannelPool(
+		ctx,
+		poolSize,
+		btopt.BigtableLoadBalancingStrategy(),
+		dial,
+		time.Now(),
+		btransport.WithInstanceName(fullInstance),
+		btransport.WithAppProfile(appProfile),
+		btransport.WithMeterProvider(factory.OtelMeterProvider),
+		btransport.WithDirectAccessChecker(btransport.NewPingAndWarmDirectAccessChecker(
+			daDial,
+			btransport.NewPingAndWarmChannelPrimer(fullInstance, appProfile, directAccessMD),
+			factory.OtelMeterProvider,
+			nil,
+		)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("session.NewSessionClient: NewBigtableChannelPool: %w", err)
+	}
+
+	stub := btpb.NewBigtableClient(pool)
+
+	// Instance-scoped headers for GetClientConfiguration polls.
+	configMD := metadata.Join(metadata.Pairs(
+		resourcePrefixHeader, fullInstance,
+		requestParamsHeader, fmt.Sprintf("name=%s", url.QueryEscape(fullInstance)),
+	), directAccessMD)
+
+	backgroundCtx, cancel := context.WithCancel(context.Background())
+
+	sc := newSessionClientFromParts(pool, stub, factory, Config{
+		Project:          project,
+		Instance:         instance,
+		AppProfile:       appProfile,
+		FeatureFlagsMD:   directAccessMD,
+		ConfigMD:         configMD,
+		MetricsEnabled:   factory.Enabled,
+		DisableRetryInfo: false,
+		MinSessions:      defaultMinSessions,
+		MaxSessions:      defaultMaxSessions,
+		BackgroundCtx:    backgroundCtx,
+	})
+	sc.backgroundCancel = cancel
+	return sc, nil
+}
+
+// newSessionClientFromParts wires a sessionClient from already-built
+// pool + stub + factory + Config. Extracted from the old public
+// constructor so the new NewSessionClient can share the assembly path.
+// Unexported — no consumer outside this package should reach for it.
+func newSessionClientFromParts(channelPool ChannelPool, stub btpb.BigtableClient, metricsFactory *metrics.Factory, cfg Config) *sessionClient {
 	if cfg.MetricsEnabled && metricsFactory != nil {
 		_ = btransport.InitializeSessionMetrics(metricsFactory.OtelMeterProvider)
 	}
@@ -143,11 +281,57 @@ func NewSessionClient(channelPool ChannelPool, stub btpb.BigtableClient, metrics
 	return sc
 }
 
+// buildFeatureFlagsMD mirrors bigtable.createFeatureFlagsMD. Duplicated
+// (rather than exported+imported) to keep the internal/session package
+// free of a back-reference to the bigtable package.
+func buildFeatureFlagsMD(clientSideMetricsEnabled, disableRetryInfo, enableDirectAccess bool) metadata.MD {
+	ff := btpb.FeatureFlags{
+		RoutingCookie:            true,
+		ReverseScans:             true,
+		LastScannedRowResponses:  true,
+		ClientSideMetricsEnabled: clientSideMetricsEnabled,
+		RetryInfo:                !disableRetryInfo,
+		TrafficDirectorEnabled:   enableDirectAccess,
+		DirectAccessRequested:    enableDirectAccess,
+		SessionsCompatible:       true,
+		PeerInfo:                 true,
+	}
+	val := ""
+	if b, err := proto.Marshal(&ff); err == nil {
+		val = base64.URLEncoding.EncodeToString(b)
+	}
+	return metadata.Pairs(featureFlagsHeaderKey, val)
+}
+
+// resolveConnPoolSize walks opts for a caller-supplied gRPC connection
+// pool size, falling back to defaultChannelPoolSize when unavailable.
+// Mirrors the same-shaped logic in bigtable/channel_pool_factory.go.
+func resolveConnPoolSize(opts []option.ClientOption, fallback int) int {
+	uResolver, err := internaloption.NewUnsafeResolver(opts...)
+	if err != nil {
+		return fallback
+	}
+	if n := uResolver.ResolvedGRPCConnPoolSize(); n > 0 {
+		return n
+	}
+	return fallback
+}
+
 func (sc *sessionClient) MeterProvider() otelmetric.MeterProvider {
 	if sc.metricsFactory == nil {
 		return nil
 	}
 	return sc.metricsFactory.OtelMeterProvider
+}
+
+// AddSessionLoadListener forwards to the internal
+// ClientConfigurationManager. Returns a no-op unregister when no
+// manager is wired (stub == nil at construction).
+func (sc *sessionClient) AddSessionLoadListener(fn func(load float64)) func() {
+	if sc.configManager == nil {
+		return func() {}
+	}
+	return sc.configManager.AddSessionLoadListener(fn)
 }
 
 // MetricsFactory returns the *metrics.Factory the SessionClient was
@@ -231,11 +415,14 @@ func (sc *sessionClient) OpenMaterializedView(view string) SessionTableApi {
 	return newSessionTable(fullName, openRead, nil, btransport.READ_ROW_MAT_VIEW, nil, sc.perResourceMetadata(fullName, "materialized_view_name", fullName), sc.metricsFactory)
 }
 
-// Close tears down in the 3-phase order that keeps late callbacks
-// from firing against half-dead pools:
+// Close tears down in the 4-phase order that keeps late callbacks from
+// firing against half-dead pools:
 //  1. Stop config polling — no more UpdateConfig can fire after.
 //  2. Close every session pool (per-pool listeners already detached).
-//  3. Close the underlying channel pool.
+//  3. Cancel the background ctx we constructed (unwinds heartbeat /
+//     AFE-prune / scaling loops parented on it).
+//  4. Close the underlying channel pool.
+//  5. Shut down the metrics factory (final flush).
 func (sc *sessionClient) Close() error {
 	sc.poolsMu.Lock()
 	defer sc.poolsMu.Unlock()
@@ -248,9 +435,15 @@ func (sc *sessionClient) Close() error {
 		}
 		mp.pool.Close()
 	}
+	if sc.backgroundCancel != nil {
+		sc.backgroundCancel()
+	}
 	var err error
 	if sc.channelPool != nil {
 		err = sc.channelPool.Close()
+	}
+	if sc.metricsFactory != nil && sc.metricsFactory.Shutdown != nil {
+		sc.metricsFactory.Shutdown()
 	}
 	return err
 }
