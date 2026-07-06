@@ -35,12 +35,13 @@ import (
 // fakeStream implements Stream and exposes channels so tests can drive both
 // sides of the conversation.
 type fakeStream struct {
-	sentMu sync.Mutex
-	sent   []*spb.SessionRequest
-	recv   chan recvOp
-	hdr    metadata.MD
-	hdrErr error
-	sendFn func(*spb.SessionRequest) error
+	sentMu    sync.Mutex
+	sent      []*spb.SessionRequest
+	recv      chan recvOp
+	hdr       metadata.MD
+	hdrErr    error
+	sendFn    func(*spb.SessionRequest) error
+	closeOnce sync.Once
 }
 
 type recvOp struct {
@@ -53,6 +54,14 @@ func newFakeStream() *fakeStream {
 		recv: make(chan recvOp, 32),
 		hdr:  metadata.MD{},
 	}
+}
+
+// Close unblocks Recv() by closing the recv channel. Production streams
+// exit Recv when the underlying gRPC context cancels; fakeStream models
+// that by closing the channel exactly once. Idempotent so cleanup and
+// explicit test teardown don't collide.
+func (f *fakeStream) Close() {
+	f.closeOnce.Do(func() { close(f.recv) })
 }
 
 func (f *fakeStream) Send(req *spb.SessionRequest) error {

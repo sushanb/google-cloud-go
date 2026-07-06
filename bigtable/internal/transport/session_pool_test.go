@@ -16,17 +16,38 @@ package internal
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 )
 
-// stubPoolStreamFactory returns a streamFactory that never gets dialled — the
-// tests inject sessions manually so the factory should not run. If it does,
-// the test should see the error.
-func stubPoolStreamFactory(_ context.Context) (Stream, error) {
-	return newFakeStream(), nil
+// newStubStreamFactory returns a streamFactory that hands out fresh
+// fakeStreams and a closeAll function that closes every stream the
+// factory produced. Tests that use SessionPoolImpl.CheckoutSession end
+// up triggering PerformScaling → createSession → Session.Start, which
+// spawns a readLoop parked on fakeStream.Recv forever unless the recv
+// channel is closed. Wire closeAll into t.Cleanup so those readLoops
+// exit at end of test instead of accumulating across -count=N runs.
+func newStubStreamFactory() (factory func(context.Context) (Stream, error), closeAll func()) {
+	var mu sync.Mutex
+	var streams []*fakeStream
+	factory = func(_ context.Context) (Stream, error) {
+		s := newFakeStream()
+		mu.Lock()
+		streams = append(streams, s)
+		mu.Unlock()
+		return s, nil
+	}
+	closeAll = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, s := range streams {
+			s.Close()
+		}
+	}
+	return factory, closeAll
 }
 
 // injectActiveSession builds a fakeStream-backed Session in StateReady,
@@ -56,15 +77,24 @@ func injectActiveSession(t testing.TB, p *SessionPoolImpl, name string, createdA
 
 func newTestPool(t testing.TB, min, max int) *SessionPoolImpl {
 	t.Helper()
-	return NewSessionPoolImpl(
+	factory, closeStreams := newStubStreamFactory()
+	p := NewSessionPoolImpl(
 		"test-pool",
 		min,
 		max,
-		stubPoolStreamFactory,
+		factory,
 		&spb.OpenSessionRequest{ProtocolVersion: 1},
 		nil,
 		SessionTypeTable,
 	)
+	// Close streams before closing the pool: the pool's Close waits for
+	// per-session teardown, which requires the readLoop goroutines to
+	// exit — and they won't while parked on fakeStream.Recv.
+	t.Cleanup(func() {
+		closeStreams()
+		_ = p.Close()
+	})
+	return p
 }
 
 // TestSessionPool_Close_CompletesWithIdleSessions verifies that Close()
