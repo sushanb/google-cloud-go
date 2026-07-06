@@ -16,6 +16,7 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -239,6 +240,110 @@ func TestSessionPool_Invoke_RecordsSlowCheckoutFailure(t *testing.T) {
 	}
 	if ev.ErrCode != "DeadlineExceeded" {
 		t.Errorf("ErrCode = %q, want DeadlineExceeded", ev.ErrCode)
+	}
+}
+
+// TestCheckoutSession_ParkedWaiter_DeadlineExceeded pins the ctx-done
+// unwind for a caller that made it into the waiter queue: the returned
+// error must unwrap to context.DeadlineExceeded, and the waiter must be
+// dequeued cleanly (no ghost entry left for a later signalFree to burn
+// on). Together these are the contract callers rely on when their
+// per-request deadline shorter than session-open time expires while
+// they're parked — the shape of pool-side backpressure.
+func TestCheckoutSession_ParkedWaiter_DeadlineExceeded(t *testing.T) {
+	// Dial that blocks until its own ctx (poolCtx, wrapped) fires. No
+	// session ever lands, so any CheckoutSession caller is forced to
+	// park on the waiter queue until their ctx cancels.
+	neverDialing := func(ctx context.Context) (Stream, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	p := NewSessionPoolImpl(
+		"test-pool",
+		0, 1,
+		neverDialing,
+		&spb.OpenSessionRequest{ProtocolVersion: 1},
+		nil,
+		SessionTypeTable,
+	)
+	defer p.Close()
+
+	// Short deadline so the test doesn't loiter, long enough that the
+	// caller is definitely parked before it fires. Kept as a named
+	// const so the wall-time floor below stays coupled to it.
+	const parkDeadline = 50 * time.Millisecond
+
+	// Positive parking assertion: observer goroutine watches
+	// waitersCount and closes `parked` the moment the caller enqueues.
+	// Direct evidence of the waiter path — doesn't rely on timing to
+	// infer that we parked. Stopped after CheckoutSession returns so
+	// it can't outlive the test if parking never happened.
+	parked := make(chan struct{})
+	stop := make(chan struct{})
+	go func() {
+		tick := time.NewTicker(time.Millisecond)
+		defer tick.Stop()
+		for {
+			if p.waitersCount.Load() > 0 {
+				close(parked)
+				return
+			}
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), parkDeadline)
+	defer cancel()
+
+	start := time.Now()
+	sh, err := p.CheckoutSession(ctx)
+	waited := time.Since(start)
+	close(stop)
+
+	if err == nil {
+		t.Fatalf("CheckoutSession succeeded (handle=%v); want ctx deadline error", sh)
+	}
+	if sh != nil {
+		t.Errorf("handle = %v, want nil on error", sh)
+	}
+	if !errors.Is(err, ErrNoSessionsAvailable) {
+		t.Errorf("err = %v (type %T), want unwrappable to ErrNoSessionsAvailable (was the pool-exhaustion sentinel dropped?)", err, err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("err = %v (type %T), want unwrappable to context.DeadlineExceeded (was the ctx cause dropped?)", err, err)
+	}
+	// Positive proof we parked (independent of timing).
+	select {
+	case <-parked:
+	default:
+		t.Error("waitersCount never observed > 0 — CheckoutSession may have fast-failed before enqueuing")
+	}
+	// Wall-time sanity: floor derived from parkDeadline (80%) so
+	// scaling the deadline auto-scales the floor. Kept as a soft
+	// diagnostic — if the observer above missed a very brief parking
+	// window, a much-less-than-deadline wall time would still surface
+	// the fast-fail regression here.
+	if minPark := parkDeadline * 8 / 10; waited < minPark {
+		t.Errorf("CheckoutSession returned after %v; want ≥ %v (parkDeadline=%v)", waited, minPark, parkDeadline)
+	}
+
+	// waitersCount must have been decremented on the ctx-done path.
+	if got := p.waitersCount.Load(); got != 0 {
+		t.Errorf("waitersCount = %d after cancelled checkout, want 0", got)
+	}
+	// Direct queue inspection — belt-and-suspenders since the counter
+	// and the list are updated separately. A leftover entry here is the
+	// "ghost waiter" bug: a subsequent signalFree would consume a wake
+	// token on a caller that already returned.
+	p.waitersMu.Lock()
+	qlen := p.waiters.Len()
+	p.waitersMu.Unlock()
+	if qlen != 0 {
+		t.Errorf("waiter queue length = %d, want 0 (ghost waiter left after ctx cancel)", qlen)
 	}
 }
 

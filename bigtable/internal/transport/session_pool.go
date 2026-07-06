@@ -37,6 +37,18 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// ErrNoSessionsAvailable is returned by CheckoutSession when a caller
+// parked in the waiter queue is unblocked by ctx cancellation or
+// deadline before a session becomes free. The returned error also
+// wraps ctx.Err(), so errors.Is(err, context.DeadlineExceeded) and
+// errors.Is(err, ErrNoSessionsAvailable) both hold — callers can
+// distinguish "pool exhaustion timed us out" from "user's ctx fired
+// mid-RPC" via the sentinel while retry code continues to key on the
+// ctx cause. Java parity: SessionPoolImpl.java:836 emits
+// Status.DEADLINE_EXCEEDED with description "Deadline exceeded
+// waiting for session".
+var ErrNoSessionsAvailable = errors.New("bigtable: no sessions available")
+
 // waiter is one parked CheckoutSession caller. ready is closed by
 // signalFree when this waiter is selected to wake, or by removeWaiter
 // when ctx cancellation pulls the waiter out of the queue.
@@ -351,7 +363,7 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 			// Remove from queue so a subsequent free-session wake
 			// doesn't burn on a caller that's already given up.
 			p.removeWaiter(w)
-			return nil, fmt.Errorf("no active sessions available: %w", ctx.Err())
+			return nil, fmt.Errorf("%w: %w", ErrNoSessionsAvailable, ctx.Err())
 		case <-w.ready:
 			p.waitersCount.Add(-1)
 			// Woken by signalFree. Loop back to re-pick.
