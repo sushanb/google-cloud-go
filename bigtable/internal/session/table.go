@@ -126,8 +126,8 @@ func (t *sessionTable) ReadRow(ctx context.Context, req *btpb.SessionReadRowRequ
 		return nil, fmt.Errorf("session ReadRow vRPC: %w", err)
 	}
 	resp, ok := res.(*btpb.SessionReadRowResponse)
-	if !ok {
-		return nil, fmt.Errorf("session ReadRow: unexpected response type %T", res)
+	if !ok || resp == nil {
+		return nil, fmt.Errorf("session ReadRow: missing response payload (%T)", res)
 	}
 	return resp, nil
 }
@@ -188,13 +188,8 @@ func (t *sessionTable) MutateRow(ctx context.Context, req *btpb.SessionMutateRow
 		return nil, fmt.Errorf("session MutateRow vRPC: %w", err)
 	}
 	resp, ok := res.(*btpb.SessionMutateRowResponse)
-	if !ok {
-		// Some vRPC descriptors return nil-typed responses on success;
-		// synthesize an empty MutateRow response for callers.
-		if res == nil {
-			return &btpb.SessionMutateRowResponse{}, nil
-		}
-		return nil, fmt.Errorf("session MutateRow: unexpected response type %T", res)
+	if !ok || resp == nil {
+		return nil, fmt.Errorf("session MutateRow: missing response payload (%T)", res)
 	}
 	return resp, nil
 }
