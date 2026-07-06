@@ -18,6 +18,7 @@ import (
 	"cloud.google.com/go/bigtable/internal/metrics"
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"google.golang.org/api/option"
@@ -119,17 +120,46 @@ func createBigtableChannelPool(
 
 	fullInstanceName := fmt.Sprintf("projects/%s/instances/%s", project, instance)
 
-	directAccessDialerOptions := make([]option.ClientOption, len(o))
-	copy(directAccessDialerOptions, o)
-	directAccessDialerOptions = append(directAccessDialerOptions, directPathOptions...)
-	directAccessDialerOptions = append(directAccessDialerOptions, internaloption.AllowHardBoundTokens("ALTS"))
+	// directAccessMD is the feature-flag metadata used for priming on both the
+	// direct-access and standard-path connection factories — the pool holds it
+	// via WithFeatureFlagsMetadata and applies it to every Prime().
+	poolOpts := []btransport.BigtableChannelPoolOption{
+		btransport.WithInstanceName(fullInstanceName),
+		btransport.WithAppProfile(config.AppProfile),
+		btransport.WithMetricsReporterConfig(btopt.DefaultMetricsReporterConfig()),
+		btransport.WithMeterProvider(metricsTracerFactory.OtelMeterProvider),
+		btransport.WithFeatureFlagsMetadata(directAccessMD),
+	}
 
-	directAccessDialer := func() (*btransport.BigtableConn, error) {
-		grpcConn, err := gtransport.Dial(ctx, directAccessDialerOptions...)
-		if err != nil {
-			return nil, err
+	// Pluggable Direct Access strategy: the classic channel pool factory uses a
+	// PingAndWarm probe; when the env/config disables Direct Access we still
+	// wire a "disabled" checker so the direct_access/compatible metric keeps
+	// surfacing the off state with reason=manually_disabled. The future
+	// session pool factory will swap in a GetClientConfiguration-based checker.
+	if isDirectAccessEnabled(config) {
+		directAccessDialerOptions := make([]option.ClientOption, len(o))
+		copy(directAccessDialerOptions, o)
+		directAccessDialerOptions = append(directAccessDialerOptions, directPathOptions...)
+		directAccessDialerOptions = append(directAccessDialerOptions, internaloption.AllowHardBoundTokens("ALTS"))
+
+		directAccessDialer := func() (*btransport.BigtableConn, error) {
+			grpcConn, err := gtransport.Dial(ctx, directAccessDialerOptions...)
+			if err != nil {
+				return nil, err
+			}
+			return btransport.NewBigtableConn(grpcConn), nil
 		}
-		return btransport.NewBigtableConn(grpcConn), nil
+		checker := btransport.NewPingAndWarmDirectAccessChecker(
+			directAccessDialer,
+			fullInstanceName,
+			config.AppProfile,
+			directAccessMD,
+			metricsTracerFactory.OtelMeterProvider,
+			nil,
+		)
+		poolOpts = append(poolOpts, btransport.WithDirectAccessChecker(checker))
+	} else {
+		poolOpts = append(poolOpts, btransport.WithDirectAccessChecker(btransport.NewDisabledDirectAccessChecker(metricsTracerFactory.OtelMeterProvider, nil)))
 	}
 
 	return btransport.NewBigtableChannelPool(ctx,
@@ -143,12 +173,17 @@ func createBigtableChannelPool(
 			return btransport.NewBigtableConn(grpcConn), nil
 		},
 		clientCreationTimestamp,
-		btransport.WithInstanceName(fullInstanceName),
-		btransport.WithAppProfile(config.AppProfile),
-		btransport.WithFeatureFlagsMetadata(directAccessMD),
-		btransport.WithMetricsReporterConfig(btopt.DefaultMetricsReporterConfig()),
-		btransport.WithMeterProvider(metricsTracerFactory.OtelMeterProvider),
-		btransport.WithDirectAccessFeatureFlagsMetadata(directAccessMD),
-		btransport.WithDirectAccessDialer(directAccessDialer),
+		poolOpts...,
 	)
+}
+
+// isDirectAccessEnabled reports whether Direct Access should be probed for
+// this client. The env var CBT_ENABLE_DIRECTPATH=false takes precedence over
+// ClientConfig.DisableDirectAccess so operators can force off from outside
+// the process.
+func isDirectAccessEnabled(config ClientConfig) bool {
+	if os.Getenv("CBT_ENABLE_DIRECTPATH") == "false" {
+		return false
+	}
+	return !config.DisableDirectAccess
 }
