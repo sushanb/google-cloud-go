@@ -21,10 +21,12 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"sync"
 	"time"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	btopt "cloud.google.com/go/bigtable/internal/option"
+	"cloud.google.com/go/bigtable/internal/session"
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 	"cloud.google.com/go/internal/trace"
 	gax "github.com/googleapis/gax-go/v2"
@@ -40,7 +42,6 @@ import (
 type Client struct {
 	classicPool                managedChannelPool
 	client                     btpb.BigtableClient
-	sessionClient              btpb.BigtableClient
 	project, instance          string
 	appProfile                 string
 	metricsTracerFactory       *builtinMetricsTracerFactory
@@ -48,11 +49,18 @@ type Client struct {
 	retryOption                gax.CallOption
 	executeQueryRetryOption    gax.CallOption
 	featureFlagsMD             metadata.MD // Pre-computed feature flags metadata to be sent with each request.
-	sessionMgr                 *SessionManager
+	sessionImpl                session.SessionClient
 	diverter                   *btransport.Diverter
 	config                     ClientConfig
 	backgroundCtx              context.Context
 	backgroundCancel           context.CancelFunc
+
+	// sessionTables caches per-resource SessionTableApi instances so
+	// repeat Open* calls return the same handle (and by extension the
+	// same underlying session pools). SessionClient does not cache; the
+	// consumer (this Client) is responsible.
+	sessionTablesMu sync.Mutex
+	sessionTables   map[string]session.SessionTableApi
 }
 
 // ClientConfig has configurations for the client.
@@ -188,7 +196,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 	btClient := btpb.NewBigtableClient(classicManaged.pool)
 
 	var sessionManaged managedChannelPool
-	var sessionClient btpb.BigtableClient
+	var sessionStub btpb.BigtableClient
 	if config.EnableSessionPool {
 		var sessionErr error
 		sessionManaged, sessionErr = createAndStartManagedChannelPool(ctx, project, instance, config, metricsTracerFactory, o, directPathOptions, directAccessMD, clientCreationTimestamp, enableBigtableConnPool)
@@ -196,13 +204,12 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 			classicManaged.Close()
 			return nil, fmt.Errorf("failed to create dedicated session pool: %w", sessionErr)
 		}
-		sessionClient = btpb.NewBigtableClient(sessionManaged.pool)
+		sessionStub = btpb.NewBigtableClient(sessionManaged.pool)
 	}
 
 	c := &Client{
 		classicPool:             classicManaged,
 		client:                  btClient,
-		sessionClient:           sessionClient,
 		project:                 project,
 		instance:                instance,
 		appProfile:              config.AppProfile,
@@ -213,34 +220,38 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		featureFlagsMD:          directAccessMD,
 		config:                  config,
 		diverter:                btransport.NewDiverter(1.0),
+		sessionTables:           make(map[string]session.SessionTableApi),
 	}
 	c.backgroundCtx, c.backgroundCancel = context.WithCancel(context.Background())
 
-	// configMD carries the resource-prefix + request-params headers on
-	// every GetClientConfiguration poll — built here (not in SessionManager)
-	// because it references Client-scoped helpers. SessionManager consumes
-	// it when it constructs its internal configManager.
-	configMD := metadata.Join(metadata.Pairs(
-		resourcePrefixHeader, c.fullInstanceName(),
-		requestParamsHeader, c.reqParamsHeaderValInstance(),
-	), c.featureFlagsMD)
-
-	c.sessionMgr = NewSessionManager(
-		config.EnableSessionPool,
-		metricsTracerFactory.enabled,
-		disableRetryInfo,
-		directAccessMD,
-		c.diverter,
-		sessionClient,
-		c.fullInstanceName(),
-		config.AppProfile,
-		configMD,
-		c.backgroundCtx,
-		config.SessionPoolMin,
-		config.SessionPoolMax,
-		metricsTracerFactory.otelMeterProvider,
-		sessionManaged,
-	)
+	// SessionClient owns the session channel pool, the gRPC stub built
+	// on top of it, and the ClientConfigurationManager. Only constructed
+	// when EnableSessionPool is set; nil sessionImpl means the shim
+	// bypasses to classic-only routing.
+	if config.EnableSessionPool {
+		configMD := metadata.Join(metadata.Pairs(
+			resourcePrefixHeader, c.fullInstanceName(),
+			requestParamsHeader, c.reqParamsHeaderValInstance(),
+		), c.featureFlagsMD)
+		c.sessionImpl = session.NewSessionClient(
+			sessionManaged,
+			sessionStub,
+			metricsTracerFactory.otelMeterProvider,
+			session.Config{
+				Project:             project,
+				Instance:            instance,
+				AppProfile:          config.AppProfile,
+				FeatureFlagsMD:      directAccessMD,
+				ConfigMD:            configMD,
+				MetricsEnabled:      metricsTracerFactory.enabled,
+				DisableRetryInfo:    disableRetryInfo,
+				MinSessions:         config.SessionPoolMin,
+				MaxSessions:         config.SessionPoolMax,
+				SessionLoadListener: c.diverter.SetSessionLoad,
+				BackgroundCtx:       c.backgroundCtx,
+			},
+		)
+	}
 
 	return c, nil
 }
@@ -248,7 +259,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 // Close closes the Client.
 //
 // Shutdown order:
-//  1. SessionManager.Close — stops the internal ClientConfigurationManager
+//  1. SessionClient.Close — stops the internal ClientConfigurationManager
 //     first (so no UpdateConfig fires against pools about to be torn
 //     down), then drains in-flight session work and closes the session
 //     channel pool.
@@ -258,8 +269,8 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 func (c *Client) Close() error {
 	fmt.Printf("Closing the client for project %s and instance %s\n", c.project, c.instance)
 	var errs []error
-	if c.sessionMgr != nil {
-		if err := c.sessionMgr.Close(); err != nil {
+	if c.sessionImpl != nil {
+		if err := c.sessionImpl.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}

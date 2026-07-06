@@ -15,6 +15,7 @@
 package bigtable
 
 import (
+	"cloud.google.com/go/bigtable/internal/session"
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 )
 
@@ -31,9 +32,7 @@ type SessionDebugProvider interface {
 	// Diverter returns the client-wide session/classic split state.
 	Diverter() btransport.DiverterSnapshot
 	// LoadBalancingSnapshots returns one per-pool picker + pick-history
-	// snapshot for the loadz debug page. Heavier surface than Snapshot
-	// (includes the ring buffer of recent picks) — kept as a separate
-	// accessor so sessionz/afez callers don't pay for it.
+	// snapshot for the loadz debug page.
 	LoadBalancingSnapshots() []btransport.LoadBalancingSnapshot
 }
 
@@ -41,23 +40,27 @@ type SessionDebugProvider interface {
 // when ClientConfig.EnableSessionPool is false — in that case there is no
 // session-based transport to report on.
 func (c *Client) SessionDebug() SessionDebugProvider {
-	if !c.config.EnableSessionPool || c.sessionMgr == nil {
+	if !c.config.EnableSessionPool || c.sessionImpl == nil {
 		return nil
 	}
-	return sessionDebugAdapter{mgr: c.sessionMgr, diverter: c.diverter}
+	dbg, ok := c.sessionImpl.(session.DebugAccess)
+	if !ok {
+		return nil
+	}
+	return sessionDebugAdapter{dbg: dbg, diverter: c.diverter}
 }
 
 type sessionDebugAdapter struct {
-	mgr      *SessionManager
+	dbg      session.DebugAccess
 	diverter *btransport.Diverter
 }
 
 func (a sessionDebugAdapter) Snapshot() []btransport.PoolSnapshot {
-	return a.mgr.ManagerSnapshot()
+	return a.dbg.PoolSnapshots()
 }
 
 func (a sessionDebugAdapter) LoadBalancingSnapshots() []btransport.LoadBalancingSnapshot {
-	return a.mgr.LoadBalancingSnapshots()
+	return a.dbg.LoadBalancingSnapshots()
 }
 
 func (a sessionDebugAdapter) Diverter() btransport.DiverterSnapshot {
@@ -70,10 +73,6 @@ func (a sessionDebugAdapter) Diverter() btransport.DiverterSnapshot {
 // ConfigDebugProvider exposes a snapshot of the most recent
 // GetClientConfiguration poll outcome. The bigtable/configz package consumes
 // this to render an HTTP debug page; callers can also use it programmatically.
-//
-// Snapshot is safe to call concurrently with other Client operations. It
-// adds no overhead to the polling loop — the manager already keeps the last
-// response under its existing mutex.
 type ConfigDebugProvider interface {
 	// Snapshot returns the most recent GetClientConfiguration response (or
 	// the most recent error if no poll has succeeded yet).
@@ -82,13 +81,16 @@ type ConfigDebugProvider interface {
 
 // ConfigDebug returns a ConfigDebugProvider for this Client. Returns nil
 // when session pool is disabled (no configuration manager is constructed
-// in that mode — nothing to configure) or when NewClientWithConfig hasn't
-// wired the SessionManager yet.
+// in that mode).
 func (c *Client) ConfigDebug() ConfigDebugProvider {
-	if c.sessionMgr == nil {
+	if c.sessionImpl == nil {
 		return nil
 	}
-	mgr := c.sessionMgr.ConfigManager()
+	dbg, ok := c.sessionImpl.(session.DebugAccess)
+	if !ok {
+		return nil
+	}
+	mgr := dbg.ConfigManager()
 	if mgr == nil {
 		return nil
 	}
@@ -105,18 +107,10 @@ func (a configDebugAdapter) Snapshot() btransport.ConfigSnapshot {
 
 // ChannelDebugProvider exposes a snapshot of every gRPC channel pool the
 // Client currently owns — the classic data-plane pool and (when session
-// pooling is enabled) the dedicated session pool. The bigtable/channelz
-// package consumes this to render a per-channel debug view.
-//
-// Each entry in the returned slice corresponds to one BigtableChannelPool.
-// Snapshot is safe to call concurrently with other Client operations and
-// adds no overhead to the request path — it reads the existing atomics
-// non-destructively.
+// pooling is enabled) the dedicated session pool.
 type ChannelDebugProvider interface {
 	// Snapshot returns one ChannelPoolSnapshot per BigtableChannelPool the
-	// client holds, labeled by Role ("classic" / "session"). The slice is
-	// empty when the client uses a non-Bigtable connection pool (e.g. the
-	// caller passed option.WithGRPCConn).
+	// client holds, labeled by Role ("classic" / "session").
 	Snapshot() []ChannelPoolDebug
 }
 
@@ -127,11 +121,7 @@ type ChannelPoolDebug struct {
 	Role     string
 	Snapshot btransport.ChannelPoolSnapshot
 	// SessionsByChannel maps a connEntry index to the sessions riding on
-	// it. Populated only for the "session" role — classic-path RPCs aren't
-	// associated with any session. nil when no sessions are linked (e.g.
-	// the underlying pool isn't a BigtableChannelPool, so the pick-hint
-	// never fired). Each SessionRef carries enough identity to deep-link
-	// back into sessionz's pool-detail anchor.
+	// it. Populated only for the "session" role.
 	SessionsByChannel map[int][]SessionRef
 }
 
@@ -144,8 +134,7 @@ type SessionRef struct {
 }
 
 // ChannelDebug returns a ChannelDebugProvider for this Client. Always
-// non-nil; if the Client uses a non-Bigtable pool (caller passed
-// option.WithGRPCConn) the snapshot will be empty.
+// non-nil; if the Client uses a non-Bigtable pool the snapshot will be empty.
 func (c *Client) ChannelDebug() ChannelDebugProvider {
 	return channelDebugAdapter{client: c}
 }
@@ -159,25 +148,23 @@ func (a channelDebugAdapter) Snapshot() []ChannelPoolDebug {
 	if p := bigtableChannelPool(a.client.classicPool.pool); p != nil {
 		out = append(out, ChannelPoolDebug{Role: "classic", Snapshot: p.ChannelPoolSnapshot()})
 	}
-	if a.client.config.EnableSessionPool {
-		// The session channel pool lives on the SessionManager because the
-		// SessionManager owns its managedChannelPool. We can fetch it via
-		// the manager's accessor.
-		if sp := a.client.sessionMgr.channelChannelPool(); sp != nil {
-			byChan := a.sessionsByChannelForSessionPool()
-			out = append(out, ChannelPoolDebug{
-				Role:              "session",
-				Snapshot:          sp.ChannelPoolSnapshot(),
-				SessionsByChannel: byChan,
-			})
+	if a.client.config.EnableSessionPool && a.client.sessionImpl != nil {
+		if dbg, ok := a.client.sessionImpl.(session.DebugAccess); ok {
+			if sp := dbg.ChannelPool(); sp != nil {
+				byChan := a.sessionsByChannelForSessionPool(dbg)
+				out = append(out, ChannelPoolDebug{
+					Role:              "session",
+					Snapshot:          sp.ChannelPoolSnapshot(),
+					SessionsByChannel: byChan,
+				})
+			}
 		}
 	}
 	return out
 }
 
 // bigtableChannelPool extracts the *btransport.BigtableChannelPool from a
-// gtransport.ConnPool, returning nil if the pool isn't a BigtableChannelPool
-// (e.g. the caller built the client with option.WithGRPCConn).
+// gtransport.ConnPool, returning nil if the pool isn't a BigtableChannelPool.
 func bigtableChannelPool(p interface{}) *btransport.BigtableChannelPool {
 	if p == nil {
 		return nil
@@ -187,16 +174,10 @@ func bigtableChannelPool(p interface{}) *btransport.BigtableChannelPool {
 }
 
 // sessionsByChannelForSessionPool walks every session pool the
-// SessionManager owns and groups the sessions by their ChannelIndex.
-// Each entry carries the owning pool name so the channelz template can
-// emit links straight into the matching sessionz pool detail page.
+// SessionClient owns and groups the sessions by their ChannelIndex.
 // Sessions without a valid channel index (sentinel -1) are skipped.
-// Returns nil if no sessions are linked.
-func (a channelDebugAdapter) sessionsByChannelForSessionPool() map[int][]SessionRef {
-	if a.client.sessionMgr == nil {
-		return nil
-	}
-	pools := a.client.sessionMgr.ManagerSnapshot()
+func (a channelDebugAdapter) sessionsByChannelForSessionPool(dbg session.DebugAccess) map[int][]SessionRef {
+	pools := dbg.PoolSnapshots()
 	var out map[int][]SessionRef
 	for _, pool := range pools {
 		for _, s := range pool.Sessions {
