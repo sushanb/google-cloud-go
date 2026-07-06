@@ -1240,7 +1240,7 @@ const tcpzFlatTplSrc = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>tcpz — {{.Count}} conns{{if .Interesting}} · {{.Interesting}} hot{{end}}</title>
-<meta http-equiv="refresh" content="2">
+<meta http-equiv="refresh" content="5">
 <style>
 body { font: 13px/1.4 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; margin: 1em; color: #222; }
 h1 { font-size: 1.1em; margin: 0 0 .3em 0; }
@@ -1299,7 +1299,7 @@ a.col-sort .arr { color: #d95700; margin-left: 2px; }
 </head>
 <body>
 <h1>tcpz — {{.Count}} conn{{if ne .Count 1}}s{{end}}{{if .Interesting}} · <span style="color:#b32222">{{.Interesting}} interesting</span>{{end}}{{if .Hidden}} <span style="color:#888;font-weight:400;font-size:.85em">({{.Hidden}} :443 hidden)</span>{{end}}{{if .Dropped}} <span style="color:#888;font-weight:400;font-size:.85em">({{.Dropped}} healthy hidden)</span>{{end}}</h1>
-<div class="meta">Snapshot at {{.Generated.Format "15:04:05.000"}} · auto-refresh 2s · <a href="?format=json{{if .ShowAll}}&amp;all=1{{end}}">JSON</a>
+<div class="meta">Snapshot at {{.Generated.Format "15:04:05.000"}} · auto-refresh 5s · <a href="?format=json{{if .ShowAll}}&amp;all=1{{end}}">JSON</a>
  · <a href="?{{if .ShowAll}}all=1{{end}}{{if .OnlyHot}}{{if .ShowAll}}&amp;{{end}}only=hot{{end}}">grouped view</a>
 {{if .ShowAll}} · <a href="?flat=1">hide :443 (default)</a>{{else if .Hidden}} · <a href="?flat=1&amp;all=1">show all ({{.Total}})</a>{{end}}
 {{if .OnlyHot}} · <a href="?flat=1{{if .ShowAll}}&amp;all=1{{end}}">show healthy too</a>{{else}} · <a href="?flat=1&amp;only=hot{{if .ShowAll}}&amp;all=1{{end}}">only hot</a>{{end}}
@@ -1368,7 +1368,7 @@ const tcpzTplSrc = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>tcpz — {{.GroupCount}} peer{{if ne .GroupCount 1}}s{{end}}{{if .Interesting}} · {{.Interesting}} hot{{end}}</title>
-<meta http-equiv="refresh" content="2">
+<meta http-equiv="refresh" content="5">
 <style>
 body { font: 13px/1.4 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; margin: 1em; color: #222; background: #fafbfc; }
 h1 { font-size: 1.15em; margin: 0 0 .3em 0; }
@@ -1460,7 +1460,7 @@ details.conn.row-crit .conn-why { color: #b32222; }
 </head>
 <body>
 <h1>tcpz — {{.GroupCount}} peer{{if ne .GroupCount 1}}s{{end}} · {{.Count}} conn{{if ne .Count 1}}s{{end}}{{if .Interesting}} · <span style="color:#b32222">{{.Interesting}} interesting</span>{{end}}{{if .Hidden}} <span style="color:#888;font-weight:400;font-size:.85em">({{.Hidden}} :443 hidden)</span>{{end}}{{if .Dropped}} <span style="color:#888;font-weight:400;font-size:.85em">({{.Dropped}} healthy hidden)</span>{{end}}</h1>
-<div class="meta">Snapshot at {{.Generated.Format "15:04:05.000"}} · auto-refresh 2s
+<div class="meta">Snapshot at {{.Generated.Format "15:04:05.000"}} · auto-refresh 5s
  · <a href="?format=json{{if .ShowAll}}&amp;all=1{{end}}">JSON</a>
 {{if .ShowAll}} · <a href="?">hide :443 (default)</a>{{else if .Hidden}} · <a href="?all=1">show all ({{.Total}})</a>{{end}}
 {{if .OnlyHot}} · <a href="?{{if .ShowAll}}all=1{{end}}">show healthy too</a>{{else}} · <a href="?only=hot{{if .ShowAll}}&amp;all=1{{end}}">only hot</a>{{end}}
