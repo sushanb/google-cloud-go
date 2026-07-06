@@ -280,7 +280,7 @@ type ReasoningEngineSpecDeploymentSpecAgentGatewayConfig struct {
 
 // Specifies the HTTP GET configuration for the probe.
 type KeepAliveProbeHTTPGet struct {
-	// Required. Specifies the path of the HTTP GET request (e.g., "/is_busy").
+	// Required. Specifies the path of the HTTP GET request (e.g., `"/is_busy"`).
 	Path string `json:"path,omitempty"`
 	// Optional. Specifies the port number on the container to which the request is sent.
 	Port *int32 `json:"port,omitempty"`
@@ -340,7 +340,7 @@ type ReasoningEngineSpecPackageSpec struct {
 	DependencyFilesGCSURI string `json:"dependencyFilesGcsUri,omitempty"`
 	// Optional. The Cloud Storage URI of the pickled python object.
 	PickleObjectGCSURI string `json:"pickleObjectGcsUri,omitempty"`
-	// Optional. The Python version. Supported values are 3.9, 3.10, 3.11, 3.12, 3.13, 3.14.
+	// Optional. The Python version. Supported values are 3.10, 3.11, 3.12, 3.13, 3.14.
 	// If not specified, the default value is 3.10.
 	PythonVersion string `json:"pythonVersion,omitempty"`
 	// Optional. The Cloud Storage URI of the `requirements.txt` file
@@ -413,8 +413,8 @@ type ReasoningEngineSpecSourceCodeSpecPythonSpec struct {
 	// Optional. The path to the requirements file, relative to the source root. If not
 	// specified, defaults to "requirements.txt".
 	RequirementsFile string `json:"requirementsFile,omitempty"`
-	// Optional. The version of Python to use. Support version includes 3.9, 3.10, 3.11,
-	// 3.12, 3.13, 3.14. If not specified, default value is 3.10.
+	// Optional. The version of Python to use. Supported versions include 3.10, 3.11, 3.12,
+	// 3.13, 3.14. If not specified, default value is 3.10.
 	Version string `json:"version,omitempty"`
 }
 
@@ -578,14 +578,16 @@ type MemoryBankCustomizationConfig struct {
 
 // Represents the active rule that determines when to flush the buffer.
 type MemoryGenerationTriggerConfigGenerationTriggerRule struct {
-	// Specifies to trigger generation if the stream is inactive for the specified duration
-	// after the most recent event. The duration must have a minute-level granularity.
+	// Optional. Specifies to trigger generation if the stream is inactive for the specified
+	// duration after the most recent event. The duration must have a minute-level granularity.
 	IdleDuration time.Duration `json:"idleDuration,omitempty"`
-	// Specifies to trigger generation at a fixed interval. The duration must have a minute-level
-	// granularity.
+	// Optional. Specifies to trigger generation at a fixed interval. The duration must
+	// have a minute-level granularity.
 	FixedInterval time.Duration `json:"fixedInterval,omitempty"`
-	// Specifies to trigger generation when the event count reaches this limit.
+	// Optional. Specifies to trigger generation when the event count reaches this limit.
 	EventCount *int32 `json:"eventCount,omitempty"`
+	// Optional. Re-include the last N already-processed events in the next window.
+	OverlapEventCount *int32 `json:"overlapEventCount,omitempty"`
 }
 
 func (m *MemoryGenerationTriggerConfigGenerationTriggerRule) UnmarshalJSON(data []byte) error {
@@ -1862,6 +1864,68 @@ type IngestEventsConfig struct {
 	// Optional. Forces a flush of all pending events in the stream and triggers memory
 	// generation immediately bypassing any conditions configured in the `generation_trigger_config`.
 	ForceFlush *bool `json:"forceFlush,omitempty"`
+	// Optional. Labels to apply to the memory revision. For example, you can use this to
+	// label a revision with its data source.
+	RevisionLabels map[string]string `json:"revisionLabels,omitempty"`
+	// Optional. Input only. Timestamp of when the revision is considered expired. If not
+	// set, the memory revision will be kept until manually deleted.
+	RevisionExpireTime time.Time `json:"revisionExpireTime,omitempty"`
+	// Optional. Input only. The TTL for the revision. The expiration time is computed:
+	// now + TTL.
+	RevisionTTL time.Duration `json:"revisionTtl,omitempty"`
+	// Optional. Input only. If true, no revisions will be created for this request.
+	DisableMemoryRevisions *bool `json:"disableMemoryRevisions,omitempty"`
+	// Optional. User-provided metadata for the generated memories. This is not generated
+	// by Memory Bank.
+	Metadata map[string]*MemoryMetadataValue `json:"metadata,omitempty"`
+	// Optional. The strategy to use when applying metadata to existing memories.
+	MetadataMergeStrategy MemoryMetadataMergeStrategy `json:"metadataMergeStrategy,omitempty"`
+}
+
+func (i *IngestEventsConfig) UnmarshalJSON(data []byte) error {
+	type Alias IngestEventsConfig
+	aux := &struct {
+		RevisionExpireTime *time.Time                        `json:"revisionExpireTime,omitempty"`
+		RevisionTTL        *genai_types.InternalDurationJSON `json:"revisionTtl,omitempty"`
+		*Alias
+	}{
+		Alias: (*Alias)(i),
+	}
+
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	if !reflect.ValueOf(aux.RevisionExpireTime).IsZero() {
+		i.RevisionExpireTime = time.Time(*aux.RevisionExpireTime)
+	}
+
+	if !reflect.ValueOf(aux.RevisionTTL).IsZero() {
+		i.RevisionTTL = time.Duration(*aux.RevisionTTL)
+	}
+
+	return nil
+}
+
+func (i *IngestEventsConfig) MarshalJSON() ([]byte, error) {
+	type Alias IngestEventsConfig
+	aux := &struct {
+		RevisionExpireTime *time.Time                        `json:"revisionExpireTime,omitempty"`
+		RevisionTTL        *genai_types.InternalDurationJSON `json:"revisionTtl,omitempty"`
+		*Alias
+	}{
+		Alias: (*Alias)(i),
+	}
+
+	if !reflect.ValueOf(i.RevisionExpireTime).IsZero() {
+		aux.RevisionExpireTime = (*time.Time)(&i.RevisionExpireTime)
+	}
+
+	if !reflect.ValueOf(i.RevisionTTL).IsZero() {
+		aux.RevisionTTL = (*genai_types.InternalDurationJSON)(&i.RevisionTTL)
+	}
+
+	return json.Marshal(aux)
 }
 
 // Operation that ingests events into a memory bank.
@@ -2400,8 +2464,6 @@ type SandboxEnvironmentConnectionInfo struct {
 	LoadBalancerIp string `json:"loadBalancerIp,omitempty"`
 	// Output only. The internal IP address of the SandboxEnvironment.
 	SandboxInternalIp string `json:"sandboxInternalIp,omitempty"`
-	// Output only. The hostname of the SandboxEnvironment.
-	SandboxHostname string `json:"sandboxHostname,omitempty"`
 	// Output only. The routing token for the SandboxEnvironment.
 	RoutingToken string `json:"routingToken,omitempty"`
 }
@@ -3337,4 +3399,62 @@ type SchemaPromptSpecAppBuilderData struct {
 	Framework Framework `json:"framework,omitempty"`
 	// Linked resources attached to the application by the user.
 	LinkedResources []*SchemaPromptSpecAppBuilderDataLinkedResource `json:"linkedResources,omitempty"`
+}
+
+// Defines data for an interaction prompt.
+type SchemaPromptSpecInteractionData struct {
+	// Optional. Lists interaction IDs associated with the prompt. This maps 1:1 to PromptMessage.contents.
+	// If InteractionData is present, every prompt message has an interaction ID.
+	InteractionIDs []string `json:"interactionIds,omitempty"`
+}
+
+// Config for listing deployable models.
+type listDeployableModelsConfig struct {
+	// Optional. Whether to list Hugging Face models.
+	IncludeHuggingFaceModels bool `json:"includeHuggingFaceModels,omitempty"`
+	// Optional. A string to filter the models by.
+	ModelFilter string `json:"modelFilter,omitempty"`
+}
+
+// Config for listing Model Garden models.
+type listModelGardenModelsConfig struct {
+	// Optional. Whether to list Hugging Face models.
+	IncludeHuggingFaceModels bool `json:"includeHuggingFaceModels,omitempty"`
+	// Optional. A string to filter the models by.
+	ModelFilter string `json:"modelFilter,omitempty"`
+}
+
+// Config for listing the deploy options of a publisher model.
+type listPublisherModelDeployOptionsConfig struct {
+	// Optional. Case-insensitive substring filter on the machine type.
+	// Accepts a single keyword (e.g. ``'g2'``) or a list of keywords (e.g.
+	// ``['n1', 'g2']``); an option matches if it contains any of them.
+	MachineTypeFilter string `json:"machineTypeFilter,omitempty"`
+	// Optional. Case-insensitive substring filter on the accelerator
+	// type. Accepts a single keyword (e.g. ``'L4'``) or a list of keywords
+	// (e.g. ``['T4', 'L4']``); an option matches if it contains any of them.
+	AcceleratorTypeFilter string `json:"acceleratorTypeFilter,omitempty"`
+	// Optional. Case-insensitive substring filter on the serving
+	// container image URI. Accepts a single keyword (e.g. ``'vllm'``) or a list
+	// of keywords (e.g. ``['vllm', 'tgi']``); an option matches if it contains
+	// any of them.
+	ServingContainerImageURIFilter string `json:"servingContainerImageUriFilter,omitempty"`
+	// Optional. If True, returns a human-readable string describing the
+	// deploy options (container and machine specs) instead of a list of
+	// ``DeployOption`` objects.
+	Concise bool `json:"concise,omitempty"`
+}
+
+// A verified deploy option for a model.
+type deployOption struct {
+	// Optional. The name of the deploy task.
+	OptionName string `json:"optionName,omitempty"`
+	// Optional. The URI of the serving container.
+	ServingContainerImageURI string `json:"servingContainerImageUri,omitempty"`
+	// Optional. The machine type.
+	MachineType string `json:"machineType,omitempty"`
+	// Optional. The accelerator type.
+	AcceleratorType string `json:"acceleratorType,omitempty"`
+	// Optional. The number of accelerators.
+	AcceleratorCount int32 `json:"acceleratorCount,omitempty"`
 }

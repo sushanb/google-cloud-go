@@ -1,5 +1,18 @@
 # Changes
 
+## [1.2.0](https://github.com/googleapis/google-cloud-go/compare/ces/v1.1.0...ces/v1.2.0) (2026-06-26)
+
+
+### Features
+
+* Update API sources and regenerate ([#20047](https://github.com/googleapis/google-cloud-go/issues/20047)) ([e10c9bf](https://github.com/googleapis/google-cloud-go/commit/e10c9bf14d4fc23906d0b369e106420d44915660))
+
+## [1.1.0](https://github.com/googleapis/google-cloud-go/releases/tag/ces%2Fv1.1.0) (2026-06-11)
+
+### Features
+
+* update API sources and regenerate (#19950) ([c7607be](https://github.com/googleapis/google-cloud-go/commit/c7607be52757b803df345670b5d0621c2bb9ba30))
+
 ## [1.0.0](https://github.com/googleapis/google-cloud-go/releases/tag/ces%2Fv1.0.0) (2026-05-08)
 
 ## [0.9.0](https://github.com/googleapis/google-cloud-go/releases/tag/ces%2Fv0.9.0) (2026-05-07)
@@ -75,4 +88,3 @@
 ### Features
 
 * add new clients (#13889) ([6ddbda6](https://github.com/googleapis/google-cloud-go/commit/6ddbda6521b6a7f70bd3e05a21c1d64b80e25847))
-

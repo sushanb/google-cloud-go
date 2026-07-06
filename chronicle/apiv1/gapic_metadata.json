@@ -1065,6 +1065,11 @@
               "methods": [
                 "UpdateReferenceList"
               ]
+            },
+            "VerifyReferenceList": {
+              "methods": [
+                "VerifyReferenceList"
+              ]
             }
           }
         },
@@ -1109,6 +1114,75 @@
             "UpdateReferenceList": {
               "methods": [
                 "UpdateReferenceList"
+              ]
+            },
+            "VerifyReferenceList": {
+              "methods": [
+                "VerifyReferenceList"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "RuleExecutionErrorService": {
+      "clients": {
+        "grpc": {
+          "libraryClient": "RuleExecutionErrorClient",
+          "rpcs": {
+            "CancelOperation": {
+              "methods": [
+                "CancelOperation"
+              ]
+            },
+            "DeleteOperation": {
+              "methods": [
+                "DeleteOperation"
+              ]
+            },
+            "GetOperation": {
+              "methods": [
+                "GetOperation"
+              ]
+            },
+            "ListOperations": {
+              "methods": [
+                "ListOperations"
+              ]
+            },
+            "ListRuleExecutionErrors": {
+              "methods": [
+                "ListRuleExecutionErrors"
+              ]
+            }
+          }
+        },
+        "rest": {
+          "libraryClient": "RuleExecutionErrorClient",
+          "rpcs": {
+            "CancelOperation": {
+              "methods": [
+                "CancelOperation"
+              ]
+            },
+            "DeleteOperation": {
+              "methods": [
+                "DeleteOperation"
+              ]
+            },
+            "GetOperation": {
+              "methods": [
+                "GetOperation"
+              ]
+            },
+            "ListOperations": {
+              "methods": [
+                "ListOperations"
+              ]
+            },
+            "ListRuleExecutionErrors": {
+              "methods": [
+                "ListRuleExecutionErrors"
               ]
             }
           }
@@ -1199,6 +1273,11 @@
               "methods": [
                 "UpdateRuleDeployment"
               ]
+            },
+            "VerifyRuleText": {
+              "methods": [
+                "VerifyRuleText"
+              ]
             }
           }
         },
@@ -1283,6 +1362,11 @@
             "UpdateRuleDeployment": {
               "methods": [
                 "UpdateRuleDeployment"
+              ]
+            },
+            "VerifyRuleText": {
+              "methods": [
+                "VerifyRuleText"
               ]
             }
           }

@@ -2569,11 +2569,11 @@ var (
 		408601302: "PREFER_IPV6",
 	}
 	BackendService_IpAddressSelectionPolicy_value = map[string]int32{
-		"UNDEFINED_IP_ADDRESS_SELECTION_POLICY": 0,
-		"IPV4_ONLY":                             22373798,
-		"IPV6_ONLY":                             79632100,
+		"UNDEFINED_IP_ADDRESS_SELECTION_POLICY":   0,
+		"IPV4_ONLY":                               22373798,
+		"IPV6_ONLY":                               79632100,
 		"IP_ADDRESS_SELECTION_POLICY_UNSPECIFIED": 36210144,
-		"PREFER_IPV6": 408601302,
+		"PREFER_IPV6":                             408601302,
 	}
 )
 
@@ -21624,91 +21624,91 @@ var (
 		95191981:  "XPN_SERVICE_PROJECTS",
 	}
 	Quota_Metric_value = map[string]int32{
-		"UNDEFINED_METRIC":                                  0,
-		"A2_CPUS":                                           153206585,
-		"AFFINITY_GROUPS":                                   108303563,
-		"AUTOSCALERS":                                       471248988,
-		"BACKEND_BUCKETS":                                   137626846,
-		"BACKEND_SERVICES":                                  269623753,
-		"C2D_CPUS":                                          508182517,
-		"C2_CPUS":                                           317601211,
-		"C3_CPUS":                                           346230362,
-		"COMMITMENTS":                                       456141790,
-		"COMMITTED_A2_CPUS":                                 59330902,
-		"COMMITTED_C2D_CPUS":                                282390904,
-		"COMMITTED_C2_CPUS":                                 223725528,
-		"COMMITTED_C3_CPUS":                                 252354679,
-		"COMMITTED_CPUS":                                    292394702,
-		"COMMITTED_E2_CPUS":                                 388120154,
-		"COMMITTED_LICENSES":                                357606869,
-		"COMMITTED_LOCAL_SSD_TOTAL_GB":                      308393480,
-		"COMMITTED_M3_CPUS":                                 585985,
-		"COMMITTED_MEMORY_OPTIMIZED_CPUS":                   489057886,
-		"COMMITTED_N2A_CPUS":                                40064304,
-		"COMMITTED_N2D_CPUS":                                125951757,
-		"COMMITTED_N2_CPUS":                                 322589603,
-		"COMMITTED_NVIDIA_A100_80GB_GPUS":                   464326565,
-		"COMMITTED_NVIDIA_A100_GPUS":                        375799445,
-		"COMMITTED_NVIDIA_H100_GPUS":                        71649180,
-		"COMMITTED_NVIDIA_K80_GPUS":                         3857188,
-		"COMMITTED_NVIDIA_L4_GPUS":                          19163645,
-		"COMMITTED_NVIDIA_P100_GPUS":                        107528100,
-		"COMMITTED_NVIDIA_P4_GPUS":                          347952897,
-		"COMMITTED_NVIDIA_T4_GPUS":                          139871237,
-		"COMMITTED_NVIDIA_V100_GPUS":                        219562,
-		"COMMITTED_T2A_CPUS":                                296378986,
-		"COMMITTED_T2D_CPUS":                                382266439,
-		"COMMITTED_Z3_CPUS":                                 263844686,
-		"CPUS":                                              2075595,
-		"CPUS_ALL_REGIONS":                                  470911149,
-		"DISKS_TOTAL_GB":                                    353520543,
-		"E2_CPUS":                                           481995837,
-		"EXTERNAL_MANAGED_FORWARDING_RULES":                 150790089,
-		"EXTERNAL_NETWORK_LB_FORWARDING_RULES":              374298265,
-		"EXTERNAL_PROTOCOL_FORWARDING_RULES":                63478888,
-		"EXTERNAL_VPN_GATEWAYS":                             272457134,
-		"FIREWALLS":                                         374485843,
-		"FORWARDING_RULES":                                  432668949,
-		"GLOBAL_EXTERNAL_MANAGED_BACKEND_SERVICES":          164566753,
-		"GLOBAL_EXTERNAL_MANAGED_FORWARDING_RULES":          327611949,
-		"GLOBAL_EXTERNAL_PROXY_LB_BACKEND_SERVICES":         400256169,
-		"GLOBAL_INTERNAL_ADDRESSES":                         42738332,
-		"GLOBAL_INTERNAL_MANAGED_BACKEND_SERVICES":          256608303,
+		"UNDEFINED_METRIC":                          0,
+		"A2_CPUS":                                   153206585,
+		"AFFINITY_GROUPS":                           108303563,
+		"AUTOSCALERS":                               471248988,
+		"BACKEND_BUCKETS":                           137626846,
+		"BACKEND_SERVICES":                          269623753,
+		"C2D_CPUS":                                  508182517,
+		"C2_CPUS":                                   317601211,
+		"C3_CPUS":                                   346230362,
+		"COMMITMENTS":                               456141790,
+		"COMMITTED_A2_CPUS":                         59330902,
+		"COMMITTED_C2D_CPUS":                        282390904,
+		"COMMITTED_C2_CPUS":                         223725528,
+		"COMMITTED_C3_CPUS":                         252354679,
+		"COMMITTED_CPUS":                            292394702,
+		"COMMITTED_E2_CPUS":                         388120154,
+		"COMMITTED_LICENSES":                        357606869,
+		"COMMITTED_LOCAL_SSD_TOTAL_GB":              308393480,
+		"COMMITTED_M3_CPUS":                         585985,
+		"COMMITTED_MEMORY_OPTIMIZED_CPUS":           489057886,
+		"COMMITTED_N2A_CPUS":                        40064304,
+		"COMMITTED_N2D_CPUS":                        125951757,
+		"COMMITTED_N2_CPUS":                         322589603,
+		"COMMITTED_NVIDIA_A100_80GB_GPUS":           464326565,
+		"COMMITTED_NVIDIA_A100_GPUS":                375799445,
+		"COMMITTED_NVIDIA_H100_GPUS":                71649180,
+		"COMMITTED_NVIDIA_K80_GPUS":                 3857188,
+		"COMMITTED_NVIDIA_L4_GPUS":                  19163645,
+		"COMMITTED_NVIDIA_P100_GPUS":                107528100,
+		"COMMITTED_NVIDIA_P4_GPUS":                  347952897,
+		"COMMITTED_NVIDIA_T4_GPUS":                  139871237,
+		"COMMITTED_NVIDIA_V100_GPUS":                219562,
+		"COMMITTED_T2A_CPUS":                        296378986,
+		"COMMITTED_T2D_CPUS":                        382266439,
+		"COMMITTED_Z3_CPUS":                         263844686,
+		"CPUS":                                      2075595,
+		"CPUS_ALL_REGIONS":                          470911149,
+		"DISKS_TOTAL_GB":                            353520543,
+		"E2_CPUS":                                   481995837,
+		"EXTERNAL_MANAGED_FORWARDING_RULES":         150790089,
+		"EXTERNAL_NETWORK_LB_FORWARDING_RULES":      374298265,
+		"EXTERNAL_PROTOCOL_FORWARDING_RULES":        63478888,
+		"EXTERNAL_VPN_GATEWAYS":                     272457134,
+		"FIREWALLS":                                 374485843,
+		"FORWARDING_RULES":                          432668949,
+		"GLOBAL_EXTERNAL_MANAGED_BACKEND_SERVICES":  164566753,
+		"GLOBAL_EXTERNAL_MANAGED_FORWARDING_RULES":  327611949,
+		"GLOBAL_EXTERNAL_PROXY_LB_BACKEND_SERVICES": 400256169,
+		"GLOBAL_INTERNAL_ADDRESSES":                 42738332,
+		"GLOBAL_INTERNAL_MANAGED_BACKEND_SERVICES":  256608303,
 		"GLOBAL_INTERNAL_TRAFFIC_DIRECTOR_BACKEND_SERVICES": 323514196,
-		"GPUS_ALL_REGIONS":                                  39387177,
-		"HDB_TOTAL_GB":                                      319316271,
-		"HDB_TOTAL_IOPS":                                    309720317,
-		"HDB_TOTAL_THROUGHPUT":                              20981374,
-		"HEALTH_CHECKS":                                     289347502,
-		"IMAGES":                                            15562360,
-		"INSTANCES":                                         131337822,
-		"INSTANCE_GROUPS":                                   355919038,
-		"INSTANCE_GROUP_MANAGERS":                           101798192,
-		"INSTANCE_TEMPLATES":                                226188271,
-		"INTERCONNECTS":                                     415204741,
-		"INTERCONNECT_ATTACHMENTS_PER_REGION":               159968086,
-		"INTERCONNECT_ATTACHMENTS_TOTAL_MBPS":               425090419,
-		"INTERCONNECT_TOTAL_GBPS":                           285341866,
-		"INTERNAL_ADDRESSES":                                197899392,
-		"INTERNAL_TRAFFIC_DIRECTOR_FORWARDING_RULES":        266433668,
-		"IN_PLACE_SNAPSHOTS":                                151359133,
-		"IN_USE_ADDRESSES":                                  402125072,
-		"IN_USE_BACKUP_SCHEDULES":                           32786705,
-		"IN_USE_SNAPSHOT_SCHEDULES":                         462104083,
-		"LOCAL_SSD_TOTAL_GB":                                330878021,
-		"M1_CPUS":                                           37203366,
-		"M2_CPUS":                                           65832517,
-		"M3_CPUS":                                           94461668,
-		"MACHINE_IMAGES":                                    446986640,
-		"N2A_CPUS":                                          265855917,
-		"N2D_CPUS":                                          351743370,
-		"N2_CPUS":                                           416465286,
-		"NETWORKS":                                          485481477,
-		"NETWORK_ATTACHMENTS":                               149028575,
-		"NETWORK_ENDPOINT_GROUPS":                           102144909,
-		"NETWORK_FIREWALL_POLICIES":                         101117374,
-		"NET_LB_SECURITY_POLICIES_PER_REGION":               157892269,
-		"NET_LB_SECURITY_POLICY_RULES_PER_REGION":           356090931,
+		"GPUS_ALL_REGIONS":                           39387177,
+		"HDB_TOTAL_GB":                               319316271,
+		"HDB_TOTAL_IOPS":                             309720317,
+		"HDB_TOTAL_THROUGHPUT":                       20981374,
+		"HEALTH_CHECKS":                              289347502,
+		"IMAGES":                                     15562360,
+		"INSTANCES":                                  131337822,
+		"INSTANCE_GROUPS":                            355919038,
+		"INSTANCE_GROUP_MANAGERS":                    101798192,
+		"INSTANCE_TEMPLATES":                         226188271,
+		"INTERCONNECTS":                              415204741,
+		"INTERCONNECT_ATTACHMENTS_PER_REGION":        159968086,
+		"INTERCONNECT_ATTACHMENTS_TOTAL_MBPS":        425090419,
+		"INTERCONNECT_TOTAL_GBPS":                    285341866,
+		"INTERNAL_ADDRESSES":                         197899392,
+		"INTERNAL_TRAFFIC_DIRECTOR_FORWARDING_RULES": 266433668,
+		"IN_PLACE_SNAPSHOTS":                         151359133,
+		"IN_USE_ADDRESSES":                           402125072,
+		"IN_USE_BACKUP_SCHEDULES":                    32786705,
+		"IN_USE_SNAPSHOT_SCHEDULES":                  462104083,
+		"LOCAL_SSD_TOTAL_GB":                         330878021,
+		"M1_CPUS":                                    37203366,
+		"M2_CPUS":                                    65832517,
+		"M3_CPUS":                                    94461668,
+		"MACHINE_IMAGES":                             446986640,
+		"N2A_CPUS":                                   265855917,
+		"N2D_CPUS":                                   351743370,
+		"N2_CPUS":                                    416465286,
+		"NETWORKS":                                   485481477,
+		"NETWORK_ATTACHMENTS":                        149028575,
+		"NETWORK_ENDPOINT_GROUPS":                    102144909,
+		"NETWORK_FIREWALL_POLICIES":                  101117374,
+		"NET_LB_SECURITY_POLICIES_PER_REGION":        157892269,
+		"NET_LB_SECURITY_POLICY_RULES_PER_REGION":    356090931,
 		"NET_LB_SECURITY_POLICY_RULE_ATTRIBUTES_PER_REGION": 311243888,
 		"NODE_GROUPS":                                            24624817,
 		"NODE_TEMPLATES":                                         474896668,
@@ -248650,40 +248650,40 @@ var file_google_cloud_compute_v1_compute_proto_goTypes = []any{
 	(*PerformMaintenanceReservationBlockRequest)(nil),                                     // 1816: google.cloud.compute.v1.PerformMaintenanceReservationBlockRequest
 	(*PerformMaintenanceReservationRequest)(nil),                                          // 1817: google.cloud.compute.v1.PerformMaintenanceReservationRequest
 	(*PerformMaintenanceReservationSubBlockRequest)(nil),                                  // 1818: google.cloud.compute.v1.PerformMaintenanceReservationSubBlockRequest
-	(*Policy)(nil),                                                                            // 1819: google.cloud.compute.v1.Policy
-	(*PreconfiguredWafSet)(nil),                                                               // 1820: google.cloud.compute.v1.PreconfiguredWafSet
-	(*PreservedState)(nil),                                                                    // 1821: google.cloud.compute.v1.PreservedState
-	(*PreservedStatePreservedDisk)(nil),                                                       // 1822: google.cloud.compute.v1.PreservedStatePreservedDisk
-	(*PreservedStatePreservedNetworkIp)(nil),                                                  // 1823: google.cloud.compute.v1.PreservedStatePreservedNetworkIp
-	(*PreservedStatePreservedNetworkIpIpAddress)(nil),                                         // 1824: google.cloud.compute.v1.PreservedStatePreservedNetworkIpIpAddress
-	(*PreviewFeature)(nil),                                                                    // 1825: google.cloud.compute.v1.PreviewFeature
-	(*PreviewFeatureList)(nil),                                                                // 1826: google.cloud.compute.v1.PreviewFeatureList
-	(*PreviewFeatureRolloutOperation)(nil),                                                    // 1827: google.cloud.compute.v1.PreviewFeatureRolloutOperation
-	(*PreviewFeatureRolloutOperationRolloutInput)(nil),                                        // 1828: google.cloud.compute.v1.PreviewFeatureRolloutOperationRolloutInput
-	(*PreviewFeatureStatus)(nil),                                                              // 1829: google.cloud.compute.v1.PreviewFeatureStatus
-	(*PreviewFeatureStatusReleaseStatus)(nil),                                                 // 1830: google.cloud.compute.v1.PreviewFeatureStatusReleaseStatus
-	(*PreviewRouterRequest)(nil),                                                              // 1831: google.cloud.compute.v1.PreviewRouterRequest
-	(*Project)(nil),                                                                           // 1832: google.cloud.compute.v1.Project
-	(*ProjectsDisableXpnResourceRequest)(nil),                                                 // 1833: google.cloud.compute.v1.ProjectsDisableXpnResourceRequest
-	(*ProjectsEnableXpnResourceRequest)(nil),                                                  // 1834: google.cloud.compute.v1.ProjectsEnableXpnResourceRequest
-	(*ProjectsGetXpnResources)(nil),                                                           // 1835: google.cloud.compute.v1.ProjectsGetXpnResources
-	(*ProjectsListXpnHostsRequest)(nil),                                                       // 1836: google.cloud.compute.v1.ProjectsListXpnHostsRequest
-	(*ProjectsSetCloudArmorTierRequest)(nil),                                                  // 1837: google.cloud.compute.v1.ProjectsSetCloudArmorTierRequest
-	(*ProjectsSetDefaultNetworkTierRequest)(nil),                                              // 1838: google.cloud.compute.v1.ProjectsSetDefaultNetworkTierRequest
-	(*PublicAdvertisedPrefix)(nil),                                                            // 1839: google.cloud.compute.v1.PublicAdvertisedPrefix
-	(*PublicAdvertisedPrefixList)(nil),                                                        // 1840: google.cloud.compute.v1.PublicAdvertisedPrefixList
-	(*PublicAdvertisedPrefixPublicDelegatedPrefix)(nil),                                       // 1841: google.cloud.compute.v1.PublicAdvertisedPrefixPublicDelegatedPrefix
-	(*PublicDelegatedPrefix)(nil),                                                             // 1842: google.cloud.compute.v1.PublicDelegatedPrefix
-	(*PublicDelegatedPrefixAggregatedList)(nil),                                               // 1843: google.cloud.compute.v1.PublicDelegatedPrefixAggregatedList
-	(*PublicDelegatedPrefixList)(nil),                                                         // 1844: google.cloud.compute.v1.PublicDelegatedPrefixList
-	(*PublicDelegatedPrefixPublicDelegatedSubPrefix)(nil),                                     // 1845: google.cloud.compute.v1.PublicDelegatedPrefixPublicDelegatedSubPrefix
-	(*PublicDelegatedPrefixesScopedList)(nil),                                                 // 1846: google.cloud.compute.v1.PublicDelegatedPrefixesScopedList
-	(*Quota)(nil),                                                                             // 1847: google.cloud.compute.v1.Quota
-	(*QuotaExceededInfo)(nil),                                                                 // 1848: google.cloud.compute.v1.QuotaExceededInfo
-	(*QuotaStatusWarning)(nil),                                                                // 1849: google.cloud.compute.v1.QuotaStatusWarning
-	(*RawDisk)(nil),                                                                           // 1850: google.cloud.compute.v1.RawDisk
-	(*RecreateInstancesInstanceGroupManagerRequest)(nil),                                      // 1851: google.cloud.compute.v1.RecreateInstancesInstanceGroupManagerRequest
-	(*RecreateInstancesRegionInstanceGroupManagerRequest)(nil),                                // 1852: google.cloud.compute.v1.RecreateInstancesRegionInstanceGroupManagerRequest
+	(*Policy)(nil),                                        // 1819: google.cloud.compute.v1.Policy
+	(*PreconfiguredWafSet)(nil),                           // 1820: google.cloud.compute.v1.PreconfiguredWafSet
+	(*PreservedState)(nil),                                // 1821: google.cloud.compute.v1.PreservedState
+	(*PreservedStatePreservedDisk)(nil),                   // 1822: google.cloud.compute.v1.PreservedStatePreservedDisk
+	(*PreservedStatePreservedNetworkIp)(nil),              // 1823: google.cloud.compute.v1.PreservedStatePreservedNetworkIp
+	(*PreservedStatePreservedNetworkIpIpAddress)(nil),     // 1824: google.cloud.compute.v1.PreservedStatePreservedNetworkIpIpAddress
+	(*PreviewFeature)(nil),                                // 1825: google.cloud.compute.v1.PreviewFeature
+	(*PreviewFeatureList)(nil),                            // 1826: google.cloud.compute.v1.PreviewFeatureList
+	(*PreviewFeatureRolloutOperation)(nil),                // 1827: google.cloud.compute.v1.PreviewFeatureRolloutOperation
+	(*PreviewFeatureRolloutOperationRolloutInput)(nil),    // 1828: google.cloud.compute.v1.PreviewFeatureRolloutOperationRolloutInput
+	(*PreviewFeatureStatus)(nil),                          // 1829: google.cloud.compute.v1.PreviewFeatureStatus
+	(*PreviewFeatureStatusReleaseStatus)(nil),             // 1830: google.cloud.compute.v1.PreviewFeatureStatusReleaseStatus
+	(*PreviewRouterRequest)(nil),                          // 1831: google.cloud.compute.v1.PreviewRouterRequest
+	(*Project)(nil),                                       // 1832: google.cloud.compute.v1.Project
+	(*ProjectsDisableXpnResourceRequest)(nil),             // 1833: google.cloud.compute.v1.ProjectsDisableXpnResourceRequest
+	(*ProjectsEnableXpnResourceRequest)(nil),              // 1834: google.cloud.compute.v1.ProjectsEnableXpnResourceRequest
+	(*ProjectsGetXpnResources)(nil),                       // 1835: google.cloud.compute.v1.ProjectsGetXpnResources
+	(*ProjectsListXpnHostsRequest)(nil),                   // 1836: google.cloud.compute.v1.ProjectsListXpnHostsRequest
+	(*ProjectsSetCloudArmorTierRequest)(nil),              // 1837: google.cloud.compute.v1.ProjectsSetCloudArmorTierRequest
+	(*ProjectsSetDefaultNetworkTierRequest)(nil),          // 1838: google.cloud.compute.v1.ProjectsSetDefaultNetworkTierRequest
+	(*PublicAdvertisedPrefix)(nil),                        // 1839: google.cloud.compute.v1.PublicAdvertisedPrefix
+	(*PublicAdvertisedPrefixList)(nil),                    // 1840: google.cloud.compute.v1.PublicAdvertisedPrefixList
+	(*PublicAdvertisedPrefixPublicDelegatedPrefix)(nil),   // 1841: google.cloud.compute.v1.PublicAdvertisedPrefixPublicDelegatedPrefix
+	(*PublicDelegatedPrefix)(nil),                         // 1842: google.cloud.compute.v1.PublicDelegatedPrefix
+	(*PublicDelegatedPrefixAggregatedList)(nil),           // 1843: google.cloud.compute.v1.PublicDelegatedPrefixAggregatedList
+	(*PublicDelegatedPrefixList)(nil),                     // 1844: google.cloud.compute.v1.PublicDelegatedPrefixList
+	(*PublicDelegatedPrefixPublicDelegatedSubPrefix)(nil), // 1845: google.cloud.compute.v1.PublicDelegatedPrefixPublicDelegatedSubPrefix
+	(*PublicDelegatedPrefixesScopedList)(nil),             // 1846: google.cloud.compute.v1.PublicDelegatedPrefixesScopedList
+	(*Quota)(nil),              // 1847: google.cloud.compute.v1.Quota
+	(*QuotaExceededInfo)(nil),  // 1848: google.cloud.compute.v1.QuotaExceededInfo
+	(*QuotaStatusWarning)(nil), // 1849: google.cloud.compute.v1.QuotaStatusWarning
+	(*RawDisk)(nil),            // 1850: google.cloud.compute.v1.RawDisk
+	(*RecreateInstancesInstanceGroupManagerRequest)(nil),       // 1851: google.cloud.compute.v1.RecreateInstancesInstanceGroupManagerRequest
+	(*RecreateInstancesRegionInstanceGroupManagerRequest)(nil), // 1852: google.cloud.compute.v1.RecreateInstancesRegionInstanceGroupManagerRequest
 	(*Reference)(nil),                                                                         // 1853: google.cloud.compute.v1.Reference
 	(*Region)(nil),                                                                            // 1854: google.cloud.compute.v1.Region
 	(*RegionAddressesMoveRequest)(nil),                                                        // 1855: google.cloud.compute.v1.RegionAddressesMoveRequest

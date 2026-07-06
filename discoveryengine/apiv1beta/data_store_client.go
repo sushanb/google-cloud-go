@@ -198,7 +198,7 @@ type DataStoreClient struct {
 
 // Wrapper methods routed to the internal client.
 
-// Close closes the connection to the API service. The user should invoke this when
+// Close closes the connection to the API service. **Always** call Close() when
 // the client is no longer required.
 func (c *DataStoreClient) Close() error {
 	return c.internalClient.Close()
@@ -400,7 +400,7 @@ func (c *dataStoreGRPCClient) setGoogleClientInfo(keyval ...string) {
 	}
 }
 
-// Close closes the connection to the API service. The user should invoke this when
+// Close closes the connection to the API service. **Always** call Close() when
 // the client is no longer required.
 func (c *dataStoreGRPCClient) Close() error {
 	return c.connPool.Close()
@@ -516,7 +516,7 @@ func (c *dataStoreRESTClient) setGoogleClientInfo(keyval ...string) {
 	}
 }
 
-// Close closes the connection to the API service. The user should invoke this when
+// Close closes the connection to the API service. **Always** call Close() when
 // the client is no longer required.
 func (c *dataStoreRESTClient) Close() error {
 	// Replace httpClient with nil to force cleanup.
@@ -789,10 +789,16 @@ func (c *dataStoreRESTClient) CreateDataStore(ctx context.Context, req *discover
 
 	params := url.Values{}
 	params.Add("$alt", "json;enum-encoding=int")
+	if req.GetCmekConfigName() != "" {
+		params.Add("cmekConfigName", fmt.Sprintf("%v", req.GetCmekConfigName()))
+	}
 	if req.GetCreateAdvancedSiteSearch() {
 		params.Add("createAdvancedSiteSearch", fmt.Sprintf("%v", req.GetCreateAdvancedSiteSearch()))
 	}
 	params.Add("dataStoreId", fmt.Sprintf("%v", req.GetDataStoreId()))
+	if req.GetDisableCmek() {
+		params.Add("disableCmek", fmt.Sprintf("%v", req.GetDisableCmek()))
+	}
 	if req.GetSkipDefaultSchemaCreation() {
 		params.Add("skipDefaultSchemaCreation", fmt.Sprintf("%v", req.GetSkipDefaultSchemaCreation()))
 	}

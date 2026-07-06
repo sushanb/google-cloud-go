@@ -60,6 +60,7 @@ import (
 	"github.com/googleapis/gax-go/v2/apierror"
 	"go.opentelemetry.io/contrib/detectors/gcp"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -140,6 +141,11 @@ func TestMain(m *testing.M) {
 // Return a cleanup function.
 func initIntegrationTest() func() error {
 	flag.Parse() // needed for testing.Short()
+	if os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") == "" {
+		if key := os.Getenv("GCLOUD_TESTS_GOLANG_KEY"); key != "" {
+			os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", key)
+		}
+	}
 	switch {
 	case testing.Short() && *record:
 		log.Fatal("cannot combine -short and -record")
@@ -1140,6 +1146,71 @@ func TestIntegration_DoNotDetectDirectConnectivityWhenDisabled(t *testing.T) {
 	})
 }
 
+// Test handles the case when Direct Connectivity is enforced but disabled
+// client-side. The GCS server must return an error because the request is not
+// routed via DirectPath.
+func TestIntegration_DirectConnectivityEnforcedError(t *testing.T) {
+	ctx := skipHTTP("grpc only test")
+	multiTransportTest(skipExtraReadAPIs(ctx, "no reads in test"), t, func(t *testing.T, ctx context.Context, _ string, prefix string, _ *Client) {
+		// Detect if we are running in GCE and get the region.
+		detectedAttrs, err := resource.New(ctx, resource.WithDetectors(gcp.NewDetector()))
+		if err != nil {
+			t.Fatalf("resource.New: %v", err)
+		}
+		attrs := detectedAttrs.Set()
+		if v, exists := attrs.Value("cloud.platform"); !exists || v.AsString() != "gcp_compute_engine" {
+			t.Skip("only testable in a GCE instance")
+		}
+		regionVal, exists := attrs.Value("cloud.region")
+		if !exists {
+			t.Skip("could not detect GCE region")
+		}
+		region := regionVal.AsString()
+		t.Logf("Detected GCE region: %q", region)
+
+		// Create a temporary client to set up the bucket in the same region.
+		client := testConfigGRPC(ctx, t)
+		defer client.Close()
+		bucketName := prefix + uidSpace.New()
+		bucket := client.Bucket(bucketName)
+		if err := bucket.Create(ctx, testutil.ProjID(), &BucketAttrs{Location: region}); err != nil {
+			t.Fatalf("failed to create bucket in region %q: %v", region, err)
+		}
+		t.Cleanup(func() {
+			bucket.Delete(ctx)
+		})
+
+		// Disable DirectPath client-side using environment variable.
+		t.Setenv("GOOGLE_CLOUD_DISABLE_DIRECT_PATH", "true")
+
+		// Create a client with Direct Connectivity Enforced.
+		enforcedClient, err := NewGRPCClient(ctx,
+			experimental.WithDirectConnectivityEnforced(),
+		)
+		if err != nil {
+			t.Fatalf("failed to create enforced client: %v", err)
+		}
+		defer enforcedClient.Close()
+
+		// Try writing an object and ensure it fails.
+		obj := enforcedClient.Bucket(bucketName).Object("test-object")
+		w := obj.NewWriter(ctx)
+		_, err = w.Write([]byte("hello world"))
+		if closeErr := w.Close(); err == nil {
+			err = closeErr
+		}
+		if err == nil {
+			t.Fatal("expected error when direct connectivity is enforced but disabled client-side, got nil")
+		}
+
+		// Verify that the error is FailedPrecondition (400 / FailedPrecondition).
+		t.Logf("Got expected error: %v", err)
+		if gotCode := status.Code(err); gotCode != codes.FailedPrecondition {
+			t.Errorf("got error code %v, want FailedPrecondition", gotCode)
+		}
+	})
+}
+
 // TestIntegration_MetricsEnablement does not use multiTransportTest because it
 // only has to run once, and creating the manual reader multiple times can
 // cause it to be registered multiple times to packages that enable by default.
@@ -1192,6 +1263,112 @@ func TestIntegration_MetricsEnablement(t *testing.T) {
 
 	if err := mr.Shutdown(ctx); err != nil {
 		t.Fatalf("manual reader shutdown: %v", err)
+	}
+}
+
+func TestIntegration_OtelMetricsEnablement(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Integration tests skipped in short mode")
+	}
+
+	ctx := context.Background()
+	prefix := grpcTestPrefix
+
+	for _, transportType := range []string{"http", "grpc"} {
+		t.Run(transportType, func(t *testing.T) {
+			res, err := resource.New(ctx,
+				resource.WithAttributes(
+					attribute.String("gcp.client.service", "storage"),
+					attribute.String("gcp.client.repo", "googleapis/google-cloud-go"),
+				),
+			)
+			if err != nil {
+				t.Fatalf("resource.New: %v", err)
+			}
+			mr := metric.NewManualReader()
+			provider := metric.NewMeterProvider(
+				metric.WithReader(mr),
+				metric.WithResource(res),
+			)
+			defer provider.Shutdown(ctx)
+
+			var client *Client
+			opts := []option.ClientOption{
+				experimental.WithOtelMetrics(),
+				experimental.WithMeterProvider(provider),
+			}
+
+			if transportType == "grpc" {
+				client = testConfigGRPC(ctx, t, opts...)
+			} else {
+				client = testConfig(ctx, t, opts...)
+			}
+			defer client.Close()
+
+			bucketName := prefix + uidSpace.New()
+			b := client.Bucket(bucketName)
+
+			if err := b.Create(ctx, testutil.ProjID(), nil); err != nil {
+				t.Fatalf("BucketHandle.Create(%q): %v", bucketName, err)
+			}
+			defer b.Delete(ctx)
+
+			it := b.Objects(ctx, nil)
+			_, err = it.Next()
+			if err != iterator.Done {
+				t.Errorf("Objects.Next: expected iterator.Done got %v", err)
+			}
+
+			rm := metricdata.ResourceMetrics{}
+			if err := mr.Collect(ctx, &rm); err != nil {
+				t.Fatalf("ManualReader.Collect: %v", err)
+			}
+
+			expectedMetricName := "rpc.client.call.duration"
+			if transportType == "http" {
+				expectedMetricName = "http.client.request.duration"
+			}
+
+			found := false
+			for _, sm := range rm.ScopeMetrics {
+				for _, m := range sm.Metrics {
+					if m.Name == expectedMetricName {
+						found = true
+						hist, ok := m.Data.(metricdata.Histogram[float64])
+						if !ok {
+							t.Fatalf("expected Histogram data, got %T", m.Data)
+						}
+						if len(hist.DataPoints) == 0 {
+							t.Fatalf("expected at least 1 datapoint, got 0")
+						}
+						dp := hist.DataPoints[0]
+
+						resAttrs := make(map[string]string)
+						for _, attr := range rm.Resource.Attributes() {
+							resAttrs[string(attr.Key)] = attr.Value.Emit()
+						}
+						if resAttrs["gcp.client.service"] != "storage" {
+							t.Errorf("expected gcp.client.service = storage, got %q", resAttrs["gcp.client.service"])
+						}
+						if resAttrs["gcp.client.repo"] != "googleapis/google-cloud-go" {
+							t.Errorf("expected gcp.client.repo = googleapis/google-cloud-go, got %q", resAttrs["gcp.client.repo"])
+						}
+
+						attrs := make(map[string]string)
+						for _, kv := range dp.Attributes.ToSlice() {
+							attrs[string(kv.Key)] = kv.Value.Emit()
+						}
+						if attrs["server.address"] == "" {
+							t.Errorf("expected non-empty server.address")
+						}
+					}
+				}
+			}
+
+			if !found {
+				t.Errorf("expected metric %q not found", expectedMetricName)
+			}
+		})
 	}
 }
 
@@ -2945,6 +3122,106 @@ func TestIntegration_ObjectCompose(t *testing.T) {
 			t.Errorf("mismatching ComponentCount: got %v, want %v", attrs.ComponentCount, int64(len(objects)))
 		}
 		checkCompose(compDst, nil, customContexts.Custom)
+	})
+}
+
+func TestIntegration_ObjectCompose_DeleteSourceObjects(t *testing.T) {
+	multiTransportTest(skipZonalBucket(context.Background(), "ZB does not support compose"), t, func(t *testing.T, ctx context.Context, bucket string, _ string, client *Client) {
+		b := client.Bucket(bucket)
+
+		testCases := []struct {
+			desc                string
+			deleteSourceObjects bool
+			wantSourcesDeleted  bool
+		}{
+			{
+				desc:                "delete source objects after compose",
+				deleteSourceObjects: true,
+				wantSourcesDeleted:  true,
+			},
+			{
+				desc:                "do not delete source objects after compose",
+				deleteSourceObjects: false,
+				wantSourcesDeleted:  false,
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.desc, func(t *testing.T) {
+				src1 := b.Object("delSrc1" + uidSpaceObjects.New())
+				c1 := randomContents()
+				if err := writeObject(ctx, src1, "text/plain", c1); err != nil {
+					t.Fatalf("Write for %v failed with %v", src1, err)
+				}
+				defer func() {
+					cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+					defer cancel()
+					src1.Delete(cleanupCtx)
+				}()
+
+				src2 := b.Object("delSrc2" + uidSpaceObjects.New())
+				c2 := randomContents()
+				if err := writeObject(ctx, src2, "text/plain", c2); err != nil {
+					t.Fatalf("Write for %v failed with %v", src2, err)
+				}
+				defer func() {
+					cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+					defer cancel()
+					src2.Delete(cleanupCtx)
+				}()
+
+				compDst := b.Object("composedDel" + uidSpaceObjects.New())
+				c := compDst.ComposerFrom(src1, src2)
+				c.DeleteSourceObjects = tc.deleteSourceObjects
+				attrs, err := c.Run(ctx)
+				if err != nil {
+					t.Fatalf("ComposeFrom error: %v", err)
+				}
+				defer compDst.Delete(ctx)
+
+				if attrs.ComponentCount != 2 {
+					t.Errorf("ComponentCount = %v, want 2", attrs.ComponentCount)
+				}
+
+				// Verify source objects existence
+				_, err1 := src1.Attrs(ctx)
+				if tc.wantSourcesDeleted {
+					if !errors.Is(err1, ErrObjectNotExist) {
+						t.Errorf("src1 still exists, expected it to be deleted. Err: %v", err1)
+					}
+				} else {
+					if err1 != nil {
+						t.Errorf("Error: src1.Attrs(): %v", err1)
+					}
+				}
+
+				_, err2 := src2.Attrs(ctx)
+				if tc.wantSourcesDeleted {
+					if !errors.Is(err2, ErrObjectNotExist) {
+						t.Errorf("src2 still exists, expected it to be deleted. Err: %v", err2)
+					}
+				} else {
+					if err2 != nil {
+						t.Errorf("Error: src2.Attrs(): %v", err2)
+					}
+				}
+
+				// Verify contents of destination object.
+				r, err := compDst.NewReader(ctx)
+				if err != nil {
+					t.Fatalf("new reader on composed target: %v", err)
+				}
+				defer r.Close()
+				slurp, err := io.ReadAll(r)
+				if err != nil {
+					t.Fatalf("reading composed target: %v", err)
+				}
+				wantContents := append(c1, c2...)
+				if !bytes.Equal(slurp, wantContents) {
+					t.Errorf("Composed object contents mismatch:\ngot  %q\nwant %q", slurp, wantContents)
+				}
+			})
+		}
 	})
 }
 
@@ -9032,4 +9309,195 @@ func TestIntegration_ParallelUpload_ChecksumValidation(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestIntegration_FetchBucketMetadata(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name             string
+		bucketAttrs      *BucketAttrs
+		expectedLocation string
+	}{
+		{
+			name:             "Multi-Region",
+			bucketAttrs:      &BucketAttrs{Location: "US"},
+			expectedLocation: "global",
+		},
+		{
+			name:             "Dual-Region",
+			bucketAttrs:      &BucketAttrs{Location: "NAM4"},
+			expectedLocation: "global",
+		},
+		{
+			name:             "Regional",
+			bucketAttrs:      &BucketAttrs{Location: "US-West1"},
+			expectedLocation: "us-west1",
+		},
+		{
+			name: "Zonal",
+			bucketAttrs: &BucketAttrs{
+				Location: testZonalLocation,
+				CustomPlacementConfig: &CustomPlacementConfig{
+					DataLocations: []string{testZonalZone},
+				},
+				StorageClass: "RAPID",
+				HierarchicalNamespace: &HierarchicalNamespace{
+					Enabled: true,
+				},
+				UniformBucketLevelAccess: UniformBucketLevelAccess{
+					Enabled: true,
+				},
+			},
+			expectedLocation: testZonalLocation,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := skipExtraReadAPIs(ctx, "bucket operations")
+			multiTransportTest(ctx, t, func(t *testing.T, ctx context.Context, _ string, _ string, client *Client) {
+				bucketName := fmt.Sprintf("test-nonreg-metadata-%d", time.Now().UnixNano())
+				err := client.Bucket(bucketName).Create(ctx, testutil.ProjID(), tc.bucketAttrs)
+				if err != nil {
+					t.Skipf("skipping: failed to create bucket in %s: %v", tc.bucketAttrs.Location, err)
+				}
+				t.Cleanup(func() {
+					client.Bucket(bucketName).Delete(ctx)
+				})
+
+				resource, location, err := client.tc.fetchBucketMetadata(ctx, bucketName)
+				if err != nil {
+					t.Fatalf("fetchBucketMetadata failed: %v", err)
+				}
+
+				if location != tc.expectedLocation {
+					t.Errorf("got location %q, want %q for %s bucket", location, tc.expectedLocation, tc.name)
+				}
+
+				if !strings.HasPrefix(resource, "projects/") || !strings.HasSuffix(resource, "/buckets/"+bucketName) {
+					t.Errorf("unexpected resource format: %q", resource)
+				}
+			})
+		})
+	}
+}
+
+func TestIntegration_ClientTracing(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name      string
+		newClient func(t *testing.T, ctx context.Context, opts ...option.ClientOption) (*Client, error)
+	}{
+		{
+			name: "gRPC",
+			newClient: func(t *testing.T, ctx context.Context, opts ...option.ClientOption) (*Client, error) {
+				return testConfigGRPC(ctx, t, opts...), nil
+			},
+		},
+		{
+			name: "HTTP",
+			newClient: func(t *testing.T, ctx context.Context, opts ...option.ClientOption) (*Client, error) {
+				return testConfig(ctx, t, opts...), nil
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			te := testutil.NewOpenTelemetryTestExporter()
+			t.Cleanup(func() {
+				te.Unregister(ctx)
+			})
+
+			t.Setenv("GO_STORAGE_DEV_OTEL_TRACING", "true")
+
+			// 1. Create bucket using a separate admin client.
+			adminClient, err := tc.newClient(t, ctx)
+			if err != nil {
+				t.Fatalf("failed to create admin client: %v", err)
+			}
+			adminClient.bucketMetadataCache = nil
+			bucketName := fmt.Sprintf("test-trace-int-%s-%d", strings.ToLower(tc.name), time.Now().UnixNano())
+			if err := adminClient.Bucket(bucketName).Create(ctx, testutil.ProjID(), &BucketAttrs{Location: "us-east1"}); err != nil {
+				adminClient.Close()
+				t.Fatalf("failed to create bucket: %v", err)
+			}
+			t.Cleanup(func() {
+				adminClient.Bucket(bucketName).Delete(ctx)
+				adminClient.Close()
+			})
+
+			// 2. Create the test client which will have an empty cache.
+			client, err := tc.newClient(t, ctx)
+			if err != nil {
+				t.Fatalf("failed to create test client: %v", err)
+			}
+			defer client.Close()
+
+			doneChan := make(chan struct{}, 1)
+			client.bucketMetadataCache.fetchDone = doneChan
+
+			// Get the number of spans before our test operations.
+			initialSpanCount := len(te.Spans())
+
+			// 1. First operation: Cache Miss. Should get placeholder attributes.
+			_, err = client.Bucket(bucketName).Attrs(ctx)
+			if err != nil {
+				t.Fatalf("Bucket.Attrs failed: %v", err)
+			}
+
+			spans := te.Spans()
+			var attrsSpan tracetest.SpanStub
+			found := false
+			for _, s := range spans[initialSpanCount:] {
+				if s.Name == "cloud.google.com/go/storage.Bucket.Attrs" {
+					attrsSpan = s
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("Bucket.Attrs span not found")
+			}
+
+			// First call should have placeholder.
+			verifySpanAttributes(t, attrsSpan, "projects/_/buckets/"+bucketName, "global")
+
+			// Wait for background fetch to complete and populate cache.
+			select {
+			case <-doneChan:
+			case <-time.After(fetchBackgroundTimeout):
+				t.Fatalf("timeout waiting for fetchBackground completion")
+			}
+			entry, cacheFound := client.bucketMetadataCache.get(bucketName)
+			if !cacheFound || entry.location != "us-east1" {
+				t.Fatalf("expected entry to be populated in cache with us-east1, got %+v (found: %t)", entry, cacheFound)
+			}
+
+			// 2. Second operation: Cache Hit. Should get resolved attributes.
+			spanCountAfterFirstOp := len(te.Spans())
+			bAttrs, err := client.Bucket(bucketName).Attrs(ctx)
+			if err != nil {
+				t.Fatalf("Bucket.Attrs failed: %v", err)
+			}
+
+			spans = te.Spans()
+			found = false
+			for _, s := range spans[spanCountAfterFirstOp:] {
+				if s.Name == "cloud.google.com/go/storage.Bucket.Attrs" {
+					attrsSpan = s
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("second Bucket.Attrs span not found")
+			}
+
+			// Second call should have resolved attributes.
+			verifySpanAttributes(t, attrsSpan, fmt.Sprintf("projects/%d/buckets/%s", bAttrs.ProjectNumber, bucketName), "us-east1")
+		})
+	}
 }

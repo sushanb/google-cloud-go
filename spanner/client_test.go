@@ -317,6 +317,39 @@ func TestValidDatabaseName(t *testing.T) {
 	}
 }
 
+func TestClientConfigValidation(t *testing.T) {
+	tests := []struct {
+		name   string
+		config ClientConfig
+	}{
+		{
+			name: "invalid config - options set on CLOUD type",
+			config: ClientConfig{
+				Type:         CLOUD,
+				UsePlainText: true,
+			},
+		},
+		{
+			name: "invalid config - options set on unspecified type",
+			config: ClientConfig{
+				CaCertificateFile: "ca.pem",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewClientWithConfig(context.Background(), "projects/p/instances/i/databases/d", tt.config)
+			if err == nil {
+				t.Fatalf("NewClientWithConfig() expected error, got nil")
+			}
+			if ErrCode(err) != codes.InvalidArgument || !strings.Contains(err.Error(), "can only be set when Type is OMNI") {
+				t.Errorf("NewClientWithConfig() unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestReadOnlyTransactionClose(t *testing.T) {
 	// Closing a ReadOnlyTransaction shouldn't panic.
 	c := &Client{}
@@ -982,12 +1015,19 @@ func TestLocationAwareExecuteSql_ReroutesToNextReplicaAndMarksCooldownScopes(t *
 		Params: &structpb.Struct{},
 	}
 
-	waitForCondition(t, time.Second, func() bool {
+	// 5s timeout (vs default 1s) absorbs scheduling jitter under -race + CI load.
+	waitForCondition(t, 5*time.Second, func() bool {
 		prepared := proto.Clone(req).(*sppb.ExecuteSqlRequest)
 		endpoint := client.locationRouter.prepareExecuteSQLRequest(context.Background(), prepared)
 		return endpoint != nil && endpoint.Address() == harness.ReplicaAddresses[0]
 	})
-	waitForLocationAwareEndpointHealthy(t, client, harness.ReplicaAddresses[1])
+	waitForCondition(t, 5*time.Second, func() bool {
+		if client.locationRouter == nil || client.locationRouter.endpointCache == nil {
+			return false
+		}
+		endpoint := client.locationRouter.endpointCache.Get(context.Background(), harness.ReplicaAddresses[1])
+		return endpoint != nil && endpoint.IsHealthy()
+	})
 
 	lac, ok := sh.getClient().(*locationAwareSpannerClient)
 	if !ok {

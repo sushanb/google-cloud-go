@@ -2654,11 +2654,11 @@ var (
 		408601302: "PREFER_IPV6",
 	}
 	BackendService_IpAddressSelectionPolicy_value = map[string]int32{
-		"UNDEFINED_IP_ADDRESS_SELECTION_POLICY": 0,
-		"IPV4_ONLY":                             22373798,
-		"IPV6_ONLY":                             79632100,
+		"UNDEFINED_IP_ADDRESS_SELECTION_POLICY":   0,
+		"IPV4_ONLY":                               22373798,
+		"IPV6_ONLY":                               79632100,
 		"IP_ADDRESS_SELECTION_POLICY_UNSPECIFIED": 36210144,
-		"PREFER_IPV6": 408601302,
+		"PREFER_IPV6":                             408601302,
 	}
 )
 
@@ -24363,91 +24363,91 @@ var (
 		95191981:  "XPN_SERVICE_PROJECTS",
 	}
 	Quota_Metric_value = map[string]int32{
-		"UNDEFINED_METRIC":                                  0,
-		"A2_CPUS":                                           153206585,
-		"AFFINITY_GROUPS":                                   108303563,
-		"AUTOSCALERS":                                       471248988,
-		"BACKEND_BUCKETS":                                   137626846,
-		"BACKEND_SERVICES":                                  269623753,
-		"C2D_CPUS":                                          508182517,
-		"C2_CPUS":                                           317601211,
-		"C3_CPUS":                                           346230362,
-		"COMMITMENTS":                                       456141790,
-		"COMMITTED_A2_CPUS":                                 59330902,
-		"COMMITTED_C2D_CPUS":                                282390904,
-		"COMMITTED_C2_CPUS":                                 223725528,
-		"COMMITTED_C3_CPUS":                                 252354679,
-		"COMMITTED_CPUS":                                    292394702,
-		"COMMITTED_E2_CPUS":                                 388120154,
-		"COMMITTED_LICENSES":                                357606869,
-		"COMMITTED_LOCAL_SSD_TOTAL_GB":                      308393480,
-		"COMMITTED_M3_CPUS":                                 585985,
-		"COMMITTED_MEMORY_OPTIMIZED_CPUS":                   489057886,
-		"COMMITTED_N2A_CPUS":                                40064304,
-		"COMMITTED_N2D_CPUS":                                125951757,
-		"COMMITTED_N2_CPUS":                                 322589603,
-		"COMMITTED_NVIDIA_A100_80GB_GPUS":                   464326565,
-		"COMMITTED_NVIDIA_A100_GPUS":                        375799445,
-		"COMMITTED_NVIDIA_H100_GPUS":                        71649180,
-		"COMMITTED_NVIDIA_K80_GPUS":                         3857188,
-		"COMMITTED_NVIDIA_L4_GPUS":                          19163645,
-		"COMMITTED_NVIDIA_P100_GPUS":                        107528100,
-		"COMMITTED_NVIDIA_P4_GPUS":                          347952897,
-		"COMMITTED_NVIDIA_T4_GPUS":                          139871237,
-		"COMMITTED_NVIDIA_V100_GPUS":                        219562,
-		"COMMITTED_T2A_CPUS":                                296378986,
-		"COMMITTED_T2D_CPUS":                                382266439,
-		"COMMITTED_Z3_CPUS":                                 263844686,
-		"CPUS":                                              2075595,
-		"CPUS_ALL_REGIONS":                                  470911149,
-		"DISKS_TOTAL_GB":                                    353520543,
-		"E2_CPUS":                                           481995837,
-		"EXTERNAL_MANAGED_FORWARDING_RULES":                 150790089,
-		"EXTERNAL_NETWORK_LB_FORWARDING_RULES":              374298265,
-		"EXTERNAL_PROTOCOL_FORWARDING_RULES":                63478888,
-		"EXTERNAL_VPN_GATEWAYS":                             272457134,
-		"FIREWALLS":                                         374485843,
-		"FORWARDING_RULES":                                  432668949,
-		"GLOBAL_EXTERNAL_MANAGED_BACKEND_SERVICES":          164566753,
-		"GLOBAL_EXTERNAL_MANAGED_FORWARDING_RULES":          327611949,
-		"GLOBAL_EXTERNAL_PROXY_LB_BACKEND_SERVICES":         400256169,
-		"GLOBAL_INTERNAL_ADDRESSES":                         42738332,
-		"GLOBAL_INTERNAL_MANAGED_BACKEND_SERVICES":          256608303,
+		"UNDEFINED_METRIC":                          0,
+		"A2_CPUS":                                   153206585,
+		"AFFINITY_GROUPS":                           108303563,
+		"AUTOSCALERS":                               471248988,
+		"BACKEND_BUCKETS":                           137626846,
+		"BACKEND_SERVICES":                          269623753,
+		"C2D_CPUS":                                  508182517,
+		"C2_CPUS":                                   317601211,
+		"C3_CPUS":                                   346230362,
+		"COMMITMENTS":                               456141790,
+		"COMMITTED_A2_CPUS":                         59330902,
+		"COMMITTED_C2D_CPUS":                        282390904,
+		"COMMITTED_C2_CPUS":                         223725528,
+		"COMMITTED_C3_CPUS":                         252354679,
+		"COMMITTED_CPUS":                            292394702,
+		"COMMITTED_E2_CPUS":                         388120154,
+		"COMMITTED_LICENSES":                        357606869,
+		"COMMITTED_LOCAL_SSD_TOTAL_GB":              308393480,
+		"COMMITTED_M3_CPUS":                         585985,
+		"COMMITTED_MEMORY_OPTIMIZED_CPUS":           489057886,
+		"COMMITTED_N2A_CPUS":                        40064304,
+		"COMMITTED_N2D_CPUS":                        125951757,
+		"COMMITTED_N2_CPUS":                         322589603,
+		"COMMITTED_NVIDIA_A100_80GB_GPUS":           464326565,
+		"COMMITTED_NVIDIA_A100_GPUS":                375799445,
+		"COMMITTED_NVIDIA_H100_GPUS":                71649180,
+		"COMMITTED_NVIDIA_K80_GPUS":                 3857188,
+		"COMMITTED_NVIDIA_L4_GPUS":                  19163645,
+		"COMMITTED_NVIDIA_P100_GPUS":                107528100,
+		"COMMITTED_NVIDIA_P4_GPUS":                  347952897,
+		"COMMITTED_NVIDIA_T4_GPUS":                  139871237,
+		"COMMITTED_NVIDIA_V100_GPUS":                219562,
+		"COMMITTED_T2A_CPUS":                        296378986,
+		"COMMITTED_T2D_CPUS":                        382266439,
+		"COMMITTED_Z3_CPUS":                         263844686,
+		"CPUS":                                      2075595,
+		"CPUS_ALL_REGIONS":                          470911149,
+		"DISKS_TOTAL_GB":                            353520543,
+		"E2_CPUS":                                   481995837,
+		"EXTERNAL_MANAGED_FORWARDING_RULES":         150790089,
+		"EXTERNAL_NETWORK_LB_FORWARDING_RULES":      374298265,
+		"EXTERNAL_PROTOCOL_FORWARDING_RULES":        63478888,
+		"EXTERNAL_VPN_GATEWAYS":                     272457134,
+		"FIREWALLS":                                 374485843,
+		"FORWARDING_RULES":                          432668949,
+		"GLOBAL_EXTERNAL_MANAGED_BACKEND_SERVICES":  164566753,
+		"GLOBAL_EXTERNAL_MANAGED_FORWARDING_RULES":  327611949,
+		"GLOBAL_EXTERNAL_PROXY_LB_BACKEND_SERVICES": 400256169,
+		"GLOBAL_INTERNAL_ADDRESSES":                 42738332,
+		"GLOBAL_INTERNAL_MANAGED_BACKEND_SERVICES":  256608303,
 		"GLOBAL_INTERNAL_TRAFFIC_DIRECTOR_BACKEND_SERVICES": 323514196,
-		"GPUS_ALL_REGIONS":                                  39387177,
-		"HDB_TOTAL_GB":                                      319316271,
-		"HDB_TOTAL_IOPS":                                    309720317,
-		"HDB_TOTAL_THROUGHPUT":                              20981374,
-		"HEALTH_CHECKS":                                     289347502,
-		"IMAGES":                                            15562360,
-		"INSTANCES":                                         131337822,
-		"INSTANCE_GROUPS":                                   355919038,
-		"INSTANCE_GROUP_MANAGERS":                           101798192,
-		"INSTANCE_TEMPLATES":                                226188271,
-		"INTERCONNECTS":                                     415204741,
-		"INTERCONNECT_ATTACHMENTS_PER_REGION":               159968086,
-		"INTERCONNECT_ATTACHMENTS_TOTAL_MBPS":               425090419,
-		"INTERCONNECT_TOTAL_GBPS":                           285341866,
-		"INTERNAL_ADDRESSES":                                197899392,
-		"INTERNAL_TRAFFIC_DIRECTOR_FORWARDING_RULES":        266433668,
-		"IN_PLACE_SNAPSHOTS":                                151359133,
-		"IN_USE_ADDRESSES":                                  402125072,
-		"IN_USE_BACKUP_SCHEDULES":                           32786705,
-		"IN_USE_SNAPSHOT_SCHEDULES":                         462104083,
-		"LOCAL_SSD_TOTAL_GB":                                330878021,
-		"M1_CPUS":                                           37203366,
-		"M2_CPUS":                                           65832517,
-		"M3_CPUS":                                           94461668,
-		"MACHINE_IMAGES":                                    446986640,
-		"N2A_CPUS":                                          265855917,
-		"N2D_CPUS":                                          351743370,
-		"N2_CPUS":                                           416465286,
-		"NETWORKS":                                          485481477,
-		"NETWORK_ATTACHMENTS":                               149028575,
-		"NETWORK_ENDPOINT_GROUPS":                           102144909,
-		"NETWORK_FIREWALL_POLICIES":                         101117374,
-		"NET_LB_SECURITY_POLICIES_PER_REGION":               157892269,
-		"NET_LB_SECURITY_POLICY_RULES_PER_REGION":           356090931,
+		"GPUS_ALL_REGIONS":                           39387177,
+		"HDB_TOTAL_GB":                               319316271,
+		"HDB_TOTAL_IOPS":                             309720317,
+		"HDB_TOTAL_THROUGHPUT":                       20981374,
+		"HEALTH_CHECKS":                              289347502,
+		"IMAGES":                                     15562360,
+		"INSTANCES":                                  131337822,
+		"INSTANCE_GROUPS":                            355919038,
+		"INSTANCE_GROUP_MANAGERS":                    101798192,
+		"INSTANCE_TEMPLATES":                         226188271,
+		"INTERCONNECTS":                              415204741,
+		"INTERCONNECT_ATTACHMENTS_PER_REGION":        159968086,
+		"INTERCONNECT_ATTACHMENTS_TOTAL_MBPS":        425090419,
+		"INTERCONNECT_TOTAL_GBPS":                    285341866,
+		"INTERNAL_ADDRESSES":                         197899392,
+		"INTERNAL_TRAFFIC_DIRECTOR_FORWARDING_RULES": 266433668,
+		"IN_PLACE_SNAPSHOTS":                         151359133,
+		"IN_USE_ADDRESSES":                           402125072,
+		"IN_USE_BACKUP_SCHEDULES":                    32786705,
+		"IN_USE_SNAPSHOT_SCHEDULES":                  462104083,
+		"LOCAL_SSD_TOTAL_GB":                         330878021,
+		"M1_CPUS":                                    37203366,
+		"M2_CPUS":                                    65832517,
+		"M3_CPUS":                                    94461668,
+		"MACHINE_IMAGES":                             446986640,
+		"N2A_CPUS":                                   265855917,
+		"N2D_CPUS":                                   351743370,
+		"N2_CPUS":                                    416465286,
+		"NETWORKS":                                   485481477,
+		"NETWORK_ATTACHMENTS":                        149028575,
+		"NETWORK_ENDPOINT_GROUPS":                    102144909,
+		"NETWORK_FIREWALL_POLICIES":                  101117374,
+		"NET_LB_SECURITY_POLICIES_PER_REGION":        157892269,
+		"NET_LB_SECURITY_POLICY_RULES_PER_REGION":    356090931,
 		"NET_LB_SECURITY_POLICY_RULE_ATTRIBUTES_PER_REGION": 311243888,
 		"NODE_GROUPS":                                            24624817,
 		"NODE_TEMPLATES":                                         474896668,
@@ -268195,51 +268195,51 @@ var file_google_cloud_compute_v1beta_compute_proto_goTypes = []any{
 	(ResourcePolicyWorkloadPolicy_Type)(0),                                                      // 415: google.cloud.compute.v1beta.ResourcePolicyWorkloadPolicy.Type
 	(ResourceStatusShutdownDetails_StopState)(0),                                                // 416: google.cloud.compute.v1beta.ResourceStatusShutdownDetails.StopState
 	(ResourceStatusShutdownDetails_TargetState)(0),                                              // 417: google.cloud.compute.v1beta.ResourceStatusShutdownDetails.TargetState
-	(Rollout_State)(0),                                                 // 418: google.cloud.compute.v1beta.Rollout.State
-	(RolloutPlan_LocationScope)(0),                                     // 419: google.cloud.compute.v1beta.RolloutPlan.LocationScope
-	(RolloutPlanWaveOrchestrationOptionsDelay_Delimiter)(0),            // 420: google.cloud.compute.v1beta.RolloutPlanWaveOrchestrationOptionsDelay.Delimiter
-	(RolloutPlanWaveOrchestrationOptionsDelay_Type)(0),                 // 421: google.cloud.compute.v1beta.RolloutPlanWaveOrchestrationOptionsDelay.Type
-	(RolloutWaveDetailsOrchestratedWaveDetailsLocationStatus_State)(0), // 422: google.cloud.compute.v1beta.RolloutWaveDetailsOrchestratedWaveDetailsLocationStatus.State
-	(Route_NextHopOrigin)(0),                                           // 423: google.cloud.compute.v1beta.Route.NextHopOrigin
-	(Route_RouteStatus)(0),                                             // 424: google.cloud.compute.v1beta.Route.RouteStatus
-	(Route_RouteType)(0),                                               // 425: google.cloud.compute.v1beta.Route.RouteType
-	(RouteAsPath_PathSegmentType)(0),                                   // 426: google.cloud.compute.v1beta.RouteAsPath.PathSegmentType
-	(RoutePolicy_Type)(0),                                              // 427: google.cloud.compute.v1beta.RoutePolicy.Type
-	(RouterBgp_AdvertiseMode)(0),                                       // 428: google.cloud.compute.v1beta.RouterBgp.AdvertiseMode
-	(RouterBgp_AdvertisedGroups)(0),                                    // 429: google.cloud.compute.v1beta.RouterBgp.AdvertisedGroups
-	(RouterBgpPeer_AdvertiseMode)(0),                                   // 430: google.cloud.compute.v1beta.RouterBgpPeer.AdvertiseMode
-	(RouterBgpPeer_AdvertisedGroups)(0),                                // 431: google.cloud.compute.v1beta.RouterBgpPeer.AdvertisedGroups
-	(RouterBgpPeer_Enable)(0),                                          // 432: google.cloud.compute.v1beta.RouterBgpPeer.Enable
-	(RouterBgpPeer_ManagementType)(0),                                  // 433: google.cloud.compute.v1beta.RouterBgpPeer.ManagementType
-	(RouterBgpPeerBfd_SessionInitializationMode)(0),                    // 434: google.cloud.compute.v1beta.RouterBgpPeerBfd.SessionInitializationMode
-	(RouterInterface_IpVersion)(0),                                     // 435: google.cloud.compute.v1beta.RouterInterface.IpVersion
-	(RouterInterface_ManagementType)(0),                                // 436: google.cloud.compute.v1beta.RouterInterface.ManagementType
-	(RouterNat_AutoNetworkTier)(0),                                     // 437: google.cloud.compute.v1beta.RouterNat.AutoNetworkTier
-	(RouterNat_EndpointTypes)(0),                                       // 438: google.cloud.compute.v1beta.RouterNat.EndpointTypes
-	(RouterNat_NatIpAllocateOption)(0),                                 // 439: google.cloud.compute.v1beta.RouterNat.NatIpAllocateOption
-	(RouterNat_SourceSubnetworkIpRangesToNat)(0),                       // 440: google.cloud.compute.v1beta.RouterNat.SourceSubnetworkIpRangesToNat
-	(RouterNat_SourceSubnetworkIpRangesToNat64)(0),                     // 441: google.cloud.compute.v1beta.RouterNat.SourceSubnetworkIpRangesToNat64
-	(RouterNat_Type)(0),                                                // 442: google.cloud.compute.v1beta.RouterNat.Type
-	(RouterNatLogConfig_Filter)(0),                                     // 443: google.cloud.compute.v1beta.RouterNatLogConfig.Filter
-	(RouterNatSubnetworkToNat_SourceIpRangesToNat)(0),                  // 444: google.cloud.compute.v1beta.RouterNatSubnetworkToNat.SourceIpRangesToNat
-	(RouterStatusBgpPeerStatus_Status)(0),                              // 445: google.cloud.compute.v1beta.RouterStatusBgpPeerStatus.Status
-	(RouterStatusBgpPeerStatus_StatusReason)(0),                        // 446: google.cloud.compute.v1beta.RouterStatusBgpPeerStatus.StatusReason
-	(SSLHealthCheck_PortSpecification)(0),                              // 447: google.cloud.compute.v1beta.SSLHealthCheck.PortSpecification
-	(SSLHealthCheck_ProxyHeader)(0),                                    // 448: google.cloud.compute.v1beta.SSLHealthCheck.ProxyHeader
-	(SavedAttachedDisk_Interface)(0),                                   // 449: google.cloud.compute.v1beta.SavedAttachedDisk.Interface
-	(SavedAttachedDisk_Mode)(0),                                        // 450: google.cloud.compute.v1beta.SavedAttachedDisk.Mode
-	(SavedAttachedDisk_StorageBytesStatus)(0),                          // 451: google.cloud.compute.v1beta.SavedAttachedDisk.StorageBytesStatus
-	(SavedAttachedDisk_Type)(0),                                        // 452: google.cloud.compute.v1beta.SavedAttachedDisk.Type
-	(SavedDisk_Architecture)(0),                                        // 453: google.cloud.compute.v1beta.SavedDisk.Architecture
-	(SavedDisk_StorageBytesStatus)(0),                                  // 454: google.cloud.compute.v1beta.SavedDisk.StorageBytesStatus
-	(ScalingScheduleStatus_State)(0),                                   // 455: google.cloud.compute.v1beta.ScalingScheduleStatus.State
-	(Scheduling_InstanceTerminationAction)(0),                          // 456: google.cloud.compute.v1beta.Scheduling.InstanceTerminationAction
-	(Scheduling_MaintenanceInterval)(0),                                // 457: google.cloud.compute.v1beta.Scheduling.MaintenanceInterval
-	(Scheduling_OnHostMaintenance)(0),                                  // 458: google.cloud.compute.v1beta.Scheduling.OnHostMaintenance
-	(Scheduling_ProvisioningModel)(0),                                  // 459: google.cloud.compute.v1beta.Scheduling.ProvisioningModel
-	(SchedulingNodeAffinity_Operator)(0),                               // 460: google.cloud.compute.v1beta.SchedulingNodeAffinity.Operator
-	(SecurityPolicy_Type)(0),                                           // 461: google.cloud.compute.v1beta.SecurityPolicy.Type
-	(SecurityPolicyAdaptiveProtectionConfigLayer7DdosDefenseConfig_RuleVisibility)(0),                              // 462: google.cloud.compute.v1beta.SecurityPolicyAdaptiveProtectionConfigLayer7DdosDefenseConfig.RuleVisibility
+	(Rollout_State)(0),                                                                // 418: google.cloud.compute.v1beta.Rollout.State
+	(RolloutPlan_LocationScope)(0),                                                    // 419: google.cloud.compute.v1beta.RolloutPlan.LocationScope
+	(RolloutPlanWaveOrchestrationOptionsDelay_Delimiter)(0),                           // 420: google.cloud.compute.v1beta.RolloutPlanWaveOrchestrationOptionsDelay.Delimiter
+	(RolloutPlanWaveOrchestrationOptionsDelay_Type)(0),                                // 421: google.cloud.compute.v1beta.RolloutPlanWaveOrchestrationOptionsDelay.Type
+	(RolloutWaveDetailsOrchestratedWaveDetailsLocationStatus_State)(0),                // 422: google.cloud.compute.v1beta.RolloutWaveDetailsOrchestratedWaveDetailsLocationStatus.State
+	(Route_NextHopOrigin)(0),                                                          // 423: google.cloud.compute.v1beta.Route.NextHopOrigin
+	(Route_RouteStatus)(0),                                                            // 424: google.cloud.compute.v1beta.Route.RouteStatus
+	(Route_RouteType)(0),                                                              // 425: google.cloud.compute.v1beta.Route.RouteType
+	(RouteAsPath_PathSegmentType)(0),                                                  // 426: google.cloud.compute.v1beta.RouteAsPath.PathSegmentType
+	(RoutePolicy_Type)(0),                                                             // 427: google.cloud.compute.v1beta.RoutePolicy.Type
+	(RouterBgp_AdvertiseMode)(0),                                                      // 428: google.cloud.compute.v1beta.RouterBgp.AdvertiseMode
+	(RouterBgp_AdvertisedGroups)(0),                                                   // 429: google.cloud.compute.v1beta.RouterBgp.AdvertisedGroups
+	(RouterBgpPeer_AdvertiseMode)(0),                                                  // 430: google.cloud.compute.v1beta.RouterBgpPeer.AdvertiseMode
+	(RouterBgpPeer_AdvertisedGroups)(0),                                               // 431: google.cloud.compute.v1beta.RouterBgpPeer.AdvertisedGroups
+	(RouterBgpPeer_Enable)(0),                                                         // 432: google.cloud.compute.v1beta.RouterBgpPeer.Enable
+	(RouterBgpPeer_ManagementType)(0),                                                 // 433: google.cloud.compute.v1beta.RouterBgpPeer.ManagementType
+	(RouterBgpPeerBfd_SessionInitializationMode)(0),                                   // 434: google.cloud.compute.v1beta.RouterBgpPeerBfd.SessionInitializationMode
+	(RouterInterface_IpVersion)(0),                                                    // 435: google.cloud.compute.v1beta.RouterInterface.IpVersion
+	(RouterInterface_ManagementType)(0),                                               // 436: google.cloud.compute.v1beta.RouterInterface.ManagementType
+	(RouterNat_AutoNetworkTier)(0),                                                    // 437: google.cloud.compute.v1beta.RouterNat.AutoNetworkTier
+	(RouterNat_EndpointTypes)(0),                                                      // 438: google.cloud.compute.v1beta.RouterNat.EndpointTypes
+	(RouterNat_NatIpAllocateOption)(0),                                                // 439: google.cloud.compute.v1beta.RouterNat.NatIpAllocateOption
+	(RouterNat_SourceSubnetworkIpRangesToNat)(0),                                      // 440: google.cloud.compute.v1beta.RouterNat.SourceSubnetworkIpRangesToNat
+	(RouterNat_SourceSubnetworkIpRangesToNat64)(0),                                    // 441: google.cloud.compute.v1beta.RouterNat.SourceSubnetworkIpRangesToNat64
+	(RouterNat_Type)(0),                                                               // 442: google.cloud.compute.v1beta.RouterNat.Type
+	(RouterNatLogConfig_Filter)(0),                                                    // 443: google.cloud.compute.v1beta.RouterNatLogConfig.Filter
+	(RouterNatSubnetworkToNat_SourceIpRangesToNat)(0),                                 // 444: google.cloud.compute.v1beta.RouterNatSubnetworkToNat.SourceIpRangesToNat
+	(RouterStatusBgpPeerStatus_Status)(0),                                             // 445: google.cloud.compute.v1beta.RouterStatusBgpPeerStatus.Status
+	(RouterStatusBgpPeerStatus_StatusReason)(0),                                       // 446: google.cloud.compute.v1beta.RouterStatusBgpPeerStatus.StatusReason
+	(SSLHealthCheck_PortSpecification)(0),                                             // 447: google.cloud.compute.v1beta.SSLHealthCheck.PortSpecification
+	(SSLHealthCheck_ProxyHeader)(0),                                                   // 448: google.cloud.compute.v1beta.SSLHealthCheck.ProxyHeader
+	(SavedAttachedDisk_Interface)(0),                                                  // 449: google.cloud.compute.v1beta.SavedAttachedDisk.Interface
+	(SavedAttachedDisk_Mode)(0),                                                       // 450: google.cloud.compute.v1beta.SavedAttachedDisk.Mode
+	(SavedAttachedDisk_StorageBytesStatus)(0),                                         // 451: google.cloud.compute.v1beta.SavedAttachedDisk.StorageBytesStatus
+	(SavedAttachedDisk_Type)(0),                                                       // 452: google.cloud.compute.v1beta.SavedAttachedDisk.Type
+	(SavedDisk_Architecture)(0),                                                       // 453: google.cloud.compute.v1beta.SavedDisk.Architecture
+	(SavedDisk_StorageBytesStatus)(0),                                                 // 454: google.cloud.compute.v1beta.SavedDisk.StorageBytesStatus
+	(ScalingScheduleStatus_State)(0),                                                  // 455: google.cloud.compute.v1beta.ScalingScheduleStatus.State
+	(Scheduling_InstanceTerminationAction)(0),                                         // 456: google.cloud.compute.v1beta.Scheduling.InstanceTerminationAction
+	(Scheduling_MaintenanceInterval)(0),                                               // 457: google.cloud.compute.v1beta.Scheduling.MaintenanceInterval
+	(Scheduling_OnHostMaintenance)(0),                                                 // 458: google.cloud.compute.v1beta.Scheduling.OnHostMaintenance
+	(Scheduling_ProvisioningModel)(0),                                                 // 459: google.cloud.compute.v1beta.Scheduling.ProvisioningModel
+	(SchedulingNodeAffinity_Operator)(0),                                              // 460: google.cloud.compute.v1beta.SchedulingNodeAffinity.Operator
+	(SecurityPolicy_Type)(0),                                                          // 461: google.cloud.compute.v1beta.SecurityPolicy.Type
+	(SecurityPolicyAdaptiveProtectionConfigLayer7DdosDefenseConfig_RuleVisibility)(0), // 462: google.cloud.compute.v1beta.SecurityPolicyAdaptiveProtectionConfigLayer7DdosDefenseConfig.RuleVisibility
 	(SecurityPolicyAdaptiveProtectionConfigLayer7DdosDefenseConfigThresholdConfigTrafficGranularityConfig_Type)(0), // 463: google.cloud.compute.v1beta.SecurityPolicyAdaptiveProtectionConfigLayer7DdosDefenseConfigThresholdConfigTrafficGranularityConfig.Type
 	(SecurityPolicyAdvancedOptionsConfig_JsonParsing)(0),                                                           // 464: google.cloud.compute.v1beta.SecurityPolicyAdvancedOptionsConfig.JsonParsing
 	(SecurityPolicyAdvancedOptionsConfig_LogLevel)(0),                                                              // 465: google.cloud.compute.v1beta.SecurityPolicyAdvancedOptionsConfig.LogLevel
@@ -269037,198 +269037,198 @@ var file_google_cloud_compute_v1beta_compute_proto_goTypes = []any{
 	(*GlobalVmExtensionPolicyRolloutOperationRolloutStatus)(nil),                // 1257: google.cloud.compute.v1beta.GlobalVmExtensionPolicyRolloutOperationRolloutStatus
 	(*GlobalVmExtensionPolicyRolloutOperationRolloutStatusRolloutMetadata)(nil), // 1258: google.cloud.compute.v1beta.GlobalVmExtensionPolicyRolloutOperationRolloutStatusRolloutMetadata
 	(*GlobalVmExtensionPolicyRolloutOperationRolloutStatusRolloutMetadataLocationRolloutStatus)(nil), // 1259: google.cloud.compute.v1beta.GlobalVmExtensionPolicyRolloutOperationRolloutStatusRolloutMetadataLocationRolloutStatus
-	(*GroupMaintenanceInfo)(nil),                                              // 1260: google.cloud.compute.v1beta.GroupMaintenanceInfo
-	(*GuestAttributes)(nil),                                                   // 1261: google.cloud.compute.v1beta.GuestAttributes
-	(*GuestAttributesEntry)(nil),                                              // 1262: google.cloud.compute.v1beta.GuestAttributesEntry
-	(*GuestAttributesValue)(nil),                                              // 1263: google.cloud.compute.v1beta.GuestAttributesValue
-	(*GuestOsFeature)(nil),                                                    // 1264: google.cloud.compute.v1beta.GuestOsFeature
-	(*HTTP2HealthCheck)(nil),                                                  // 1265: google.cloud.compute.v1beta.HTTP2HealthCheck
-	(*HTTPHealthCheck)(nil),                                                   // 1266: google.cloud.compute.v1beta.HTTPHealthCheck
-	(*HTTPSHealthCheck)(nil),                                                  // 1267: google.cloud.compute.v1beta.HTTPSHealthCheck
-	(*HealthAggregationPoliciesScopedList)(nil),                               // 1268: google.cloud.compute.v1beta.HealthAggregationPoliciesScopedList
-	(*HealthAggregationPolicy)(nil),                                           // 1269: google.cloud.compute.v1beta.HealthAggregationPolicy
-	(*HealthAggregationPolicyAggregatedList)(nil),                             // 1270: google.cloud.compute.v1beta.HealthAggregationPolicyAggregatedList
-	(*HealthAggregationPolicyList)(nil),                                       // 1271: google.cloud.compute.v1beta.HealthAggregationPolicyList
-	(*HealthCheck)(nil),                                                       // 1272: google.cloud.compute.v1beta.HealthCheck
-	(*HealthCheckList)(nil),                                                   // 1273: google.cloud.compute.v1beta.HealthCheckList
-	(*HealthCheckLogConfig)(nil),                                              // 1274: google.cloud.compute.v1beta.HealthCheckLogConfig
-	(*HealthCheckReference)(nil),                                              // 1275: google.cloud.compute.v1beta.HealthCheckReference
-	(*HealthCheckService)(nil),                                                // 1276: google.cloud.compute.v1beta.HealthCheckService
-	(*HealthCheckServiceAggregatedList)(nil),                                  // 1277: google.cloud.compute.v1beta.HealthCheckServiceAggregatedList
-	(*HealthCheckServiceReference)(nil),                                       // 1278: google.cloud.compute.v1beta.HealthCheckServiceReference
-	(*HealthCheckServicesList)(nil),                                           // 1279: google.cloud.compute.v1beta.HealthCheckServicesList
-	(*HealthCheckServicesScopedList)(nil),                                     // 1280: google.cloud.compute.v1beta.HealthCheckServicesScopedList
-	(*HealthChecksAggregatedList)(nil),                                        // 1281: google.cloud.compute.v1beta.HealthChecksAggregatedList
-	(*HealthChecksScopedList)(nil),                                            // 1282: google.cloud.compute.v1beta.HealthChecksScopedList
-	(*HealthSource)(nil),                                                      // 1283: google.cloud.compute.v1beta.HealthSource
-	(*HealthSourceAggregatedList)(nil),                                        // 1284: google.cloud.compute.v1beta.HealthSourceAggregatedList
-	(*HealthSourceHealth)(nil),                                                // 1285: google.cloud.compute.v1beta.HealthSourceHealth
-	(*HealthSourceList)(nil),                                                  // 1286: google.cloud.compute.v1beta.HealthSourceList
-	(*HealthSourcesGetHealthResponseSourceInfo)(nil),                          // 1287: google.cloud.compute.v1beta.HealthSourcesGetHealthResponseSourceInfo
-	(*HealthSourcesGetHealthResponseSourceInfoBackendInfo)(nil),               // 1288: google.cloud.compute.v1beta.HealthSourcesGetHealthResponseSourceInfoBackendInfo
-	(*HealthSourcesScopedList)(nil),                                           // 1289: google.cloud.compute.v1beta.HealthSourcesScopedList
-	(*HealthStatus)(nil),                                                      // 1290: google.cloud.compute.v1beta.HealthStatus
-	(*HealthStatusForNetworkEndpoint)(nil),                                    // 1291: google.cloud.compute.v1beta.HealthStatusForNetworkEndpoint
-	(*Help)(nil),                                                              // 1292: google.cloud.compute.v1beta.Help
-	(*HelpLink)(nil),                                                          // 1293: google.cloud.compute.v1beta.HelpLink
-	(*HostRule)(nil),                                                          // 1294: google.cloud.compute.v1beta.HostRule
-	(*HttpFaultAbort)(nil),                                                    // 1295: google.cloud.compute.v1beta.HttpFaultAbort
-	(*HttpFaultDelay)(nil),                                                    // 1296: google.cloud.compute.v1beta.HttpFaultDelay
-	(*HttpFaultInjection)(nil),                                                // 1297: google.cloud.compute.v1beta.HttpFaultInjection
-	(*HttpFilterConfig)(nil),                                                  // 1298: google.cloud.compute.v1beta.HttpFilterConfig
-	(*HttpHeaderAction)(nil),                                                  // 1299: google.cloud.compute.v1beta.HttpHeaderAction
-	(*HttpHeaderMatch)(nil),                                                   // 1300: google.cloud.compute.v1beta.HttpHeaderMatch
-	(*HttpHeaderOption)(nil),                                                  // 1301: google.cloud.compute.v1beta.HttpHeaderOption
-	(*HttpQueryParameterMatch)(nil),                                           // 1302: google.cloud.compute.v1beta.HttpQueryParameterMatch
-	(*HttpRedirectAction)(nil),                                                // 1303: google.cloud.compute.v1beta.HttpRedirectAction
-	(*HttpRetryPolicy)(nil),                                                   // 1304: google.cloud.compute.v1beta.HttpRetryPolicy
-	(*HttpRouteAction)(nil),                                                   // 1305: google.cloud.compute.v1beta.HttpRouteAction
-	(*HttpRouteRule)(nil),                                                     // 1306: google.cloud.compute.v1beta.HttpRouteRule
-	(*HttpRouteRuleMatch)(nil),                                                // 1307: google.cloud.compute.v1beta.HttpRouteRuleMatch
-	(*Image)(nil),                                                             // 1308: google.cloud.compute.v1beta.Image
-	(*ImageFamilyView)(nil),                                                   // 1309: google.cloud.compute.v1beta.ImageFamilyView
-	(*ImageList)(nil),                                                         // 1310: google.cloud.compute.v1beta.ImageList
-	(*ImageParams)(nil),                                                       // 1311: google.cloud.compute.v1beta.ImageParams
-	(*InitialStateConfig)(nil),                                                // 1312: google.cloud.compute.v1beta.InitialStateConfig
-	(*InsertAddressRequest)(nil),                                              // 1313: google.cloud.compute.v1beta.InsertAddressRequest
-	(*InsertAutoscalerRequest)(nil),                                           // 1314: google.cloud.compute.v1beta.InsertAutoscalerRequest
-	(*InsertBackendBucketRequest)(nil),                                        // 1315: google.cloud.compute.v1beta.InsertBackendBucketRequest
-	(*InsertBackendServiceRequest)(nil),                                       // 1316: google.cloud.compute.v1beta.InsertBackendServiceRequest
-	(*InsertCrossSiteNetworkRequest)(nil),                                     // 1317: google.cloud.compute.v1beta.InsertCrossSiteNetworkRequest
-	(*InsertDiskRequest)(nil),                                                 // 1318: google.cloud.compute.v1beta.InsertDiskRequest
-	(*InsertExternalVpnGatewayRequest)(nil),                                   // 1319: google.cloud.compute.v1beta.InsertExternalVpnGatewayRequest
-	(*InsertFirewallPolicyRequest)(nil),                                       // 1320: google.cloud.compute.v1beta.InsertFirewallPolicyRequest
-	(*InsertFirewallRequest)(nil),                                             // 1321: google.cloud.compute.v1beta.InsertFirewallRequest
-	(*InsertForwardingRuleRequest)(nil),                                       // 1322: google.cloud.compute.v1beta.InsertForwardingRuleRequest
-	(*InsertFutureReservationRequest)(nil),                                    // 1323: google.cloud.compute.v1beta.InsertFutureReservationRequest
-	(*InsertGlobalAddressRequest)(nil),                                        // 1324: google.cloud.compute.v1beta.InsertGlobalAddressRequest
-	(*InsertGlobalForwardingRuleRequest)(nil),                                 // 1325: google.cloud.compute.v1beta.InsertGlobalForwardingRuleRequest
-	(*InsertGlobalNetworkEndpointGroupRequest)(nil),                           // 1326: google.cloud.compute.v1beta.InsertGlobalNetworkEndpointGroupRequest
-	(*InsertGlobalPublicDelegatedPrefixeRequest)(nil),                         // 1327: google.cloud.compute.v1beta.InsertGlobalPublicDelegatedPrefixeRequest
-	(*InsertGlobalVmExtensionPolicyRequest)(nil),                              // 1328: google.cloud.compute.v1beta.InsertGlobalVmExtensionPolicyRequest
-	(*InsertHealthCheckRequest)(nil),                                          // 1329: google.cloud.compute.v1beta.InsertHealthCheckRequest
-	(*InsertImageRequest)(nil),                                                // 1330: google.cloud.compute.v1beta.InsertImageRequest
-	(*InsertInstanceGroupManagerRequest)(nil),                                 // 1331: google.cloud.compute.v1beta.InsertInstanceGroupManagerRequest
-	(*InsertInstanceGroupManagerResizeRequestRequest)(nil),                    // 1332: google.cloud.compute.v1beta.InsertInstanceGroupManagerResizeRequestRequest
-	(*InsertInstanceGroupRequest)(nil),                                        // 1333: google.cloud.compute.v1beta.InsertInstanceGroupRequest
-	(*InsertInstanceRequest)(nil),                                             // 1334: google.cloud.compute.v1beta.InsertInstanceRequest
-	(*InsertInstanceTemplateRequest)(nil),                                     // 1335: google.cloud.compute.v1beta.InsertInstanceTemplateRequest
-	(*InsertInstantSnapshotGroupRequest)(nil),                                 // 1336: google.cloud.compute.v1beta.InsertInstantSnapshotGroupRequest
-	(*InsertInstantSnapshotRequest)(nil),                                      // 1337: google.cloud.compute.v1beta.InsertInstantSnapshotRequest
-	(*InsertInterconnectAttachmentGroupRequest)(nil),                          // 1338: google.cloud.compute.v1beta.InsertInterconnectAttachmentGroupRequest
-	(*InsertInterconnectAttachmentRequest)(nil),                               // 1339: google.cloud.compute.v1beta.InsertInterconnectAttachmentRequest
-	(*InsertInterconnectGroupRequest)(nil),                                    // 1340: google.cloud.compute.v1beta.InsertInterconnectGroupRequest
-	(*InsertInterconnectRequest)(nil),                                         // 1341: google.cloud.compute.v1beta.InsertInterconnectRequest
-	(*InsertLicenseRequest)(nil),                                              // 1342: google.cloud.compute.v1beta.InsertLicenseRequest
-	(*InsertMachineImageRequest)(nil),                                         // 1343: google.cloud.compute.v1beta.InsertMachineImageRequest
-	(*InsertNetworkAttachmentRequest)(nil),                                    // 1344: google.cloud.compute.v1beta.InsertNetworkAttachmentRequest
-	(*InsertNetworkEdgeSecurityServiceRequest)(nil),                           // 1345: google.cloud.compute.v1beta.InsertNetworkEdgeSecurityServiceRequest
-	(*InsertNetworkEndpointGroupRequest)(nil),                                 // 1346: google.cloud.compute.v1beta.InsertNetworkEndpointGroupRequest
-	(*InsertNetworkFirewallPolicyRequest)(nil),                                // 1347: google.cloud.compute.v1beta.InsertNetworkFirewallPolicyRequest
-	(*InsertNetworkRequest)(nil),                                              // 1348: google.cloud.compute.v1beta.InsertNetworkRequest
-	(*InsertNodeGroupRequest)(nil),                                            // 1349: google.cloud.compute.v1beta.InsertNodeGroupRequest
-	(*InsertNodeTemplateRequest)(nil),                                         // 1350: google.cloud.compute.v1beta.InsertNodeTemplateRequest
-	(*InsertOrganizationSecurityPolicyRequest)(nil),                           // 1351: google.cloud.compute.v1beta.InsertOrganizationSecurityPolicyRequest
-	(*InsertPacketMirroringRequest)(nil),                                      // 1352: google.cloud.compute.v1beta.InsertPacketMirroringRequest
-	(*InsertPublicAdvertisedPrefixeRequest)(nil),                              // 1353: google.cloud.compute.v1beta.InsertPublicAdvertisedPrefixeRequest
-	(*InsertPublicDelegatedPrefixeRequest)(nil),                               // 1354: google.cloud.compute.v1beta.InsertPublicDelegatedPrefixeRequest
-	(*InsertRegionAutoscalerRequest)(nil),                                     // 1355: google.cloud.compute.v1beta.InsertRegionAutoscalerRequest
-	(*InsertRegionBackendBucketRequest)(nil),                                  // 1356: google.cloud.compute.v1beta.InsertRegionBackendBucketRequest
-	(*InsertRegionBackendServiceRequest)(nil),                                 // 1357: google.cloud.compute.v1beta.InsertRegionBackendServiceRequest
-	(*InsertRegionCommitmentRequest)(nil),                                     // 1358: google.cloud.compute.v1beta.InsertRegionCommitmentRequest
-	(*InsertRegionCompositeHealthCheckRequest)(nil),                           // 1359: google.cloud.compute.v1beta.InsertRegionCompositeHealthCheckRequest
-	(*InsertRegionDiskRequest)(nil),                                           // 1360: google.cloud.compute.v1beta.InsertRegionDiskRequest
-	(*InsertRegionHealthAggregationPolicyRequest)(nil),                        // 1361: google.cloud.compute.v1beta.InsertRegionHealthAggregationPolicyRequest
-	(*InsertRegionHealthCheckRequest)(nil),                                    // 1362: google.cloud.compute.v1beta.InsertRegionHealthCheckRequest
-	(*InsertRegionHealthCheckServiceRequest)(nil),                             // 1363: google.cloud.compute.v1beta.InsertRegionHealthCheckServiceRequest
-	(*InsertRegionHealthSourceRequest)(nil),                                   // 1364: google.cloud.compute.v1beta.InsertRegionHealthSourceRequest
-	(*InsertRegionInstanceGroupManagerRequest)(nil),                           // 1365: google.cloud.compute.v1beta.InsertRegionInstanceGroupManagerRequest
-	(*InsertRegionInstanceGroupManagerResizeRequestRequest)(nil),              // 1366: google.cloud.compute.v1beta.InsertRegionInstanceGroupManagerResizeRequestRequest
-	(*InsertRegionInstanceTemplateRequest)(nil),                               // 1367: google.cloud.compute.v1beta.InsertRegionInstanceTemplateRequest
-	(*InsertRegionInstantSnapshotGroupRequest)(nil),                           // 1368: google.cloud.compute.v1beta.InsertRegionInstantSnapshotGroupRequest
-	(*InsertRegionInstantSnapshotRequest)(nil),                                // 1369: google.cloud.compute.v1beta.InsertRegionInstantSnapshotRequest
-	(*InsertRegionMultiMigRequest)(nil),                                       // 1370: google.cloud.compute.v1beta.InsertRegionMultiMigRequest
-	(*InsertRegionNetworkEndpointGroupRequest)(nil),                           // 1371: google.cloud.compute.v1beta.InsertRegionNetworkEndpointGroupRequest
-	(*InsertRegionNetworkFirewallPolicyRequest)(nil),                          // 1372: google.cloud.compute.v1beta.InsertRegionNetworkFirewallPolicyRequest
-	(*InsertRegionNetworkPolicyRequest)(nil),                                  // 1373: google.cloud.compute.v1beta.InsertRegionNetworkPolicyRequest
-	(*InsertRegionNotificationEndpointRequest)(nil),                           // 1374: google.cloud.compute.v1beta.InsertRegionNotificationEndpointRequest
-	(*InsertRegionSecurityPolicyRequest)(nil),                                 // 1375: google.cloud.compute.v1beta.InsertRegionSecurityPolicyRequest
-	(*InsertRegionSnapshotRequest)(nil),                                       // 1376: google.cloud.compute.v1beta.InsertRegionSnapshotRequest
-	(*InsertRegionSslCertificateRequest)(nil),                                 // 1377: google.cloud.compute.v1beta.InsertRegionSslCertificateRequest
-	(*InsertRegionSslPolicyRequest)(nil),                                      // 1378: google.cloud.compute.v1beta.InsertRegionSslPolicyRequest
-	(*InsertRegionTargetHttpProxyRequest)(nil),                                // 1379: google.cloud.compute.v1beta.InsertRegionTargetHttpProxyRequest
-	(*InsertRegionTargetHttpsProxyRequest)(nil),                               // 1380: google.cloud.compute.v1beta.InsertRegionTargetHttpsProxyRequest
-	(*InsertRegionTargetTcpProxyRequest)(nil),                                 // 1381: google.cloud.compute.v1beta.InsertRegionTargetTcpProxyRequest
-	(*InsertRegionUrlMapRequest)(nil),                                         // 1382: google.cloud.compute.v1beta.InsertRegionUrlMapRequest
-	(*InsertReservationRequest)(nil),                                          // 1383: google.cloud.compute.v1beta.InsertReservationRequest
-	(*InsertResourcePolicyRequest)(nil),                                       // 1384: google.cloud.compute.v1beta.InsertResourcePolicyRequest
-	(*InsertRolloutPlanRequest)(nil),                                          // 1385: google.cloud.compute.v1beta.InsertRolloutPlanRequest
-	(*InsertRouteRequest)(nil),                                                // 1386: google.cloud.compute.v1beta.InsertRouteRequest
-	(*InsertRouterRequest)(nil),                                               // 1387: google.cloud.compute.v1beta.InsertRouterRequest
-	(*InsertSecurityPolicyRequest)(nil),                                       // 1388: google.cloud.compute.v1beta.InsertSecurityPolicyRequest
-	(*InsertServiceAttachmentRequest)(nil),                                    // 1389: google.cloud.compute.v1beta.InsertServiceAttachmentRequest
-	(*InsertSnapshotGroupRequest)(nil),                                        // 1390: google.cloud.compute.v1beta.InsertSnapshotGroupRequest
-	(*InsertSnapshotRequest)(nil),                                             // 1391: google.cloud.compute.v1beta.InsertSnapshotRequest
-	(*InsertSslCertificateRequest)(nil),                                       // 1392: google.cloud.compute.v1beta.InsertSslCertificateRequest
-	(*InsertSslPolicyRequest)(nil),                                            // 1393: google.cloud.compute.v1beta.InsertSslPolicyRequest
-	(*InsertStoragePoolRequest)(nil),                                          // 1394: google.cloud.compute.v1beta.InsertStoragePoolRequest
-	(*InsertSubnetworkRequest)(nil),                                           // 1395: google.cloud.compute.v1beta.InsertSubnetworkRequest
-	(*InsertTargetGrpcProxyRequest)(nil),                                      // 1396: google.cloud.compute.v1beta.InsertTargetGrpcProxyRequest
-	(*InsertTargetHttpProxyRequest)(nil),                                      // 1397: google.cloud.compute.v1beta.InsertTargetHttpProxyRequest
-	(*InsertTargetHttpsProxyRequest)(nil),                                     // 1398: google.cloud.compute.v1beta.InsertTargetHttpsProxyRequest
-	(*InsertTargetInstanceRequest)(nil),                                       // 1399: google.cloud.compute.v1beta.InsertTargetInstanceRequest
-	(*InsertTargetPoolRequest)(nil),                                           // 1400: google.cloud.compute.v1beta.InsertTargetPoolRequest
-	(*InsertTargetSslProxyRequest)(nil),                                       // 1401: google.cloud.compute.v1beta.InsertTargetSslProxyRequest
-	(*InsertTargetTcpProxyRequest)(nil),                                       // 1402: google.cloud.compute.v1beta.InsertTargetTcpProxyRequest
-	(*InsertTargetVpnGatewayRequest)(nil),                                     // 1403: google.cloud.compute.v1beta.InsertTargetVpnGatewayRequest
-	(*InsertUrlMapRequest)(nil),                                               // 1404: google.cloud.compute.v1beta.InsertUrlMapRequest
-	(*InsertVpnGatewayRequest)(nil),                                           // 1405: google.cloud.compute.v1beta.InsertVpnGatewayRequest
-	(*InsertVpnTunnelRequest)(nil),                                            // 1406: google.cloud.compute.v1beta.InsertVpnTunnelRequest
-	(*InsertWireGroupRequest)(nil),                                            // 1407: google.cloud.compute.v1beta.InsertWireGroupRequest
-	(*InsertZoneVmExtensionPolicyRequest)(nil),                                // 1408: google.cloud.compute.v1beta.InsertZoneVmExtensionPolicyRequest
-	(*Instance)(nil),                                                          // 1409: google.cloud.compute.v1beta.Instance
-	(*InstanceAggregatedList)(nil),                                            // 1410: google.cloud.compute.v1beta.InstanceAggregatedList
-	(*InstanceConsumptionData)(nil),                                           // 1411: google.cloud.compute.v1beta.InstanceConsumptionData
-	(*InstanceConsumptionInfo)(nil),                                           // 1412: google.cloud.compute.v1beta.InstanceConsumptionInfo
-	(*InstanceFlexibilityPolicy)(nil),                                         // 1413: google.cloud.compute.v1beta.InstanceFlexibilityPolicy
-	(*InstanceFlexibilityPolicyInstanceSelection)(nil),                        // 1414: google.cloud.compute.v1beta.InstanceFlexibilityPolicyInstanceSelection
-	(*InstanceGroup)(nil),                                                     // 1415: google.cloud.compute.v1beta.InstanceGroup
-	(*InstanceGroupAggregatedList)(nil),                                       // 1416: google.cloud.compute.v1beta.InstanceGroupAggregatedList
-	(*InstanceGroupList)(nil),                                                 // 1417: google.cloud.compute.v1beta.InstanceGroupList
-	(*InstanceGroupManager)(nil),                                              // 1418: google.cloud.compute.v1beta.InstanceGroupManager
-	(*InstanceGroupManagerActionsSummary)(nil),                                // 1419: google.cloud.compute.v1beta.InstanceGroupManagerActionsSummary
-	(*InstanceGroupManagerAggregatedList)(nil),                                // 1420: google.cloud.compute.v1beta.InstanceGroupManagerAggregatedList
-	(*InstanceGroupManagerAllInstancesConfig)(nil),                            // 1421: google.cloud.compute.v1beta.InstanceGroupManagerAllInstancesConfig
-	(*InstanceGroupManagerAutoHealingPolicy)(nil),                             // 1422: google.cloud.compute.v1beta.InstanceGroupManagerAutoHealingPolicy
-	(*InstanceGroupManagerInstanceFlexibilityPolicy)(nil),                     // 1423: google.cloud.compute.v1beta.InstanceGroupManagerInstanceFlexibilityPolicy
-	(*InstanceGroupManagerInstanceFlexibilityPolicyInstanceSelection)(nil),    // 1424: google.cloud.compute.v1beta.InstanceGroupManagerInstanceFlexibilityPolicyInstanceSelection
-	(*InstanceGroupManagerInstanceFlexibilityPolicyProvisioningModelMix)(nil), // 1425: google.cloud.compute.v1beta.InstanceGroupManagerInstanceFlexibilityPolicyProvisioningModelMix
-	(*InstanceGroupManagerInstanceLifecyclePolicy)(nil),                       // 1426: google.cloud.compute.v1beta.InstanceGroupManagerInstanceLifecyclePolicy
-	(*InstanceGroupManagerInstanceLifecyclePolicyOnRepair)(nil),               // 1427: google.cloud.compute.v1beta.InstanceGroupManagerInstanceLifecyclePolicyOnRepair
-	(*InstanceGroupManagerList)(nil),                                          // 1428: google.cloud.compute.v1beta.InstanceGroupManagerList
-	(*InstanceGroupManagerParams)(nil),                                        // 1429: google.cloud.compute.v1beta.InstanceGroupManagerParams
-	(*InstanceGroupManagerResizeRequest)(nil),                                 // 1430: google.cloud.compute.v1beta.InstanceGroupManagerResizeRequest
-	(*InstanceGroupManagerResizeRequestStatus)(nil),                           // 1431: google.cloud.compute.v1beta.InstanceGroupManagerResizeRequestStatus
-	(*InstanceGroupManagerResizeRequestStatusLastAttempt)(nil),                // 1432: google.cloud.compute.v1beta.InstanceGroupManagerResizeRequestStatusLastAttempt
-	(*InstanceGroupManagerResizeRequestsListResponse)(nil),                    // 1433: google.cloud.compute.v1beta.InstanceGroupManagerResizeRequestsListResponse
-	(*InstanceGroupManagerResourcePolicies)(nil),                              // 1434: google.cloud.compute.v1beta.InstanceGroupManagerResourcePolicies
-	(*InstanceGroupManagerStandbyPolicy)(nil),                                 // 1435: google.cloud.compute.v1beta.InstanceGroupManagerStandbyPolicy
-	(*InstanceGroupManagerStatus)(nil),                                        // 1436: google.cloud.compute.v1beta.InstanceGroupManagerStatus
-	(*InstanceGroupManagerStatusAcceleratorTopology)(nil),                     // 1437: google.cloud.compute.v1beta.InstanceGroupManagerStatusAcceleratorTopology
-	(*InstanceGroupManagerStatusAcceleratorTopologyAcceleratorTopologyStateDetails)(nil),               // 1438: google.cloud.compute.v1beta.InstanceGroupManagerStatusAcceleratorTopologyAcceleratorTopologyStateDetails
-	(*InstanceGroupManagerStatusAllInstancesConfig)(nil),                                               // 1439: google.cloud.compute.v1beta.InstanceGroupManagerStatusAllInstancesConfig
-	(*InstanceGroupManagerStatusBulkInstanceOperation)(nil),                                            // 1440: google.cloud.compute.v1beta.InstanceGroupManagerStatusBulkInstanceOperation
-	(*InstanceGroupManagerStatusBulkInstanceOperationLastProgressCheck)(nil),                           // 1441: google.cloud.compute.v1beta.InstanceGroupManagerStatusBulkInstanceOperationLastProgressCheck
-	(*InstanceGroupManagerStatusInstanceStatusSummary)(nil),                                            // 1442: google.cloud.compute.v1beta.InstanceGroupManagerStatusInstanceStatusSummary
-	(*InstanceGroupManagerStatusStateful)(nil),                                                         // 1443: google.cloud.compute.v1beta.InstanceGroupManagerStatusStateful
-	(*InstanceGroupManagerStatusStatefulPerInstanceConfigs)(nil),                                       // 1444: google.cloud.compute.v1beta.InstanceGroupManagerStatusStatefulPerInstanceConfigs
-	(*InstanceGroupManagerStatusVersionTarget)(nil),                                                    // 1445: google.cloud.compute.v1beta.InstanceGroupManagerStatusVersionTarget
-	(*InstanceGroupManagerTargetSizePolicy)(nil),                                                       // 1446: google.cloud.compute.v1beta.InstanceGroupManagerTargetSizePolicy
-	(*InstanceGroupManagerUpdatePolicy)(nil),                                                           // 1447: google.cloud.compute.v1beta.InstanceGroupManagerUpdatePolicy
-	(*InstanceGroupManagerVersion)(nil),                                                                // 1448: google.cloud.compute.v1beta.InstanceGroupManagerVersion
-	(*InstanceGroupManagersAbandonInstancesRequest)(nil),                                               // 1449: google.cloud.compute.v1beta.InstanceGroupManagersAbandonInstancesRequest
-	(*InstanceGroupManagersApplyUpdatesRequest)(nil),                                                   // 1450: google.cloud.compute.v1beta.InstanceGroupManagersApplyUpdatesRequest
-	(*InstanceGroupManagersConfigureAcceleratorTopologiesRequest)(nil),                                 // 1451: google.cloud.compute.v1beta.InstanceGroupManagersConfigureAcceleratorTopologiesRequest
+	(*GroupMaintenanceInfo)(nil),                                                         // 1260: google.cloud.compute.v1beta.GroupMaintenanceInfo
+	(*GuestAttributes)(nil),                                                              // 1261: google.cloud.compute.v1beta.GuestAttributes
+	(*GuestAttributesEntry)(nil),                                                         // 1262: google.cloud.compute.v1beta.GuestAttributesEntry
+	(*GuestAttributesValue)(nil),                                                         // 1263: google.cloud.compute.v1beta.GuestAttributesValue
+	(*GuestOsFeature)(nil),                                                               // 1264: google.cloud.compute.v1beta.GuestOsFeature
+	(*HTTP2HealthCheck)(nil),                                                             // 1265: google.cloud.compute.v1beta.HTTP2HealthCheck
+	(*HTTPHealthCheck)(nil),                                                              // 1266: google.cloud.compute.v1beta.HTTPHealthCheck
+	(*HTTPSHealthCheck)(nil),                                                             // 1267: google.cloud.compute.v1beta.HTTPSHealthCheck
+	(*HealthAggregationPoliciesScopedList)(nil),                                          // 1268: google.cloud.compute.v1beta.HealthAggregationPoliciesScopedList
+	(*HealthAggregationPolicy)(nil),                                                      // 1269: google.cloud.compute.v1beta.HealthAggregationPolicy
+	(*HealthAggregationPolicyAggregatedList)(nil),                                        // 1270: google.cloud.compute.v1beta.HealthAggregationPolicyAggregatedList
+	(*HealthAggregationPolicyList)(nil),                                                  // 1271: google.cloud.compute.v1beta.HealthAggregationPolicyList
+	(*HealthCheck)(nil),                                                                  // 1272: google.cloud.compute.v1beta.HealthCheck
+	(*HealthCheckList)(nil),                                                              // 1273: google.cloud.compute.v1beta.HealthCheckList
+	(*HealthCheckLogConfig)(nil),                                                         // 1274: google.cloud.compute.v1beta.HealthCheckLogConfig
+	(*HealthCheckReference)(nil),                                                         // 1275: google.cloud.compute.v1beta.HealthCheckReference
+	(*HealthCheckService)(nil),                                                           // 1276: google.cloud.compute.v1beta.HealthCheckService
+	(*HealthCheckServiceAggregatedList)(nil),                                             // 1277: google.cloud.compute.v1beta.HealthCheckServiceAggregatedList
+	(*HealthCheckServiceReference)(nil),                                                  // 1278: google.cloud.compute.v1beta.HealthCheckServiceReference
+	(*HealthCheckServicesList)(nil),                                                      // 1279: google.cloud.compute.v1beta.HealthCheckServicesList
+	(*HealthCheckServicesScopedList)(nil),                                                // 1280: google.cloud.compute.v1beta.HealthCheckServicesScopedList
+	(*HealthChecksAggregatedList)(nil),                                                   // 1281: google.cloud.compute.v1beta.HealthChecksAggregatedList
+	(*HealthChecksScopedList)(nil),                                                       // 1282: google.cloud.compute.v1beta.HealthChecksScopedList
+	(*HealthSource)(nil),                                                                 // 1283: google.cloud.compute.v1beta.HealthSource
+	(*HealthSourceAggregatedList)(nil),                                                   // 1284: google.cloud.compute.v1beta.HealthSourceAggregatedList
+	(*HealthSourceHealth)(nil),                                                           // 1285: google.cloud.compute.v1beta.HealthSourceHealth
+	(*HealthSourceList)(nil),                                                             // 1286: google.cloud.compute.v1beta.HealthSourceList
+	(*HealthSourcesGetHealthResponseSourceInfo)(nil),                                     // 1287: google.cloud.compute.v1beta.HealthSourcesGetHealthResponseSourceInfo
+	(*HealthSourcesGetHealthResponseSourceInfoBackendInfo)(nil),                          // 1288: google.cloud.compute.v1beta.HealthSourcesGetHealthResponseSourceInfoBackendInfo
+	(*HealthSourcesScopedList)(nil),                                                      // 1289: google.cloud.compute.v1beta.HealthSourcesScopedList
+	(*HealthStatus)(nil),                                                                 // 1290: google.cloud.compute.v1beta.HealthStatus
+	(*HealthStatusForNetworkEndpoint)(nil),                                               // 1291: google.cloud.compute.v1beta.HealthStatusForNetworkEndpoint
+	(*Help)(nil),                                                                         // 1292: google.cloud.compute.v1beta.Help
+	(*HelpLink)(nil),                                                                     // 1293: google.cloud.compute.v1beta.HelpLink
+	(*HostRule)(nil),                                                                     // 1294: google.cloud.compute.v1beta.HostRule
+	(*HttpFaultAbort)(nil),                                                               // 1295: google.cloud.compute.v1beta.HttpFaultAbort
+	(*HttpFaultDelay)(nil),                                                               // 1296: google.cloud.compute.v1beta.HttpFaultDelay
+	(*HttpFaultInjection)(nil),                                                           // 1297: google.cloud.compute.v1beta.HttpFaultInjection
+	(*HttpFilterConfig)(nil),                                                             // 1298: google.cloud.compute.v1beta.HttpFilterConfig
+	(*HttpHeaderAction)(nil),                                                             // 1299: google.cloud.compute.v1beta.HttpHeaderAction
+	(*HttpHeaderMatch)(nil),                                                              // 1300: google.cloud.compute.v1beta.HttpHeaderMatch
+	(*HttpHeaderOption)(nil),                                                             // 1301: google.cloud.compute.v1beta.HttpHeaderOption
+	(*HttpQueryParameterMatch)(nil),                                                      // 1302: google.cloud.compute.v1beta.HttpQueryParameterMatch
+	(*HttpRedirectAction)(nil),                                                           // 1303: google.cloud.compute.v1beta.HttpRedirectAction
+	(*HttpRetryPolicy)(nil),                                                              // 1304: google.cloud.compute.v1beta.HttpRetryPolicy
+	(*HttpRouteAction)(nil),                                                              // 1305: google.cloud.compute.v1beta.HttpRouteAction
+	(*HttpRouteRule)(nil),                                                                // 1306: google.cloud.compute.v1beta.HttpRouteRule
+	(*HttpRouteRuleMatch)(nil),                                                           // 1307: google.cloud.compute.v1beta.HttpRouteRuleMatch
+	(*Image)(nil),                                                                        // 1308: google.cloud.compute.v1beta.Image
+	(*ImageFamilyView)(nil),                                                              // 1309: google.cloud.compute.v1beta.ImageFamilyView
+	(*ImageList)(nil),                                                                    // 1310: google.cloud.compute.v1beta.ImageList
+	(*ImageParams)(nil),                                                                  // 1311: google.cloud.compute.v1beta.ImageParams
+	(*InitialStateConfig)(nil),                                                           // 1312: google.cloud.compute.v1beta.InitialStateConfig
+	(*InsertAddressRequest)(nil),                                                         // 1313: google.cloud.compute.v1beta.InsertAddressRequest
+	(*InsertAutoscalerRequest)(nil),                                                      // 1314: google.cloud.compute.v1beta.InsertAutoscalerRequest
+	(*InsertBackendBucketRequest)(nil),                                                   // 1315: google.cloud.compute.v1beta.InsertBackendBucketRequest
+	(*InsertBackendServiceRequest)(nil),                                                  // 1316: google.cloud.compute.v1beta.InsertBackendServiceRequest
+	(*InsertCrossSiteNetworkRequest)(nil),                                                // 1317: google.cloud.compute.v1beta.InsertCrossSiteNetworkRequest
+	(*InsertDiskRequest)(nil),                                                            // 1318: google.cloud.compute.v1beta.InsertDiskRequest
+	(*InsertExternalVpnGatewayRequest)(nil),                                              // 1319: google.cloud.compute.v1beta.InsertExternalVpnGatewayRequest
+	(*InsertFirewallPolicyRequest)(nil),                                                  // 1320: google.cloud.compute.v1beta.InsertFirewallPolicyRequest
+	(*InsertFirewallRequest)(nil),                                                        // 1321: google.cloud.compute.v1beta.InsertFirewallRequest
+	(*InsertForwardingRuleRequest)(nil),                                                  // 1322: google.cloud.compute.v1beta.InsertForwardingRuleRequest
+	(*InsertFutureReservationRequest)(nil),                                               // 1323: google.cloud.compute.v1beta.InsertFutureReservationRequest
+	(*InsertGlobalAddressRequest)(nil),                                                   // 1324: google.cloud.compute.v1beta.InsertGlobalAddressRequest
+	(*InsertGlobalForwardingRuleRequest)(nil),                                            // 1325: google.cloud.compute.v1beta.InsertGlobalForwardingRuleRequest
+	(*InsertGlobalNetworkEndpointGroupRequest)(nil),                                      // 1326: google.cloud.compute.v1beta.InsertGlobalNetworkEndpointGroupRequest
+	(*InsertGlobalPublicDelegatedPrefixeRequest)(nil),                                    // 1327: google.cloud.compute.v1beta.InsertGlobalPublicDelegatedPrefixeRequest
+	(*InsertGlobalVmExtensionPolicyRequest)(nil),                                         // 1328: google.cloud.compute.v1beta.InsertGlobalVmExtensionPolicyRequest
+	(*InsertHealthCheckRequest)(nil),                                                     // 1329: google.cloud.compute.v1beta.InsertHealthCheckRequest
+	(*InsertImageRequest)(nil),                                                           // 1330: google.cloud.compute.v1beta.InsertImageRequest
+	(*InsertInstanceGroupManagerRequest)(nil),                                            // 1331: google.cloud.compute.v1beta.InsertInstanceGroupManagerRequest
+	(*InsertInstanceGroupManagerResizeRequestRequest)(nil),                               // 1332: google.cloud.compute.v1beta.InsertInstanceGroupManagerResizeRequestRequest
+	(*InsertInstanceGroupRequest)(nil),                                                   // 1333: google.cloud.compute.v1beta.InsertInstanceGroupRequest
+	(*InsertInstanceRequest)(nil),                                                        // 1334: google.cloud.compute.v1beta.InsertInstanceRequest
+	(*InsertInstanceTemplateRequest)(nil),                                                // 1335: google.cloud.compute.v1beta.InsertInstanceTemplateRequest
+	(*InsertInstantSnapshotGroupRequest)(nil),                                            // 1336: google.cloud.compute.v1beta.InsertInstantSnapshotGroupRequest
+	(*InsertInstantSnapshotRequest)(nil),                                                 // 1337: google.cloud.compute.v1beta.InsertInstantSnapshotRequest
+	(*InsertInterconnectAttachmentGroupRequest)(nil),                                     // 1338: google.cloud.compute.v1beta.InsertInterconnectAttachmentGroupRequest
+	(*InsertInterconnectAttachmentRequest)(nil),                                          // 1339: google.cloud.compute.v1beta.InsertInterconnectAttachmentRequest
+	(*InsertInterconnectGroupRequest)(nil),                                               // 1340: google.cloud.compute.v1beta.InsertInterconnectGroupRequest
+	(*InsertInterconnectRequest)(nil),                                                    // 1341: google.cloud.compute.v1beta.InsertInterconnectRequest
+	(*InsertLicenseRequest)(nil),                                                         // 1342: google.cloud.compute.v1beta.InsertLicenseRequest
+	(*InsertMachineImageRequest)(nil),                                                    // 1343: google.cloud.compute.v1beta.InsertMachineImageRequest
+	(*InsertNetworkAttachmentRequest)(nil),                                               // 1344: google.cloud.compute.v1beta.InsertNetworkAttachmentRequest
+	(*InsertNetworkEdgeSecurityServiceRequest)(nil),                                      // 1345: google.cloud.compute.v1beta.InsertNetworkEdgeSecurityServiceRequest
+	(*InsertNetworkEndpointGroupRequest)(nil),                                            // 1346: google.cloud.compute.v1beta.InsertNetworkEndpointGroupRequest
+	(*InsertNetworkFirewallPolicyRequest)(nil),                                           // 1347: google.cloud.compute.v1beta.InsertNetworkFirewallPolicyRequest
+	(*InsertNetworkRequest)(nil),                                                         // 1348: google.cloud.compute.v1beta.InsertNetworkRequest
+	(*InsertNodeGroupRequest)(nil),                                                       // 1349: google.cloud.compute.v1beta.InsertNodeGroupRequest
+	(*InsertNodeTemplateRequest)(nil),                                                    // 1350: google.cloud.compute.v1beta.InsertNodeTemplateRequest
+	(*InsertOrganizationSecurityPolicyRequest)(nil),                                      // 1351: google.cloud.compute.v1beta.InsertOrganizationSecurityPolicyRequest
+	(*InsertPacketMirroringRequest)(nil),                                                 // 1352: google.cloud.compute.v1beta.InsertPacketMirroringRequest
+	(*InsertPublicAdvertisedPrefixeRequest)(nil),                                         // 1353: google.cloud.compute.v1beta.InsertPublicAdvertisedPrefixeRequest
+	(*InsertPublicDelegatedPrefixeRequest)(nil),                                          // 1354: google.cloud.compute.v1beta.InsertPublicDelegatedPrefixeRequest
+	(*InsertRegionAutoscalerRequest)(nil),                                                // 1355: google.cloud.compute.v1beta.InsertRegionAutoscalerRequest
+	(*InsertRegionBackendBucketRequest)(nil),                                             // 1356: google.cloud.compute.v1beta.InsertRegionBackendBucketRequest
+	(*InsertRegionBackendServiceRequest)(nil),                                            // 1357: google.cloud.compute.v1beta.InsertRegionBackendServiceRequest
+	(*InsertRegionCommitmentRequest)(nil),                                                // 1358: google.cloud.compute.v1beta.InsertRegionCommitmentRequest
+	(*InsertRegionCompositeHealthCheckRequest)(nil),                                      // 1359: google.cloud.compute.v1beta.InsertRegionCompositeHealthCheckRequest
+	(*InsertRegionDiskRequest)(nil),                                                      // 1360: google.cloud.compute.v1beta.InsertRegionDiskRequest
+	(*InsertRegionHealthAggregationPolicyRequest)(nil),                                   // 1361: google.cloud.compute.v1beta.InsertRegionHealthAggregationPolicyRequest
+	(*InsertRegionHealthCheckRequest)(nil),                                               // 1362: google.cloud.compute.v1beta.InsertRegionHealthCheckRequest
+	(*InsertRegionHealthCheckServiceRequest)(nil),                                        // 1363: google.cloud.compute.v1beta.InsertRegionHealthCheckServiceRequest
+	(*InsertRegionHealthSourceRequest)(nil),                                              // 1364: google.cloud.compute.v1beta.InsertRegionHealthSourceRequest
+	(*InsertRegionInstanceGroupManagerRequest)(nil),                                      // 1365: google.cloud.compute.v1beta.InsertRegionInstanceGroupManagerRequest
+	(*InsertRegionInstanceGroupManagerResizeRequestRequest)(nil),                         // 1366: google.cloud.compute.v1beta.InsertRegionInstanceGroupManagerResizeRequestRequest
+	(*InsertRegionInstanceTemplateRequest)(nil),                                          // 1367: google.cloud.compute.v1beta.InsertRegionInstanceTemplateRequest
+	(*InsertRegionInstantSnapshotGroupRequest)(nil),                                      // 1368: google.cloud.compute.v1beta.InsertRegionInstantSnapshotGroupRequest
+	(*InsertRegionInstantSnapshotRequest)(nil),                                           // 1369: google.cloud.compute.v1beta.InsertRegionInstantSnapshotRequest
+	(*InsertRegionMultiMigRequest)(nil),                                                  // 1370: google.cloud.compute.v1beta.InsertRegionMultiMigRequest
+	(*InsertRegionNetworkEndpointGroupRequest)(nil),                                      // 1371: google.cloud.compute.v1beta.InsertRegionNetworkEndpointGroupRequest
+	(*InsertRegionNetworkFirewallPolicyRequest)(nil),                                     // 1372: google.cloud.compute.v1beta.InsertRegionNetworkFirewallPolicyRequest
+	(*InsertRegionNetworkPolicyRequest)(nil),                                             // 1373: google.cloud.compute.v1beta.InsertRegionNetworkPolicyRequest
+	(*InsertRegionNotificationEndpointRequest)(nil),                                      // 1374: google.cloud.compute.v1beta.InsertRegionNotificationEndpointRequest
+	(*InsertRegionSecurityPolicyRequest)(nil),                                            // 1375: google.cloud.compute.v1beta.InsertRegionSecurityPolicyRequest
+	(*InsertRegionSnapshotRequest)(nil),                                                  // 1376: google.cloud.compute.v1beta.InsertRegionSnapshotRequest
+	(*InsertRegionSslCertificateRequest)(nil),                                            // 1377: google.cloud.compute.v1beta.InsertRegionSslCertificateRequest
+	(*InsertRegionSslPolicyRequest)(nil),                                                 // 1378: google.cloud.compute.v1beta.InsertRegionSslPolicyRequest
+	(*InsertRegionTargetHttpProxyRequest)(nil),                                           // 1379: google.cloud.compute.v1beta.InsertRegionTargetHttpProxyRequest
+	(*InsertRegionTargetHttpsProxyRequest)(nil),                                          // 1380: google.cloud.compute.v1beta.InsertRegionTargetHttpsProxyRequest
+	(*InsertRegionTargetTcpProxyRequest)(nil),                                            // 1381: google.cloud.compute.v1beta.InsertRegionTargetTcpProxyRequest
+	(*InsertRegionUrlMapRequest)(nil),                                                    // 1382: google.cloud.compute.v1beta.InsertRegionUrlMapRequest
+	(*InsertReservationRequest)(nil),                                                     // 1383: google.cloud.compute.v1beta.InsertReservationRequest
+	(*InsertResourcePolicyRequest)(nil),                                                  // 1384: google.cloud.compute.v1beta.InsertResourcePolicyRequest
+	(*InsertRolloutPlanRequest)(nil),                                                     // 1385: google.cloud.compute.v1beta.InsertRolloutPlanRequest
+	(*InsertRouteRequest)(nil),                                                           // 1386: google.cloud.compute.v1beta.InsertRouteRequest
+	(*InsertRouterRequest)(nil),                                                          // 1387: google.cloud.compute.v1beta.InsertRouterRequest
+	(*InsertSecurityPolicyRequest)(nil),                                                  // 1388: google.cloud.compute.v1beta.InsertSecurityPolicyRequest
+	(*InsertServiceAttachmentRequest)(nil),                                               // 1389: google.cloud.compute.v1beta.InsertServiceAttachmentRequest
+	(*InsertSnapshotGroupRequest)(nil),                                                   // 1390: google.cloud.compute.v1beta.InsertSnapshotGroupRequest
+	(*InsertSnapshotRequest)(nil),                                                        // 1391: google.cloud.compute.v1beta.InsertSnapshotRequest
+	(*InsertSslCertificateRequest)(nil),                                                  // 1392: google.cloud.compute.v1beta.InsertSslCertificateRequest
+	(*InsertSslPolicyRequest)(nil),                                                       // 1393: google.cloud.compute.v1beta.InsertSslPolicyRequest
+	(*InsertStoragePoolRequest)(nil),                                                     // 1394: google.cloud.compute.v1beta.InsertStoragePoolRequest
+	(*InsertSubnetworkRequest)(nil),                                                      // 1395: google.cloud.compute.v1beta.InsertSubnetworkRequest
+	(*InsertTargetGrpcProxyRequest)(nil),                                                 // 1396: google.cloud.compute.v1beta.InsertTargetGrpcProxyRequest
+	(*InsertTargetHttpProxyRequest)(nil),                                                 // 1397: google.cloud.compute.v1beta.InsertTargetHttpProxyRequest
+	(*InsertTargetHttpsProxyRequest)(nil),                                                // 1398: google.cloud.compute.v1beta.InsertTargetHttpsProxyRequest
+	(*InsertTargetInstanceRequest)(nil),                                                  // 1399: google.cloud.compute.v1beta.InsertTargetInstanceRequest
+	(*InsertTargetPoolRequest)(nil),                                                      // 1400: google.cloud.compute.v1beta.InsertTargetPoolRequest
+	(*InsertTargetSslProxyRequest)(nil),                                                  // 1401: google.cloud.compute.v1beta.InsertTargetSslProxyRequest
+	(*InsertTargetTcpProxyRequest)(nil),                                                  // 1402: google.cloud.compute.v1beta.InsertTargetTcpProxyRequest
+	(*InsertTargetVpnGatewayRequest)(nil),                                                // 1403: google.cloud.compute.v1beta.InsertTargetVpnGatewayRequest
+	(*InsertUrlMapRequest)(nil),                                                          // 1404: google.cloud.compute.v1beta.InsertUrlMapRequest
+	(*InsertVpnGatewayRequest)(nil),                                                      // 1405: google.cloud.compute.v1beta.InsertVpnGatewayRequest
+	(*InsertVpnTunnelRequest)(nil),                                                       // 1406: google.cloud.compute.v1beta.InsertVpnTunnelRequest
+	(*InsertWireGroupRequest)(nil),                                                       // 1407: google.cloud.compute.v1beta.InsertWireGroupRequest
+	(*InsertZoneVmExtensionPolicyRequest)(nil),                                           // 1408: google.cloud.compute.v1beta.InsertZoneVmExtensionPolicyRequest
+	(*Instance)(nil),                                                                     // 1409: google.cloud.compute.v1beta.Instance
+	(*InstanceAggregatedList)(nil),                                                       // 1410: google.cloud.compute.v1beta.InstanceAggregatedList
+	(*InstanceConsumptionData)(nil),                                                      // 1411: google.cloud.compute.v1beta.InstanceConsumptionData
+	(*InstanceConsumptionInfo)(nil),                                                      // 1412: google.cloud.compute.v1beta.InstanceConsumptionInfo
+	(*InstanceFlexibilityPolicy)(nil),                                                    // 1413: google.cloud.compute.v1beta.InstanceFlexibilityPolicy
+	(*InstanceFlexibilityPolicyInstanceSelection)(nil),                                   // 1414: google.cloud.compute.v1beta.InstanceFlexibilityPolicyInstanceSelection
+	(*InstanceGroup)(nil),                                                                // 1415: google.cloud.compute.v1beta.InstanceGroup
+	(*InstanceGroupAggregatedList)(nil),                                                  // 1416: google.cloud.compute.v1beta.InstanceGroupAggregatedList
+	(*InstanceGroupList)(nil),                                                            // 1417: google.cloud.compute.v1beta.InstanceGroupList
+	(*InstanceGroupManager)(nil),                                                         // 1418: google.cloud.compute.v1beta.InstanceGroupManager
+	(*InstanceGroupManagerActionsSummary)(nil),                                           // 1419: google.cloud.compute.v1beta.InstanceGroupManagerActionsSummary
+	(*InstanceGroupManagerAggregatedList)(nil),                                           // 1420: google.cloud.compute.v1beta.InstanceGroupManagerAggregatedList
+	(*InstanceGroupManagerAllInstancesConfig)(nil),                                       // 1421: google.cloud.compute.v1beta.InstanceGroupManagerAllInstancesConfig
+	(*InstanceGroupManagerAutoHealingPolicy)(nil),                                        // 1422: google.cloud.compute.v1beta.InstanceGroupManagerAutoHealingPolicy
+	(*InstanceGroupManagerInstanceFlexibilityPolicy)(nil),                                // 1423: google.cloud.compute.v1beta.InstanceGroupManagerInstanceFlexibilityPolicy
+	(*InstanceGroupManagerInstanceFlexibilityPolicyInstanceSelection)(nil),               // 1424: google.cloud.compute.v1beta.InstanceGroupManagerInstanceFlexibilityPolicyInstanceSelection
+	(*InstanceGroupManagerInstanceFlexibilityPolicyProvisioningModelMix)(nil),            // 1425: google.cloud.compute.v1beta.InstanceGroupManagerInstanceFlexibilityPolicyProvisioningModelMix
+	(*InstanceGroupManagerInstanceLifecyclePolicy)(nil),                                  // 1426: google.cloud.compute.v1beta.InstanceGroupManagerInstanceLifecyclePolicy
+	(*InstanceGroupManagerInstanceLifecyclePolicyOnRepair)(nil),                          // 1427: google.cloud.compute.v1beta.InstanceGroupManagerInstanceLifecyclePolicyOnRepair
+	(*InstanceGroupManagerList)(nil),                                                     // 1428: google.cloud.compute.v1beta.InstanceGroupManagerList
+	(*InstanceGroupManagerParams)(nil),                                                   // 1429: google.cloud.compute.v1beta.InstanceGroupManagerParams
+	(*InstanceGroupManagerResizeRequest)(nil),                                            // 1430: google.cloud.compute.v1beta.InstanceGroupManagerResizeRequest
+	(*InstanceGroupManagerResizeRequestStatus)(nil),                                      // 1431: google.cloud.compute.v1beta.InstanceGroupManagerResizeRequestStatus
+	(*InstanceGroupManagerResizeRequestStatusLastAttempt)(nil),                           // 1432: google.cloud.compute.v1beta.InstanceGroupManagerResizeRequestStatusLastAttempt
+	(*InstanceGroupManagerResizeRequestsListResponse)(nil),                               // 1433: google.cloud.compute.v1beta.InstanceGroupManagerResizeRequestsListResponse
+	(*InstanceGroupManagerResourcePolicies)(nil),                                         // 1434: google.cloud.compute.v1beta.InstanceGroupManagerResourcePolicies
+	(*InstanceGroupManagerStandbyPolicy)(nil),                                            // 1435: google.cloud.compute.v1beta.InstanceGroupManagerStandbyPolicy
+	(*InstanceGroupManagerStatus)(nil),                                                   // 1436: google.cloud.compute.v1beta.InstanceGroupManagerStatus
+	(*InstanceGroupManagerStatusAcceleratorTopology)(nil),                                // 1437: google.cloud.compute.v1beta.InstanceGroupManagerStatusAcceleratorTopology
+	(*InstanceGroupManagerStatusAcceleratorTopologyAcceleratorTopologyStateDetails)(nil), // 1438: google.cloud.compute.v1beta.InstanceGroupManagerStatusAcceleratorTopologyAcceleratorTopologyStateDetails
+	(*InstanceGroupManagerStatusAllInstancesConfig)(nil),                                 // 1439: google.cloud.compute.v1beta.InstanceGroupManagerStatusAllInstancesConfig
+	(*InstanceGroupManagerStatusBulkInstanceOperation)(nil),                              // 1440: google.cloud.compute.v1beta.InstanceGroupManagerStatusBulkInstanceOperation
+	(*InstanceGroupManagerStatusBulkInstanceOperationLastProgressCheck)(nil),             // 1441: google.cloud.compute.v1beta.InstanceGroupManagerStatusBulkInstanceOperationLastProgressCheck
+	(*InstanceGroupManagerStatusInstanceStatusSummary)(nil),                              // 1442: google.cloud.compute.v1beta.InstanceGroupManagerStatusInstanceStatusSummary
+	(*InstanceGroupManagerStatusStateful)(nil),                                           // 1443: google.cloud.compute.v1beta.InstanceGroupManagerStatusStateful
+	(*InstanceGroupManagerStatusStatefulPerInstanceConfigs)(nil),                         // 1444: google.cloud.compute.v1beta.InstanceGroupManagerStatusStatefulPerInstanceConfigs
+	(*InstanceGroupManagerStatusVersionTarget)(nil),                                      // 1445: google.cloud.compute.v1beta.InstanceGroupManagerStatusVersionTarget
+	(*InstanceGroupManagerTargetSizePolicy)(nil),                                         // 1446: google.cloud.compute.v1beta.InstanceGroupManagerTargetSizePolicy
+	(*InstanceGroupManagerUpdatePolicy)(nil),                                             // 1447: google.cloud.compute.v1beta.InstanceGroupManagerUpdatePolicy
+	(*InstanceGroupManagerVersion)(nil),                                                  // 1448: google.cloud.compute.v1beta.InstanceGroupManagerVersion
+	(*InstanceGroupManagersAbandonInstancesRequest)(nil),                                 // 1449: google.cloud.compute.v1beta.InstanceGroupManagersAbandonInstancesRequest
+	(*InstanceGroupManagersApplyUpdatesRequest)(nil),                                     // 1450: google.cloud.compute.v1beta.InstanceGroupManagersApplyUpdatesRequest
+	(*InstanceGroupManagersConfigureAcceleratorTopologiesRequest)(nil),                   // 1451: google.cloud.compute.v1beta.InstanceGroupManagersConfigureAcceleratorTopologiesRequest
 	(*InstanceGroupManagersConfigureAcceleratorTopologiesRequestAcceleratorTopologyConfiguration)(nil), // 1452: google.cloud.compute.v1beta.InstanceGroupManagersConfigureAcceleratorTopologiesRequestAcceleratorTopologyConfiguration
 	(*InstanceGroupManagersCreateInstancesRequest)(nil),                                                // 1453: google.cloud.compute.v1beta.InstanceGroupManagersCreateInstancesRequest
 	(*InstanceGroupManagersDeleteInstancesRequest)(nil),                                                // 1454: google.cloud.compute.v1beta.InstanceGroupManagersDeleteInstancesRequest
@@ -269769,35 +269769,35 @@ var file_google_cloud_compute_v1beta_compute_proto_goTypes = []any{
 	(*PerformMaintenanceReservationBlockRequest)(nil),                          // 1989: google.cloud.compute.v1beta.PerformMaintenanceReservationBlockRequest
 	(*PerformMaintenanceReservationRequest)(nil),                               // 1990: google.cloud.compute.v1beta.PerformMaintenanceReservationRequest
 	(*PerformMaintenanceReservationSubBlockRequest)(nil),                       // 1991: google.cloud.compute.v1beta.PerformMaintenanceReservationSubBlockRequest
-	(*Policy)(nil),                                                             // 1992: google.cloud.compute.v1beta.Policy
-	(*PreconfiguredWafSet)(nil),                                                // 1993: google.cloud.compute.v1beta.PreconfiguredWafSet
-	(*PreservedState)(nil),                                                     // 1994: google.cloud.compute.v1beta.PreservedState
-	(*PreservedStatePreservedDisk)(nil),                                        // 1995: google.cloud.compute.v1beta.PreservedStatePreservedDisk
-	(*PreservedStatePreservedNetworkIp)(nil),                                   // 1996: google.cloud.compute.v1beta.PreservedStatePreservedNetworkIp
-	(*PreservedStatePreservedNetworkIpIpAddress)(nil),                          // 1997: google.cloud.compute.v1beta.PreservedStatePreservedNetworkIpIpAddress
-	(*PreviewFeature)(nil),                                                     // 1998: google.cloud.compute.v1beta.PreviewFeature
-	(*PreviewFeatureList)(nil),                                                 // 1999: google.cloud.compute.v1beta.PreviewFeatureList
-	(*PreviewFeatureRolloutOperation)(nil),                                     // 2000: google.cloud.compute.v1beta.PreviewFeatureRolloutOperation
-	(*PreviewFeatureRolloutOperationRolloutInput)(nil),                         // 2001: google.cloud.compute.v1beta.PreviewFeatureRolloutOperationRolloutInput
-	(*PreviewFeatureStatus)(nil),                                               // 2002: google.cloud.compute.v1beta.PreviewFeatureStatus
-	(*PreviewFeatureStatusReleaseStatus)(nil),                                  // 2003: google.cloud.compute.v1beta.PreviewFeatureStatusReleaseStatus
-	(*PreviewRouterRequest)(nil),                                               // 2004: google.cloud.compute.v1beta.PreviewRouterRequest
-	(*Project)(nil),                                                            // 2005: google.cloud.compute.v1beta.Project
-	(*ProjectsDisableXpnResourceRequest)(nil),                                  // 2006: google.cloud.compute.v1beta.ProjectsDisableXpnResourceRequest
-	(*ProjectsEnableXpnResourceRequest)(nil),                                   // 2007: google.cloud.compute.v1beta.ProjectsEnableXpnResourceRequest
-	(*ProjectsGetXpnResources)(nil),                                            // 2008: google.cloud.compute.v1beta.ProjectsGetXpnResources
-	(*ProjectsListXpnHostsRequest)(nil),                                        // 2009: google.cloud.compute.v1beta.ProjectsListXpnHostsRequest
-	(*ProjectsSetCloudArmorTierRequest)(nil),                                   // 2010: google.cloud.compute.v1beta.ProjectsSetCloudArmorTierRequest
-	(*ProjectsSetDefaultNetworkTierRequest)(nil),                               // 2011: google.cloud.compute.v1beta.ProjectsSetDefaultNetworkTierRequest
-	(*ProjectsSetManagedProtectionTierRequest)(nil),                            // 2012: google.cloud.compute.v1beta.ProjectsSetManagedProtectionTierRequest
-	(*PublicAdvertisedPrefix)(nil),                                             // 2013: google.cloud.compute.v1beta.PublicAdvertisedPrefix
-	(*PublicAdvertisedPrefixList)(nil),                                         // 2014: google.cloud.compute.v1beta.PublicAdvertisedPrefixList
-	(*PublicAdvertisedPrefixPublicDelegatedPrefix)(nil),                        // 2015: google.cloud.compute.v1beta.PublicAdvertisedPrefixPublicDelegatedPrefix
-	(*PublicDelegatedPrefix)(nil),                                              // 2016: google.cloud.compute.v1beta.PublicDelegatedPrefix
-	(*PublicDelegatedPrefixAggregatedList)(nil),                                // 2017: google.cloud.compute.v1beta.PublicDelegatedPrefixAggregatedList
-	(*PublicDelegatedPrefixList)(nil),                                          // 2018: google.cloud.compute.v1beta.PublicDelegatedPrefixList
-	(*PublicDelegatedPrefixPublicDelegatedSubPrefix)(nil),                      // 2019: google.cloud.compute.v1beta.PublicDelegatedPrefixPublicDelegatedSubPrefix
-	(*PublicDelegatedPrefixesScopedList)(nil),                                  // 2020: google.cloud.compute.v1beta.PublicDelegatedPrefixesScopedList
+	(*Policy)(nil),                                        // 1992: google.cloud.compute.v1beta.Policy
+	(*PreconfiguredWafSet)(nil),                           // 1993: google.cloud.compute.v1beta.PreconfiguredWafSet
+	(*PreservedState)(nil),                                // 1994: google.cloud.compute.v1beta.PreservedState
+	(*PreservedStatePreservedDisk)(nil),                   // 1995: google.cloud.compute.v1beta.PreservedStatePreservedDisk
+	(*PreservedStatePreservedNetworkIp)(nil),              // 1996: google.cloud.compute.v1beta.PreservedStatePreservedNetworkIp
+	(*PreservedStatePreservedNetworkIpIpAddress)(nil),     // 1997: google.cloud.compute.v1beta.PreservedStatePreservedNetworkIpIpAddress
+	(*PreviewFeature)(nil),                                // 1998: google.cloud.compute.v1beta.PreviewFeature
+	(*PreviewFeatureList)(nil),                            // 1999: google.cloud.compute.v1beta.PreviewFeatureList
+	(*PreviewFeatureRolloutOperation)(nil),                // 2000: google.cloud.compute.v1beta.PreviewFeatureRolloutOperation
+	(*PreviewFeatureRolloutOperationRolloutInput)(nil),    // 2001: google.cloud.compute.v1beta.PreviewFeatureRolloutOperationRolloutInput
+	(*PreviewFeatureStatus)(nil),                          // 2002: google.cloud.compute.v1beta.PreviewFeatureStatus
+	(*PreviewFeatureStatusReleaseStatus)(nil),             // 2003: google.cloud.compute.v1beta.PreviewFeatureStatusReleaseStatus
+	(*PreviewRouterRequest)(nil),                          // 2004: google.cloud.compute.v1beta.PreviewRouterRequest
+	(*Project)(nil),                                       // 2005: google.cloud.compute.v1beta.Project
+	(*ProjectsDisableXpnResourceRequest)(nil),             // 2006: google.cloud.compute.v1beta.ProjectsDisableXpnResourceRequest
+	(*ProjectsEnableXpnResourceRequest)(nil),              // 2007: google.cloud.compute.v1beta.ProjectsEnableXpnResourceRequest
+	(*ProjectsGetXpnResources)(nil),                       // 2008: google.cloud.compute.v1beta.ProjectsGetXpnResources
+	(*ProjectsListXpnHostsRequest)(nil),                   // 2009: google.cloud.compute.v1beta.ProjectsListXpnHostsRequest
+	(*ProjectsSetCloudArmorTierRequest)(nil),              // 2010: google.cloud.compute.v1beta.ProjectsSetCloudArmorTierRequest
+	(*ProjectsSetDefaultNetworkTierRequest)(nil),          // 2011: google.cloud.compute.v1beta.ProjectsSetDefaultNetworkTierRequest
+	(*ProjectsSetManagedProtectionTierRequest)(nil),       // 2012: google.cloud.compute.v1beta.ProjectsSetManagedProtectionTierRequest
+	(*PublicAdvertisedPrefix)(nil),                        // 2013: google.cloud.compute.v1beta.PublicAdvertisedPrefix
+	(*PublicAdvertisedPrefixList)(nil),                    // 2014: google.cloud.compute.v1beta.PublicAdvertisedPrefixList
+	(*PublicAdvertisedPrefixPublicDelegatedPrefix)(nil),   // 2015: google.cloud.compute.v1beta.PublicAdvertisedPrefixPublicDelegatedPrefix
+	(*PublicDelegatedPrefix)(nil),                         // 2016: google.cloud.compute.v1beta.PublicDelegatedPrefix
+	(*PublicDelegatedPrefixAggregatedList)(nil),           // 2017: google.cloud.compute.v1beta.PublicDelegatedPrefixAggregatedList
+	(*PublicDelegatedPrefixList)(nil),                     // 2018: google.cloud.compute.v1beta.PublicDelegatedPrefixList
+	(*PublicDelegatedPrefixPublicDelegatedSubPrefix)(nil), // 2019: google.cloud.compute.v1beta.PublicDelegatedPrefixPublicDelegatedSubPrefix
+	(*PublicDelegatedPrefixesScopedList)(nil),             // 2020: google.cloud.compute.v1beta.PublicDelegatedPrefixesScopedList
 	(*Quota)(nil),              // 2021: google.cloud.compute.v1beta.Quota
 	(*QuotaExceededInfo)(nil),  // 2022: google.cloud.compute.v1beta.QuotaExceededInfo
 	(*QuotaStatusWarning)(nil), // 2023: google.cloud.compute.v1beta.QuotaStatusWarning
