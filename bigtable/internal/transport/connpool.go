@@ -125,6 +125,18 @@ func WithDirectAccessChecker(checker DirectAccessChecker) BigtableChannelPoolOpt
 	}
 }
 
+// WithChannelPrimer plugs in the strategy used to warm freshly-dialed
+// channels before they enter rotation. Optional: when no primer is supplied,
+// the pool's connection factory dials the channel and returns it without
+// issuing any prime RPC. The classic channel pool factory wires up a
+// PingAndWarm-based primer; alternative pool factories can swap in a
+// different strategy (e.g. session-based) or pass nothing at all.
+func WithChannelPrimer(primer ChannelPrimer) BigtableChannelPoolOption {
+	return func(p *BigtableChannelPool) {
+		p.channelPrimer = primer
+	}
+}
+
 // WithLogger provides the logger for logging events. Retained even
 // though no in-tree caller sets it — the debug-path Debugf calls
 // throughout connpool no-op on a nil logger, so this is the intended
@@ -139,13 +151,6 @@ func WithLogger(logger *log.Logger) BigtableChannelPoolOption {
 func WithInstanceName(instanceName string) BigtableChannelPoolOption {
 	return func(p *BigtableChannelPool) {
 		p.instanceName = instanceName
-	}
-}
-
-// WithFeatureFlagsMetadata provides the feature flags metadata
-func WithFeatureFlagsMetadata(featureFlagsMd metadata.MD) BigtableChannelPoolOption {
-	return func(p *BigtableChannelPool) {
-		p.featureFlagsMD = featureFlagsMd
 	}
 }
 
@@ -495,10 +500,9 @@ type BigtableChannelPool struct {
 	poolCtx    context.Context    // Context for the pool's background tasks
 	poolCancel context.CancelFunc // Function to cancel the poolCtx
 
-	logger         *log.Logger // logging events
-	appProfile     string
-	instanceName   string
-	featureFlagsMD metadata.MD
+	logger       *log.Logger // logging events
+	appProfile   string
+	instanceName string
 
 	factory *connectionFactory // Use the factory for connection creation
 
@@ -513,6 +517,13 @@ type BigtableChannelPool struct {
 	// Direct Access off pass the disabled stub so the
 	// direct_access/compatible metric still surfaces the off state.
 	directAccessChecker DirectAccessChecker
+
+	// channelPrimer is the pluggable strategy used to warm freshly-dialed
+	// channels. Optional: when nil, the connection factory skips priming
+	// entirely and hands the raw connection straight to the pool. The
+	// classic channel pool factory wires up a PingAndWarm-based primer; the
+	// future session-pool factory may skip it.
+	channelPrimer ChannelPrimer
 
 	// background monitors
 	monitors []Monitor
@@ -564,9 +575,9 @@ func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btop
 
 	// Default to the standard dialer. The Direct Access checker may swap the
 	// dialer for the direct-access equivalent after a successful compatibility
-	// probe. Feature-flag metadata always comes from pool.featureFlagsMD (set
-	// via WithFeatureFlagsMetadata) — both the direct-access and standard-path
-	// connection factories read it from the same place.
+	// probe. The ChannelPrimer (if any) is the single source of priming
+	// behavior — both the direct-access and standard-path factories run
+	// fresh connections through it before they enter rotation.
 	factoryDial := dial
 
 	var firstConn *BigtableConn
@@ -586,11 +597,9 @@ func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btop
 
 	// Initialize the connectionFactory
 	pool.factory = &connectionFactory{
-		dial:           factoryDial,
-		instanceName:   pool.instanceName,
-		appProfile:     pool.appProfile,
-		featureFlagsMD: pool.featureFlagsMD,
-		logger:         pool.logger,
+		dial:   factoryDial,
+		primer: pool.channelPrimer,
+		logger: pool.logger,
 	}
 
 	// Set the selection function based on the strategy
@@ -1144,18 +1153,18 @@ func (p *BigtableChannelPool) removeConnections(decreaseDelta, minConns, maxRemo
 
 }
 
-// connectionFactory is responsible for creating and priming new Bigtable connections.
-// TODO remove these members from BigtableConnPool struct
+// connectionFactory is responsible for creating and (optionally) priming
+// new Bigtable connections. When primer is nil the factory dials and
+// returns the connection without warming it.
 type connectionFactory struct {
-	dial           func() (*BigtableConn, error)
-	instanceName   string
-	appProfile     string
-	featureFlagsMD metadata.MD
-	logger         *log.Logger
+	dial   func() (*BigtableConn, error)
+	primer ChannelPrimer
+	logger *log.Logger
 }
 
-// newEntry creates a new connection, primes it, and returns it as a connEntry.
-// Blocks until the connection is successfully primed, or returns an error.
+// newEntry creates a new connection, primes it (if a primer is configured),
+// and returns it as a connEntry. Blocks until the connection is ready, or
+// returns an error.
 func (cf *connectionFactory) newEntry(ctx context.Context) (*connEntry, error) {
 	conn, err := cf.dial()
 	if err != nil {
@@ -1170,8 +1179,13 @@ func (cf *connectionFactory) newEntry(ctx context.Context) (*connEntry, error) {
 	return &connEntry{conn: conn}, nil
 }
 
-// primeWithRetry attempts to prime the connection, retrying with exponential backoff.
+// primeWithRetry runs the configured ChannelPrimer with exponential backoff.
+// Returns nil immediately when no primer is configured, so the pool can be
+// used without priming.
 func (cf *connectionFactory) primeWithRetry(ctx context.Context, conn *BigtableConn) error {
+	if cf.primer == nil {
+		return nil
+	}
 	backoffPolicy := gax.Backoff{
 		Initial:    100 * time.Millisecond,
 		Max:        2 * time.Second,
@@ -1186,7 +1200,7 @@ func (cf *connectionFactory) primeWithRetry(ctx context.Context, conn *BigtableC
 			return fmt.Errorf("bigtable_connpool:  error before prime attempt %d: %w", attempt, err)
 		}
 
-		lastErr = conn.Prime(ctx, cf.instanceName, cf.appProfile, cf.featureFlagsMD)
+		lastErr = cf.primer.Prime(ctx, conn)
 		if lastErr == nil {
 			return nil
 		}

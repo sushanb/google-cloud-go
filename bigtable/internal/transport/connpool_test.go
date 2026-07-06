@@ -51,6 +51,7 @@ func poolOpts() []BigtableChannelPoolOption {
 	return []BigtableChannelPoolOption{
 		WithInstanceName(testInstanceName),
 		WithAppProfile(testAppProfile),
+		WithChannelPrimer(NewPingAndWarmChannelPrimer(testInstanceName, testAppProfile, nil)),
 		WithDirectAccessChecker(NewDisabledDirectAccessChecker(nil, nil)),
 	}
 }
@@ -156,7 +157,7 @@ func TestNewBigtableChannelPoolEdgeCases(t *testing.T) {
 		{
 			name: "NilDirectAccessChecker",
 			size: 1, dial: dialFunc,
-			opts:     []BigtableChannelPoolOption{WithInstanceName(testInstanceName), WithAppProfile(testAppProfile)},
+			opts:     []BigtableChannelPoolOption{WithInstanceName(testInstanceName), WithAppProfile(testAppProfile), WithChannelPrimer(NewPingAndWarmChannelPrimer(testInstanceName, testAppProfile, nil))},
 			wantErr:  true,
 			errMatch: "DirectAccessChecker is required",
 		},
@@ -255,10 +256,8 @@ func TestConnectionFactory(t *testing.T) {
 			fake.setDelay(tt.primeDelay)
 
 			factory := &connectionFactory{
-				dial:           tt.dialFunc,
-				instanceName:   testInstanceName,
-				appProfile:     testAppProfile,
-				featureFlagsMD: metadata.MD{},
+				dial:   tt.dialFunc,
+				primer: NewPingAndWarmChannelPrimer(testInstanceName, testAppProfile, metadata.MD{}),
 			}
 
 			ctx := context.Background()
@@ -1678,7 +1677,7 @@ func TestDirectAccessLogic(t *testing.T) {
 
 		poolSize := 3
 		fake.setPingCount(0)
-		opts := append(poolOpts(), WithDirectAccessChecker(NewPingAndWarmDirectAccessChecker(daDial, testInstanceName, testAppProfile, nil, nil, nil)))
+		opts := append(poolOpts(), WithDirectAccessChecker(NewPingAndWarmDirectAccessChecker(daDial, NewPingAndWarmChannelPrimer(testInstanceName, testAppProfile, nil), nil, nil)))
 		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, baseDialFunc, time.Now(), opts...)
 
 		if err != nil {
@@ -1721,7 +1720,7 @@ func TestDirectAccessLogic(t *testing.T) {
 		}
 
 		poolSize := 2
-		opts := append(poolOpts(), WithDirectAccessChecker(NewPingAndWarmDirectAccessChecker(daDial, testInstanceName, testAppProfile, nil, nil, nil)))
+		opts := append(poolOpts(), WithDirectAccessChecker(NewPingAndWarmDirectAccessChecker(daDial, NewPingAndWarmChannelPrimer(testInstanceName, testAppProfile, nil), nil, nil)))
 		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, baseDialFunc, time.Now(), opts...)
 		if err != nil {
 			t.Fatalf("Failed to create pool: %v", err)
@@ -1746,7 +1745,7 @@ func TestDirectAccessLogic(t *testing.T) {
 		}
 
 		poolSize := 1
-		opts := append(poolOpts(), WithDirectAccessChecker(NewPingAndWarmDirectAccessChecker(daDial, testInstanceName, testAppProfile, nil, nil, nil)))
+		opts := append(poolOpts(), WithDirectAccessChecker(NewPingAndWarmDirectAccessChecker(daDial, NewPingAndWarmChannelPrimer(testInstanceName, testAppProfile, nil), nil, nil)))
 		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, baseDialFunc, time.Now(), opts...)
 		if err != nil {
 			t.Fatalf("Failed to create pool: %v", err)
@@ -1772,7 +1771,7 @@ func TestDirectAccessLogic(t *testing.T) {
 			daConn = c
 			return c, nil
 		}
-		opts := append(poolOpts(), WithDirectAccessChecker(NewPingAndWarmDirectAccessChecker(daDial, testInstanceName, testAppProfile, nil, nil, nil)))
+		opts := append(poolOpts(), WithDirectAccessChecker(NewPingAndWarmDirectAccessChecker(daDial, NewPingAndWarmChannelPrimer(testInstanceName, testAppProfile, nil), nil, nil)))
 		poolSize := 1
 		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, baseDialFunc, time.Now(), opts...)
 		if err != nil {
@@ -1837,7 +1836,7 @@ func TestDirectAccessLogic(t *testing.T) {
 		}
 
 		poolSize := 1
-		opts := append(poolOpts(), WithDirectAccessChecker(NewPingAndWarmDirectAccessChecker(daDial, testInstanceName, testAppProfile, nil, nil, nil)))
+		opts := append(poolOpts(), WithDirectAccessChecker(NewPingAndWarmDirectAccessChecker(daDial, NewPingAndWarmChannelPrimer(testInstanceName, testAppProfile, nil), nil, nil)))
 		pool, err := NewBigtableChannelPool(ctx, poolSize, btopt.RoundRobin, baseDialFunc, time.Now(), opts...)
 		if err != nil {
 			t.Fatalf("Failed to create pool: %v", err)
