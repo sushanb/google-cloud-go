@@ -23,9 +23,7 @@ import (
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"cloud.google.com/go/bigtable/internal/metrics"
 	btransport "cloud.google.com/go/bigtable/internal/transport"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 )
 
 // ErrWriteNotSupported is returned by MutateRow when the resource has
@@ -122,8 +120,7 @@ func (t *sessionTable) ReadRow(ctx context.Context, req *btpb.SessionReadRowRequ
 	chained := btransport.ChainInterceptors(retryInterceptor)
 	res, err := chained(ctx, args, baseHandler)
 	if ownedTracer {
-		statusCode, _ := grpcStatusOf(err)
-		mt.SetCurrOpStatus(statusCode)
+		mt.SetCurrOpStatus(metrics.GrpcCodeOf(err))
 	}
 	if err != nil {
 		return nil, fmt.Errorf("session ReadRow vRPC: %w", err)
@@ -185,8 +182,7 @@ func (t *sessionTable) MutateRow(ctx context.Context, req *btpb.SessionMutateRow
 	chained := btransport.ChainInterceptors(retryInterceptor)
 	res, err := chained(ctx, args, baseHandler)
 	if ownedTracer {
-		statusCode, _ := grpcStatusOf(err)
-		mt.SetCurrOpStatus(statusCode)
+		mt.SetCurrOpStatus(metrics.GrpcCodeOf(err))
 	}
 	if err != nil {
 		return nil, fmt.Errorf("session MutateRow vRPC: %w", err)
@@ -254,23 +250,6 @@ func stampAttempt(ctx context.Context, result btransport.InvokeResult) {
 		att.SetTransportZone(result.PeerInfo.GetApplicationFrontendZone())
 		att.SetTransportSubZone(result.PeerInfo.GetApplicationFrontendSubzone())
 	}
-}
-
-// grpcStatusOf maps a Go error to a gRPC status code for the
-// standalone-tracer op-status stamping. Mirrors
-// bigtable.convertToGrpcStatusErr; kept local to avoid an import
-// cycle.
-func grpcStatusOf(err error) (codes.Code, error) {
-	if err == nil {
-		return codes.OK, nil
-	}
-	if errStatus, ok := status.FromError(err); ok {
-		return errStatus.Code(), err
-	}
-	if ctxStatus := status.FromContextError(err); ctxStatus.Code() != codes.Unknown {
-		return ctxStatus.Code(), err
-	}
-	return codes.Unknown, err
 }
 
 // attachOutgoingMetadata is the internal-session equivalent of

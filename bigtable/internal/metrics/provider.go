@@ -43,18 +43,20 @@ const methodNameReadRows = "ReadRows"
 
 // convertToGrpcStatusErr mirrors bigtable.convertToGrpcStatusErr —
 // tracer paths need the (code, err) shape at attempt/operation
-// completion. Duplicated to avoid an import cycle; keep in sync with
-// the bigtable-side helper.
+// completion, with the error canonicalized to a plain status.Error so
+// downstream logging doesn't leak wrapping/details. Code extraction is
+// shared with the code-only callers via GrpcCodeOf.
 func convertToGrpcStatusErr(err error) (codes.Code, error) {
+	code := GrpcCodeOf(err)
 	if err == nil {
-		return codes.OK, nil
+		return code, nil
 	}
-	if errStatus, ok := status.FromError(err); ok {
-		return errStatus.Code(), status.Error(errStatus.Code(), errStatus.Message())
+	if s, ok := status.FromError(err); ok {
+		return code, status.Error(code, s.Message())
 	}
-	ctxStatus := status.FromContextError(err)
-	if ctxStatus.Code() != codes.Unknown {
-		return ctxStatus.Code(), status.Error(ctxStatus.Code(), ctxStatus.Message())
+	if code != codes.Unknown {
+		// Context error path — canonicalize with the ctx-derived message.
+		return code, status.Error(code, status.FromContextError(err).Message())
 	}
-	return codes.Unknown, err
+	return code, err
 }

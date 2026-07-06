@@ -25,7 +25,9 @@ import (
 	"time"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -131,4 +133,22 @@ func ExtractPeerInfo(headerMD metadata.MD, trailerMD metadata.MD) (*btpb.PeerInf
 
 func ConvertToMs(d time.Duration) float64 {
 	return float64(d.Nanoseconds()) / 1000000
+}
+
+// GrpcCodeOf extracts the gRPC status code from an error. Maps a nil
+// error to codes.OK, a status.Error to its embedded code, a context
+// deadline/canceled error to its canonical code, and anything else to
+// codes.Unknown. Shared helper so tracer/session paths that only need
+// the code (not the wrapped error) don't reimplement the walk.
+func GrpcCodeOf(err error) codes.Code {
+	if err == nil {
+		return codes.OK
+	}
+	if s, ok := status.FromError(err); ok {
+		return s.Code()
+	}
+	if s := status.FromContextError(err); s.Code() != codes.Unknown {
+		return s.Code()
+	}
+	return codes.Unknown
 }
