@@ -15,6 +15,7 @@
 package bigtable
 
 import (
+	"cloud.google.com/go/bigtable/internal/metrics"
 	"context"
 	"io"
 
@@ -29,12 +30,12 @@ func (t *Table) SampleRowKeys(ctx context.Context) ([]string, error) {
 	ctx = mergeOutgoingMetadata(ctx, t.md)
 
 	mt := t.newBuiltinMetricsTracer(ctx, true)
-	defer mt.recordOperationCompletion()
-	ctx = contextWithMetricsTracer(ctx, mt)
+	defer mt.RecordOperationCompletion()
+	ctx = metrics.NewContext(ctx, mt)
 
 	rowKeys, err := t.sampleRowKeys(ctx)
 	statusCode, statusErr := convertToGrpcStatusErr(err)
-	mt.setCurrOpStatus(statusCode)
+	mt.SetCurrOpStatus(statusCode)
 	return rowKeys, statusErr
 }
 

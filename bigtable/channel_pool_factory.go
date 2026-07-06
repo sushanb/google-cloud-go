@@ -15,6 +15,7 @@
 package bigtable
 
 import (
+	"cloud.google.com/go/bigtable/internal/metrics"
 	"context"
 	"fmt"
 	"time"
@@ -54,7 +55,7 @@ func createAndStartManagedChannelPool(
 	ctx context.Context,
 	project, instance string,
 	config ClientConfig,
-	metricsTracerFactory *builtinMetricsTracerFactory,
+	metricsTracerFactory *metrics.Factory,
 	o []option.ClientOption,
 	directPathOptions []option.ClientOption,
 	directAccessMD metadata.MD,
@@ -99,7 +100,7 @@ func createBigtableChannelPool(
 	ctx context.Context,
 	project, instance string,
 	config ClientConfig,
-	metricsTracerFactory *builtinMetricsTracerFactory,
+	metricsTracerFactory *metrics.Factory,
 	o []option.ClientOption,
 	directPathOptions []option.ClientOption,
 	directAccessMD metadata.MD,
@@ -146,7 +147,7 @@ func createBigtableChannelPool(
 		btransport.WithAppProfile(config.AppProfile),
 		btransport.WithFeatureFlagsMetadata(directAccessMD),
 		btransport.WithMetricsReporterConfig(btopt.DefaultMetricsReporterConfig()),
-		btransport.WithMeterProvider(metricsTracerFactory.otelMeterProvider),
+		btransport.WithMeterProvider(metricsTracerFactory.OtelMeterProvider),
 		btransport.WithDirectAccessFeatureFlagsMetadata(directAccessMD),
 		btransport.WithDirectAccessDialer(directAccessDialer),
 	)

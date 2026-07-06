@@ -15,6 +15,7 @@
 package bigtable
 
 import (
+	"cloud.google.com/go/bigtable/internal/metrics"
 	"context"
 	"errors"
 	"fmt"
@@ -96,8 +97,8 @@ func (t *Table) ApplyBulk(ctx context.Context, rowKeys []string, muts []*Mutatio
 func (t *Table) applyGroup(ctx context.Context, group []*entryErr, opts ...ApplyOption) (err error) {
 	attrMap := make(map[string]interface{})
 	mt := t.newBuiltinMetricsTracer(ctx, true)
-	defer mt.recordOperationCompletion()
-	ctx = contextWithMetricsTracer(ctx, mt)
+	defer mt.RecordOperationCompletion()
+	ctx = metrics.NewContext(ctx, mt)
 
 	err = gaxInvokeWithRecorder(ctx, "MutateRows", func(ctx context.Context, headerMD, trailerMD *metadata.MD, _ gax.CallSettings) error {
 		attrMap["rowCount"] = len(group)
@@ -118,7 +119,7 @@ func (t *Table) applyGroup(ctx context.Context, group []*entryErr, opts ...Apply
 	}, t.c.retryOption)
 
 	statusCode, statusErr := convertToGrpcStatusErr(err)
-	mt.setCurrOpStatus(statusCode)
+	mt.SetCurrOpStatus(statusCode)
 	return statusErr
 }
 

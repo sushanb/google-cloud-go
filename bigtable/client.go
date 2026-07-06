@@ -15,6 +15,7 @@
 package bigtable
 
 import (
+	"cloud.google.com/go/bigtable/internal/metrics"
 	"context"
 	"errors"
 	"fmt"
@@ -44,7 +45,7 @@ type Client struct {
 	client                     btpb.BigtableClient
 	project, instance          string
 	appProfile                 string
-	metricsTracerFactory       *builtinMetricsTracerFactory
+	metricsTracerFactory       *metrics.Factory
 	disableRetryInfo           bool
 	retryOption                gax.CallOption
 	executeQueryRetryOption    gax.CallOption
@@ -96,15 +97,14 @@ type ClientConfig struct {
 	SessionPoolMax int
 }
 
-// MetricsProvider is a wrapper for built in metrics meter provider
-type MetricsProvider interface {
-	isMetricsProvider()
-}
+// MetricsProvider is a wrapper for the built-in metrics meter provider.
+// Type alias so callers keep using bigtable.MetricsProvider while the
+// interface itself lives in bigtable/internal/metrics.
+type MetricsProvider = metrics.MetricsProvider
 
-// NoopMetricsProvider can be used to disable built in metrics
-type NoopMetricsProvider struct{}
-
-func (NoopMetricsProvider) isMetricsProvider() {}
+// NoopMetricsProvider disables the built-in metrics. Type alias to the
+// internal metrics package's implementation.
+type NoopMetricsProvider = metrics.NoopMetricsProvider
 
 // NewClient creates a new Client for a given project and instance.
 // The default ClientConfig will be used.
@@ -122,7 +122,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 	}
 
 	// Create a OpenTelemetry metrics configuration
-	metricsTracerFactory, err := newBuiltinMetricsTracerFactory(ctx, project, instance, config.AppProfile, metricsProvider, opts...)
+	metricsTracerFactory, err := metrics.NewFactory(ctx, project, instance, config.AppProfile, metricsProvider, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -132,15 +132,15 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		return nil, err
 	}
 	// for otel metrics
-	if metricsTracerFactory.enabled {
-		if len(metricsTracerFactory.clientOpts) > 0 {
-			o = append(o, metricsTracerFactory.clientOpts...)
+	if metricsTracerFactory.Enabled {
+		if len(metricsTracerFactory.ClientOpts) > 0 {
+			o = append(o, metricsTracerFactory.ClientOpts...)
 		}
 	}
 
 	// Add gRPC client interceptors to supply Google client information. No external interceptors are passed.
 	o = append(o, btopt.ClientInterceptorOptions(nil, nil)...)
-	o = append(o, option.WithGRPCDialOption(grpc.WithStatsHandler(sharedLatencyStatsHandler)))
+	o = append(o, option.WithGRPCDialOption(grpc.WithStatsHandler(metrics.SharedStatsHandler)))
 	// Default to a small connection pool that can be overridden.
 	o = append(o,
 		option.WithGRPCConnectionPool(4),
@@ -158,7 +158,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 	o = append(o, opts...)
 
 	// TODO(b/372244283): Remove after b/358175516 has been fixed
-	o = append(o, internaloption.EnableAsyncRefreshDryRun(metricsTracerFactory.newAsyncRefreshErrHandler()))
+	o = append(o, internaloption.EnableAsyncRefreshDryRun(metricsTracerFactory.NewAsyncRefreshErrHandler()))
 
 	disableRetryInfo := false
 
@@ -177,7 +177,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 	// as CFE/GFE will call RLS with gslb target type
 	// only TD calls the RLS with grpc target type
 	// and we evaluate the directAccess option after that.
-	directAccessMD := createFeatureFlagsMD(metricsTracerFactory.enabled, disableRetryInfo, true)
+	directAccessMD := createFeatureFlagsMD(metricsTracerFactory.Enabled, disableRetryInfo, true)
 
 	enableBigtableConnPool := btopt.EnableBigtableConnectionPool()
 	grpcConnOptType := reflect.TypeOf(option.WithGRPCConn(nil))
@@ -236,14 +236,14 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		c.sessionImpl = session.NewSessionClient(
 			sessionManaged,
 			sessionStub,
-			metricsTracerFactory.otelMeterProvider,
+			metricsTracerFactory,
 			session.Config{
 				Project:             project,
 				Instance:            instance,
 				AppProfile:          config.AppProfile,
 				FeatureFlagsMD:      directAccessMD,
 				ConfigMD:            configMD,
-				MetricsEnabled:      metricsTracerFactory.enabled,
+				MetricsEnabled:      metricsTracerFactory.Enabled,
 				DisableRetryInfo:    disableRetryInfo,
 				MinSessions:         config.SessionPoolMin,
 				MaxSessions:         config.SessionPoolMax,
@@ -278,7 +278,7 @@ func (c *Client) Close() error {
 		c.backgroundCancel()
 	}
 	if c.metricsTracerFactory != nil {
-		c.metricsTracerFactory.shutdown()
+		c.metricsTracerFactory.Shutdown()
 	}
 	// managedChannelPool.Close is nil-safe internally.
 	if err := c.classicPool.Close(); err != nil {
@@ -324,12 +324,12 @@ func (c *Client) PingAndWarm(ctx context.Context) (err error) {
 	ctx = trace.StartSpan(ctx, "cloud.google.com/go/bigtable/PingAndWarm")
 	defer func() { trace.EndSpan(ctx, err) }()
 	mt := c.newBuiltinMetricsTracer(ctx, "", false)
-	defer mt.recordOperationCompletion()
-	ctx = contextWithMetricsTracer(ctx, mt)
+	defer mt.RecordOperationCompletion()
+	ctx = metrics.NewContext(ctx, mt)
 
 	err = c.pingerWithMetadata(ctx)
 	statusCode, statusErr := convertToGrpcStatusErr(err)
-	mt.currOp.setStatus(statusCode.String())
+	mt.SetCurrOpStatus(statusCode)
 	return statusErr
 }
 
@@ -348,8 +348,8 @@ func (c *Client) pingerWithMetadata(ctx context.Context) (err error) {
 
 }
 
-func (c *Client) newBuiltinMetricsTracer(ctx context.Context, table string, isStreaming bool) *builtinMetricsTracer {
-	mt := c.metricsTracerFactory.createBuiltinMetricsTracer(ctx, table, isStreaming)
+func (c *Client) newBuiltinMetricsTracer(ctx context.Context, table string, isStreaming bool) *metrics.Tracer {
+	mt := c.metricsTracerFactory.CreateTracer(ctx, table, isStreaming)
 	return &mt
 }
 

@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package bigtable
+package metrics
 
 import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
@@ -28,10 +29,49 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// equalErrs compares two errors by string containment. Local helper
+// so util_test.go doesn't need to import from the bigtable package
+// (which is upstream of the metrics package).
+func equalErrs(gotErr error, wantErr error) bool {
+	if gotErr == nil && wantErr == nil {
+		return true
+	}
+	if gotErr == nil || wantErr == nil {
+		return false
+	}
+	return strings.Contains(gotErr.Error(), wantErr.Error())
+}
+
+// Test fixtures — duplicated from the bigtable-package metrics_test.go
+// since util_test.go lives in a separate package now.
+var (
+	clusterID1 = "cluster-id-1"
+	clusterID2 = "cluster-id-2"
+	zoneID1    = "zone-id-1"
+
+	testHeadersUtil, _ = proto.Marshal(&btpb.ResponseParams{
+		ClusterId: &clusterID1,
+		ZoneId:    &zoneID1,
+	})
+	testTrailersUtil, _ = proto.Marshal(&btpb.ResponseParams{
+		ClusterId: &clusterID2,
+		ZoneId:    &zoneID1,
+	})
+
+	testHeaderMD = &metadata.MD{
+		LocationMDKey:     []string{string(testHeadersUtil)},
+		ServerTimingMDKey: []string{"gfet4t7; dur=1234"},
+	}
+	testTrailerMD = &metadata.MD{
+		LocationMDKey:     []string{string(testTrailersUtil)},
+		ServerTimingMDKey: []string{"gfet4t7; dur=5678"},
+	}
+)
+
 func TestExtractServerLatency(t *testing.T) {
 	invalidFormat := "invalid format"
 	invalidFormatMD := metadata.MD{
-		serverTimingMDKey: []string{invalidFormat},
+		ServerTimingMDKey: []string{invalidFormat},
 	}
 	invalidFormatErr := fmt.Errorf("strconv.ParseFloat: parsing %q: invalid syntax", invalidFormat)
 
@@ -52,7 +92,7 @@ func TestExtractServerLatency(t *testing.T) {
 		{
 			desc: "Server latency in header",
 			headerMD: metadata.MD{
-				serverTimingMDKey: []string{"gfet4t7; dur=1234"},
+				ServerTimingMDKey: []string{"gfet4t7; dur=1234"},
 			},
 			trailerMD:   metadata.MD{},
 			wantLatency: 1234,
@@ -62,7 +102,7 @@ func TestExtractServerLatency(t *testing.T) {
 			desc:     "Server latency in trailer",
 			headerMD: metadata.MD{},
 			trailerMD: metadata.MD{
-				serverTimingMDKey: []string{"gfet4t7; dur=5678"},
+				ServerTimingMDKey: []string{"gfet4t7; dur=5678"},
 			},
 			wantLatency: 5678,
 			wantError:   nil,
@@ -70,10 +110,10 @@ func TestExtractServerLatency(t *testing.T) {
 		{
 			desc: "Server latency in both header and trailer",
 			headerMD: metadata.MD{
-				serverTimingMDKey: []string{"gfet4t7; dur=1234"},
+				ServerTimingMDKey: []string{"gfet4t7; dur=1234"},
 			},
 			trailerMD: metadata.MD{
-				serverTimingMDKey: []string{"gfet4t7; dur=5678"},
+				ServerTimingMDKey: []string{"gfet4t7; dur=5678"},
 			},
 			wantLatency: 1234,
 			wantError:   nil,
@@ -96,7 +136,7 @@ func TestExtractServerLatency(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
-			gotLatency, gotErr := extractServerLatency(test.headerMD, test.trailerMD)
+			gotLatency, gotErr := ExtractServerLatency(test.headerMD, test.trailerMD)
 			if !equalErrs(gotErr, test.wantError) {
 				t.Errorf("error got: %v, want: %v", gotErr, test.wantError)
 			}
@@ -152,7 +192,7 @@ func TestExtractLocation(t *testing.T) {
 		{
 			desc: "Invalid location metadata format in header",
 			headerMD: metadata.MD{
-				locationMDKey: []string{"invalid format"},
+				LocationMDKey: []string{"invalid format"},
 			},
 			trailerMD:   metadata.MD{},
 			wantCluster: defaultCluster,
@@ -163,7 +203,7 @@ func TestExtractLocation(t *testing.T) {
 			desc:     "Invalid location metadata format in trailer",
 			headerMD: metadata.MD{},
 			trailerMD: metadata.MD{
-				locationMDKey: []string{"invalid format"},
+				LocationMDKey: []string{"invalid format"},
 			},
 			wantCluster: defaultCluster,
 			wantZone:    defaultZone,
@@ -173,7 +213,7 @@ func TestExtractLocation(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
-			gotCluster, gotZone, gotErr := extractLocation(test.headerMD, test.trailerMD)
+			gotCluster, gotZone, gotErr := ExtractLocation(test.headerMD, test.trailerMD)
 			if gotCluster != test.wantCluster {
 				t.Errorf("cluster got: %v, want: %v", gotCluster, test.wantCluster)
 			}
@@ -196,7 +236,7 @@ func TestExtractPeerInfo(t *testing.T) {
 		t.Fatalf("marshal peer info: %v", err)
 	}
 	// Server sends URL-safe base64; unpadded (RawURL) is the wire shape,
-	// but URLEncoding (padded) must also decode — see extractPeerInfo.
+	// but URLEncoding (padded) must also decode — see ExtractPeerInfo.
 	validRawURL := base64.RawURLEncoding.EncodeToString(protoBytes)
 	validURLPadded := base64.URLEncoding.EncodeToString(protoBytes)
 	invalidBase64 := "invalid-base64-data-$$$"
@@ -218,14 +258,14 @@ func TestExtractPeerInfo(t *testing.T) {
 		},
 		{
 			desc:      "Peer info in header (raw url, unpadded)",
-			headerMD:  metadata.MD{peerInfoMDKey: []string{validRawURL}},
+			headerMD:  metadata.MD{PeerInfoMDKey: []string{validRawURL}},
 			trailerMD: metadata.MD{},
 			want:      expectedPeerInfo,
 			wantErr:   false,
 		},
 		{
 			desc:      "Peer info in header (url, padded)",
-			headerMD:  metadata.MD{peerInfoMDKey: []string{validURLPadded}},
+			headerMD:  metadata.MD{PeerInfoMDKey: []string{validURLPadded}},
 			trailerMD: metadata.MD{},
 			want:      expectedPeerInfo,
 			wantErr:   false,
@@ -233,27 +273,27 @@ func TestExtractPeerInfo(t *testing.T) {
 		{
 			desc:      "Peer info in trailer",
 			headerMD:  metadata.MD{},
-			trailerMD: metadata.MD{peerInfoMDKey: []string{validRawURL}},
+			trailerMD: metadata.MD{PeerInfoMDKey: []string{validRawURL}},
 			want:      expectedPeerInfo,
 			wantErr:   false,
 		},
 		{
 			desc:      "Header wins over trailer",
-			headerMD:  metadata.MD{peerInfoMDKey: []string{validRawURL}},
-			trailerMD: metadata.MD{peerInfoMDKey: []string{"garbage"}},
+			headerMD:  metadata.MD{PeerInfoMDKey: []string{validRawURL}},
+			trailerMD: metadata.MD{PeerInfoMDKey: []string{"garbage"}},
 			want:      expectedPeerInfo,
 			wantErr:   false,
 		},
 		{
 			desc:      "Invalid base64",
-			headerMD:  metadata.MD{peerInfoMDKey: []string{invalidBase64}},
+			headerMD:  metadata.MD{PeerInfoMDKey: []string{invalidBase64}},
 			trailerMD: metadata.MD{},
 			want:      nil,
 			wantErr:   true,
 		},
 		{
 			desc:      "Invalid protobuf",
-			headerMD:  metadata.MD{peerInfoMDKey: []string{invalidProtoBase64}},
+			headerMD:  metadata.MD{PeerInfoMDKey: []string{invalidProtoBase64}},
 			trailerMD: metadata.MD{},
 			want:      nil,
 			wantErr:   true,
@@ -261,28 +301,28 @@ func TestExtractPeerInfo(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
-			got, err := extractPeerInfo(test.headerMD, test.trailerMD)
+			got, err := ExtractPeerInfo(test.headerMD, test.trailerMD)
 			if (err != nil) != test.wantErr {
-				t.Fatalf("extractPeerInfo() err = %v, wantErr %v", err, test.wantErr)
+				t.Fatalf("ExtractPeerInfo() err = %v, wantErr %v", err, test.wantErr)
 			}
 			if !proto.Equal(got, test.want) {
-				t.Errorf("extractPeerInfo() got = %v, want %v", got, test.want)
+				t.Errorf("ExtractPeerInfo() got = %v, want %v", got, test.want)
 			}
 		})
 	}
 }
 
 func TestToOtelMetricAttrsAttemptLatencies2(t *testing.T) {
-	tracer := &builtinMetricsTracer{
+	tracer := &Tracer{
 		method:      metricMethodPrefix + "ReadRows",
 		tableName:   "test-table",
 		isStreaming: true,
 		clientAttributes: []attribute.KeyValue{
-			attribute.String(monitoredResLabelKeyProject, "test-project"),
+			attribute.String(MonitoredResLabelKeyProject, "test-project"),
 		},
-		currOp: opTracer{
+		currOp: OpTracer{
 			status: "UNAVAILABLE",
-			currAttempt: attemptTracer{
+			currAttempt: AttemptTracer{
 				status:           "OK",
 				clusterID:        "test-cluster",
 				zoneID:           "test-zone",
@@ -294,22 +334,22 @@ func TestToOtelMetricAttrsAttemptLatencies2(t *testing.T) {
 		},
 	}
 
-	attrSet, err := tracer.toOtelMetricAttrs(metricNameAttemptLatencies2)
+	attrSet, err := tracer.toOtelMetricAttrs(MetricNameAttemptLatencies2)
 	if err != nil {
 		t.Fatalf("toOtelMetricAttrs: %v", err)
 	}
 	want := map[attribute.Key]attribute.Value{
-		metricLabelKeyMethod:             attribute.StringValue("Bigtable.ReadRows"),
-		monitoredResLabelKeyTable:        attribute.StringValue("test-table"),
-		monitoredResLabelKeyCluster:      attribute.StringValue("test-cluster"),
-		monitoredResLabelKeyZone:         attribute.StringValue("test-zone"),
-		monitoredResLabelKeyProject:      attribute.StringValue("test-project"),
-		metricLabelKeyStatus:             attribute.StringValue("OK"),
-		metricLabelKeyStreamingOperation: attribute.BoolValue(true),
-		metricTransportType:              attribute.StringValue("cloudpath"),
-		metricTransportRegion:            attribute.StringValue("us-central1"),
-		metricTransportZone:              attribute.StringValue("us-central1-b"),
-		metricTransportSubZone:           attribute.StringValue("sub-1"),
+		MetricLabelKeyMethod:             attribute.StringValue("Bigtable.ReadRows"),
+		MonitoredResLabelKeyTable:        attribute.StringValue("test-table"),
+		MonitoredResLabelKeyCluster:      attribute.StringValue("test-cluster"),
+		MonitoredResLabelKeyZone:         attribute.StringValue("test-zone"),
+		MonitoredResLabelKeyProject:      attribute.StringValue("test-project"),
+		MetricLabelKeyStatus:             attribute.StringValue("OK"),
+		MetricLabelKeyStreamingOperation: attribute.BoolValue(true),
+		MetricTransportType:              attribute.StringValue("cloudpath"),
+		MetricTransportRegion:            attribute.StringValue("us-central1"),
+		MetricTransportZone:              attribute.StringValue("us-central1-b"),
+		MetricTransportSubZone:           attribute.StringValue("sub-1"),
 	}
 	for key, expected := range want {
 		val, ok := attrSet.Value(key)

@@ -17,6 +17,7 @@ limitations under the License.
 package bigtable // import "cloud.google.com/go/bigtable"
 
 import (
+	"cloud.google.com/go/bigtable/internal/metrics"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -226,17 +227,17 @@ func (t *Table) ReadRows(ctx context.Context, arg RowSet, f func(Row) bool, opts
 	defer func() { trace.EndSpan(ctx, err) }()
 
 	mt := t.newBuiltinMetricsTracer(ctx, true)
-	defer mt.recordOperationCompletion()
-	ctx = contextWithMetricsTracer(ctx, mt)
+	defer mt.RecordOperationCompletion()
+	ctx = metrics.NewContext(ctx, mt)
 
 	err = t.readRows(ctx, arg, f, opts...)
 	statusCode, statusErr := convertToGrpcStatusErr(err)
-	mt.setCurrOpStatus(statusCode)
+	mt.SetCurrOpStatus(statusCode)
 	return statusErr
 }
 
 func (t *Table) readRows(ctx context.Context, arg RowSet, f func(Row) bool, opts ...ReadOption) (err error) {
-	mt := metricsTracerFromContext(ctx)
+	mt := metrics.FromContext(ctx)
 	var prevRowKey string
 	attrMap := make(map[string]interface{})
 
@@ -308,7 +309,7 @@ func (t *Table) readRows(ctx context.Context, arg RowSet, f func(Row) bool, opts
 			err := stream.RecvMsg(res)
 			if !firstResponseRecorded && (err == nil || err == io.EOF) {
 				firstResponseRecorded = true
-				mt.currOp.setFirstRespTime(time.Now())
+				mt.SetFirstRespTime(time.Now())
 			}
 			if err == io.EOF {
 				*trailerMD = stream.Trailer()
@@ -350,7 +351,7 @@ func (t *Table) readRows(ctx context.Context, arg RowSet, f func(Row) bool, opts
 				appBlockingLatencyStart := time.Now()
 				continueReading := f(row)
 				numRowsRead++
-				mt.incrementAppBlockingLatency(convertToMs(time.Since(appBlockingLatencyStart)))
+				mt.IncrementAppBlockingLatency(metrics.ConvertToMs(time.Since(appBlockingLatencyStart)))
 
 				if !continueReading {
 					// Cancel and drain stream.
@@ -909,12 +910,12 @@ func (t *Table) Apply(ctx context.Context, row string, m *Mutation, opts ...Appl
 	ctx = trace.StartSpan(ctx, "cloud.google.com/go/bigtable/Apply")
 	defer func() { trace.EndSpan(ctx, err) }()
 	mt := t.newBuiltinMetricsTracer(ctx, false)
-	defer mt.recordOperationCompletion()
-	ctx = contextWithMetricsTracer(ctx, mt)
+	defer mt.RecordOperationCompletion()
+	ctx = metrics.NewContext(ctx, mt)
 
 	err = t.apply(ctx, row, m, opts...)
 	statusCode, statusErr := convertToGrpcStatusErr(err)
-	mt.setCurrOpStatus(statusCode)
+	mt.SetCurrOpStatus(statusCode)
 	return statusErr
 }
 
@@ -1142,16 +1143,15 @@ func (ts Timestamp) TruncateToMilliseconds() Timestamp {
 // - then, calls gax.Invoke with 'callWrapper' as an argument
 func gaxInvokeWithRecorder(ctx context.Context, method string,
 	f func(ctx context.Context, headerMD, trailerMD *metadata.MD, _ gax.CallSettings) error, opts ...gax.CallOption) error {
-	mt := metricsTracerFromContext(ctx)
+	mt := metrics.FromContext(ctx)
 	attemptHeaderMD := metadata.New(nil)
 	attempTrailerMD := metadata.New(nil)
-	mt.setMethod(method)
+	mt.SetMethod(method)
 
 	callWrapper := func(ctx context.Context, callSettings gax.CallSettings) error {
-		op := &mt.currOp
-		// Inject cookie and attempt information
+		// Inject cookie and attempt information from prior attempts.
 		md := metadata.New(nil)
-		for k, v := range op.cookies {
+		for k, v := range mt.Cookies() {
 			md.Append(k, v)
 		}
 
@@ -1160,24 +1160,16 @@ func gaxInvokeWithRecorder(ctx context.Context, method string,
 		newCtx := metadata.NewOutgoingContext(ctx, finalMD)
 
 		// Per-attempt metric setup (recordAttemptStart, blockingLatencyTracker,
-		// t4t7Tracker) is owned by latencyStatsHandler.TagRPC. f's headerMD /
+		// t4t7Tracker) is owned by StatsHandler.TagRPC. f's headerMD /
 		// trailerMD are still needed for routing-cookie extraction below.
 		err := f(newCtx, &attemptHeaderMD, &attempTrailerMD, callSettings)
 
-		extractCookies(attemptHeaderMD, op)
-		extractCookies(attempTrailerMD, op)
+		mt.ExtractCookiesFromMD(attemptHeaderMD, cookiePrefix)
+		mt.ExtractCookiesFromMD(attempTrailerMD, cookiePrefix)
 		return err
 	}
 
 	return gax.Invoke(ctx, callWrapper, opts...)
-}
-
-func extractCookies(md metadata.MD, op *opTracer) {
-	for k, v := range md {
-		if strings.HasPrefix(k, cookiePrefix) {
-			op.cookies[k] = v[len(v)-1]
-		}
-	}
 }
 
 // reqParamsHeaderValAuthorizedView returns the request-params header value for an

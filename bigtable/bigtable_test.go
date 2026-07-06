@@ -28,6 +28,8 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/bigtable/internal/metrics"
+
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"cloud.google.com/go/civil"
 	"github.com/google/go-cmp/cmp"
@@ -273,7 +275,7 @@ func TestApplyErrors(t *testing.T) {
 		c: &Client{
 			project:              "P",
 			instance:             "I",
-			metricsTracerFactory: &builtinMetricsTracerFactory{},
+			metricsTracerFactory: &metrics.Factory{},
 		},
 		table: "t",
 	}

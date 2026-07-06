@@ -15,6 +15,7 @@
 package bigtable
 
 import (
+	"cloud.google.com/go/bigtable/internal/metrics"
 	"context"
 	"errors"
 
@@ -30,12 +31,12 @@ func (t *Table) ApplyReadModifyWrite(ctx context.Context, row string, m *ReadMod
 	ctx = mergeOutgoingMetadata(ctx, t.md)
 
 	mt := t.newBuiltinMetricsTracer(ctx, false)
-	defer mt.recordOperationCompletion()
-	ctx = contextWithMetricsTracer(ctx, mt)
+	defer mt.RecordOperationCompletion()
+	ctx = metrics.NewContext(ctx, mt)
 
 	updatedRow, err := t.applyReadModifyWrite(ctx, row, m)
 	statusCode, statusErr := convertToGrpcStatusErr(err)
-	mt.setCurrOpStatus(statusCode)
+	mt.SetCurrOpStatus(statusCode)
 	return updatedRow, statusErr
 }
 

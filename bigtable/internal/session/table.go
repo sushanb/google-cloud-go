@@ -21,8 +21,11 @@ import (
 	"time"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+	"cloud.google.com/go/bigtable/internal/metrics"
 	btransport "cloud.google.com/go/bigtable/internal/transport"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // ErrWriteNotSupported is returned by MutateRow when the resource has
@@ -34,17 +37,19 @@ var ErrWriteNotSupported = errors.New("bigtable/session: write operations not su
 // fallback — callers that want fallback wrap sessionTable in
 // bigtable.TableShim.
 type sessionTable struct {
-	tableName     string
-	readPool      *lazyPool
-	writePool     *lazyPool
-	readVRpcDesc  btransport.VRpcDescriptor
-	writeVRpcDesc btransport.VRpcDescriptor
-	md            metadata.MD
+	tableName      string
+	readPool       *lazyPool
+	writePool      *lazyPool
+	readVRpcDesc   btransport.VRpcDescriptor
+	writeVRpcDesc  btransport.VRpcDescriptor
+	md             metadata.MD
+	metricsFactory *metrics.Factory
 }
 
 // newSessionTable is the internal constructor. Callers (sessionClient)
 // build the lazyPool open closures + supply the vRPC descriptors and
-// resource-scoped metadata.
+// resource-scoped metadata. metricsFactory may be nil to disable
+// per-attempt metrics.
 func newSessionTable(
 	tableName string,
 	openRead func() (Invoker, error),
@@ -52,20 +57,28 @@ func newSessionTable(
 	readVRpcDesc btransport.VRpcDescriptor,
 	writeVRpcDesc btransport.VRpcDescriptor,
 	md metadata.MD,
+	metricsFactory *metrics.Factory,
 ) *sessionTable {
 	return &sessionTable{
-		tableName:     tableName,
-		readPool:      &lazyPool{open: openRead},
-		writePool:     &lazyPool{open: openWrite},
-		readVRpcDesc:  readVRpcDesc,
-		writeVRpcDesc: writeVRpcDesc,
-		md:            md,
+		tableName:      tableName,
+		readPool:       &lazyPool{open: openRead},
+		writePool:      &lazyPool{open: openWrite},
+		readVRpcDesc:   readVRpcDesc,
+		writeVRpcDesc:  writeVRpcDesc,
+		md:             md,
+		metricsFactory: metricsFactory,
 	}
 }
 
 // ReadRow dispatches a proto-native ReadRow through a lazily-opened
 // READ session pool. Wraps the invoke in RetryingVRpc (idempotent =
 // true — reads are always retryable).
+//
+// Metrics stamping: if ctx already carries a *metrics.Tracer (e.g.
+// TableShim stashed one on the classic client path), the per-attempt
+// stamps go there. Otherwise sessionTable constructs a new tracer
+// from the SessionClient's factory so standalone SessionClient users
+// still get metrics.
 func (t *sessionTable) ReadRow(ctx context.Context, req *btpb.SessionReadRowRequest) (*btpb.SessionReadRowResponse, error) {
 	if req == nil {
 		return nil, errors.New("bigtable/session: SessionReadRowRequest is nil")
@@ -79,6 +92,10 @@ func (t *sessionTable) ReadRow(ctx context.Context, req *btpb.SessionReadRowRequ
 	}
 
 	ctx = attachOutgoingMetadata(ctx, t.md)
+	ctx, mt, ownedTracer := t.ensureTracer(ctx, "ReadRow")
+	if ownedTracer {
+		defer mt.RecordOperationCompletion()
+	}
 
 	retryInterceptor := btransport.RetryingVRpc(btransport.RetryingOptions{
 		MaxAttempts:       10,
@@ -94,6 +111,7 @@ func (t *sessionTable) ReadRow(ctx context.Context, req *btpb.SessionReadRowRequ
 	}
 	baseHandler := func(attemptCtx context.Context, request interface{}) (interface{}, error) {
 		result, err := readPool.Invoke(attemptCtx, t.readVRpcDesc, request)
+		stampAttempt(attemptCtx, result)
 		if err != nil {
 			return nil, err
 		}
@@ -103,6 +121,10 @@ func (t *sessionTable) ReadRow(ctx context.Context, req *btpb.SessionReadRowRequ
 	ctx = btransport.WithVRpcMetadata(ctx, t.readVRpcDesc.Method(), 0)
 	chained := btransport.ChainInterceptors(retryInterceptor)
 	res, err := chained(ctx, args, baseHandler)
+	if ownedTracer {
+		statusCode, _ := grpcStatusOf(err)
+		mt.SetCurrOpStatus(statusCode)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("session ReadRow vRPC: %w", err)
 	}
@@ -133,6 +155,10 @@ func (t *sessionTable) MutateRow(ctx context.Context, req *btpb.SessionMutateRow
 	}
 
 	ctx = attachOutgoingMetadata(ctx, t.md)
+	ctx, mt, ownedTracer := t.ensureTracer(ctx, "MutateRow")
+	if ownedTracer {
+		defer mt.RecordOperationCompletion()
+	}
 
 	retryInterceptor := btransport.RetryingVRpc(btransport.RetryingOptions{
 		MaxAttempts:       10,
@@ -148,6 +174,7 @@ func (t *sessionTable) MutateRow(ctx context.Context, req *btpb.SessionMutateRow
 	}
 	baseHandler := func(attemptCtx context.Context, request interface{}) (interface{}, error) {
 		result, err := writePool.Invoke(attemptCtx, t.writeVRpcDesc, request)
+		stampAttempt(attemptCtx, result)
 		if err != nil {
 			return nil, err
 		}
@@ -157,6 +184,10 @@ func (t *sessionTable) MutateRow(ctx context.Context, req *btpb.SessionMutateRow
 	ctx = btransport.WithVRpcMetadata(ctx, t.writeVRpcDesc.Method(), 0)
 	chained := btransport.ChainInterceptors(retryInterceptor)
 	res, err := chained(ctx, args, baseHandler)
+	if ownedTracer {
+		statusCode, _ := grpcStatusOf(err)
+		mt.SetCurrOpStatus(statusCode)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("session MutateRow vRPC: %w", err)
 	}
@@ -178,6 +209,68 @@ func (t *sessionTable) MutateRow(ctx context.Context, req *btpb.SessionMutateRow
 // pattern and future implementations can add per-resource teardown.
 func (t *sessionTable) Close() error {
 	return nil
+}
+
+// ensureTracer returns a Tracer stashed on ctx (via metrics.NewContext
+// upstream, typically by TableShim on the mixed-mode client path), or
+// constructs a fresh one from the SessionClient's factory so
+// standalone-SessionClient callers still get metrics exported.
+// The bool signals whether sessionTable owns the tracer lifecycle
+// (i.e. must call RecordOperationCompletion + SetCurrOpStatus itself).
+func (t *sessionTable) ensureTracer(ctx context.Context, method string) (context.Context, *metrics.Tracer, bool) {
+	if mt := metrics.FromContext(ctx); mt.BuiltInEnabled {
+		return ctx, mt, false
+	}
+	if t.metricsFactory == nil {
+		return ctx, metrics.FromContext(ctx), false // disabled Tracer sentinel; no ownership
+	}
+	fresh := t.metricsFactory.CreateTracer(ctx, t.tableName, false)
+	fresh.SetMethod(method)
+	ctx = metrics.NewContext(ctx, &fresh)
+	return ctx, &fresh, true
+}
+
+// stampAttempt copies per-attempt fields off the InvokeResult onto the
+// active per-attempt tracer. No-op when metrics are disabled or when
+// the field is empty (nil ClusterInfo, zero SentAt, etc.).
+func stampAttempt(ctx context.Context, result btransport.InvokeResult) {
+	att := metrics.FromContext(ctx).CurrAttempt()
+	if att == nil {
+		return
+	}
+	if result.ClusterInfo != nil {
+		att.SetClusterID(result.ClusterInfo.ClusterId)
+		att.SetZoneID(result.ClusterInfo.ZoneId)
+	}
+	if !result.SentAt.IsZero() && !att.StartTime().IsZero() {
+		att.SetClientBlockingLatency(metrics.ConvertToMs(result.SentAt.Sub(att.StartTime())))
+	}
+	if result.Stats != nil && result.Stats.BackendLatency != nil {
+		att.SetServerLatency(metrics.ConvertToMs(result.Stats.GetBackendLatency().AsDuration()))
+	}
+	if result.PeerInfo != nil {
+		att.SetTransportType(btransport.TransportTypeName(result.PeerInfo.GetTransportType()))
+		att.SetTransportRegion(result.PeerInfo.GetApplicationFrontendRegion())
+		att.SetTransportZone(result.PeerInfo.GetApplicationFrontendZone())
+		att.SetTransportSubZone(result.PeerInfo.GetApplicationFrontendSubzone())
+	}
+}
+
+// grpcStatusOf maps a Go error to a gRPC status code for the
+// standalone-tracer op-status stamping. Mirrors
+// bigtable.convertToGrpcStatusErr; kept local to avoid an import
+// cycle.
+func grpcStatusOf(err error) (codes.Code, error) {
+	if err == nil {
+		return codes.OK, nil
+	}
+	if errStatus, ok := status.FromError(err); ok {
+		return errStatus.Code(), err
+	}
+	if ctxStatus := status.FromContextError(err); ctxStatus.Code() != codes.Unknown {
+		return ctxStatus.Code(), err
+	}
+	return codes.Unknown, err
 }
 
 // attachOutgoingMetadata is the internal-session equivalent of

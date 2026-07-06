@@ -15,6 +15,7 @@
 package bigtable
 
 import (
+	"cloud.google.com/go/bigtable/internal/metrics"
 	"bytes"
 	"context"
 	"errors"
@@ -107,12 +108,12 @@ func (c *Client) prepareStatementWithMetadata(ctx context.Context, query string,
 	defer func() { trace.EndSpan(ctx, err) }()
 
 	mt := c.newBuiltinMetricsTracer(ctx, "", false)
-	defer mt.recordOperationCompletion()
-	ctx = contextWithMetricsTracer(ctx, mt)
+	defer mt.RecordOperationCompletion()
+	ctx = metrics.NewContext(ctx, mt)
 
 	preparedStatement, err = c.prepareStatement(ctx, query, paramTypes, opts...)
 	statusCode, statusErr := convertToGrpcStatusErr(err)
-	mt.setCurrOpStatus(statusCode)
+	mt.SetCurrOpStatus(statusCode)
 	return preparedStatement, statusErr
 }
 
@@ -287,12 +288,12 @@ func (bs *BoundStatement) Execute(ctx context.Context, f func(ResultRow) bool, o
 	defer func() { trace.EndSpan(ctx, err) }()
 
 	mt := bs.ps.c.newBuiltinMetricsTracer(ctx, "", true)
-	defer mt.recordOperationCompletion()
-	ctx = contextWithMetricsTracer(ctx, mt)
+	defer mt.RecordOperationCompletion()
+	ctx = metrics.NewContext(ctx, mt)
 
 	err = bs.execute(ctx, f)
 	statusCode, statusErr := convertToGrpcStatusErr(err)
-	mt.setCurrOpStatus(statusCode)
+	mt.SetCurrOpStatus(statusCode)
 	return statusErr
 }
 

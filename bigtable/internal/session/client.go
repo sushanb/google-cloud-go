@@ -25,8 +25,9 @@ import (
 	"time"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+	"cloud.google.com/go/bigtable/internal/metrics"
 	btransport "cloud.google.com/go/bigtable/internal/transport"
-	"go.opentelemetry.io/otel/metric"
+	otelmetric "go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
@@ -103,11 +104,11 @@ type managedPool struct {
 // interface. Owns the channel pool + gRPC stub + configuration
 // manager, and vends per-resource SessionTableApi instances.
 type sessionClient struct {
-	cfg           Config
-	channelPool   ChannelPool
-	stub          btpb.BigtableClient
-	meterProvider metric.MeterProvider
-	configManager *btransport.ClientConfigurationManager
+	cfg            Config
+	channelPool    ChannelPool
+	stub           btpb.BigtableClient
+	metricsFactory *metrics.Factory
+	configManager  *btransport.ClientConfigurationManager
 
 	poolsMu    sync.Mutex
 	pools      map[string]*managedPool
@@ -116,17 +117,19 @@ type sessionClient struct {
 
 // NewSessionClient constructs a sessionClient. The channel pool is
 // OWNED — closing sessionClient closes the pool. The stub is expected
-// to have been built against the same channel pool.
-func NewSessionClient(channelPool ChannelPool, stub btpb.BigtableClient, meterProvider metric.MeterProvider, cfg Config) SessionClient {
-	if cfg.MetricsEnabled && meterProvider != nil {
-		_ = btransport.InitializeSessionMetrics(meterProvider)
+// to have been built against the same channel pool. metricsFactory
+// may be nil to disable per-attempt metrics; the SessionClient still
+// works but sessionTable will skip tracer construction.
+func NewSessionClient(channelPool ChannelPool, stub btpb.BigtableClient, metricsFactory *metrics.Factory, cfg Config) SessionClient {
+	if cfg.MetricsEnabled && metricsFactory != nil {
+		_ = btransport.InitializeSessionMetrics(metricsFactory.OtelMeterProvider)
 	}
 	sc := &sessionClient{
-		cfg:           cfg,
-		channelPool:   channelPool,
-		stub:          stub,
-		meterProvider: meterProvider,
-		pools:         make(map[string]*managedPool),
+		cfg:            cfg,
+		channelPool:    channelPool,
+		stub:           stub,
+		metricsFactory: metricsFactory,
+		pools:          make(map[string]*managedPool),
 	}
 	if stub != nil {
 		sc.configManager = btransport.NewClientConfigurationManager(
@@ -140,8 +143,18 @@ func NewSessionClient(channelPool ChannelPool, stub btpb.BigtableClient, meterPr
 	return sc
 }
 
-func (sc *sessionClient) MeterProvider() metric.MeterProvider {
-	return sc.meterProvider
+func (sc *sessionClient) MeterProvider() otelmetric.MeterProvider {
+	if sc.metricsFactory == nil {
+		return nil
+	}
+	return sc.metricsFactory.OtelMeterProvider
+}
+
+// MetricsFactory returns the *metrics.Factory the SessionClient was
+// constructed with. Exposed to internal callers (sessionTable) that
+// need to construct tracers lazily when ctx doesn't already carry one.
+func (sc *sessionClient) MetricsFactory() *metrics.Factory {
+	return sc.metricsFactory
 }
 
 // OpenSessionTable returns a SessionTableApi for a standard table.
@@ -169,7 +182,7 @@ func (sc *sessionClient) OpenSessionTable(tableName string) SessionTableApi {
 		},
 		fmt.Sprintf("table:%s:write", tableName),
 	)
-	return newSessionTable(fullName, openRead, openWrite, btransport.READ_ROW, btransport.MUTATE_ROW, sc.perResourceMetadata(fullName, "table_name", fullName))
+	return newSessionTable(fullName, openRead, openWrite, btransport.READ_ROW, btransport.MUTATE_ROW, sc.perResourceMetadata(fullName, "table_name", fullName), sc.metricsFactory)
 }
 
 // OpenAuthorizedView returns a SessionTableApi for an authorized view.
@@ -197,7 +210,7 @@ func (sc *sessionClient) OpenAuthorizedView(table, view string) SessionTableApi 
 		},
 		fmt.Sprintf("av:%s:%s:write", table, view),
 	)
-	return newSessionTable(fullName, openRead, openWrite, btransport.READ_ROW_AUTH_VIEW, btransport.MUTATE_ROW_AUTH_VIEW, sc.perResourceMetadata(fullName, "authorized_view_name", fullName))
+	return newSessionTable(fullName, openRead, openWrite, btransport.READ_ROW_AUTH_VIEW, btransport.MUTATE_ROW_AUTH_VIEW, sc.perResourceMetadata(fullName, "authorized_view_name", fullName), sc.metricsFactory)
 }
 
 // OpenMaterializedView returns a read-only SessionTableApi for a
@@ -215,7 +228,7 @@ func (sc *sessionClient) OpenMaterializedView(view string) SessionTableApi {
 		},
 		fmt.Sprintf("mv:%s:read", view),
 	)
-	return newSessionTable(fullName, openRead, nil, btransport.READ_ROW_MAT_VIEW, nil, sc.perResourceMetadata(fullName, "materialized_view_name", fullName))
+	return newSessionTable(fullName, openRead, nil, btransport.READ_ROW_MAT_VIEW, nil, sc.perResourceMetadata(fullName, "materialized_view_name", fullName), sc.metricsFactory)
 }
 
 // Close tears down in the 3-phase order that keeps late callbacks

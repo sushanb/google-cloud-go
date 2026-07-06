@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-package bigtable
+package metrics
 
 import (
 	"context"
@@ -245,13 +245,13 @@ func TestExportMetrics(t *testing.T) {
 	}
 
 	// Reduce sampling period to reduce test run time
-	origSamplePeriod := defaultSamplePeriod
-	defaultSamplePeriod = 500 * time.Millisecond
+	origSamplePeriod := DefaultSamplePeriod
+	DefaultSamplePeriod = 500 * time.Millisecond
 	defer func() {
-		defaultSamplePeriod = origSamplePeriod
+		DefaultSamplePeriod = origSamplePeriod
 	}()
 	provider := metric.NewMeterProvider(
-		metric.WithReader(metric.NewPeriodicReader(exporter, metric.WithInterval(defaultSamplePeriod))),
+		metric.WithReader(metric.NewPeriodicReader(exporter, metric.WithInterval(DefaultSamplePeriod))),
 		metric.WithResource(res),
 	)
 
@@ -261,7 +261,7 @@ func TestExportMetrics(t *testing.T) {
 		assertNoError(t, err)
 	}()
 
-	meterBuiltIn := provider.Meter(builtInMetricsMeterName)
+	meterBuiltIn := provider.Meter(BuiltInMetricsMeterName)
 	counterBuiltIn, err := meterBuiltIn.Int64Counter("name.lastvalue")
 	requireNoError(t, err)
 
@@ -322,7 +322,7 @@ func TestExportCounter(t *testing.T) {
 	}()
 
 	// Start meter
-	meter := provider.Meter(builtInMetricsMeterName)
+	meter := provider.Meter(BuiltInMetricsMeterName)
 
 	// Register counter value
 	counter, err := meter.Int64Counter("counter-a")
@@ -364,7 +364,7 @@ func TestExportHistogram(t *testing.T) {
 	}()
 
 	// Start meter
-	meter := provider.Meter(builtInMetricsMeterName)
+	meter := provider.Meter(BuiltInMetricsMeterName)
 
 	// Register counter value
 	counter, err := meter.Float64Histogram("counter-a")
@@ -389,18 +389,18 @@ func TestRecordToMpb(t *testing.T) {
 	inputAttributes := attribute.NewSet(
 		attribute.Key("a").String("A"),
 		attribute.Key("b").Int64(100),
-		attribute.Key(monitoredResLabelKeyProject).String(monitoredResLabelValueProject),
-		attribute.Key(monitoredResLabelKeyInstance).String(monitoredResLabelValueInstance),
-		attribute.Key(monitoredResLabelKeyZone).String(monitoredResLabelValueZone),
-		attribute.Key(monitoredResLabelKeyTable).String(monitoredResLabelValueTable),
-		attribute.Key(monitoredResLabelKeyCluster).String(monitoredResLabelValueCluster),
+		attribute.Key(MonitoredResLabelKeyProject).String(monitoredResLabelValueProject),
+		attribute.Key(MonitoredResLabelKeyInstance).String(monitoredResLabelValueInstance),
+		attribute.Key(MonitoredResLabelKeyZone).String(monitoredResLabelValueZone),
+		attribute.Key(MonitoredResLabelKeyTable).String(monitoredResLabelValueTable),
+		attribute.Key(MonitoredResLabelKeyCluster).String(monitoredResLabelValueCluster),
 	)
 	inputMetrics := metricdata.Metrics{
 		Name: metricName,
 	}
 
 	wantMetric := &googlemetricpb.Metric{
-		Type: fmt.Sprintf("%v%s", builtInMetricsMeterName, metricName),
+		Type: fmt.Sprintf("%v%s", BuiltInMetricsMeterName, metricName),
 		Labels: map[string]string{
 			"a": "A",
 			"b": "100",
@@ -410,11 +410,11 @@ func TestRecordToMpb(t *testing.T) {
 	wantMonitoredResource := &monitoredrespb.MonitoredResource{
 		Type: "bigtable_client_raw",
 		Labels: map[string]string{
-			monitoredResLabelKeyProject:  monitoredResLabelValueProject,
-			monitoredResLabelKeyInstance: monitoredResLabelValueInstance,
-			monitoredResLabelKeyZone:     monitoredResLabelValueZone,
-			monitoredResLabelKeyTable:    monitoredResLabelValueTable,
-			monitoredResLabelKeyCluster:  monitoredResLabelValueCluster,
+			MonitoredResLabelKeyProject:  monitoredResLabelValueProject,
+			MonitoredResLabelKeyInstance: monitoredResLabelValueInstance,
+			MonitoredResLabelKeyZone:     monitoredResLabelValueZone,
+			MonitoredResLabelKeyTable:    monitoredResLabelValueTable,
+			MonitoredResLabelKeyCluster:  monitoredResLabelValueCluster,
 		},
 	}
 
@@ -668,7 +668,7 @@ func TestBatchingExport(t *testing.T) {
 				ScopeMetrics: []metricdata.ScopeMetrics{
 					{
 						Scope: instrumentation.Scope{
-							Name: builtInMetricsMeterName,
+							Name: BuiltInMetricsMeterName,
 						},
 						Metrics: input,
 					},
