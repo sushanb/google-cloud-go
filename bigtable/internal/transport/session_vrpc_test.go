@@ -319,3 +319,88 @@ func TestInvoke_RetryInfoPackedIntoStatus(t *testing.T) {
 	}
 }
 
+// TestHandleVRPCResponse_DuplicateFrame_TagsAsDuplicate depicts a
+// protocol violation: the server sends two VirtualRpcResponse frames
+// with the same rpc_id while the first hasn't been consumed. The
+// second delivery hits deliver's default branch (channel already full)
+// and the receive-loop caller must flag it via
+// tagSessionVRPCDuplicateResult so operators see the invariant break
+// instead of a silent drop.
+func TestHandleVRPCResponse_DuplicateFrame_TagsAsDuplicate(t *testing.T) {
+	resetDebugTagCountsForTest()
+	s, _ := makeActive(t, SessionHooks{})
+	rpc := &vrpcImpl{id: 3, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
+	s.activeRPC.Store(rpc)
+
+	resp1 := &spb.VirtualRpcResponse{RpcId: 3}
+	resp2 := &spb.VirtualRpcResponse{RpcId: 3}
+	s.handleVRPCResponse(resp1)
+	s.handleVRPCResponse(resp2)
+
+	if got := snapshotDebugTagCounts()[tagSessionVRPCDuplicateResult]; got != 1 {
+		t.Errorf("tagSessionVRPCDuplicateResult count = %d, want 1 (server double-frame should be flagged)", got)
+	}
+
+	// First delivery wins; second is dropped.
+	select {
+	case res := <-rpc.resultChan:
+		if res.resp != resp1 {
+			t.Errorf("got resp %p, want first %p (duplicate should not overwrite)", res.resp, resp1)
+		}
+	default:
+		t.Fatal("no result on resultChan")
+	}
+	select {
+	case res := <-rpc.resultChan:
+		t.Errorf("channel had a second value: %+v — deliver's cap-1 guard failed", res)
+	default:
+	}
+}
+
+// TestDeliver_CancelRacingCompletion_TagsAsDuplicate depicts the race
+// between a completion delivered by the receive loop and
+// cancelActiveRPCs firing before Invoke's deferred releaseSlot has
+// cleared activeRPC. Both paths call deliver on the same
+// rpc.resultChan; the second hits the default branch. Per the deliver
+// invariant ("first wins, subsequent ones are dropped"), the losing
+// side is a bug and must be flagged with tagSessionVRPCDuplicateResult
+// regardless of which caller lost.
+//
+// Currently FAILS on the cancel-path loser: handleVRPCResponse tags on
+// false, cancelActiveRPCs ignores the return. Driving the per-rpc
+// atomic completion gate (see the "Gate deliver on per-rpc atomic
+// completion flag" TODO) that closes this race — once the gate lands
+// each rpc has exactly one deliver caller, deliver's default becomes
+// truly unreachable, and this scenario is caught at the gate instead
+// of in deliver.
+func TestDeliver_CancelRacingCompletion_TagsAsDuplicate(t *testing.T) {
+	resetDebugTagCountsForTest()
+	s, _ := makeActive(t, SessionHooks{})
+	rpc := &vrpcImpl{id: 5, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
+	s.activeRPC.Store(rpc)
+
+	// Receive loop: server delivers a real success frame, filling the
+	// resultChan cap-1 slot.
+	s.handleVRPCResponse(&spb.VirtualRpcResponse{RpcId: 5})
+
+	// Cancel path: session tear-down fires while activeRPC still points
+	// to rpc (Invoke has not consumed / defer-released). cancel's
+	// CAS(rpc, nil) succeeds; deliver hits the full channel → default
+	// branch. Cancel currently drops this silently.
+	s.cancelActiveRPCs(unavailable(ErrUnavailableSessionError, "server-reported"))
+
+	if got := snapshotDebugTagCounts()[tagSessionVRPCDuplicateResult]; got != 1 {
+		t.Errorf("tagSessionVRPCDuplicateResult count = %d, want 1 (cancel-vs-completion loser should be flagged)", got)
+	}
+
+	// Whichever path lost, the winning delivery must survive on the
+	// channel — a duplicate must never overwrite a landed result.
+	select {
+	case res := <-rpc.resultChan:
+		if res.resp == nil || res.resp.RpcId != 5 {
+			t.Errorf("channel value = %+v, want the receive-loop VirtualRpcResponse (id=5)", res)
+		}
+	default:
+		t.Fatal("no result on resultChan — the winner's delivery was lost")
+	}
+}
