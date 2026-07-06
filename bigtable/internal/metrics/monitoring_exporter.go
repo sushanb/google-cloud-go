@@ -93,7 +93,7 @@ func wrapMetricsError(err error) error {
 	if err == nil {
 		return err
 	}
-	return fmt.Errorf("%v%w", metricsErrorPrefix, err)
+	return fmt.Errorf("%v%w", MetricsErrorPrefix, err)
 }
 
 // ForceFlush does nothing, the exporter holds no state.

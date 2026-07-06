@@ -131,7 +131,10 @@ var (
 		Shutdown: func() {},
 	}
 
-	metricsErrorPrefix = "bigtable-metrics: "
+	// MetricsErrorPrefix wraps every metrics-subsystem error surfaced to
+	// the OTel error handler. Exposed so tests can assert that exporter
+	// / handler failures make it into the error stream.
+	MetricsErrorPrefix = "bigtable-metrics: "
 
 	clientName = fmt.Sprintf("go-bigtable/%v", internal.Version)
 
@@ -217,11 +220,11 @@ var (
 
 	endpointOptionType = reflect.TypeOf(option.WithEndpoint(""))
 
-	// GCM exporter should use the same options as Bigtable client
-	// createExporterOptions takes Bigtable client options and returns exporter options,
-	// filtering out any WithEndpoint option to ensure the metrics exporter uses its default endpoint.
-	// Overwritten in tests
-	createExporterOptions = func(btOpts ...option.ClientOption) []option.ClientOption {
+	// CreateExporterOptions takes Bigtable client options and returns exporter
+	// options, filtering out any WithEndpoint option to ensure the metrics
+	// exporter uses its default endpoint. Overridden in tests to redirect
+	// the exporter to a fake Cloud Monitoring server.
+	CreateExporterOptions = func(btOpts ...option.ClientOption) []option.ClientOption {
 		filteredOptions := []option.ClientOption{}
 		for _, opt := range btOpts {
 			if reflect.TypeOf(opt) != endpointOptionType {
@@ -343,7 +346,7 @@ func NewFactory(ctx context.Context, project, instance, appProfile string, Metri
 }
 
 func builtInMeterProviderOptions(project string, opts ...option.ClientOption) ([]sdkmetric.Option, error) {
-	allOpts := createExporterOptions(opts...)
+	allOpts := CreateExporterOptions(opts...)
 	defaultExporter, err := newMonitoringExporter(context.Background(), project, allOpts...)
 	if err != nil {
 		return nil, err
