@@ -339,15 +339,20 @@ func errorResponseToErr(errResp *spb.ErrorResponse) error {
 // deliver writes a result onto the RPC's buffered (cap 1) channel and
 // returns true. Returns false if the slot is already full (a duplicate
 // frame or a cancel racing a completion) — the first wins, subsequent
-// ones are dropped. Callers on the server-frame path treat false as a
-// server-side duplicate and tag it; cancelActiveRPCs ignores false
-// because a filled slot means the completion already landed.
+// ones are dropped. Every default-branch drop is stamped into the
+// per-session event ring ("dup-deliver") so operators can see the race
+// in sessionz regardless of which caller lost. Callers on the
+// server-frame path additionally tag it as a metric
+// (tagSessionVRPCDuplicateResult); cancelActiveRPCs ignores false
+// because a filled slot means the completion already landed and no
+// metric warning is warranted.
 func (s *Session) deliver(rpc *vrpcImpl, res vrpcResult) bool {
 	select {
 	case rpc.resultChan <- res:
 		return true
 	default:
 		s.debugf("duplicate result for rpc_id=%d (%s) dropped", rpc.id, rpc.method)
+		s.recordEvent("dup-deliver", "rpc_id=%d method=%s dropped (channel full)", rpc.id, rpc.method)
 		return false
 	}
 }

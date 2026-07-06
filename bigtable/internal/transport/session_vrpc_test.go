@@ -319,14 +319,14 @@ func TestInvoke_RetryInfoPackedIntoStatus(t *testing.T) {
 	}
 }
 
-// TestHandleVRPCResponse_DuplicateFrame_TagsAsDuplicate depicts a
+// TestHandleVRPCResponse_DuplicateFrame_FlagsDuplicate depicts a
 // protocol violation: the server sends two VirtualRpcResponse frames
 // with the same rpc_id while the first hasn't been consumed. The
-// second delivery hits deliver's default branch (channel already full)
-// and the receive-loop caller must flag it via
-// tagSessionVRPCDuplicateResult so operators see the invariant break
-// instead of a silent drop.
-func TestHandleVRPCResponse_DuplicateFrame_TagsAsDuplicate(t *testing.T) {
+// second delivery hits deliver's default branch (channel already full).
+// Two signals must fire: the metric tag tagSessionVRPCDuplicateResult
+// from the receive-loop caller (dashboard-visible) and the "dup-deliver"
+// per-session event from deliver itself (sessionz-visible).
+func TestHandleVRPCResponse_DuplicateFrame_FlagsDuplicate(t *testing.T) {
 	resetDebugTagCountsForTest()
 	s, _ := makeActive(t, SessionHooks{})
 	rpc := &vrpcImpl{id: 3, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
@@ -338,7 +338,10 @@ func TestHandleVRPCResponse_DuplicateFrame_TagsAsDuplicate(t *testing.T) {
 	s.handleVRPCResponse(resp2)
 
 	if got := snapshotDebugTagCounts()[tagSessionVRPCDuplicateResult]; got != 1 {
-		t.Errorf("tagSessionVRPCDuplicateResult count = %d, want 1 (server double-frame should be flagged)", got)
+		t.Errorf("tagSessionVRPCDuplicateResult count = %d, want 1 (server double-frame should be tagged)", got)
+	}
+	if got := countEventsByKind(s.snapshotEvents(), "dup-deliver"); got != 1 {
+		t.Errorf("dup-deliver events = %d, want 1", got)
 	}
 
 	// First delivery wins; second is dropped.
@@ -357,23 +360,21 @@ func TestHandleVRPCResponse_DuplicateFrame_TagsAsDuplicate(t *testing.T) {
 	}
 }
 
-// TestDeliver_CancelRacingCompletion_TagsAsDuplicate depicts the race
+// TestDeliver_CancelRacingCompletion_FlagsEvent depicts the race
 // between a completion delivered by the receive loop and
 // cancelActiveRPCs firing before Invoke's deferred releaseSlot has
 // cleared activeRPC. Both paths call deliver on the same
 // rpc.resultChan; the second hits the default branch. Per the deliver
-// invariant ("first wins, subsequent ones are dropped"), the losing
-// side is a bug and must be flagged with tagSessionVRPCDuplicateResult
-// regardless of which caller lost.
+// invariant ("first wins, subsequent ones are dropped"), the loser
+// must be surfaced somewhere so an operator investigating an
+// unexpectedly-torn-down session in sessionz can see the race.
 //
-// Currently FAILS on the cancel-path loser: handleVRPCResponse tags on
-// false, cancelActiveRPCs ignores the return. Driving the per-rpc
-// atomic completion gate (see the "Gate deliver on per-rpc atomic
-// completion flag" TODO) that closes this race — once the gate lands
-// each rpc has exactly one deliver caller, deliver's default becomes
-// truly unreachable, and this scenario is caught at the gate instead
-// of in deliver.
-func TestDeliver_CancelRacingCompletion_TagsAsDuplicate(t *testing.T) {
+// Cancel path duplicates are benign (not a server bug), so we do NOT
+// emit the tagSessionVRPCDuplicateResult metric — that stays scoped to
+// the server-frame paths. Instead deliver stamps a "dup-deliver"
+// event on the per-session ring, which shows up in sessionz's recent-
+// events column for this session and its containing pool.
+func TestDeliver_CancelRacingCompletion_FlagsEvent(t *testing.T) {
 	resetDebugTagCountsForTest()
 	s, _ := makeActive(t, SessionHooks{})
 	rpc := &vrpcImpl{id: 5, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
@@ -386,11 +387,15 @@ func TestDeliver_CancelRacingCompletion_TagsAsDuplicate(t *testing.T) {
 	// Cancel path: session tear-down fires while activeRPC still points
 	// to rpc (Invoke has not consumed / defer-released). cancel's
 	// CAS(rpc, nil) succeeds; deliver hits the full channel → default
-	// branch. Cancel currently drops this silently.
+	// branch → dup-deliver event fires.
 	s.cancelActiveRPCs(unavailable(ErrUnavailableSessionError, "server-reported"))
 
-	if got := snapshotDebugTagCounts()[tagSessionVRPCDuplicateResult]; got != 1 {
-		t.Errorf("tagSessionVRPCDuplicateResult count = %d, want 1 (cancel-vs-completion loser should be flagged)", got)
+	if got := countEventsByKind(s.snapshotEvents(), "dup-deliver"); got != 1 {
+		t.Errorf("dup-deliver events = %d, want 1 (cancel-vs-completion loser should be flagged)", got)
+	}
+	// Benign race: no metric tag from this path.
+	if got := snapshotDebugTagCounts()[tagSessionVRPCDuplicateResult]; got != 0 {
+		t.Errorf("tagSessionVRPCDuplicateResult count = %d, want 0 (cancel-path drop is not a server bug)", got)
 	}
 
 	// Whichever path lost, the winning delivery must survive on the
@@ -403,4 +408,16 @@ func TestDeliver_CancelRacingCompletion_TagsAsDuplicate(t *testing.T) {
 	default:
 		t.Fatal("no result on resultChan — the winner's delivery was lost")
 	}
+}
+
+// countEventsByKind returns how many SessionEvents in events have the
+// given Kind. Small helper used by the dup-deliver tests above.
+func countEventsByKind(events []SessionEvent, kind string) int {
+	n := 0
+	for _, ev := range events {
+		if ev.Kind == kind {
+			n++
+		}
+	}
+	return n
 }

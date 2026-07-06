@@ -128,6 +128,13 @@ func (d *sessionDebug) init(sessionType SessionType) {
 //	"ctx-done"  — Session.Invoke's per-attempt wait was killed by the
 //	              caller's context (deadline or cancel); Message carries
 //	              method, rpc id, time waited, ctx err, session state.
+//	"dup-deliver" — deliver's default branch fired: something tried to
+//	              publish a second value on rpc.resultChan while it
+//	              was still full. Either a server double-frame
+//	              (protocol violation — also tagged
+//	              tagSessionVRPCDuplicateResult from the receive-loop
+//	              caller) or a cancel racing a completion (benign;
+//	              cancel-side loser). Message carries rpc id and method.
 type SessionEvent struct {
 	At      time.Time
 	Kind    string
