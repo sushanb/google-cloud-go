@@ -91,6 +91,18 @@ type SessionClient interface {
 	// register additional instruments against the same provider.
 	MeterProvider() metric.MeterProvider
 
+	// SessionDebug / ChannelDebug / ConfigDebug expose the debug-page
+	// data surfaces. Together they satisfy the same shape
+	// debugview.DebugProviders needs, so a SessionClient (or a public
+	// wrapper composed of one) can be handed to debugview.Handler
+	// without an adapter. Diverter() on the returned SessionDebugProvider
+	// is empty for standalone SessionClient — the classic/session
+	// split is a mixed-mode concept that only makes sense on a
+	// bigtable.Client that also owns a classic pool.
+	SessionDebug() btransport.SessionDebugProvider
+	ChannelDebug() btransport.ChannelDebugProvider
+	ConfigDebug() btransport.ConfigDebugProvider
+
 	// Close closes the underlying channel pool. SessionTableApi
 	// instances previously vended become unusable.
 	Close() error

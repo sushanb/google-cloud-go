@@ -26,11 +26,11 @@
 //	    debugview.Handler(client, stats)))
 //
 // Handler accepts anything satisfying DebugProviders — *bigtable.Client
-// today, and *bigtable.SessionClient once that public type lands (both
-// implement the same three debug hooks). Both arguments are nil-safe:
-// client-backed views on a nil DebugProviders render their "not enabled"
-// empty state, and /tcpz/ with nil stats renders "TCP stats collector
-// not attached".
+// today, internal/session.SessionClient (via a future public wrapper),
+// and any custom type that exposes the same three methods. Both arguments
+// are nil-safe: client-backed views on a nil DebugProviders render their
+// "not enabled" empty state, and /tcpz/ with nil stats renders
+// "TCP stats collector not attached".
 package debugview
 
 import (
@@ -43,9 +43,11 @@ import (
 
 // DebugProviders is the surface Handler needs from whatever client owns
 // the session + channel + config debug state. *bigtable.Client implements
-// it directly; a future *bigtable.SessionClient will implement the same
-// three methods so callers can hand either to Handler without changing
-// wiring.
+// it directly, and so does the internal session.SessionClient (whose
+// provider methods a future public wrapper composes with). The provider
+// types are the same identifiers here as on bigtable.Client — bigtable
+// re-exports the underlying btransport types as aliases, so returning
+// either works.
 type DebugProviders interface {
 	// SessionDebug returns the session-pool provider (drives sessionz /
 	// afez / loadz). May return nil when session pooling isn't enabled.
@@ -57,6 +59,12 @@ type DebugProviders interface {
 	// May return nil when no ConfigurationManager is wired.
 	ConfigDebug() bigtable.ConfigDebugProvider
 }
+
+// Compile-time check: *bigtable.Client satisfies DebugProviders. The
+// same shape is implemented by internal/session.SessionClient — asserting
+// that here would create an import cycle, so it's checked in a test
+// (see handler_iface_test.go).
+var _ DebugProviders = (*bigtable.Client)(nil)
 
 // Handler returns the combined debug mux. See package doc for the routes
 // it exposes. Passing a nil DebugProviders is fine — every client-backed
