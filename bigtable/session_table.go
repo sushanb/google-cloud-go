@@ -254,6 +254,11 @@ func (t *SessionTable) ReadRow(ctx context.Context, row string, opts ...ReadOpti
 		return nil, fmt.Errorf("unexpected response type from vRPC: %T", res)
 	}
 
+	if readResp.Stats != nil && settings.fullReadStatsFunc != nil {
+		stats := makeFullReadStats(readResp.Stats)
+		settings.fullReadStatsFunc(&stats)
+	}
+
 	return protoRowToRow(readResp.GetRow()), nil
 }
 
