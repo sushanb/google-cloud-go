@@ -25,9 +25,12 @@
 //	http.Handle("/debug/", http.StripPrefix("/debug",
 //	    debugview.Handler(client, stats)))
 //
-// Both arguments are nil-safe: client-backed views on a nil client render
-// their "not enabled" empty state, and /tcpz/ with nil stats renders
-// "TCP stats collector not attached".
+// Handler accepts anything satisfying DebugProviders — *bigtable.Client
+// today, and *bigtable.SessionClient once that public type lands (both
+// implement the same three debug hooks). Both arguments are nil-safe:
+// client-backed views on a nil DebugProviders render their "not enabled"
+// empty state, and /tcpz/ with nil stats renders "TCP stats collector
+// not attached".
 package debugview
 
 import (
@@ -38,15 +41,34 @@ import (
 	"cloud.google.com/go/bigtable"
 )
 
+// DebugProviders is the surface Handler needs from whatever client owns
+// the session + channel + config debug state. *bigtable.Client implements
+// it directly; a future *bigtable.SessionClient will implement the same
+// three methods so callers can hand either to Handler without changing
+// wiring.
+type DebugProviders interface {
+	// SessionDebug returns the session-pool provider (drives sessionz /
+	// afez / loadz). May return nil when session pooling isn't enabled.
+	SessionDebug() bigtable.SessionDebugProvider
+	// ChannelDebug returns the channel-pool provider (drives channelz).
+	// Always non-nil in the current implementations; snapshot may be empty.
+	ChannelDebug() bigtable.ChannelDebugProvider
+	// ConfigDebug returns the client-configuration provider (drives configz).
+	// May return nil when no ConfigurationManager is wired.
+	ConfigDebug() bigtable.ConfigDebugProvider
+}
+
 // Handler returns the combined debug mux. See package doc for the routes
-// it exposes. Panics on template parse errors would surface at
-// package-init time (see the per-view *TplSrc constants), not here.
-func Handler(c *bigtable.Client, s *bigtable.TCPStats) http.Handler {
+// it exposes. Passing a nil DebugProviders is fine — every client-backed
+// view falls back to its "not enabled" empty state. Panics on template
+// parse errors would surface at package-init time (see the per-view
+// *TplSrc constants), not here.
+func Handler(p DebugProviders, s *bigtable.TCPStats) http.Handler {
 	mux := http.NewServeMux()
 
-	sessionProv := sessionProviderForClient(c)
-	channelProv := channelProviderForClient(c)
-	configProv := configProviderForClient(c)
+	sessionProv := sessionProviderFor(p)
+	channelProv := channelProviderFor(p)
+	configProv := configProviderFor(p)
 
 	mux.Handle("/sessionz/", http.StripPrefix("/sessionz", newSessionzHandler(sessionProv)))
 	mux.Handle("/afez/", http.StripPrefix("/afez", newAfezHandler(sessionProv)))
@@ -55,7 +77,7 @@ func Handler(c *bigtable.Client, s *bigtable.TCPStats) http.Handler {
 	mux.Handle("/configz/", http.StripPrefix("/configz", newConfigzHandler(configProv)))
 	mux.Handle("/tcpz/", http.StripPrefix("/tcpz", newTcpzHandler(s)))
 	// debugtagsz reads a process-global tracer, no per-Client wiring
-	// needed — mounts even when Client is nil.
+	// needed — mounts even when DebugProviders is nil.
 	mux.Handle("/debugtagsz/", http.StripPrefix("/debugtagsz", newDebugtagszHandler()))
 
 	// Index page lives at the root. Anything else that lands here (a
@@ -71,27 +93,43 @@ func Handler(c *bigtable.Client, s *bigtable.TCPStats) http.Handler {
 	return mux
 }
 
-// sessionProviderForClient returns c.SessionDebug() with a nil-safe
-// short-circuit so callers don't have to check nil twice.
-func sessionProviderForClient(c *bigtable.Client) bigtable.SessionDebugProvider {
-	if c == nil {
+// sessionProviderFor returns p.SessionDebug() with a nil-safe short-circuit
+// so callers don't have to check nil twice. Also handles the
+// typed-nil-interface trap (e.g. a nil *bigtable.Client wrapped in a
+// non-nil DebugProviders would otherwise NPE inside SessionDebug()).
+func sessionProviderFor(p DebugProviders) bigtable.SessionDebugProvider {
+	if isNilDebugProviders(p) {
 		return nil
 	}
-	return c.SessionDebug()
+	return p.SessionDebug()
 }
 
-func channelProviderForClient(c *bigtable.Client) bigtable.ChannelDebugProvider {
-	if c == nil {
+func channelProviderFor(p DebugProviders) bigtable.ChannelDebugProvider {
+	if isNilDebugProviders(p) {
 		return nil
 	}
-	return c.ChannelDebug()
+	return p.ChannelDebug()
 }
 
-func configProviderForClient(c *bigtable.Client) bigtable.ConfigDebugProvider {
-	if c == nil {
+func configProviderFor(p DebugProviders) bigtable.ConfigDebugProvider {
+	if isNilDebugProviders(p) {
 		return nil
 	}
-	return c.ConfigDebug()
+	return p.ConfigDebug()
+}
+
+// isNilDebugProviders reports whether p is either an untyped nil interface
+// or a typed nil pointer (e.g. (*bigtable.Client)(nil)). The typed-nil
+// check matters because callers commonly pass a client variable that may
+// be nil — the interface value wraps the nil pointer and p == nil is false.
+func isNilDebugProviders(p DebugProviders) bool {
+	if p == nil {
+		return true
+	}
+	if c, ok := p.(*bigtable.Client); ok {
+		return c == nil
+	}
+	return false
 }
 
 type indexPageData struct {
