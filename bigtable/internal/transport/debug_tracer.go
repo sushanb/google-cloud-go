@@ -45,7 +45,7 @@
 //
 // Format-free when the tag name is enough:
 //
-//	if !assertDebugTag(rpc != nil, tagSessionVRPCUnknownID) {
+//	if !assertDebugTag(rpc != nil, tagSessionVRPCNil) {
 //	    return
 //	}
 //
@@ -142,10 +142,11 @@ const (
 	tagSessionCloseNoReason         = "session_close_no_reason"
 
 	// vRPC dispatch observations.
-	tagSessionVRPCUnknownID          = "session_vrpc_unknown_id"
-	tagSessionVRPCErrorUnknownID     = "session_vrpc_error_unknown_id"
+	tagSessionVRPCNil                = "session_vrpc_nil"
+	tagSessionVRPCErrorNil           = "session_vrpc_error_nil"
 	tagSessionVRPCIDMismatch         = "session_vrpc_id_mismatch"
 	tagSessionVRPCResponseWrongState = "session_vrpc_response_wrong_state"
+	tagSessionVRPCDuplicateResult    = "session_vrpc_duplicate_result"
 
 	// Pool-scoped anomalies.
 	tagSessionPoolStuckSessionSwept = "session_pool_stuck_session_swept"

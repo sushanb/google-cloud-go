@@ -178,10 +178,30 @@ func (h SessionHooks) onClose(s *Session, err error) {
 }
 
 // vrpcResult is the single value delivered to Invoke through resultChan.
+// Exactly one of resp, errResp, err is set:
+//
+//	resp    — server success frame; ClusterInfo lives on it.
+//	errResp — server error frame; ClusterInfo lives on it, Status carries
+//	          the gRPC code and any RetryInfo.
+//	err     — transport-side failure (cancel, close, heartbeat miss);
+//	          already tagged StateTransportFailure at the source. No server
+//	          frame arrived, so no ClusterInfo.
 type vrpcResult struct {
-	resp        *spb.VirtualRpcResponse
-	clusterInfo *spb.ClusterInformation
-	err         error
+	resp    *spb.VirtualRpcResponse
+	errResp *spb.ErrorResponse
+	err     error
+}
+
+// ClusterInfo returns whichever server frame's ClusterInformation is set,
+// or nil if the result carries a transport-side error.
+func (r vrpcResult) ClusterInfo() *spb.ClusterInformation {
+	if r.resp != nil {
+		return r.resp.ClusterInfo
+	}
+	if r.errResp != nil {
+		return r.errResp.ClusterInfo
+	}
+	return nil
 }
 
 // vrpcImpl tracks the state of an in-flight virtual RPC. Populated once

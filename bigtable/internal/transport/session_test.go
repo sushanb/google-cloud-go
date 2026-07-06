@@ -406,10 +406,10 @@ func TestHandleVRPCErrorResponse_RoutesByRpcID(t *testing.T) {
 
 	select {
 	case res := <-rpc.resultChan:
-		if res.err == nil {
-			t.Fatal("expected error result")
+		if res.errResp == nil {
+			t.Fatal("expected errResp result")
 		}
-		if got := status.Code(res.err); got != codes.FailedPrecondition {
+		if got := codes.Code(res.errResp.Status.GetCode()); got != codes.FailedPrecondition {
 			t.Errorf("status code = %v, want FailedPrecondition", got)
 		}
 	default:

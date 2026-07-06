@@ -203,9 +203,9 @@ func buildInvokeRequest(rpcID int64, reqBytes []byte, attempt int64, startTime t
 // delivers a result on rpc.resultChan. Populates the tail of result
 // (TransportLatency, ClusterInfo, Stats, Response) and returns a
 // fully-tagged error on failure. res.err from resultChan is already
-// tagged by the source site (handleVRPCErrorResponse tags ServerResult;
-// cancelActiveRPCs tags TransportFailure), so this path forwards it
-// verbatim.
+// tagged StateTransportFailure at the source (cancelActiveRPCs); server
+// error frames arrive as res.errResp and are unpacked here into a
+// StateServerResult-tagged error.
 func (s *Session) awaitInvokeResult(ctx context.Context, rpc *vrpcImpl, desc VRpcDescriptor, result *InvokeResult) error {
 	select {
 	case <-ctx.Done():
@@ -213,12 +213,16 @@ func (s *Session) awaitInvokeResult(ctx context.Context, rpc *vrpcImpl, desc VRp
 		return tagErr(StateTransportFailure, ctx.Err())
 	case res := <-rpc.resultChan:
 		result.TransportLatency = time.Since(result.SentAt)
-		result.ClusterInfo = res.clusterInfo
-		if res.clusterInfo != nil {
-			s.recordCluster(res.clusterInfo.GetClusterId())
+		ci := res.ClusterInfo()
+		result.ClusterInfo = ci
+		if ci != nil {
+			s.recordCluster(ci.GetClusterId())
 		}
 		if res.err != nil {
 			return res.err
+		}
+		if res.errResp != nil {
+			return tagErr(StateServerResult, errorResponseToErr(res.errResp))
 		}
 		if res.resp.RpcId != rpc.id {
 			// This is a bookkeeping bug: deliver() only publishes into
@@ -272,7 +276,7 @@ func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
 	}
 	rpc := s.activeRPC.Load()
 	if rpc == nil {
-		recordDebugTag(tagSessionVRPCUnknownID)
+		recordDebugTag(tagSessionVRPCNil)
 		s.debugf("dropping VirtualRpcResponse for rpc_id=%d — no in-flight RPC tracked", resp.RpcId)
 		return
 	}
@@ -282,7 +286,9 @@ func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
 		return
 	}
 	s.okRpcs.Add(1)
-	s.deliver(rpc, vrpcResult{resp: resp, clusterInfo: resp.ClusterInfo})
+	if !s.deliver(rpc, vrpcResult{resp: resp}) {
+		recordDebugTag(tagSessionVRPCDuplicateResult)
+	}
 }
 
 // handleVRPCErrorResponse routes per-vRPC errors to the waiting caller.
@@ -295,7 +301,7 @@ func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 	}
 	rpc := s.activeRPC.Load()
 	if rpc == nil {
-		recordDebugTag(tagSessionVRPCErrorUnknownID)
+		recordDebugTag(tagSessionVRPCErrorNil)
 		s.debugf("dropping ErrorResponse for rpc_id=%d — no in-flight RPC tracked", errResp.RpcId)
 		return
 	}
@@ -305,39 +311,44 @@ func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 		return
 	}
 	s.errorRpcs.Add(1)
-
-	var goErr error
-	if errResp.Status != nil {
-		st := status.FromProto(errResp.Status)
-		// If the server attached RetryInfo to the ErrorResponse envelope,
-		// pack it into the status details so downstream consumers
-		// (notably RetryingVRpc) can recover it via status.FromError(err).
-		// .Details() — the same path they already use for inline retry
-		// hints. WithDetails returns a fresh *Status on success; on the
-		// rare failure (e.g. anypb marshal) we fall back to the bare
-		// status so the error path still propagates the server's code.
-		if errResp.RetryInfo != nil {
-			if withDetails, derr := st.WithDetails(errResp.RetryInfo); derr == nil {
-				st = withDetails
-			}
-		}
-		goErr = st.Err()
-	} else {
-		goErr = fmt.Errorf("unknown vRPC error (rpc_id=%d)", errResp.RpcId)
+	if !s.deliver(rpc, vrpcResult{errResp: errResp}) {
+		recordDebugTag(tagSessionVRPCDuplicateResult)
 	}
-	// Real server ErrorResponse frame → ServerResult. Retry decision at
-	// the interceptor gates on the underlying gRPC code + any RetryInfo.
-	s.deliver(rpc, vrpcResult{err: tagErr(StateServerResult, goErr), clusterInfo: errResp.ClusterInfo})
 }
 
-// deliver writes a result onto the RPC's buffered (cap 1) channel. The
-// non-blocking send protects against duplicate server frames for the same
-// rpc_id; the first wins, subsequent ones are dropped.
-func (s *Session) deliver(rpc *vrpcImpl, res vrpcResult) {
+// errorResponseToErr converts a server ErrorResponse frame into a Go
+// error carrying the gRPC status code and any RetryInfo the server
+// attached. RetryInfo is packed into the status details so downstream
+// consumers (notably RetryingVRpc) can recover it via status.FromError.
+// WithDetails returns a fresh *Status on success; on the rare failure
+// (e.g. anypb marshal) we fall back to the bare status so the error path
+// still propagates the server's code.
+func errorResponseToErr(errResp *spb.ErrorResponse) error {
+	if errResp.Status == nil {
+		return fmt.Errorf("unknown vRPC error (rpc_id=%d)", errResp.RpcId)
+	}
+	st := status.FromProto(errResp.Status)
+	if errResp.RetryInfo != nil {
+		if withDetails, derr := st.WithDetails(errResp.RetryInfo); derr == nil {
+			st = withDetails
+		}
+	}
+	return st.Err()
+}
+
+// deliver writes a result onto the RPC's buffered (cap 1) channel and
+// returns true. Returns false if the slot is already full (a duplicate
+// frame or a cancel racing a completion) — the first wins, subsequent
+// ones are dropped. Callers on the server-frame path treat false as a
+// server-side duplicate and tag it; cancelActiveRPCs ignores false
+// because a filled slot means the completion already landed.
+func (s *Session) deliver(rpc *vrpcImpl, res vrpcResult) bool {
 	select {
 	case rpc.resultChan <- res:
+		return true
 	default:
 		s.debugf("duplicate result for rpc_id=%d (%s) dropped", rpc.id, rpc.method)
+		return false
 	}
 }
 
