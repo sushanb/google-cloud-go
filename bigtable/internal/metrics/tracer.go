@@ -345,6 +345,35 @@ func NewFactory(ctx context.Context, project, instance, appProfile string, Metri
 	return tracerFactory, nil
 }
 
+// NewFactoryForTest constructs an enabled Factory backed by the supplied
+// MeterProvider. Test-only: skips the built-in Cloud Monitoring exporter
+// setup NewFactory does, so callers can inject a ManualReader-backed
+// provider and assert on the emitted data points. Production code must
+// use NewFactory.
+func NewFactoryForTest(project, instance, appProfile string, mp metric.MeterProvider) (*Factory, error) {
+	clientUID, err := GenerateClientUID()
+	if err != nil {
+		return nil, err
+	}
+	tf := &Factory{
+		Enabled: true,
+		clientAttributes: []attribute.KeyValue{
+			attribute.String(MonitoredResLabelKeyProject, project),
+			attribute.String(MonitoredResLabelKeyInstance, instance),
+			attribute.String(MetricLabelKeyAppProfile, appProfile),
+			attribute.String(MetricLabelKeyClientUID, clientUID),
+			attribute.String(MetricLabelKeyClientName, clientName),
+		},
+		OtelMeterProvider: mp,
+		Shutdown:          func() {},
+	}
+	meter := mp.Meter(BuiltInMetricsMeterName, metric.WithInstrumentationVersion(internal.Version))
+	if err := tf.createInstruments(meter); err != nil {
+		return nil, err
+	}
+	return tf, nil
+}
+
 func builtInMeterProviderOptions(project string, opts ...option.ClientOption) ([]sdkmetric.Option, error) {
 	allOpts := CreateExporterOptions(opts...)
 	defaultExporter, err := newMonitoringExporter(context.Background(), project, allOpts...)
