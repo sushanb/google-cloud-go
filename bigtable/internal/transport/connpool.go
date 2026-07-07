@@ -16,7 +16,9 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"math/rand/v2"
@@ -32,7 +34,6 @@ import (
 	"github.com/googleapis/gax-go/v2"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
-	"golang.org/x/sync/errgroup"
 	gtransport "google.golang.org/api/transport/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/alts"
@@ -53,11 +54,6 @@ const (
 	artificialLoadIfError        = 10
 	artificialLoadPenalizedTimer = 5 * time.Second
 	requestParamsHeader          = "x-goog-request-params"
-	// maxPrimeWorkers caps the goroutines used to prime initial pool
-	// connections in parallel. Pools smaller than this naturally fan out to
-	// connPoolSize workers; larger pools cap here so we don't spawn one
-	// dial+Prime goroutine per connection.
-	maxPrimeWorkers = 10
 )
 
 // ipProtocol represents the type of IP protocol used.
@@ -101,6 +97,13 @@ type connPoolStats struct {
 
 var _ Monitor = (*MetricsReporter)(nil)
 
+// WithAppProfile provides the appProfile
+func WithAppProfile(appProfile string) BigtableChannelPoolOption {
+	return func(p *BigtableChannelPool) {
+		p.appProfile = appProfile
+	}
+}
+
 // WithMeterProvider provides the meter provider for writing metrics
 func WithMeterProvider(mp metric.MeterProvider) BigtableChannelPoolOption {
 	return func(p *BigtableChannelPool) {
@@ -134,10 +137,20 @@ func WithChannelPrimer(primer ChannelPrimer) BigtableChannelPoolOption {
 	}
 }
 
-// WithLogger provides the logger for logging events
+// WithLogger provides the logger for logging events. Retained even
+// though no in-tree caller sets it — the debug-path Debugf calls
+// throughout connpool no-op on a nil logger, so this is the intended
+// escape hatch for wiring up diagnostic output.
 func WithLogger(logger *log.Logger) BigtableChannelPoolOption {
 	return func(p *BigtableChannelPool) {
 		p.logger = logger
+	}
+}
+
+// WithInstanceName provides the full instance Name
+func WithInstanceName(instanceName string) BigtableChannelPoolOption {
+	return func(p *BigtableChannelPool) {
+		p.instanceName = instanceName
 	}
 }
 
@@ -229,6 +242,81 @@ func (p *BigtableChannelPool) connPoolStatsSupplier() []connPoolStats {
 	return stats
 }
 
+// ChannelSnapshot is one row in a ChannelPoolSnapshot. All numeric fields are
+// read non-destructively, so the debug UI can poll without disturbing the
+// metrics exporter (which itself swaps errorCount to 0 on each report).
+type ChannelSnapshot struct {
+	Index                int
+	OutstandingUnary     int32
+	OutstandingStreaming int32
+	ErrorCount           int64
+	IsALTSUsed           bool
+	IsDraining           bool
+	CreatedAt            time.Time
+	IPProtocol           string
+	TargetState          string
+	PenaltyExpiresAt     time.Time
+	Picks                int64
+	LastActivity         time.Time
+}
+
+// ChannelPoolSnapshot is what bigtable/channelz renders. It captures pool-wide
+// metadata (LB policy, instance name, app profile) plus one ChannelSnapshot
+// per live connection.
+type ChannelPoolSnapshot struct {
+	LBPolicy     string
+	InstanceName string
+	AppProfile   string
+	TotalConns   int
+	Channels     []ChannelSnapshot
+	CapturedAt   time.Time
+}
+
+// ChannelPoolSnapshot returns a non-destructive snapshot of every connection
+// in the pool, plus pool-wide identity (LB policy, instance, app profile).
+// Safe to call concurrently with traffic; reads use the same atomics the hot
+// path uses.
+func (p *BigtableChannelPool) ChannelPoolSnapshot() ChannelPoolSnapshot {
+	conns := p.getConns()
+	snap := ChannelPoolSnapshot{
+		LBPolicy:     p.strategy.String(),
+		InstanceName: p.instanceName,
+		AppProfile:   p.appProfile,
+		TotalConns:   len(conns),
+		Channels:     make([]ChannelSnapshot, 0, len(conns)),
+		CapturedAt:   time.Now(),
+	}
+	for i, entry := range conns {
+		if entry == nil {
+			continue
+		}
+		cs := ChannelSnapshot{
+			Index:                i,
+			OutstandingUnary:     entry.unaryLoad.Load(),
+			OutstandingStreaming: entry.streamingLoad.Load(),
+			ErrorCount:           entry.errorCount.Load(),
+			IsALTSUsed:           entry.isALTSUsed(),
+			IsDraining:           entry.isDraining(),
+			Picks:                entry.picks.Load(),
+		}
+		if nanos := entry.lastActivityNanos.Load(); nanos > 0 {
+			cs.LastActivity = time.Unix(0, nanos)
+		}
+		if entry.conn != nil {
+			cs.IPProtocol = entry.conn.ipProtocol()
+			cs.TargetState = entry.conn.GetState().String()
+			if created := entry.createdAt(); created > 0 {
+				cs.CreatedAt = time.UnixMilli(created)
+			}
+		}
+		if expiry := entry.penaltyExpiry.Load(); expiry > 0 {
+			cs.PenaltyExpiresAt = time.Unix(0, expiry)
+		}
+		snap.Channels = append(snap.Channels, cs)
+	}
+	return snap
+}
+
 // NewBigtableConn creates a wrapped grpc Client Conn
 func NewBigtableConn(conn *grpc.ClientConn) *BigtableConn {
 	bc := &BigtableConn{
@@ -253,6 +341,55 @@ type connEntry struct {
 	drainingState atomic.Bool  // True if the connection is being gracefully drained.
 	penaltyExpiry atomic.Int64 // penaltyExpiry stores the UnixNano timestamp of when the penalty ends
 
+	// picks counts how many times the pool's selectFunc has returned this
+	// entry — used by the channelz debug UI to expose load-balancing skew.
+	picks atomic.Int64
+	// lastActivityNanos is the UnixNano timestamp of the most recent pick.
+	// Stamped on every successful Invoke / NewStream start so the UI can
+	// distinguish "idle and abandoned" from "actively used."
+	lastActivityNanos atomic.Int64
+	// index is the entry's position when added to the pool. Stable for the
+	// lifetime of the entry; used to stamp the channel-pick hint into
+	// caller-provided context values.
+	index int
+}
+
+// markPicked stamps a single selection by the pool's load-balancer onto this
+// entry — used by the channelz UI to surface picker skew and idle channels.
+func (e *connEntry) markPicked(now time.Time) {
+	e.picks.Add(1)
+	e.lastActivityNanos.Store(now.UnixNano())
+}
+
+// channelPickHintKey is the context-value key BigtableChannelPool.NewStream /
+// Invoke uses to optionally publish the picked connEntry index back to the
+// caller, so a Session can learn which gRPC channel its bidi stream landed
+// on. The hint is a *atomic.Int32 the caller pre-allocates and the pool
+// writes into; if absent, the pool is a no-op.
+type channelPickHintKey struct{}
+
+// ChannelPickHintInto returns a context that BigtableChannelPool will use to
+// publish the picked connEntry index into the supplied *atomic.Int32. The
+// caller can then read the value once the stream/invoke has returned.
+//
+// Used by Session creation to link sessions back to the channel they ride
+// on — surfaced in the sessionz / channelz debug UIs. Untouched by callers
+// that don't care: stamp() short-circuits when the context lacks the key.
+func ChannelPickHintInto(ctx context.Context, dst *atomic.Int32) context.Context {
+	if dst == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, channelPickHintKey{}, dst)
+}
+
+// stampChannelPickHint writes idx into the *atomic.Int32 the caller stashed
+// on ctx, if any. Cheap no-op on contexts that don't carry the key.
+func stampChannelPickHint(ctx context.Context, idx int) {
+	dst, ok := ctx.Value(channelPickHintKey{}).(*atomic.Int32)
+	if !ok || dst == nil {
+		return
+	}
+	dst.Store(int32(idx))
 }
 
 // isALTSUsed reports whether the connection is using ALTS aka Direct Access.
@@ -363,7 +500,9 @@ type BigtableChannelPool struct {
 	poolCtx    context.Context    // Context for the pool's background tasks
 	poolCancel context.CancelFunc // Function to cancel the poolCtx
 
-	logger *log.Logger // logging events
+	logger       *log.Logger // logging events
+	appProfile   string
+	instanceName string
 
 	factory *connectionFactory // Use the factory for connection creation
 
@@ -473,23 +612,46 @@ func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btop
 		pool.selectFunc = pool.selectRoundRobin
 	}
 
+	var exitSignal error
 	btopt.Debugf(pool.logger, "bigtable_connpool: Creating conn pool with %d connections", connPoolSize)
 	// TODO: Replace this logic with addConnections(...).
 	initialConns := make([]*connEntry, connPoolSize)
-	primeStart := 0
-	if firstConn != nil {
-		initialConns[0] = &connEntry{conn: firstConn}
-		primeStart = 1
-	}
+	for i := 0; i < connPoolSize; i++ {
+		select {
+		case <-pool.poolCtx.Done():
+			exitSignal = errors.New("bigtable_connpool: pool context canceled")
+		default:
+		}
 
-	if err := pool.primeInitialConns(pool.poolCtx, initialConns, primeStart); err != nil {
-		btopt.Debugf(pool.logger, "bigtable_connpool: error during initial connection creation: %v\n", err)
+		if exitSignal != nil {
+			break
+		}
+
+		var entry *connEntry
+		var err error
+
+		if i == 0 && firstConn != nil {
+			entry = &connEntry{conn: firstConn}
+		} else {
+			entry, err = pool.factory.newEntry(ctx)
+		}
+
+		if err != nil {
+			exitSignal = err
+			break
+		}
+		entry.index = i
+		initialConns[i] = entry
+	}
+	if exitSignal != nil {
+		btopt.Debugf(pool.logger, "bigtable_connpool: error during initial connection creation: %v\n", exitSignal)
+		// Close populated conns
 		for _, entry := range initialConns {
 			if entry != nil && entry.conn != nil {
 				entry.conn.Close()
 			}
 		}
-		return nil, err
+		return nil, exitSignal
 	}
 
 	pool.conns.Store(&initialConns)
@@ -516,43 +678,6 @@ func NewBigtableChannelPool(ctx context.Context, connPoolSize int, strategy btop
 	pool.recordClientStartUp(clientCreationTimestamp, transportType)
 
 	return pool, nil
-}
-
-// primeInitialConns dials and primes the connections at indices [primeStart, len(out))
-// in parallel, capped at maxPrimeWorkers. Successful entries are written into out at
-// their target index; if any prime fails, the first error is returned and the caller is
-// responsible for closing any populated entries.
-//
-// ctx scopes the prime operations: the first worker error (or ctx cancellation) tears
-// down the rest via errgroup's derived context.
-func (p *BigtableChannelPool) primeInitialConns(ctx context.Context, out []*connEntry, primeStart int) error {
-	jobs := len(out) - primeStart
-	if jobs <= 0 {
-		return nil
-	}
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("bigtable_connpool: pool context canceled: %w", err)
-	}
-
-	workers := jobs
-	if workers > maxPrimeWorkers {
-		workers = maxPrimeWorkers
-	}
-
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(workers)
-	for i := primeStart; i < len(out); i++ {
-		idx := i
-		g.Go(func() error {
-			entry, err := p.factory.newEntry(gctx)
-			if err != nil {
-				return err
-			}
-			out[idx] = entry
-			return nil
-		})
-	}
-	return g.Wait()
 }
 
 func (p *BigtableChannelPool) recordClientStartUp(clientCreationTimestamp time.Time, transportType string) {
@@ -651,6 +776,11 @@ func (p *BigtableChannelPool) replaceConnection(oldEntry *connEntry) {
 		btopt.Debugf(p.logger, "bigtable_connpool: Failed to replace connection at index %d: %v. Closing new conn. Old connection remains (draining).\n", idx, err)
 		return
 	}
+	// The factory returns entries with index zero-valued. Every other
+	// mutation site (initial build, addConnections, removeConnections)
+	// assigns the slot index; recycling must too, or channelz→sessionz
+	// stamping degenerates to 0 for the replaced slot.
+	newEntry.index = idx
 
 	btopt.Debugf(p.logger, "bigtable_connpool: Successfully primed new connection. Replacing connection at index %d\n", idx)
 	// Copy-on-write
@@ -670,6 +800,8 @@ func (p *BigtableChannelPool) Invoke(ctx context.Context, method string, args in
 	if err != nil {
 		return err
 	}
+	entry.markPicked(time.Now())
+	stampChannelPickHint(ctx, entry.index)
 	entry.unaryLoad.Add(1)
 	defer entry.unaryLoad.Add(-1)
 
@@ -696,44 +828,38 @@ func (p *BigtableChannelPool) getBigtableConn() *BigtableConn {
 	if err != nil {
 		return nil
 	}
+	entry.markPicked(time.Now())
 	return entry.conn
 }
 
-// NewStream selects a connection by the configured load-balancing strategy
-// and opens a stream on it. grpc.OnFinish fires exactly once for any stream
-// that was successfully created (normal completion, context cancellation,
-// transport teardown), so it is the single source of truth for both load
-// accounting and per-stream error attribution — no need to wrap the
-// returned ClientStream.
+// NewStream selects the least loaded connection and calls NewStream on it.
+// This method provides automatic load tracking via a wrapped stream.
 func (p *BigtableChannelPool) NewStream(ctx context.Context, desc *grpc.StreamDesc, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
 	entry, err := p.selectFunc()
 	if err != nil {
 		return nil, err
 	}
 
+	entry.markPicked(time.Now())
+	stampChannelPickHint(ctx, entry.index)
 	entry.streamingLoad.Add(1)
-
-	onFinish := grpc.OnFinish(func(err error) {
-		if err != nil {
-			entry.errorCount.Add(1)
-			entry.applyErrorPenalty(err)
-		}
-		entry.streamingLoad.Add(-1)
-	})
-	// Prepend onto a fresh slice so we never write into spare capacity of
-	// the caller's opts (which would race with concurrent NewStream calls
-	// that share the same backing array).
-	opts = append([]grpc.CallOption{onFinish}, opts...)
-
 	stream, err := entry.conn.NewStream(ctx, desc, method, opts...)
 	if err != nil {
 		entry.errorCount.Add(1)
-		entry.applyErrorPenalty(err)
 		entry.streamingLoad.Add(-1) // Decrement immediately on creation failure
 		return nil, err
 	}
 
-	return stream, nil
+	return &refCountedStream{
+		ClientStream: stream,
+		entry:        entry, // Store the entry itself
+		once:         sync.Once{},
+	}, nil
+}
+
+// MeterProvider returns the meter provider for creating instruments.
+func (p *BigtableChannelPool) MeterProvider() metric.MeterProvider {
+	return p.meterProvider
 }
 
 // selectLeastLoadedRandomOfTwo() returns the index of the connection via random of two
@@ -823,6 +949,51 @@ func (p *BigtableChannelPool) selectLeastLoaded() (*connEntry, error) {
 	return conns[minIndex], nil
 }
 
+// refCountedStream wraps a grpc.ClientStream to decrement the load count when the stream is done.
+// refCountedStream in this BigtableConnectionPool is to hook into the stream's lifecycle
+// to decrement the load counter (s.pool.load[s.connIndex]) when the stream is no longer usable.
+// This is primarily detected by errors occurring during SendMsg or RecvMsg (including io.EOF on RecvMsg).
+
+// Another option would have been to use grpc.OnFinish for streams is about the timing of when the load should be considered "finished".
+// The grpc.OnFinish callback is executed only when the entire stream is fully closed and the final status is determined.
+type refCountedStream struct {
+	grpc.ClientStream
+	entry *connEntry // Reference to the connection entry
+	once  sync.Once
+}
+
+// SendMsg calls the embedded stream's SendMsg method.
+func (s *refCountedStream) SendMsg(m interface{}) error {
+	err := s.ClientStream.SendMsg(m)
+	if err != nil {
+		s.entry.errorCount.Add(1)
+		s.entry.applyErrorPenalty(err)
+		s.decrementLoad()
+	}
+	return err
+}
+
+// RecvMsg calls the embedded stream's RecvMsg method and decrements load on error.
+func (s *refCountedStream) RecvMsg(m interface{}) error {
+	err := s.ClientStream.RecvMsg(m)
+	if err != nil { // io.EOF is also an error, indicating stream end.
+		// io.EOF is a normal stream termination, not an error to be counted.
+		if !errors.Is(err, io.EOF) {
+			s.entry.errorCount.Add(1)
+			s.entry.applyErrorPenalty(err)
+		}
+		s.decrementLoad()
+	}
+	return err
+}
+
+// decrementLoad ensures the load count is decremented exactly once.
+func (s *refCountedStream) decrementLoad() {
+	s.once.Do(func() {
+		s.entry.streamingLoad.Add(-1)
+	})
+}
+
 // addConnections returns true if the pool size changed.
 // TODO: addConnections has a long section where we dial and prime the connections.
 // Currently, we are taking dialMu() throughout the section and dialMu() is also required for
@@ -888,10 +1059,15 @@ func (p *BigtableChannelPool) addConnections(increaseDelta, maxConns int) bool {
 
 	// LONG SECTION<END>
 
-	// add now
+	// add now — re-index every entry so its connEntry.index matches its
+	// position in the combined slice, keeping the channelz pick-hint
+	// indices stable per pool size.
 	combinedConns := make([]*connEntry, numCurrent+len(newEntries))
 	copy(combinedConns, currentConns)
 	copy(combinedConns[numCurrent:], newEntries)
+	for i, e := range combinedConns {
+		e.index = i
+	}
 	p.conns.Store(&combinedConns)
 
 	btopt.Debugf(p.logger, "bigtable_connpool: Added %d connections, new size: %d\n", numCurrent+len(newEntries), len(combinedConns))
@@ -958,6 +1134,10 @@ func (p *BigtableChannelPool) removeConnections(decreaseDelta, minConns, maxRemo
 		if !entry.isDraining() {
 			connsToKeep = append(connsToKeep, entry)
 		}
+	}
+	// Re-index so connEntry.index stays aligned with slice position.
+	for i, e := range connsToKeep {
+		e.index = i
 	}
 
 	p.conns.Store(&connsToKeep) // new slice

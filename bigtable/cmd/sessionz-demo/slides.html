@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Bigtable Debug UI — sessionz / channelz / configz</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: #1a1a1a; color: #f0f0f0;
+    overflow: hidden;
+  }
+  .deck { height: 100%; position: relative; }
+  .slide {
+    position: absolute; inset: 0;
+    display: none;
+    flex-direction: column;
+    padding: 3em 4em 1.5em 4em;
+    box-sizing: border-box;
+  }
+  .slide.active { display: flex; }
+  h1 { font-size: 2.4em; margin: 0 0 .3em 0; color: #61afef; font-weight: 700; }
+  h2 { font-size: 1.05em; margin: 0 0 1.5em 0; color: #888; font-weight: 400; letter-spacing: .04em; }
+  h3 { font-size: 1.1em; margin: 1.4em 0 .6em 0; color: #e5c07b; }
+  ul, ol { line-height: 1.65; font-size: 1.05em; }
+  li { margin-bottom: .35em; }
+  code, .mono { font-family: ui-monospace, "JetBrains Mono", Consolas, monospace; font-size: .92em; color: #98c379; }
+  .ascii {
+    font-family: ui-monospace, "JetBrains Mono", Consolas, monospace;
+    background: #0f0f0f;
+    color: #d4d4d4;
+    padding: 1em 1.2em;
+    border-radius: 6px;
+    border-left: 3px solid #61afef;
+    font-size: .82em;
+    line-height: 1.35;
+    white-space: pre;
+    overflow-x: auto;
+    box-shadow: inset 0 0 12px rgba(0, 0, 0, .4);
+  }
+  .grid2 {
+    display: grid;
+    grid-template-columns: 1fr 1.2fr;
+    gap: 1.5em;
+    align-items: start;
+  }
+  .nav {
+    position: fixed; bottom: 1em; right: 1.5em;
+    font-family: ui-monospace, monospace;
+    font-size: .8em; color: #555;
+  }
+  .url {
+    color: #c678dd;
+    font-family: ui-monospace, monospace;
+    font-size: .92em;
+  }
+  .tag {
+    display: inline-block;
+    background: #313640; color: #61afef;
+    padding: .15em .55em;
+    border-radius: 3px;
+    font-size: .8em;
+    margin-right: .4em;
+    font-family: ui-monospace, monospace;
+  }
+  .tag.green { background: #2c3a2c; color: #98c379; }
+  .tag.amber { background: #3a352c; color: #e5c07b; }
+  .tag.red { background: #3a2c2c; color: #e06c75; }
+  .title-slide {
+    justify-content: center; align-items: center; text-align: center;
+  }
+  .title-slide h1 { font-size: 3.4em; }
+  .title-slide h2 { font-size: 1.4em; color: #abb2bf; }
+  .title-slide .meta { margin-top: 3em; color: #555; font-size: .9em; }
+  .footer { margin-top: auto; padding-top: 1.5em; color: #555; font-size: .8em; }
+  hr { border: none; border-top: 1px dashed #333; margin: 1em 0; }
+</style>
+</head>
+<body>
+
+<div class="deck">
+
+  <!-- Slide 1 -->
+  <section class="slide title-slide active">
+    <h1>Bigtable Session Debug UI</h1>
+    <h2>sessionz · channelz · configz</h2>
+    <p style="max-width: 36em; line-height: 1.6;">
+      A channelz-style, zero-JS debug UI for the Bigtable Go data client's
+      session-based transport. Live state of every session pool, gRPC channel,
+      and server-driven configuration — all from atomic counters already on
+      the hot path. <strong>No new goroutines, no performance hit.</strong>
+    </p>
+    <div class="meta">
+      Mount: <code>http.Handle("/debug/sessionz/", http.StripPrefix("/debug/sessionz", sessionz.Handler(client)))</code><br>
+      Branch: <code>feat/bigtable-sessionz-debug</code>
+    </div>
+  </section>
+
+  <!-- Slide 2 -->
+  <section class="slide">
+    <h1>sessionz</h1>
+    <h2>Per-pool / per-session state — drill into any pool to see who's serving what</h2>
+    <div class="grid2">
+      <div>
+        <h3>What it shows</h3>
+        <ul>
+          <li><span class="tag">pool identity</span> <code>{ProtoType}Pool-{id} [PERMISSION]</code> e.g. <code>OpenTablePool-1 [READ]</code></li>
+          <li><span class="tag">pool</span> sizes, picker, scale history</li>
+          <li><span class="tag green">per session</span> state, PeerInfo (AFE region/subzone, GFE id, transport type)</li>
+          <li><span class="tag green">RPCs</span> OK / errors / retries, msgs sent/recv <em>(click for type breakdown)</em></li>
+          <li><span class="tag amber">latency</span> p50 / p95 / p99 from server-reported BackendLatency</li>
+          <li><span class="tag amber">cluster routing</span> tally per ClusterId</li>
+          <li><span class="tag">lifecycle</span> opened / closed / close reasons / config-listener fires</li>
+          <li><span class="tag red">slow vRPCs</span> last 100 calls over threshold</li>
+          <li><span class="tag">sparklines</span> ok/s, err/s, session count, last 5 min</li>
+          <li><span class="tag">churn histogram</span> session lifetimes bucketed &lt;10s … ≥24h</li>
+          <li><span class="tag">OpenSessionRequest</span> proto rendered as JSON</li>
+        </ul>
+      </div>
+      <div class="ascii">Pool OpenTablePool-1 [READ]   picker RandomPicker   5 ready / 0 starting
+
+Sessions opened 12   Sessions closed 7   Close reasons [7 total ▾]
+BackendLatency  p50 720µs · p95 1.04ms · p99 6.2ms  (n=412)
+Clusters        [test-sushanb-c1: 412 ▾]
+sessions ▁▂▃▄▄▅▅▆  ok/s ▂▃▃▄▄▄▃▃  err/s ▁▁▁▁▁▁▁▁
+
+OpenSessionRequest ▸ OpenTableRequest (protocol v1)  — click to expand
+  { "table_name": "projects/p/instances/i/tables/sushanb",
+    "permission": "PERMISSION_READ" }
+
+┌─────────────┬────────┬───────────┬────────┬────┬─────┬─────┐
+│ Session     │ State  │ Transport │ Ch #   │ OK │ Err │ p99 │
+├─────────────┼────────┼───────────┼────────┼────┼─────┼─────┤
+│ read-1      │ Active │ DIRECT    │ 0 →    │ 67 │   0 │ 1ms │
+│ read-2      │ Active │ DIRECT    │ 1 →    │ 71 │   0 │ 1ms │
+│ read-3      │ Active │ DIRECT    │ 1 →    │ 63 │   0 │ 2ms │
+└─────────────┴────────┴───────────┴────────┴────┴─────┴─────┘</div>
+    </div>
+    <div class="footer">URL <span class="url">/debug/sessionz/</span> · JSON shortcut on every page</div>
+  </section>
+
+  <!-- Slide 3 -->
+  <section class="slide">
+    <h1>channelz</h1>
+    <h2>Per-pool gRPC channel inventory — classic data path + dedicated session path</h2>
+    <div class="grid2">
+      <div>
+        <h3>What it shows</h3>
+        <ul>
+          <li><span class="tag">pool</span> LB policy, instance, app profile, channel count</li>
+          <li><span class="tag green">per channel</span> gRPC state, ALTS / IP, draining flag</li>
+          <li><span class="tag">load</span> outstanding unary / streaming, picks, errors, age</li>
+          <li><span class="tag amber">last activity</span> distinguishes idle vs working</li>
+          <li><span class="tag">sessions on me</span> reverse lookup of every session riding this channel — clicks back into sessionz</li>
+        </ul>
+        <h3>Bidirectional with sessionz</h3>
+        <ul>
+          <li>sessionz <code>Ch #</code> → <code>channelz#channel-session-2</code></li>
+          <li>channelz <code>Sessions</code> col → matches a session in any <code>OpenTablePool-N</code> / <code>OpenAuthorizedViewPool-N</code> / <code>OpenMaterializedViewPool-N</code></li>
+        </ul>
+      </div>
+      <div class="ascii">session pool   lb=RoundRobin   channels=4
+↳ powers OpenTablePool-1 [READ]  +  OpenTablePool-2 [WRITE]
+
+┌──┬───────┬──────┬────┬───────────┬────┬─────┬─────────────────────┐
+│ #│ state │ ALTS │ IP │ in-flight │Pks │ Err │ Sessions            │
+├──┼───────┼──────┼────┼───────────┼────┼─────┼─────────────────────┤
+│ 0│ READY │  ✓   │ip4 │   3 / 1   │248 │   0 │ read-3,             │
+│  │       │      │    │           │    │     │  write-3, write-2   │
+│ 1│ READY │  ✓   │ip4 │   0 / 2   │246 │   0 │ write-5, write-4    │
+│ 2│ READY │  ✓   │ip4 │  10 / 4   │249 │   0 │ read-5, read-4,     │
+│  │       │      │    │           │    │     │  write-1            │
+│ 3│ READY │  ✓   │ip4 │   0 / 0   │257 │   0 │ read-1, read-2      │
+└──┴───────┴──────┴────┴───────────┴────┴─────┴─────────────────────┘</div>
+    </div>
+    <div class="footer">URL <span class="url">/debug/channelz/</span></div>
+  </section>
+
+  <!-- Slide 4 -->
+  <section class="slide">
+    <h1>configz + Diverter + Lifecycle</h1>
+    <h2>Server-driven config &amp; the new SessionState machine</h2>
+    <div class="grid2">
+      <div>
+        <h3>configz — the server's voice</h3>
+        <ul>
+          <li>Latest <code>GetClientConfiguration</code> response rendered as protojson</li>
+          <li>Instance, app profile, config-seq, fetched-ago, validity window</li>
+          <li>Last 100 polls (time, duration, OK/error code)</li>
+          <li>"Polls stopped 4 minutes ago" jumps out at a glance</li>
+        </ul>
+
+        <h3>Diverter</h3>
+        <ul>
+          <li>Target <code>SessionLoad</code> 0.0 – 1.0 from the control plane</li>
+          <li>Running pick totals: <code>session_picks / classic_picks</code></li>
+          <li>Actual ratio computed from totals — catches drift from target</li>
+        </ul>
+      </div>
+      <div>
+        <h3>SessionState lifecycle (matches Java)</h3>
+        <div class="ascii">  New → Starting → Active
+                   ↓
+                Closing ── drain admitted vRPCs
+                   ↓
+          WaitServerClose ── CloseSession sent
+                   ↓
+                Closed</div>
+        <ul style="margin-top: 1em;">
+          <li>GoAway transitions to <code>Closing</code>, drains, sends <code>CloseSession</code>, parks in <code>WaitServerClose</code></li>
+          <li>Pool monitor force-closes sessions stuck in <code>WaitServerClose</code> &gt; 30s — bounds the case where the server forgets to EOF</li>
+          <li>Close reasons surface in sessionz: <span class="tag green">User</span> <span class="tag amber">Downsize</span> <span class="tag red">GoAway</span> <span class="tag red">MissedHeartbeat</span> <span class="tag red">Error</span></li>
+        </ul>
+      </div>
+    </div>
+    <div class="footer">URL <span class="url">/debug/configz/</span> · diverter on sessionz index · lifecycle in sessionz pool detail</div>
+  </section>
+
+</div>
+
+<div class="nav">← / → to navigate · <span id="counter">1 / 4</span></div>
+
+<script>
+  const slides = document.querySelectorAll('.slide');
+  let cur = 0;
+  const counter = document.getElementById('counter');
+  function show(i) {
+    cur = (i + slides.length) % slides.length;
+    slides.forEach((s, idx) => s.classList.toggle('active', idx === cur));
+    counter.textContent = (cur + 1) + ' / ' + slides.length;
+  }
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') show(cur + 1);
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') show(cur - 1);
+    if (e.key === 'Home') show(0);
+    if (e.key === 'End') show(slides.length - 1);
+  });
+  document.addEventListener('click', () => show(cur + 1));
+</script>
+
+</body>
+</html>

@@ -1,0 +1,219 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package internal
+
+import (
+	"math"
+	"sync"
+
+	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+)
+
+// PoolStats defines the snapshot statistics of a session pool.
+type PoolStats struct {
+	ReadyCount    int
+	StartingCount int
+	InUseCount    int
+	PendingCount  int
+}
+
+// StatsFetcher is a function type that retrieves the current PoolStats.
+type StatsFetcher func() *PoolStats
+
+// PoolSizer calculates the optimal session pool size based on workload metrics.
+//
+// Stateless mirror of the Java `PoolSizer` in google-cloud-java (see
+// java-bigtable/.../session/PoolSizer.java). Decisions are made on the
+// current snapshot only — no windowed peak tracking, no scale-down
+// cooldown, no historical state.
+//
+// The client only ever GROWS the pool proactively: growth fires when
+// CheckoutSession misses (Java's `handleNewCall`). Shrinkage is passive
+// — sessions die when the server closes them (GoAway, maxAge, error)
+// and `SessionPoolImpl.OnClose` decides whether to replace based on
+// the sizer's current delta. When the pool is overprovisioned the
+// sizer returns delta < 0, OnClose declines the replacement, and the
+// pool shrinks by exactly one. Convergence rate is bounded by
+// server-driven session churn (~5 min for a typical Bigtable server).
+//
+// This design cannot oscillate: the client never proactively kills a
+// healthy session, so a burst-then-lull traffic wave whose trough sits
+// outside any peak-window cannot trigger a mass prune followed by a
+// cold-start scale-up on the next crest — the pathology observed with
+// the previous active-scale-down design.
+type PoolSizer struct {
+	mu              sync.Mutex
+	fetcher         StatsFetcher
+	minSessions     int
+	maxSessions     int
+	headroomPct     float64 // Idle headroom as a fraction of sessions in use (e.g., 0.10 = 10%)
+	newSessionQLen  int     // server-driven per-session pending queue length; divides PendingCount
+	minIdleSessions int     // floor on the idle cushion so headroom never collapses to 0
+}
+
+const (
+	defaultNewSessionQueueLength = 10
+	defaultMinIdleSessions       = 1
+)
+
+// NewPoolSizer creates a new PoolSizer.
+func NewPoolSizer(fetcher StatsFetcher, minSessions, maxSessions int, headroomPct float64) *PoolSizer {
+	if headroomPct <= 0 {
+		headroomPct = 0.10 // Default to 10% headroom
+	}
+	return &PoolSizer{
+		fetcher:         fetcher,
+		minSessions:     minSessions,
+		maxSessions:     maxSessions,
+		headroomPct:     headroomPct,
+		newSessionQLen:  defaultNewSessionQueueLength,
+		minIdleSessions: defaultMinIdleSessions,
+	}
+}
+
+// UpdateConfig dynamically adjusts the sizer capacity bounds and headroom cushions at runtime.
+func (s *PoolSizer) UpdateConfig(config *spb.SessionClientConfiguration_SessionPoolConfiguration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.minSessions = int(config.MinSessionCount)
+	s.maxSessions = int(config.MaxSessionCount)
+	s.headroomPct = float64(config.Headroom)
+	if nsql := int(config.GetNewSessionQueueLength()); nsql > 0 {
+		s.newSessionQLen = nsql
+	}
+}
+
+// ScaleDecision is the full decision trace from one evaluation of the
+// sizer. Every input, every intermediate value, plus the final delta
+// and the reason it landed where it did. Surfaced in ScalingEvent so
+// operators can answer "WHY did the sizer choose this?" without
+// re-running the math by hand.
+type ScaleDecision struct {
+	// Inputs (copy of PoolStats at the moment of decision)
+	ReadyCount    int
+	StartingCount int
+	InUseCount    int
+	PendingCount  int // pool-boundary waiters
+
+	// Sizer config snapshot
+	MinSessions     int
+	MaxSessions     int
+	HeadroomPct     float64
+	NewSessionQLen  int
+	MinIdleSessions int
+
+	// Intermediates
+	EffectivePending  int // ceil(PendingCount / NewSessionQLen)
+	SessionsInUse     int // InUseCount + EffectivePending
+	IdleHeadroom      int // max(MinIdleSessions, ceil(SessionsInUse * HeadroomPct))
+	DesiredRaw        int // SessionsInUse + IdleHeadroom (pre-clamp)
+	DesiredCapacity   int // clamped to [MinSessions, MaxSessions]
+	ImmediateCapacity int // ReadyCount
+	EventualCapacity  int // ReadyCount + StartingCount
+
+	// Final decision
+	Delta  int    // desired − eventual (scale-up) or desired − immediate (scale-down); 0 otherwise
+	Branch string // "scale-up" | "scale-down" | "dead-band" | "no-stats"
+}
+
+// GetScaleDelta evaluates the current statistics and calculates the required scaling delta.
+// Thin wrapper around Decide() that returns only the final delta — kept for callers
+// that don't need the trace.
+func (s *PoolSizer) GetScaleDelta() int {
+	return s.Decide().Delta
+}
+
+// Decide computes a full ScaleDecision from the current snapshot.
+//
+// Branch semantics match Java's PoolSizer.getScaleDelta:
+//   - scale-up   (Delta > 0): desired capacity exceeds what will be
+//     available once starting sessions finish. Caller SHOULD create
+//     `Delta` new sessions.
+//   - scale-down (Delta < 0): desired capacity is below what's already
+//     ready. Caller MUST NOT proactively kill sessions to close the gap
+//     — that's the whole point of the passive-shrink design. This
+//     branch is advisory: `OnClose` reads the delta and lets the pool
+//     shrink by one (per closed session) when the sign is negative.
+//   - dead-band  (Delta == 0): desired sits between immediate and
+//     eventual capacity — do nothing, in-flight starts will absorb any
+//     pending demand.
+//   - no-stats:  the StatsFetcher returned nil (pool not started yet).
+func (s *PoolSizer) Decide() ScaleDecision {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	d := ScaleDecision{
+		MinSessions:     s.minSessions,
+		MaxSessions:     s.maxSessions,
+		HeadroomPct:     s.headroomPct,
+		NewSessionQLen:  s.newSessionQLen,
+		MinIdleSessions: s.minIdleSessions,
+	}
+
+	stats := s.fetcher()
+	if stats == nil {
+		d.Branch = "no-stats"
+		return d
+	}
+	d.ReadyCount = stats.ReadyCount
+	d.StartingCount = stats.StartingCount
+	d.InUseCount = stats.InUseCount
+	d.PendingCount = stats.PendingCount
+
+	// effectivePending = ceil(PendingCount / NewSessionQueueLength)
+	// Java: int effectivePending = (int) Math.ceil((double) pendingRpcs.getSize() / pendingVRpcsPerSession);
+	divisor := s.newSessionQLen
+	if divisor <= 0 {
+		divisor = defaultNewSessionQueueLength
+	}
+	d.EffectivePending = int(math.Ceil(float64(stats.PendingCount) / float64(divisor)))
+	d.SessionsInUse = stats.InUseCount + d.EffectivePending
+
+	// Idle headroom as a fraction of in-use, FLOORED so a brief in-use
+	// dip can't collapse the cushion to zero.
+	d.IdleHeadroom = int(math.Ceil(float64(d.SessionsInUse) * s.headroomPct))
+	if d.IdleHeadroom < s.minIdleSessions {
+		d.IdleHeadroom = s.minIdleSessions
+	}
+	d.DesiredRaw = d.SessionsInUse + d.IdleHeadroom
+	d.DesiredCapacity = clamp(d.DesiredRaw, s.minSessions, s.maxSessions)
+
+	d.ImmediateCapacity = stats.ReadyCount
+	d.EventualCapacity = stats.ReadyCount + stats.StartingCount
+
+	switch {
+	case d.DesiredCapacity > d.EventualCapacity:
+		d.Delta = d.DesiredCapacity - d.EventualCapacity
+		d.Branch = "scale-up"
+	case d.DesiredCapacity < d.ImmediateCapacity:
+		d.Delta = d.DesiredCapacity - d.ImmediateCapacity // negative; ADVISORY
+		d.Branch = "scale-down"
+	default:
+		d.Branch = "dead-band"
+	}
+	return d
+}
+
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+

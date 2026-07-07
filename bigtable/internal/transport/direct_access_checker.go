@@ -100,17 +100,17 @@ type pingAndWarmDirectAccessChecker struct {
 	logger          *log.Logger
 }
 
-// newPingAndWarmDirectAccessChecker constructs the today-default checker.
+// NewPingAndWarmDirectAccessChecker constructs the today-default checker.
 // A nil meterProvider produces a checker that silently skips metric
 // reporting. The primer must be non-nil; the channel pool factory
 // constructs a single ChannelPrimer and shares it with both the pool (via
 // WithChannelPrimer) and this checker.
-func newPingAndWarmDirectAccessChecker(
+func NewPingAndWarmDirectAccessChecker(
 	dialer func() (*BigtableConn, error),
 	primer ChannelPrimer,
 	meterProvider metric.MeterProvider,
 	logger *log.Logger,
-) *pingAndWarmDirectAccessChecker {
+) DirectAccessChecker {
 	return &pingAndWarmDirectAccessChecker{
 		dialer:          dialer,
 		primer:          primer,
@@ -348,10 +348,10 @@ type disabledDirectAccessChecker struct {
 	daEligibleGauge metric.Int64Gauge
 }
 
-// newDisabledDirectAccessChecker constructs the always-disabled checker. The
+// NewDisabledDirectAccessChecker constructs the always-disabled checker. The
 // manually_disabled metric is recorded lazily inside CheckCompatibility so it
 // uses the pool's ctx for propagation and keeps construction side-effect-free.
-func newDisabledDirectAccessChecker(meterProvider metric.MeterProvider, logger *log.Logger) *disabledDirectAccessChecker {
+func NewDisabledDirectAccessChecker(meterProvider metric.MeterProvider, logger *log.Logger) DirectAccessChecker {
 	return &disabledDirectAccessChecker{
 		daEligibleGauge: newDirectAccessEligibleGauge(meterProvider, logger),
 	}

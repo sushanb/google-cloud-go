@@ -16,10 +16,24 @@ package internal
 
 import (
 	"fmt"
+	"strings"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"google.golang.org/protobuf/proto"
 )
+
+// resourceLeaf returns the last segment of a slash-separated resource path
+// — e.g. "sushanb" from "projects/p/instances/i/tables/sushanb". Empty
+// string when the path is empty.
+func resourceLeaf(path string) string {
+	if path == "" {
+		return ""
+	}
+	if i := strings.LastIndex(path, "/"); i >= 0 && i < len(path)-1 {
+		return path[i+1:]
+	}
+	return path
+}
 
 // SessionType represents the protocol target session type.
 type SessionType int
@@ -46,88 +60,113 @@ func (t SessionType) String() string {
 	}
 }
 
+// ProtoName returns the bare name of the inner OpenSessionRequest proto for
+// this session type — e.g. "OpenTable" — used to build human-readable
+// pool identifiers ("OpenTablePool-3 [READ]") in the debug UI.
+func (t SessionType) ProtoName() string {
+	switch t {
+	case SessionTypeTable:
+		return "OpenTable"
+	case SessionTypeAuthorizedView:
+		return "OpenAuthorizedView"
+	case SessionTypeMaterializedView:
+		return "OpenMaterializedView"
+	default:
+		return "OpenSession"
+	}
+}
+
 // SessionDescriptor models a dynamic envelope handshake parameters compiler.
 type SessionDescriptor struct {
 	Type       SessionType
 	MethodName string
 	HeaderKeys []string
 	LogNameFn  func(req proto.Message) string
-	MetadataFn func(req proto.Message) map[string]string // Populates session metadata headers required for OpenSession{} RPC
+	MetadataFn func(req proto.Message) map[string]string // Dynamically populates handshake metadata headers E2E!
+	// ShortNameFn returns a compact, human-readable identifier for the
+	// resource this descriptor opens — e.g. the table leaf "sushanb" from
+	// the full "projects/.../tables/sushanb" path. Used by SessionManager
+	// to bake the resource into the pool name ("OpenTablePool-1 (sushanb)
+	// [READ]") so operators can tell two pools of the same proto type
+	// apart at a glance.
+	ShortNameFn func(req proto.Message) string
 }
 
 var (
-	// TABLE_SESSION manages standard table scoped Session streams.
+	// TABLE_SESSION manages standard table scoped connection streams.
 	TABLE_SESSION = &SessionDescriptor{
 		Type:       SessionTypeTable,
 		MethodName: "OpenTable",
 		HeaderKeys: []string{"table_name", "app_profile_id", "permission"},
 		LogNameFn: func(req proto.Message) string {
-			r, ok := req.(*spb.OpenTableRequest)
-			if !ok || r == nil {
-				return "TableSession(nil)"
-			}
+			r := req.(*spb.OpenTableRequest)
 			return fmt.Sprintf("TableSession(table=%s, app_profile=%s, perm=%s)", r.TableName, r.AppProfileId, r.Permission.String())
 		},
 		MetadataFn: func(req proto.Message) map[string]string {
-			r, ok := req.(*spb.OpenTableRequest)
-			if !ok || r == nil {
-				return nil
-			}
+			r := req.(*spb.OpenTableRequest)
 			return map[string]string{
 				"open_session.payload.table_name":     r.TableName,
 				"open_session.payload.app_profile_id": r.AppProfileId,
 				"open_session.payload.permission":     r.Permission.String(),
 			}
 		},
+		ShortNameFn: func(req proto.Message) string {
+			r := req.(*spb.OpenTableRequest)
+			return resourceLeaf(r.TableName)
+		},
 	}
 
-	// AUTHORIZED_VIEW_SESSION manages authorized view scoped Session streams.
+	// AUTHORIZED_VIEW_SESSION manages authorized view scoped connection streams.
 	AUTHORIZED_VIEW_SESSION = &SessionDescriptor{
 		Type:       SessionTypeAuthorizedView,
 		MethodName: "OpenAuthorizedView",
 		HeaderKeys: []string{"authorized_view_name", "app_profile_id", "permission"},
 		LogNameFn: func(req proto.Message) string {
-			r, ok := req.(*spb.OpenAuthorizedViewRequest)
-			if !ok || r == nil {
-				return "AuthorizedViewSession(nil)"
-			}
+			r := req.(*spb.OpenAuthorizedViewRequest)
 			return fmt.Sprintf("AuthorizedViewSession(view=%s, app_profile=%s, perm=%s)", r.AuthorizedViewName, r.AppProfileId, r.Permission.String())
 		},
 		MetadataFn: func(req proto.Message) map[string]string {
-			r, ok := req.(*spb.OpenAuthorizedViewRequest)
-			if !ok || r == nil {
-				return nil
-			}
+			r := req.(*spb.OpenAuthorizedViewRequest)
 			return map[string]string{
 				"open_session.payload.authorized_view_name": r.AuthorizedViewName,
 				"open_session.payload.app_profile_id":       r.AppProfileId,
 				"open_session.payload.permission":           r.Permission.String(),
 			}
 		},
+		ShortNameFn: func(req proto.Message) string {
+			r := req.(*spb.OpenAuthorizedViewRequest)
+			// Authorized views live under a table — surface both leafs
+			// joined by "/" so the pool name uniquely identifies the
+			// {table, view} pair without exposing the full resource path.
+			parts := strings.Split(r.AuthorizedViewName, "/")
+			n := len(parts)
+			if n >= 3 && parts[n-2] == "authorizedViews" && parts[n-4] == "tables" {
+				return parts[n-3] + "/" + parts[n-1]
+			}
+			return resourceLeaf(r.AuthorizedViewName)
+		},
 	}
 
-	// MATERIALIZED_VIEW_SESSION manages materialized view scoped Session streams (Read-Only).
+	// MATERIALIZED_VIEW_SESSION manages materialized view scoped connection streams (Read-Only).
 	MATERIALIZED_VIEW_SESSION = &SessionDescriptor{
 		Type:       SessionTypeMaterializedView,
 		MethodName: "OpenMaterializedView",
 		HeaderKeys: []string{"materialized_view_name", "app_profile_id", "permission"},
 		LogNameFn: func(req proto.Message) string {
-			r, ok := req.(*spb.OpenMaterializedViewRequest)
-			if !ok || r == nil {
-				return "MaterializedViewSession(nil)"
-			}
+			r := req.(*spb.OpenMaterializedViewRequest)
 			return fmt.Sprintf("MaterializedViewSession(view=%s, app_profile=%s, perm=%s)", r.MaterializedViewName, r.AppProfileId, r.Permission.String())
 		},
 		MetadataFn: func(req proto.Message) map[string]string {
-			r, ok := req.(*spb.OpenMaterializedViewRequest)
-			if !ok || r == nil {
-				return nil
-			}
+			r := req.(*spb.OpenMaterializedViewRequest)
 			return map[string]string{
 				"open_session.payload.materialized_view_name": r.MaterializedViewName,
 				"open_session.payload.app_profile_id":         r.AppProfileId,
 				"open_session.payload.permission":             r.Permission.String(),
 			}
+		},
+		ShortNameFn: func(req proto.Message) string {
+			r := req.(*spb.OpenMaterializedViewRequest)
+			return resourceLeaf(r.MaterializedViewName)
 		},
 	}
 )

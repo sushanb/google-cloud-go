@@ -47,8 +47,8 @@ type pingAndWarmChannelPrimer struct {
 	featureFlagsMD metadata.MD
 }
 
-// newPingAndWarmChannelPrimer constructs the today-default channel primer.
-func newPingAndWarmChannelPrimer(instanceName, appProfile string, featureFlagsMD metadata.MD) *pingAndWarmChannelPrimer {
+// NewPingAndWarmChannelPrimer constructs the today-default channel primer.
+func NewPingAndWarmChannelPrimer(instanceName, appProfile string, featureFlagsMD metadata.MD) ChannelPrimer {
 	return &pingAndWarmChannelPrimer{
 		instanceName:   instanceName,
 		appProfile:     appProfile,

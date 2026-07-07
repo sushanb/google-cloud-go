@@ -35,7 +35,7 @@ func TestPingAndWarmChannelPrimer_Prime(t *testing.T) {
 	t.Cleanup(func() { conn.Close() })
 
 	flagsMD := metadata.Pairs("bigtable-features", "primer-test")
-	primer := newPingAndWarmChannelPrimer(testInstanceName, testAppProfile, flagsMD)
+	primer := NewPingAndWarmChannelPrimer(testInstanceName, testAppProfile, flagsMD)
 
 	if err := primer.Prime(context.Background(), conn); err != nil {
 		t.Fatalf("Prime returned error: %v", err)
