@@ -108,8 +108,11 @@ func (t *sessionTable) ReadRow(ctx context.Context, req *btpb.SessionReadRowRequ
 		Filter: req.GetFilter(),
 	}
 	baseHandler := func(attemptCtx context.Context, request interface{}) (interface{}, error) {
+		attemptTracer := metrics.FromContext(attemptCtx)
+		attemptTracer.RecordAttemptStart()
 		result, err := readPool.Invoke(attemptCtx, t.readVRpcDesc, request)
 		stampAttempt(attemptCtx, result)
+		attemptTracer.RecordAttemptCompletion(nil, nil, err)
 		if err != nil {
 			return nil, err
 		}
@@ -170,8 +173,11 @@ func (t *sessionTable) MutateRow(ctx context.Context, req *btpb.SessionMutateRow
 		Mutations: req.GetMutations(),
 	}
 	baseHandler := func(attemptCtx context.Context, request interface{}) (interface{}, error) {
+		attemptTracer := metrics.FromContext(attemptCtx)
+		attemptTracer.RecordAttemptStart()
 		result, err := writePool.Invoke(attemptCtx, t.writeVRpcDesc, request)
 		stampAttempt(attemptCtx, result)
+		attemptTracer.RecordAttemptCompletion(nil, nil, err)
 		if err != nil {
 			return nil, err
 		}
