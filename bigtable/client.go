@@ -244,7 +244,6 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 //  3. metricsTracerFactory.shutdown — flush metrics now that no further RPCs will run.
 //  4. classicPool.Close — finally tear down the underlying connection pool.
 func (c *Client) Close() error {
-	fmt.Printf("Closing the client for project %s and instance %s\n", c.project, c.instance)
 	var errs []error
 	if c.sessionImpl != nil {
 		if err := c.sessionImpl.Close(); err != nil {
