@@ -49,6 +49,15 @@ import (
 // waiting for session".
 var ErrNoSessionsAvailable = errors.New("bigtable: no sessions available")
 
+// ErrConsecutiveFailures is returned by CheckoutSession when the pool
+// has tripped its consecutive-session-failure circuit breaker (Java
+// parity: SessionPoolImpl.popClosableRpcs, fired when consecutive
+// abnormal session closes reach ConsecutiveSessionFailureThreshold).
+// All parked waiters at trip time are woken with this sentinel so
+// callers surface the failure to the user instead of continuing to
+// block on a pool whose backend is repeatedly rejecting OpenSession.
+var ErrConsecutiveFailures = errors.New("bigtable: session pool tripped consecutive-failure threshold")
+
 // waiter is one parked CheckoutSession caller. ready is closed by
 // signalFree when this waiter is selected to wake, or by removeWaiter
 // when ctx cancellation pulls the waiter out of the queue.
@@ -58,6 +67,13 @@ var ErrNoSessionsAvailable = errors.New("bigtable: no sessions available")
 type waiter struct {
 	ready chan struct{}
 	elem  *list.Element // non-nil while enqueued; nil after dequeue
+	// err is set by the wake path (under waitersMu, before close(ready))
+	// when the waiter should fail with a specific error instead of
+	// looping back to re-pick. Today only the consecutive-failure trip
+	// path uses this (sets ErrConsecutiveFailures on every waiter it
+	// drains). A normal signalFree leaves err nil so CheckoutSession
+	// continues its retry loop.
+	err error
 }
 
 // SessionPoolImpl implements a thread-safe session pool.
@@ -120,6 +136,17 @@ type SessionPoolImpl struct {
 	// (mis)reporting sum(outstanding) as PendingCount, which equaled
 	// InUseCount and made the sizer oscillate.
 	waitersCount atomic.Int32
+
+	// consecutiveFailures counts session closes classified as abnormal
+	// by isAbnormalCloseReason since the last successful vRPC. Reset to
+	// 0 on any ok vRPC outcome (hot path — hence atomic, not p.mu).
+	// When it crosses consecutiveFailureThreshold the pool trips: every
+	// parked waiter is woken with ErrConsecutiveFailures and the
+	// counter is reset so the next round of traffic gets a fresh
+	// window. Java parity: SessionPoolImpl.consecutiveFailures /
+	// getMaxConsecutiveFailures / popClosableRpcs.
+	consecutiveFailures        atomic.Int32
+	consecutiveFailureThreshold atomic.Int32
 
 	// m owns every observability-only field — counters, ring buffers,
 	// histograms. Extracted into a sub-struct so this definition shows
@@ -213,9 +240,16 @@ func (p *SessionPoolImpl) releaseSession(sh *SessionHandle) {
 }
 
 // recordVRpcOutcome updates the AFE's PeakEwma trackers with an OK
-// vRPC's e2e and backend latencies. Non-OK is a no-op (Java parity).
+// vRPC's e2e and backend latencies. Non-OK is a no-op for the picker
+// (Java parity). A successful vRPC also resets the pool's consecutive-
+// failure counter — SessionPoolImpl.java:488 does the equivalent on
+// any successful session-close path; we key on vRPC success instead
+// because that's the strongest "backend is healthy" signal we have.
 func (p *SessionPoolImpl) recordVRpcOutcome(sh *SessionHandle, e2e, backend time.Duration, ok bool) {
 	p.sl.RecordVRpcOutcome(sh, e2e, backend, ok)
+	if ok {
+		p.consecutiveFailures.Store(0)
+	}
 }
 
 // readyCount returns the count of Ready-state handles — the scale-up
@@ -278,6 +312,10 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 	// with the server-driven ceiling (default 50) and penalty
 	// (default 60s) before the pool serves real traffic.
 	pool.budget = NewAdaptiveSessionThrottler(10, 10*time.Second)
+	// Bootstrap consecutive-failure threshold. Java default is 10.
+	// UpdateConfig overwrites this with the server-driven value on
+	// the same registration path.
+	pool.consecutiveFailureThreshold.Store(10)
 
 	return pool
 }
@@ -370,6 +408,12 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 			return nil, fmt.Errorf("%w: %w", ErrNoSessionsAvailable, ctx.Err())
 		case <-w.ready:
 			p.waitersCount.Add(-1)
+			// A poisoned wake (drainWaitersWithErr) sets w.err before
+			// closing w.ready. Normal signalFree leaves it nil so the
+			// caller loops back to re-pick.
+			if w.err != nil {
+				return nil, w.err
+			}
 			// Woken by signalFree. Loop back to re-pick.
 		}
 	}
@@ -402,6 +446,30 @@ func (p *SessionPoolImpl) signalFree() {
 		close(w.ready)
 	}
 	p.waitersMu.Unlock()
+}
+
+// drainWaitersWithErr wakes every parked CheckoutSession caller with
+// the given error. Java parity: SessionPoolImpl.popClosableRpcs, which
+// drains the pool-level pendingRpcs deque and fails each with a
+// consecutive-failures status. Returns the number of waiters woken so
+// the caller can log / meter the blast radius. Safe to call with the
+// queue empty (returns 0).
+func (p *SessionPoolImpl) drainWaitersWithErr(err error) int {
+	p.waitersMu.Lock()
+	defer p.waitersMu.Unlock()
+	n := 0
+	for {
+		e := p.waiters.Front()
+		if e == nil {
+			return n
+		}
+		w := e.Value.(*waiter)
+		p.waiters.Remove(e)
+		w.elem = nil
+		w.err = err
+		close(w.ready)
+		n++
+	}
 }
 
 // Stats returns the current operational statistics of the session pool.
@@ -456,6 +524,15 @@ func (p *SessionPoolImpl) UpdateConfig(config *spb.SessionClientConfiguration_Se
 	if budget := int(config.GetNewSessionCreationBudget()); budget > 0 {
 		penalty := config.GetNewSessionCreationPenalty().AsDuration()
 		p.budget.UpdateConfig(budget, penalty)
+	}
+
+	// Consecutive-failure threshold: Java parity
+	// SessionPoolImpl.getMaxConsecutiveFailures. Server-driven cap on
+	// how many back-to-back abnormal session closes the pool tolerates
+	// before failing all parked waiters. Zero/negative means "no
+	// change" — the bootstrap default (10) stays in force.
+	if thr := config.GetConsecutiveSessionFailureThreshold(); thr > 0 {
+		p.consecutiveFailureThreshold.Store(thr)
 	}
 }
 

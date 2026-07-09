@@ -149,10 +149,11 @@ const (
 	tagSessionVRPCDuplicateResult    = "session_vrpc_duplicate_result"
 
 	// Pool-scoped anomalies.
-	tagSessionPoolStuckSessionSwept = "session_pool_stuck_session_swept"
-	tagSessionPoolDrainTimeout      = "session_pool_drain_timeout"
-	tagSessionPoolCreateFailed      = "session_pool_create_failed"
-	tagSessionPoolPickLostRace      = "session_pool_pick_lost_race"
+	tagSessionPoolStuckSessionSwept          = "session_pool_stuck_session_swept"
+	tagSessionPoolDrainTimeout               = "session_pool_drain_timeout"
+	tagSessionPoolCreateFailed               = "session_pool_create_failed"
+	tagSessionPoolPickLostRace               = "session_pool_pick_lost_race"
+	tagSessionPoolConsecutiveFailuresTripped = "session_pool_consecutive_failures_tripped"
 
 	// Client configuration polling.
 	tagClientConfigPollFailed     = "client_config_poll_failed"

@@ -327,6 +327,12 @@ func (p *SessionPoolImpl) OnClose(s *Session, err error) {
 		// A session that was never promoted to active still counts toward
 		// the close ledger — bumpStartingClose is the once-flag path.
 		p.bumpStartingClose(s)
+		// A start that never reached Active but failed abnormally still
+		// contributes to the consecutive-failure signal. createSession
+		// already routes the OpenSession error through budget.Release
+		// (which applies the creation penalty); this counter is the
+		// separate "did any session make progress" signal Java tracks.
+		p.noteAbnormalCloseIfAny(s)
 		return
 	}
 	p.mu.Unlock()
@@ -337,6 +343,36 @@ func (p *SessionPoolImpl) OnClose(s *Session, err error) {
 	// recordSessionClose is once-guarded via s.poolCloseRecorded — safe
 	// to call even when OnClosing already invoked it.
 	p.recordSessionClose(s, "")
+	p.noteAbnormalCloseIfAny(s)
+}
+
+// noteAbnormalCloseIfAny bumps the consecutive-failure counter when
+// the session's final close reason classifies as abnormal (same gate
+// the debug tracer uses for tagSessionAbnormalClose). When the counter
+// crosses consecutiveFailureThreshold, every parked waiter is woken
+// with ErrConsecutiveFailures and the counter is reset. Java parity:
+// SessionPoolImpl.handleSessionClose lines 572-586.
+func (p *SessionPoolImpl) noteAbnormalCloseIfAny(s *Session) {
+	if !isAbnormalCloseReason(s.CloseReason()) {
+		return
+	}
+	n := p.consecutiveFailures.Add(1)
+	threshold := p.consecutiveFailureThreshold.Load()
+	if threshold <= 0 || n < threshold {
+		return
+	}
+	// Reset before draining so a concurrent OnClose crossing the
+	// threshold again doesn't double-drain the queue. CAS guards
+	// against two goroutines both seeing n == threshold and both
+	// draining. The loser exits after the CAS fails; the winner
+	// drains and logs.
+	if !p.consecutiveFailures.CompareAndSwap(n, 0) {
+		return
+	}
+	woken := p.drainWaitersWithErr(ErrConsecutiveFailures)
+	if woken > 0 {
+		recordDebugTag(tagSessionPoolConsecutiveFailuresTripped)
+	}
 }
 
 // StartHeartbeat begins the background scaling watchdog evaluation loop.
