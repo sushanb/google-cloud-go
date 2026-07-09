@@ -16,6 +16,7 @@ package internal
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -25,10 +26,15 @@ type SessionThrottler interface {
 	Acquire(ctx context.Context) error
 	// Release returns a token back to the throttler, registering a penalty duration hold-off on failure.
 	Release(success bool)
+	// UpdateConfig swaps the concurrency ceiling and failure-penalty
+	// duration at runtime (driven by ClientConfigurationManager polls).
+	// New penalty applies to failures observed after the call; already-
+	// scheduled hold-offs keep their original expiry.
+	UpdateConfig(maxConcurrent int, penalty time.Duration)
 	// Snapshot exposes the throttler's current state for the debug UI:
-	// InUse is the number of tokens currently held by in-flight creations,
-	// Capacity is the total semaphore size, PenaltyDuration is the hold-off
-	// applied to a failed-creation token before it returns to the pool.
+	// InUse is the number of tokens currently held (in-flight creations
+	// plus not-yet-expired failure hold-offs), Capacity is the ceiling,
+	// PenaltyDuration is the hold-off applied to a failed-creation token.
 	Snapshot() ThrottlerSnapshot
 }
 
@@ -39,48 +45,151 @@ type ThrottlerSnapshot struct {
 	PenaltyDuration time.Duration
 }
 
-// AdaptiveSessionThrottler implements a concurrency governor with adaptive failure penalties using a channel semaphore.
+// AdaptiveSessionThrottler is a concurrency governor with adaptive
+// failure penalties. Semantics match Java's SessionCreationBudget
+// (google-cloud-java: SessionCreationBudget.java): a failed OpenSession
+// keeps its slot reserved for penaltyDuration before returning it to
+// the pool, so repeated failures throttle further attempts. Unlike a
+// chan-based semaphore, the counter+slice representation lets
+// UpdateConfig raise or lower the ceiling without leaking in-flight
+// callers or orphaning a channel.
 type AdaptiveSessionThrottler struct {
-	sem             chan struct{}
+	mu              sync.Mutex
+	cond            *sync.Cond
+	maxConcurrent   int
 	penaltyDuration time.Duration
+	inUse           int         // active creations holding a token
+	penalties       []time.Time // sorted-ish expirations of failure hold-offs
+
+	nowFn func() time.Time // injectable for tests
 }
 
 // NewAdaptiveSessionThrottler creates a new SessionThrottler implemented by AdaptiveSessionThrottler.
 func NewAdaptiveSessionThrottler(maxConcurrent int, penaltyDuration time.Duration) SessionThrottler {
-	return &AdaptiveSessionThrottler{
-		sem:             make(chan struct{}, maxConcurrent),
+	t := &AdaptiveSessionThrottler{
+		maxConcurrent:   maxConcurrent,
 		penaltyDuration: penaltyDuration,
+		nowFn:           time.Now,
 	}
+	t.cond = sync.NewCond(&t.mu)
+	return t
 }
 
-// Acquire blocks context-safely until a session creation token is available or ctx is done.
+// Acquire blocks until a token is available or ctx is done. Fairness is
+// FIFO under sync.Cond broadcast, which is close enough for a creation
+// path that fires at most a few times per second.
 func (b *AdaptiveSessionThrottler) Acquire(ctx context.Context) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case b.sem <- struct{}{}:
+	// Fast path + ctx wake: run the wait on a helper goroutine so ctx
+	// cancellation can interrupt it via cond.Broadcast. We only spawn
+	// the watcher if we actually have to wait.
+	b.mu.Lock()
+	if b.tryAcquireLocked() {
+		b.mu.Unlock()
 		return nil
 	}
-}
 
-// Release releases a token back to the throttler, registering a penalty duration hold-off on failure.
-func (b *AdaptiveSessionThrottler) Release(success bool) {
-	if success {
-		<-b.sem
-	} else {
-		// Hold the token for b.penaltyDuration before releasing it to protect the backend AFE
-		time.AfterFunc(b.penaltyDuration, func() {
-			<-b.sem
-		})
+	// Set up ctx-driven wake before dropping the lock so the watcher
+	// can't race ahead of our Wait.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			b.mu.Lock()
+			b.cond.Broadcast()
+			b.mu.Unlock()
+		case <-done:
+		}
+	}()
+
+	for {
+		if ctx.Err() != nil {
+			b.mu.Unlock()
+			return ctx.Err()
+		}
+		if b.tryAcquireLocked() {
+			b.mu.Unlock()
+			return nil
+		}
+		b.cond.Wait()
 	}
 }
 
-// Snapshot returns the throttler's current state. len(sem) is the number of
-// in-flight creations holding a token; cap(sem) is the configured ceiling.
+// tryAcquireLocked drains expired penalties, then reserves a slot if
+// one is free. Caller holds b.mu.
+func (b *AdaptiveSessionThrottler) tryAcquireLocked() bool {
+	b.drainPenaltiesLocked()
+	if b.inUse+len(b.penalties) >= b.maxConcurrent {
+		return false
+	}
+	b.inUse++
+	return true
+}
+
+// Release returns a token. On success the slot is freed immediately.
+// On failure the slot is held for penaltyDuration (as of Release time),
+// then reclaimed on the next Acquire. Java parity:
+// SessionCreationBudget.onSessionCreationSuccess / onSessionCreationFailure.
+func (b *AdaptiveSessionThrottler) Release(success bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.inUse > 0 {
+		b.inUse--
+	}
+	if !success && b.penaltyDuration > 0 {
+		b.penalties = append(b.penalties, b.nowFn().Add(b.penaltyDuration))
+	}
+	// A slot may have just opened up (success) or the ceiling may have
+	// grown since the waiter parked (UpdateConfig). Wake everyone; the
+	// loop re-checks under the lock.
+	b.cond.Broadcast()
+}
+
+// UpdateConfig hot-swaps the ceiling and penalty. Called from
+// SessionPoolImpl.UpdateConfig on every config-manager fire.
+func (b *AdaptiveSessionThrottler) UpdateConfig(maxConcurrent int, penalty time.Duration) {
+	if maxConcurrent <= 0 {
+		return
+	}
+	b.mu.Lock()
+	grew := maxConcurrent > b.maxConcurrent
+	b.maxConcurrent = maxConcurrent
+	if penalty >= 0 {
+		b.penaltyDuration = penalty
+	}
+	if grew {
+		b.cond.Broadcast()
+	}
+	b.mu.Unlock()
+}
+
+// Snapshot returns the current state. InUse counts both live creations
+// and unexpired failure hold-offs, so the debug page can distinguish
+// "budget fully consumed by real work" from "budget burned by penalty
+// tokens" by comparing to the live inUse counter (surfaced via
+// SessionPoolImpl.Stats().StartingCount, which is the same population
+// as inUse minus penalties).
 func (b *AdaptiveSessionThrottler) Snapshot() ThrottlerSnapshot {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.drainPenaltiesLocked()
 	return ThrottlerSnapshot{
-		InUse:           len(b.sem),
-		Capacity:        cap(b.sem),
+		InUse:           b.inUse + len(b.penalties),
+		Capacity:        b.maxConcurrent,
 		PenaltyDuration: b.penaltyDuration,
 	}
+}
+
+func (b *AdaptiveSessionThrottler) drainPenaltiesLocked() {
+	if len(b.penalties) == 0 {
+		return
+	}
+	now := b.nowFn()
+	kept := b.penalties[:0]
+	for _, t := range b.penalties {
+		if t.After(now) {
+			kept = append(kept, t)
+		}
+	}
+	b.penalties = kept
 }

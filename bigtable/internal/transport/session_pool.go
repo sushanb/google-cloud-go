@@ -273,6 +273,10 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 	// wiring. Single source of truth for the LBO → picker mapping lives
 	// in pickerFromLoadBalancing.
 	pool.picker = pickerFromLoadBalancing(nil)
+	// Bootstrap budget with the "no config yet" fallback. Same
+	// UpdateConfig-on-registration path as the picker replaces this
+	// with the server-driven ceiling (default 50) and penalty
+	// (default 60s) before the pool serves real traffic.
 	pool.budget = NewAdaptiveSessionThrottler(10, 10*time.Second)
 
 	return pool
@@ -442,6 +446,17 @@ func (p *SessionPoolImpl) UpdateConfig(config *spb.SessionClientConfiguration_Se
 
 	// Dynamically update sizer thresholds E2E!
 	p.sizer.UpdateConfig(config)
+
+	// Budget: the throttler was bootstrapped with a placeholder in
+	// NewSessionPoolImpl. Every real caller registers with
+	// ClientConfigurationManager which fires UpdateConfig synchronously,
+	// so this is where the server-driven ceiling + penalty actually
+	// take effect. Java parity: SessionCreationBudget.updateConfig
+	// (SessionCreationBudget.java:129).
+	if budget := int(config.GetNewSessionCreationBudget()); budget > 0 {
+		penalty := config.GetNewSessionCreationPenalty().AsDuration()
+		p.budget.UpdateConfig(budget, penalty)
+	}
 }
 
 // pickerFromLoadBalancing builds an AfePicker from server-driven
