@@ -191,3 +191,78 @@ func TestSessionTableReadRow_RetriesRecordAttemptPerAttempt(t *testing.T) {
 	assertSamples(t, reader, "attempt_latencies2", 3)
 	assertSamples(t, reader, "operation_latencies", 1)
 }
+
+// TestSessionTable_MatView_MutateRowReturnsErrWriteNotSupported verifies
+// SESSION_SPEC.md #11: MaterializedView is read-only by contract. When
+// constructed with a nil writeInv (which OpenMaterializedView passes for
+// openWrite in client.go:415), MutateRow MUST return ErrWriteNotSupported
+// — NOT a generic "no pool" error, and NOT panic.
+func TestSessionTable_MatView_MutateRowReturnsErrWriteNotSupported(t *testing.T) {
+	readInv := &fakeInvoker{result: btransport.InvokeResult{Response: &btpb.SessionReadRowResponse{}}}
+	// writeInv=nil mirrors OpenMaterializedView's construction path.
+	tbl, _ := newTestTable(t, readInv, nil)
+
+	_, err := tbl.MutateRow(context.Background(), &btpb.SessionMutateRowRequest{
+		Key: []byte("row1"),
+		Mutations: []*btpb.Mutation{{
+			Mutation: &btpb.Mutation_SetCell_{SetCell: &btpb.Mutation_SetCell{
+				FamilyName:      "cf",
+				ColumnQualifier: []byte("q"),
+				TimestampMicros: 1_000_000,
+				Value:           []byte("v"),
+			}},
+		}},
+	})
+	if err == nil {
+		t.Fatal("MutateRow on read-only (MatView-shape) table returned nil, want ErrWriteNotSupported")
+	}
+	if err != ErrWriteNotSupported {
+		t.Errorf("err = %v, want ErrWriteNotSupported (SESSION_SPEC.md #11)", err)
+	}
+	// Read side must still work — MatView is read-only, not fully disabled.
+	if _, rerr := tbl.ReadRow(context.Background(), &btpb.SessionReadRowRequest{Key: []byte("row1")}); rerr != nil {
+		t.Errorf("ReadRow on MatView table = %v, want nil (read path must remain functional)", rerr)
+	}
+}
+
+// TestSessionTable_ReadAndWritePoolsDoNotShareSessions verifies
+// SESSION_SPEC.md #11: read and write pools are distinct. ReadRow MUST
+// dispatch through the READ Invoker; MutateRow MUST dispatch through the
+// WRITE Invoker; the two MUST NOT cross-invoke. This is what keeps the
+// multiplex=1 rule (spec #2) from starving cross-direction traffic.
+func TestSessionTable_ReadAndWritePoolsDoNotShareSessions(t *testing.T) {
+	readInv := &fakeInvoker{result: btransport.InvokeResult{Response: &btpb.SessionReadRowResponse{}}}
+	writeInv := &fakeInvoker{result: btransport.InvokeResult{Response: &btpb.SessionMutateRowResponse{}}}
+	tbl, _ := newTestTable(t, readInv, writeInv)
+
+	if _, err := tbl.ReadRow(context.Background(), &btpb.SessionReadRowRequest{Key: []byte("row1")}); err != nil {
+		t.Fatalf("ReadRow: %v", err)
+	}
+	if got, want := readInv.callCount(), 1; got != want {
+		t.Errorf("readInv.calls after ReadRow = %d, want %d", got, want)
+	}
+	if got := writeInv.callCount(); got != 0 {
+		t.Errorf("writeInv.calls after ReadRow = %d, want 0 — write pool MUST NOT receive read traffic", got)
+	}
+
+	req := &btpb.SessionMutateRowRequest{
+		Key: []byte("row1"),
+		Mutations: []*btpb.Mutation{{
+			Mutation: &btpb.Mutation_SetCell_{SetCell: &btpb.Mutation_SetCell{
+				FamilyName:      "cf",
+				ColumnQualifier: []byte("q"),
+				TimestampMicros: 1_000_000,
+				Value:           []byte("v"),
+			}},
+		}},
+	}
+	if _, err := tbl.MutateRow(context.Background(), req); err != nil {
+		t.Fatalf("MutateRow: %v", err)
+	}
+	if got, want := writeInv.callCount(), 1; got != want {
+		t.Errorf("writeInv.calls after MutateRow = %d, want %d", got, want)
+	}
+	if got := readInv.callCount(); got != 1 {
+		t.Errorf("readInv.calls after MutateRow = %d, want still 1 — read pool MUST NOT receive write traffic", got)
+	}
+}

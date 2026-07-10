@@ -257,3 +257,129 @@ func TestTableShim_ReadRows_AlwaysClassic(t *testing.T) {
 		t.Errorf("classic.ReadRows calls = %d, want 1 (ReadRows always goes classic)", classicCalled)
 	}
 }
+
+// TestTableShim_SampleRowKeys_AlwaysClassic — spec #14: no vRPC equivalent.
+func TestTableShim_SampleRowKeys_AlwaysClassic(t *testing.T) {
+	classicCalled := 0
+	classic := &mockClassicTable{
+		sampleFn: func(ctx context.Context) ([]string, error) {
+			classicCalled++
+			return []string{"a", "b"}, nil
+		},
+	}
+	shim := NewTableShim(classic, &mockSessionTable{}, btransport.NewDiverter(1.0))
+	if _, err := shim.SampleRowKeys(context.Background()); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if classicCalled != 1 {
+		t.Errorf("classic.SampleRowKeys calls = %d, want 1 (no vRPC equivalent)", classicCalled)
+	}
+}
+
+// TestTableShim_ApplyBulk_AlwaysClassic — spec #14: no vRPC equivalent.
+func TestTableShim_ApplyBulk_AlwaysClassic(t *testing.T) {
+	classicCalled := 0
+	classic := &mockClassicTable{
+		applyBulkFn: func(ctx context.Context, rowKeys []string, muts []*Mutation, opts ...ApplyOption) ([]error, error) {
+			classicCalled++
+			return nil, nil
+		},
+	}
+	shim := NewTableShim(classic, &mockSessionTable{}, btransport.NewDiverter(1.0))
+	if _, err := shim.ApplyBulk(context.Background(), []string{"r1"}, []*Mutation{NewMutation()}); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if classicCalled != 1 {
+		t.Errorf("classic.ApplyBulk calls = %d, want 1 (no vRPC equivalent)", classicCalled)
+	}
+}
+
+// TestTableShim_ApplyReadModifyWrite_AlwaysClassic — spec #14: no vRPC equivalent.
+func TestTableShim_ApplyReadModifyWrite_AlwaysClassic(t *testing.T) {
+	classicCalled := 0
+	classic := &mockClassicTable{
+		rmwFn: func(ctx context.Context, row string, m *ReadModifyWrite) (Row, error) {
+			classicCalled++
+			return Row{"fam": []ReadItem{{Row: row}}}, nil
+		},
+	}
+	shim := NewTableShim(classic, &mockSessionTable{}, btransport.NewDiverter(1.0))
+	if _, err := shim.ApplyReadModifyWrite(context.Background(), "r1", NewReadModifyWrite()); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if classicCalled != 1 {
+		t.Errorf("classic.ApplyReadModifyWrite calls = %d, want 1 (no vRPC equivalent)", classicCalled)
+	}
+}
+
+// TestTableShim_NilSession_AllMethodsFallBackToClassic verifies
+// SESSION_SPEC.md #14's nil-safety contract across the full TableAPI
+// surface. The existing subtest in TestTableShim_ReadRow_RoutesByDiverter
+// only covers ReadRow — this test extends the assertion to Apply plus
+// every non-vRPC method so a future TableAPI addition is caught by
+// coverage of the shim's fallback path.
+func TestTableShim_NilSession_AllMethodsFallBackToClassic(t *testing.T) {
+	classic := &mockClassicTable{}
+	// session=nil, diverter says session (1.0) — nil-safety MUST win.
+	shim := NewTableShim(classic, nil, btransport.NewDiverter(1.0))
+
+	if _, err := shim.ReadRow(context.Background(), "r1"); err != nil {
+		t.Fatalf("ReadRow: %v", err)
+	}
+	if err := shim.Apply(context.Background(), "r1", NewMutation()); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if err := shim.ReadRows(context.Background(), RowRange{}, func(Row) bool { return true }); err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	if _, err := shim.SampleRowKeys(context.Background()); err != nil {
+		t.Fatalf("SampleRowKeys: %v", err)
+	}
+	if _, err := shim.ApplyBulk(context.Background(), []string{"r1"}, []*Mutation{NewMutation()}); err != nil {
+		t.Fatalf("ApplyBulk: %v", err)
+	}
+	if _, err := shim.ApplyReadModifyWrite(context.Background(), "r1", NewReadModifyWrite()); err != nil {
+		t.Fatalf("ApplyReadModifyWrite: %v", err)
+	}
+
+	// Every routable method must have gone classic (Apply=1, ReadRow=1);
+	// non-routable methods are trivially classic. If session were nil-unsafe,
+	// one of the two routable calls would nil-panic before reaching here.
+	if classic.readRowCalls != 1 {
+		t.Errorf("classic.readRowCalls = %d, want 1", classic.readRowCalls)
+	}
+	if classic.applyCalls != 1 {
+		t.Errorf("classic.applyCalls = %d, want 1", classic.applyCalls)
+	}
+}
+
+// TestTableShim_SessionErrorNotRetriedOnClassic verifies SESSION_SPEC.md
+// #14's retry-safety contract: a session-path error MUST propagate as-is;
+// the shim MUST NOT silently retry the failed op on the classic path.
+// Doing so would violate the retry oracle (spec #9) — a session-side
+// TransportFailure on a non-idempotent Apply is not automatically safe to
+// re-run on classic.
+func TestTableShim_SessionErrorNotRetriedOnClassic(t *testing.T) {
+	wantErr := errors.New("session apply failed")
+	classic := &mockClassicTable{}
+	session := &mockSessionTable{
+		mutateRowFn: func(ctx context.Context, req *btpb.SessionMutateRowRequest) (*btpb.SessionMutateRowResponse, error) {
+			return nil, wantErr
+		},
+	}
+	shim := NewTableShim(classic, session, btransport.NewDiverter(1.0))
+
+	mut := NewMutation()
+	mut.Set("fam", "col", 1_000_000, []byte("v"))
+	err := shim.Apply(context.Background(), "r1", mut)
+
+	if !errors.Is(err, wantErr) {
+		t.Errorf("err = %v, want unwrap to %v", err, wantErr)
+	}
+	if session.mutateRowCalls != 1 {
+		t.Errorf("session.mutateRowCalls = %d, want 1 (single attempt)", session.mutateRowCalls)
+	}
+	if classic.applyCalls != 0 {
+		t.Errorf("classic.applyCalls = %d, want 0 — shim MUST NOT retry session failure on classic (spec #14 + #9)", classic.applyCalls)
+	}
+}

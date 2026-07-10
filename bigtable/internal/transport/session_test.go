@@ -995,3 +995,61 @@ func TestStart_RejectsIfNotNew(t *testing.T) {
 		t.Error("Start on active session should return error")
 	}
 }
+
+// TestForceClose_SendsNoCloseSessionRequest verifies SESSION_SPEC.md #5:
+// ForceClose MUST NOT send a CloseSessionRequest on the wire. The stream is
+// presumed dead, so we don't wait to write. Contrast with the graceful
+// Close path (see TestClose_Graceful_NoInflightSendsCloseRequest), which
+// DOES send CloseSession as the first frame.
+func TestForceClose_SendsNoCloseSessionRequest(t *testing.T) {
+	s, stream := makeActive(t, SessionHooks{})
+
+	s.ForceClose(&spb.CloseSessionRequest{
+		Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR,
+		Description: "test-induced",
+	})
+
+	if got := s.State(); got != StateClosed {
+		t.Errorf("state = %v, want StateClosed after ForceClose", got)
+	}
+	sent := stream.snapshotSent()
+	for i, req := range sent {
+		if req.GetCloseSession() != nil {
+			t.Errorf("sent frame [%d] contains CloseSession, but ForceClose MUST NOT send CloseSessionRequest: %v", i, req)
+		}
+	}
+}
+
+// TestClose_IdempotentAcrossNCalls extends TestClose_AlreadyClosingIsNoop
+// with an N-repeat, exercising SESSION_SPEC.md #5's requirement that Close
+// be "safe to call any number of times from any goroutine/thread." A single
+// repeat wouldn't catch a bug in a counter-based idempotency check.
+func TestClose_IdempotentAcrossNCalls(t *testing.T) {
+	listener := &hookCounts{}
+	s, stream := makeActive(t, listener.hooks())
+
+	// First close is the real one (in-flight drain + CloseSessionRequest).
+	if err := s.Close(context.Background(), &spb.CloseSessionRequest{
+		Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_USER,
+	}); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	sentAfterFirst := len(stream.snapshotSent())
+
+	// N-4 additional Close calls MUST NOT panic, MUST return nil, MUST NOT
+	// send additional frames, and MUST NOT re-fire OnClose.
+	for i := 0; i < 5; i++ {
+		if err := s.Close(context.Background(), nil); err != nil {
+			t.Errorf("Close call #%d returned err = %v, want nil (spec #5: idempotent)", i+2, err)
+		}
+	}
+	if got := len(stream.snapshotSent()); got != sentAfterFirst {
+		t.Errorf("sent frame count = %d, want %d — additional Close calls MUST NOT send frames", got, sentAfterFirst)
+	}
+	// OnClose fires when the session actually reaches Closed. Depending on
+	// whether the stream saw an EOF, that may not have happened yet — but if
+	// it did fire, it must have fired exactly once.
+	if _, _, closed := listener.counts(); closed > 1 {
+		t.Errorf("OnClose fired %d times, want <= 1", closed)
+	}
+}

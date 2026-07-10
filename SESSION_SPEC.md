@@ -142,6 +142,52 @@ Additional invariants:
 - Response-side plumbing lives in the shim, not the session package: `WithFullReadStats` callbacks fire from `TableShim.ReadRow` after `protoRowToRow` converts the response.
 - Errors from either side are surfaced to the caller as-is — the shim does NOT retry a session-side failure on classic. That would violate the retry-oracle contract (spec #9): a session `TransportFailure` on a non-idempotent `Apply` is not automatically safe to re-run on classic.
 
+### 15. Debug views (all `/-z` pages) MUST NOT block hot-path latencies
+
+Every debug view — `sessionz`, `afez`, `flightz`, `loadz`, `channelz`, `configz`, `tcpz`, `debugtagsz` — is a **passive observer** of session/pool state. It MUST NOT be able to slow down a real vRPC, session Send/Recv, pool checkout/return, or heartbeat.
+
+**Concrete rules:**
+
+- **Snapshot returns a value, not a live view.** Every `SessionDebugProvider.Snapshot()`, `LoadBalancingSnapshots()`, `Diverter()`, `Snapshot()` on any provider MUST copy the state it needs under its lock and release the lock before returning. The z-page handler holds no lock while writing the HTTP response body (`debugview/sessionz.go:100-104`, `debugview/afez.go:104`, `debugview/loadz.go:125`, `debugview/configz.go:61`).
+- **Snapshots take at most an RLock, never a write lock, on any mutex held by the hot path.** `SessionPoolImpl.mu` and `sessionList.mu` are hot-path mutexes (acquired by `CheckoutSession`, `ReleaseSession`, `RecordVRpcOutcome`, `AddSession`). A snapshot method that takes the write side would serialize the hot path against a random HTTP request.
+- **No lock on `Session` is held across HTTP write.** `Session`'s ring buffer (`sessionDebug.events`) and slow-vRPC log MUST be snapshotted with a short RLock or via `atomic.*` reads, then rendered lock-free.
+- **Bounded work per request.** Ring buffers are fixed-size (session event ring, `pickHistory` at 500, `pollHistory` capped). No z-page may iterate an unbounded structure — if a snapshot would exceed a bound, it MUST truncate and mark the response with a `truncated=true` flag.
+- **Metric emission is separate from snapshot rendering.** OTel histograms/counters are recorded synchronously on the hot path by the tracer (`internal/metrics/tracer.go`) — that's the source of truth. Z-pages read those metrics via the OTel SDK's own async collection path; they MUST NOT compute derived statistics inline that would require iterating live pool state a second time.
+- **Auto-refresh cadence has a floor.** Each z-page's client-side refresh MUST be ≥ 2s (currently 2–10s per view). No page may poll faster; a 100ms refresh over 20 pools would burn measurable CPU on snapshot construction.
+- **Provider dependency is via interface, not concrete type.** Per SESSION_COMPONENT_SPEC.md B3, debug code takes `SessionDebugProvider` (and siblings), never `*SessionPoolImpl`. This is what lets snapshot semantics evolve without breaking the debug UI, and it's what makes the "no hot-path lock" invariant enforceable — the interface says "return a snapshot," not "give me a pointer to internal state."
+- **A hung z-page MUST NOT hang the process.** All snapshot methods MUST complete in bounded time even if the target pool is deadlocked (i.e. tryLock semantics or best-effort read of atomics). A z-page that blocks on `p.mu` forever, waiting on a stuck checkout, turns a debug URL into a liveness weapon.
+
+**How the mixed-mode Client stays honest.** `mixedModeSessionDebug` (`bigtable/session_debug.go:66`) MUST NOT synthesize snapshots by reaching into `*Client` internals. It composes the underlying `SessionClient`'s provider with the classic-path diverter snapshot, both accessed through interfaces. Any new mixed-mode observability field goes on the provider interface, not on `*Client`.
+
+### 16. `cluster_id` / `zone_id` / `transport peer` MUST be populated per-attempt on BOTH the classic (unary) and session (vRPC) paths, from path-specific sources
+
+Client-side metrics (attribute labels on `attempt_latencies`, `attempt_latencies2`, `operation_latencies`) MUST carry the same set of routing/identity attributes regardless of which data path served the call. Cross-path dashboards would otherwise be unusable — half the traffic would be missing `cluster_id`. But the *source* of each field differs by path, and that difference is architectural, not accidental.
+
+**Fields both paths MUST populate per attempt:**
+- `cluster_id` — Bigtable cluster that served the request.
+- `zone_id` — GCP zone of that cluster.
+- `client_uid` — stable client identity (from the metrics factory).
+- Transport peer labels — `transport_type`, `transport_region`, `transport_zone`, `transport_subzone` (from the AFE/backend PeerInfo).
+
+**Where each field comes from — classic (unary) path:**
+- **`cluster_id` + `zone_id`:** from the response's `ResponseParams` proto, packed into gRPC headers (`x-goog-cbt-cookie-*` routing cookies) and trailers by the server. Extracted per-attempt in `bigtable/internal/metrics/util.go:96-102` via `proto.Unmarshal` of the header/trailer bytes into a `btpb.ResponseParams`. Populated on the tracer's `attempt` state in `onAttemptCompletion`.
+- **Transport peer labels:** from the gRPC connection's grpc.Peer info — a per-attempt observation, potentially different across attempts even in one operation.
+- **Retry cookies:** the same `x-goog-cbt-cookie-routing-cookie` header is round-tripped as-is on the next attempt to preserve routing stickiness; that flow is separate from the metrics stamp but shares the same header.
+
+**Where each field comes from — session (vRPC) path:**
+- **`cluster_id` + `zone_id`:** from the vRPC response's typed `ClusterInformation` field, plumbed via `InvokeResult.ClusterInfo` (`session_vrpc.go:44-46, 216-219`). Stamped per-attempt on the tracer in `sessionTable.stampAttempt` → `att.SetClusterID(result.ClusterInfo.ClusterId)` / `att.SetZoneID(result.ClusterInfo.ZoneId)` (`internal/session/table.go:238-240`). **No `ResponseParams` unmarshal** — the server sends the cluster identity as a typed field on the vRPC response frame, not as an opaque header blob.
+- **Transport peer labels:** from `InvokeResult.PeerInfo` (`session_vrpc.go`), which is a pointer to the owning `Session.peerInfo` — **the same PeerInfo every attempt on the same session sees**, because it was parsed once from the `bigtable-peer-info` header at session open (spec #3). This is a real semantic difference from classic: on classic, transport peer can vary per attempt; on session, it's fixed for the session's lifetime.
+- **Retry cookies:** vRPC does not use `x-goog-cbt-cookie-routing-cookie`. Retry routing on session is a property of picker + AFE selection (spec #5's removed AFE items, preserved in SESSION_COMPONENT_SPEC.md Part C), not a header round-trip.
+
+**Consequences worth calling out:**
+
+- **A classic-path retry may hop clusters.** The `cluster_id` on attempt N-1 and attempt N may differ (routing cookie updates between attempts). Dashboards MUST NOT assume `cluster_id` is invariant across an operation.
+- **A session-path retry within the same session cannot hop backends.** All attempts on session S have identical `transport_*` labels. Retries that need a different backend must be checked out onto a different session by RetryingVRpc — an observable, dashboard-visible event.
+- **`ClusterInfo` may be nil on a session response.** Server MAY omit it on some responses (typically errors); the metric stamp gracefully skips (`session/table.go:238` guards `if result.ClusterInfo != nil`). Classic path has the same nil-guard on `ResponseParams` unmarshal.
+- **BOTH paths MUST NOT leak session-only sources into classic tracers, or vice versa.** The metrics tracer is a shared type (`internal/metrics/tracer.go`) but the *stamp sites* live in path-specific code — classic stamps from headers/trailers in the unary interceptor; session stamps from `InvokeResult` in `sessionTable.ReadRow`/`MutateRow`. Do not add a "grab ClusterInfo from wherever" utility that both call; it would collapse the source distinction and hide protocol bugs.
+
+Ownership matrix additions live in SESSION_COMPONENT_SPEC.md Part C.
+
 ---
 
 **See `SESSION_COMPONENT_SPEC.md`** for the component reference map and boundary/layering rules that prevent one component's logic from muddling into another's.

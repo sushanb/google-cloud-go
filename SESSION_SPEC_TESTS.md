@@ -23,6 +23,42 @@ All other spec items (#2–#8, #10–#14) require code that is not on this branc
 
 ---
 
+## Coverage on `feat/bigtable-sessionz-debug` (as of 2026-07-10, batch 1)
+
+Newly added in commit series after the base survey (see `SESSION_COMPONENT_SPEC.md` Part A snapshot date). All added tests were verified against the spec by the `session-reviewer` self-check pattern before commit.
+
+| Spec | Test added | File | Notes |
+|---|---|---|---|
+| #5 | `TestForceClose_SendsNoCloseSessionRequest` | `bigtable/internal/transport/session_test.go` | Asserts ForceClose sends no CloseSessionRequest frame. |
+| #5 | `TestClose_IdempotentAcrossNCalls` | `bigtable/internal/transport/session_test.go` | 5 repeat Close calls: nil returns, no extra frames, ≤1 OnClose. |
+| #11 | `TestSessionTable_MatView_MutateRowReturnsErrWriteNotSupported` | `bigtable/internal/session/table_test.go` | MatView write → `ErrWriteNotSupported`; read still works. |
+| #11 | `TestSessionTable_ReadAndWritePoolsDoNotShareSessions` | `bigtable/internal/session/table_test.go` | Read invoker gets ReadRow only; write invoker gets MutateRow only. |
+| #11 | `TestLazyPool_NilPoolAndNilOpenReturnNilNil` | `bigtable/internal/session/lazy_pool_test.go` | Nil-receiver + nil-open contract. |
+| #11 | `TestLazyPool_FailedOpenNotCached` | `bigtable/internal/session/lazy_pool_test.go` | 4 failures + 1 success ⇒ 5 open() calls (not 1). |
+| #13 | `TestManagerPoll_MinPollingIntervalClamp` | `bigtable/internal/transport/client_configuration_manager_test.go` | Server 30s → clamped to `MinPollingInterval` (1min). |
+| #14 | `TestDiverter_UseSession_LoadZero_Counters` | `bigtable/internal/transport/diverter_test.go` | Extends fast-path 0 with `SessionPicks`/`ClassicPicks` assertion. |
+| #14 | `TestDiverter_UseSession_LoadOne_Counters` | `bigtable/internal/transport/diverter_test.go` | Extends fast-path 1 with counter assertion. |
+| #14 | `TestTableShim_SampleRowKeys_AlwaysClassic` | `bigtable/table_shim_test.go` | Non-vRPC method breadth. |
+| #14 | `TestTableShim_ApplyBulk_AlwaysClassic` | `bigtable/table_shim_test.go` | Non-vRPC method breadth. |
+| #14 | `TestTableShim_ApplyReadModifyWrite_AlwaysClassic` | `bigtable/table_shim_test.go` | Non-vRPC method breadth. |
+| #14 | `TestTableShim_NilSession_AllMethodsFallBackToClassic` | `bigtable/table_shim_test.go` | Nil-safety across all 6 TableAPI methods. |
+| #14 | `TestTableShim_SessionErrorNotRetriedOnClassic` | `bigtable/table_shim_test.go` | Cross-cite to #9: shim never retries session error on classic. |
+
+**Still MISSING on this branch** (from the base survey — none yet started; require heavy fixtures):
+- #2: `TestSession_InvokeConcurrent_RejectsSecond`, `TestSession_ResponseRpcIdMismatch_Dropped`
+- #4: `TestSession_HooksFireExactlyOnce_UnderConcurrentClose`, `TestSession_HookOrdering`
+- #5: `TestSession_CloseReasonCASOnce`
+- #7: `TestSession_Heartbeat_ResetByAnyFrame` (partial gaps around request-Send / response-Recv reset)
+- #8: `TestSession_MissedHeartbeat_SequenceIsExact` (partial — needs counter + ring + hook assertions)
+- #10: `TestSession_ConcurrentInvokeAndClose_NoRace`, `TestPool_LockOrder_NoReentrantDeadlock`
+- #11: `TestSessionTable_ReadAndWritePools_DoNotShareSessions` was added; distinctness partial gap resolved
+- #12: `TestSessionClient_SharedChannelPool`, `TestSessionClient_Close_UnwindsAllPools`
+- **All #15 and #16 tests** — see the newly-added sections below.
+
+The added tests raise coverage from ~8 COVERED (survey baseline) to **~22 COVERED / PARTIAL** on this branch. The remaining ~15 pending items are the hard-fixture cluster: fake clocks, concurrent races, ast/lock-order source checks, source-provenance separation. Batch them into a follow-up when someone can dedicate time to the fixtures.
+
+---
+
 ## Pending tests for `feat/bigtable-sessionz-debug`
 
 Add these when Session + pool + shim code lands. Each row lists the minimum assertion that would enforce the spec item.
@@ -66,6 +102,27 @@ Add these when Session + pool + shim code lands. Each row lists the minimum asse
 | #14 | `TestTableShim_Apply_Conditional_AlwaysClassic` — mock both paths; call `Apply` with a conditional mutation; assert only classic; repeat with `Diverter` load=1; still only classic. | Method-shape gate. |
 | #14 | `TestTableShim_ReadRows_AlwaysClassic` (similar for `SampleRowKeys`, `ApplyBulk`, `ApplyReadModifyWrite`). | Non-vRPC methods. |
 | #14 | `TestTableShim_Errors_NotRetriedOnClassic` — session path returns a `StateTransportFailure` on a non-idempotent Apply; assert shim returns the error, does NOT retry on classic. | Retry-oracle safety. |
+
+### Debug non-blocking (#15)
+
+| Spec | Test to add | Notes |
+|---|---|---|
+| #15 | `TestSessionPoolImpl_Snapshot_DoesNotBlockCheckoutSession` — spin a goroutine hammering `CheckoutSession`/`ReleaseSession` at high concurrency, snapshot the pool 100x from another goroutine, assert p95 checkout latency does not degrade materially. | Runtime hot-path guard. |
+| #15 | `TestSessionDebugProvider_Snapshot_ReturnsValueNotView` — mutate pool state after taking a snapshot, assert the snapshot is unchanged (byte-for-byte or deep-equal). | Immutability guard. |
+| #15 | `TestSessionPoolImpl_Snapshot_UsesRLockNotLock` — with `-race`, run parallel snapshots concurrently; MUST NOT serialize. Consider a `go/ast` check that snapshot methods use `RLock` not `Lock`. | Reader-parallelism guard. |
+| #15 | `TestSessionEventRing_BoundedIteration` — push >ring-cap events to a session's debug ring, snapshot, assert length == cap and oldest entry evicted. | Bounded-work guard. |
+| #15 | `TestZPage_HungPoolDoesNotHangHandler` — construct a pool that never releases `p.mu`; snapshot MUST return within a bounded deadline (via TryLock or atomic fallback), not block forever. | Liveness-weapon guard. |
+
+### Metrics fields per attempt (#16)
+
+| Spec | Test to add | Notes |
+|---|---|---|
+| #16 | `TestClassicPath_StampsClusterAndZoneFromResponseParams` — inject a `x-goog-cbt-cookie-*` header with a marshaled `ResponseParams{ClusterId, ZoneId}`; assert emitted `attempt_latencies` carries those labels. | Classic source-of-truth guard. |
+| #16 | `TestSessionPath_StampsClusterAndZoneFromInvokeResult` — fake Invoker returns `InvokeResult{ClusterInfo: &spb.ClusterInformation{ClusterId: "c", ZoneId: "z"}}`; assert emitted `attempt_latencies` carries those labels. Confirms `sessionTable.stampAttempt` wires them. | Session source-of-truth guard. |
+| #16 | `TestSessionPath_MissingClusterInfo_DoesNotPanicOrLeakStale` — `InvokeResult.ClusterInfo == nil`; assert emit still fires (possibly with empty labels), no panic, no stale labels from a previous attempt. | Nil-guard. |
+| #16 | `TestSessionPath_TransportPeerFixedAcrossAttempts` — same session, N retries; assert `transport_zone` / `transport_subzone` labels are byte-identical across all N attempts (session invariant vs classic). | Session-invariant guard. |
+| #16 | `TestClassicPath_TransportPeerCanVaryAcrossAttempts` — force two attempts on different subchannels; assert `transport_*` labels MAY differ (regression guard against accidental sticky-peer logic). | Classic-variability guard. |
+| #16 | `TestMetricsTracer_NoCrossPathLeakage` — set up both paths; verify classic-side attempts NEVER call into `InvokeResult.ClusterInfo` and session-side attempts NEVER unmarshal `ResponseParams`. Structural (ast) check. | Source-distinction guard per spec #16 last bullet. |
 
 ### Component/boundary rules (SESSION_COMPONENT_SPEC.md Part B)
 

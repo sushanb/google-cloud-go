@@ -91,6 +91,48 @@ func TestDiverterProbabilistic(t *testing.T) {
 	}
 }
 
+// TestDiverter_UseSession_LoadZero_Counters extends the load=0 fast path with
+// the counter assertion required by SESSION_SPEC.md #14: every UseSession()
+// outcome MUST tally to sessionPicks or classicPicks so the debug UI can
+// report the actual traffic ratio (not just the configured SessionLoad).
+func TestDiverter_UseSession_LoadZero_Counters(t *testing.T) {
+	d := NewDiverter(0.0)
+	const iterations = 1000
+	for i := 0; i < iterations; i++ {
+		_ = d.UseSession()
+	}
+	snap := d.Snapshot()
+	if snap.SessionPicks != 0 {
+		t.Errorf("SessionPicks = %d, want 0 at load=0", snap.SessionPicks)
+	}
+	if snap.ClassicPicks != iterations {
+		t.Errorf("ClassicPicks = %d, want %d at load=0", snap.ClassicPicks, iterations)
+	}
+	if snap.SessionLoad != 0.0 {
+		t.Errorf("SessionLoad = %v, want 0.0", snap.SessionLoad)
+	}
+}
+
+// TestDiverter_UseSession_LoadOne_Counters is the load=1 mirror of
+// TestDiverter_UseSession_LoadZero_Counters.
+func TestDiverter_UseSession_LoadOne_Counters(t *testing.T) {
+	d := NewDiverter(1.0)
+	const iterations = 1000
+	for i := 0; i < iterations; i++ {
+		_ = d.UseSession()
+	}
+	snap := d.Snapshot()
+	if snap.SessionPicks != iterations {
+		t.Errorf("SessionPicks = %d, want %d at load=1", snap.SessionPicks, iterations)
+	}
+	if snap.ClassicPicks != 0 {
+		t.Errorf("ClassicPicks = %d, want 0 at load=1", snap.ClassicPicks)
+	}
+	if snap.SessionLoad != 1.0 {
+		t.Errorf("SessionLoad = %v, want 1.0", snap.SessionLoad)
+	}
+}
+
 func TestDiverterConcurrentAccess(t *testing.T) {
 	d := NewDiverter(0.5)
 	var wg sync.WaitGroup

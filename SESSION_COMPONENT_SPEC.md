@@ -184,6 +184,11 @@ Every rule is a MUST. Violations are bugs, not preferences.
 | Read pool vs write pool selection | `sessionTable.ReadRow` / `sessionTable.MutateRow` | `TableShim` MUST NOT pick the pool — it picks session-vs-classic only |
 | Debug/z-page state access | `SessionDebugProvider` (interface) | providers implemented on `sessionClient` and `mixedModeSessionDebug`; z-pages depend only on the interface |
 | Close reason | `Session.closeReason` (CAS-once) | first cause wins; late `StreamEnd:*` classifications MUST NOT overwrite |
+| Per-attempt `ClusterInfo` (classic path) | metrics tracer's `attempt` state, stamped from response `ResponseParams` in unary interceptor | `internal/metrics/util.go:96-102`; MUST NOT be stamped from session-side sources |
+| Per-attempt `ClusterInfo` (session path) | `InvokeResult.ClusterInfo` (returned by `Session.Invoke`) | `session_vrpc.go:44-46, 216-219`; stamped by `sessionTable.stampAttempt`; MUST NOT be re-derived from headers |
+| Per-attempt transport peer labels (classic) | grpc.Peer at attempt time | can vary across attempts within an operation |
+| Per-attempt transport peer labels (session) | `InvokeResult.PeerInfo` (== `Session.peerInfo`, set once) | fixed for the session's lifetime; all attempts on session S share it (spec #16) |
+| Debug snapshot lock discipline | `SessionPoolImpl`/`Session`/etc. — snapshot methods only | MUST take at most RLock, release before returning value; z-pages hold no lock across HTTP write (spec #15) |
 
 ---
 

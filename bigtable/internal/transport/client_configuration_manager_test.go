@@ -496,3 +496,35 @@ func TestManagerNotifyListeners_Race(t *testing.T) {
 		t.Errorf("Expected activeConfig to have MinSessionCount 20 (config2), got %d", minSessions)
 	}
 }
+
+// TestManagerPoll_MinPollingIntervalClamp verifies SESSION_SPEC.md #13:
+// the server cannot ask the client to poll faster than MinPollingInterval
+// (1 min). A server-supplied 30s interval MUST be clamped up to 1min
+// before the manager acts on it. Protects the control plane from a
+// misconfigured server response DDoS-ing itself.
+func TestManagerPoll_MinPollingIntervalClamp(t *testing.T) {
+	client := &mockBigtableClient{}
+	client.getConfigFunc = func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
+		return &bigtablepb.ClientConfiguration{
+			Polling: &bigtablepb.ClientConfiguration_PollingConfiguration_{
+				PollingConfiguration: &bigtablepb.ClientConfiguration_PollingConfiguration{
+					// Server asks for 30s (below the 1min floor).
+					PollingInterval: durationpb.New(30 * time.Second),
+				},
+			},
+		}, nil
+	}
+
+	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
+	manager.poll(context.Background())
+
+	cfg := manager.getConfig()
+	if cfg.Polling.PollingInterval < MinPollingInterval {
+		t.Errorf("PollingInterval = %v, want >= MinPollingInterval (%v) — server-supplied 30s MUST be clamped up",
+			cfg.Polling.PollingInterval, MinPollingInterval)
+	}
+	if cfg.Polling.PollingInterval != MinPollingInterval {
+		t.Errorf("PollingInterval = %v, want exactly MinPollingInterval (%v) after clamp",
+			cfg.Polling.PollingInterval, MinPollingInterval)
+	}
+}
