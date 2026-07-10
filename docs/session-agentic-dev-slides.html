@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agentic Development on the Bigtable Session Subsystem</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-elev: #161b22;
+    --bg-code: #010409;
+    --fg: #e6edf3;
+    --fg-dim: #8d96a0;
+    --fg-mute: #6e7681;
+    --accent: #58a6ff;
+    --accent-warm: #f0883e;
+    --accent-good: #3fb950;
+    --accent-bad: #f85149;
+    --border: #30363d;
+    --border-emph: #484f58;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--sans);
+    font-size: 18px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  .deck { height: 100vh; width: 100vw; position: relative; }
+  .slide {
+    position: absolute;
+    inset: 0;
+    padding: 60px 80px 80px;
+    display: none;
+    flex-direction: column;
+    overflow: auto;
+  }
+  .slide.active { display: flex; }
+  .slide h1 {
+    font-size: 40px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    color: var(--fg);
+    margin-bottom: 8px;
+    line-height: 1.15;
+  }
+  .slide h2 {
+    font-size: 15px;
+    font-weight: 500;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    margin-bottom: 24px;
+  }
+  .slide h3 {
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--fg);
+    margin: 20px 0 10px;
+  }
+  .slide p { margin-bottom: 14px; color: var(--fg); max-width: 900px; }
+  .slide p.lead { font-size: 22px; line-height: 1.5; color: var(--fg); max-width: 1000px; margin-top: 18px; }
+  .slide ul, .slide ol { margin: 8px 0 14px 0; padding-left: 22px; max-width: 1000px; }
+  .slide li { margin-bottom: 6px; color: var(--fg); }
+  .slide li::marker { color: var(--fg-mute); }
+  code {
+    font-family: var(--mono);
+    font-size: 0.92em;
+    background: var(--bg-code);
+    padding: 2px 6px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    color: #d2a8ff;
+  }
+  pre {
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.55;
+    background: var(--bg-code);
+    padding: 16px 20px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    overflow: auto;
+    margin: 12px 0 16px;
+    color: var(--fg);
+  }
+  pre code { background: none; border: none; padding: 0; color: inherit; }
+  .kbd { font-family: var(--mono); font-size: 12px; padding: 2px 6px; border: 1px solid var(--border-emph); border-radius: 3px; background: var(--bg-elev); color: var(--fg-dim); }
+  .footer {
+    position: absolute;
+    bottom: 20px;
+    left: 80px;
+    right: 80px;
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--fg-mute);
+    font-family: var(--mono);
+  }
+  .footer .keys { opacity: 0.55; }
+  .grid { display: grid; gap: 18px; margin-top: 12px; }
+  .grid-2 { grid-template-columns: 1fr 1fr; }
+  .grid-3 { grid-template-columns: repeat(3, 1fr); }
+  .card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 18px 20px;
+  }
+  .card h4 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    margin-bottom: 8px;
+  }
+  .card p { font-size: 15px; line-height: 1.5; color: var(--fg); margin: 0; }
+  .flow {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin: 24px 0 8px;
+  }
+  .flow-node {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px;
+    font-size: 13px;
+    line-height: 1.35;
+    text-align: center;
+    position: relative;
+  }
+  .flow-node.emph { border-color: var(--accent); }
+  .flow-node.good { border-color: var(--accent-good); }
+  .flow-node.bad { border-color: var(--accent-bad); }
+  .flow-node strong { display: block; font-family: var(--mono); font-size: 12px; color: var(--accent); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.08em; }
+  .flow-node.good strong { color: var(--accent-good); }
+  .flow-node.bad strong { color: var(--accent-bad); }
+  .flow-arrow {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--fg-mute);
+    font-family: var(--mono);
+    font-size: 16px;
+    line-height: 1;
+    padding-top: 22px;
+  }
+  .spec-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin-top: 12px;
+    font-size: 13px;
+  }
+  .spec-cell {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 10px 12px;
+    line-height: 1.35;
+  }
+  .spec-cell .num {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+    display: block;
+    margin-bottom: 4px;
+    letter-spacing: 0.08em;
+  }
+  .spec-cell.pool { border-left: 3px solid var(--accent-warm); }
+  .spec-cell.pool .num { color: var(--accent-warm); }
+  .spec-cell.bnd .num { color: var(--accent-good); }
+  .spec-cell.bnd { border-left: 3px solid var(--accent-good); }
+  table.compare {
+    width: 100%;
+    max-width: 1100px;
+    border-collapse: collapse;
+    margin-top: 12px;
+    font-size: 14px;
+  }
+  table.compare th, table.compare td {
+    text-align: left;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  table.compare th { color: var(--accent); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; border-bottom-color: var(--border-emph); }
+  table.compare td:first-child { font-family: var(--mono); font-size: 12px; color: var(--fg-dim); width: 200px; }
+  .callout {
+    background: var(--bg-elev);
+    border-left: 3px solid var(--accent);
+    padding: 14px 20px;
+    margin: 18px 0;
+    border-radius: 0 4px 4px 0;
+    max-width: 1000px;
+  }
+  .callout.warn { border-left-color: var(--accent-warm); }
+  .callout.good { border-left-color: var(--accent-good); }
+  .callout p { margin: 0; }
+  .caption { font-size: 13px; color: var(--fg-mute); font-family: var(--mono); margin-top: 6px; }
+  .title-slide { justify-content: center; align-items: flex-start; }
+  .title-slide h1 { font-size: 56px; line-height: 1.05; letter-spacing: -0.03em; max-width: 1100px; }
+  .title-slide .subtitle { font-size: 22px; color: var(--fg-dim); margin-top: 20px; max-width: 900px; }
+  .title-slide .meta { font-family: var(--mono); font-size: 13px; color: var(--fg-mute); margin-top: 40px; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; margin-top: 12px; }
+  .two-col > div h3 { margin-top: 0; }
+  .file-badge {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 3px 8px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border-emph);
+    border-radius: 3px;
+    color: var(--accent);
+    margin-right: 6px;
+  }
+  .file-badge.warn { color: var(--accent-warm); }
+  .file-badge.good { color: var(--accent-good); }
+  .progress {
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: var(--border);
+  }
+  .progress-fill {
+    height: 100%;
+    background: var(--accent);
+    transition: width 0.3s ease;
+  }
+</style>
+</head>
+<body>
+<div class="progress"><div class="progress-fill" id="progressFill"></div></div>
+<div class="deck" id="deck">
+
+<!-- 1: Title -->
+<section class="slide title-slide active" data-title="Title">
+  <h1>Agentic Development on the<br>Bigtable Session Subsystem</h1>
+  <p class="subtitle">How two spec files, two subagents, and one hook keep Claude from drifting off Java parity or muddling components — on a codebase of ~36k lines of session/vRPC infrastructure.</p>
+  <p class="meta">google-cloud-go &middot; bigtable/ &middot; sushanb &middot; 2026-07-10</p>
+</section>
+
+<!-- 2: The problem -->
+<section class="slide" data-title="The problem">
+  <h2>The problem</h2>
+  <h1>Left alone on a large codebase, an agent drifts.</h1>
+  <p class="lead">Two things happen quietly when an agent works session code without a pinned spec:</p>
+  <div class="grid grid-2" style="margin-top: 18px;">
+    <div class="card">
+      <h4>Java parity drift</h4>
+      <p>The Go client is one of two implementations of the Session protocol. Every deviation from Java (heartbeat timing, retry classification, PeerInfo ordering, close-reason semantics) becomes an operator-visible cross-language bug. Agents don't cross-check Java by default.</p>
+    </div>
+    <div class="card">
+      <h4>Component muddling</h4>
+      <p><code>internal/session</code> starts importing <code>bigtable.Row</code>. <code>Diverter</code> grows per-method logic. <code>Session</code> holds pool-level counters. Each shortcut collapses a layer boundary and cements a design mistake that's expensive to unwind.</p>
+    </div>
+  </div>
+  <div class="callout warn" style="margin-top: 26px;">
+    <p><strong>Neither problem manifests immediately.</strong> The tests pass, the PR reviews look clean. The debt shows up months later when Java rolls a change and the Go client can't follow — or when a refactor requires unwinding a cross-layer dependency that shouldn't exist.</p>
+  </div>
+</section>
+
+<!-- 3: The two-file approach -->
+<section class="slide" data-title="Two files">
+  <h2>The approach</h2>
+  <h1>Two specs. Two layers. Never mixed.</h1>
+  <div class="two-col" style="margin-top: 24px;">
+    <div>
+      <h3><span class="file-badge">SESSION_SPEC.md</span></h3>
+      <p><strong>14 behavioral invariants.</strong> How each layer must *behave* at runtime.</p>
+      <ul>
+        <li>#1–#10: single-Session behavior (state machine, in-flight limit, PeerInfo timing, hooks, close/GOAWAY, heartbeat rules, missed-heartbeat sequence, retry oracle, concurrency)</li>
+        <li>#11–#14: pool topology + routing (read/write pool split, shared channel pool, <code>GetClientConfiguration</code> authority, <code>Diverter</code>+<code>TableShim</code>)</li>
+      </ul>
+      <p class="caption">Each item cites Java line-by-line where parity matters.</p>
+    </div>
+    <div>
+      <h3><span class="file-badge good">SESSION_COMPONENT_SPEC.md</span></h3>
+      <p><strong>12 boundary rules + ownership matrix.</strong> How the layers must *compose*.</p>
+      <ul>
+        <li>Part A: layer map (reference, drifts with code)</li>
+        <li>Part B: 12 MUST rules — import direction, type leakage, ownership duplication, lock ordering</li>
+        <li>Part C: ownership matrix — sole owner per concern</li>
+      </ul>
+      <p class="caption">Part B rules are grep-checkable. Part C prevents duplicated state.</p>
+    </div>
+  </div>
+  <div class="callout" style="margin-top: 24px;">
+    <p>The behavior file says <em>what each layer must do</em>. The component file says <em>where each layer lives</em>. Neither answers the other's question. Mixing them re-introduces the muddling they're meant to prevent.</p>
+  </div>
+</section>
+
+<!-- 4: Wiring diagram -->
+<section class="slide" data-title="Wiring">
+  <h2>Wiring</h2>
+  <h1>Four surfaces enforce the specs.</h1>
+  <p class="lead" style="margin-bottom: 10px;">All four hang off the two spec files at the repo root. Removing any one leaves a gap; keeping all four is the durable minimum.</p>
+  <div class="flow" style="grid-template-columns: repeat(4, 1fr); margin-top: 30px;">
+    <div class="flow-node emph">
+      <strong>1. Always-loaded</strong>
+      <code>CLAUDE.md</code> points to both spec files; loads on every session start. Trigger paths (<code>internal/session/**</code> etc.) named explicitly.
+    </div>
+    <div class="flow-node emph">
+      <strong>2. Just-in-time reminder</strong>
+      <code>PostToolUse</code> hook fires after every Edit/Write on session-touching paths. Injects a system reminder: "verify against both specs."
+    </div>
+    <div class="flow-node emph">
+      <strong>3. Behavioral review</strong>
+      <code>session-reviewer</code> subagent. Diff → 14-invariant table → pass/fail/violate with cited spec lines.
+    </div>
+    <div class="flow-node emph">
+      <strong>4. Boundary review</strong>
+      <code>session-component-review</code> subagent. Diff → grep-checks + ownership walk → violations with fix suggestions.
+    </div>
+  </div>
+  <div class="grid grid-2" style="margin-top: 30px;">
+    <div class="card">
+      <h4>Load path</h4>
+      <p><code>CLAUDE.md</code> is loaded into every session's context. It names both spec files and the file patterns that trigger a read. Claude opens the specs *before* editing, not after.</p>
+    </div>
+    <div class="card">
+      <h4>Enforcement path</h4>
+      <p>Hook + subagents catch what the load path missed. Hook fires unconditionally on session-file edits; subagents run on demand before commit or as a <code>Stop</code>-hook.</p>
+    </div>
+  </div>
+</section>
+
+<!-- 5: How Java parity is protected -->
+<section class="slide" data-title="Java parity">
+  <h2>Protection #1 — Java parity</h2>
+  <h1>Every parity-critical rule cites its Java source line.</h1>
+  <p class="lead">The spec is not aspirational. Each Java-derived invariant carries a live citation into <code>~/google-cloud-java/java-bigtable/</code> (sparse local checkout).</p>
+  <table class="compare" style="margin-top: 24px;">
+    <thead>
+      <tr><th>Invariant</th><th>Go implementation</th><th>Java citation</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>#5 OK-gated PeakEwma (removed as an in-doc example — but preserved as archetype)</td>
+        <td><code>sessionList.RecordVRpcOutcome</code></td>
+        <td><code>SessionList.java:181-187</code></td>
+      </tr>
+      <tr>
+        <td>#6 GOAWAY does NOT cancel in-flight vRPC</td>
+        <td><code>session_lifecycle.go:353-402</code></td>
+        <td><code>SessionImpl.java:689-716</code></td>
+      </tr>
+      <tr>
+        <td>#7 Heartbeat 3× interval, unknown frames do not reset</td>
+        <td><code>session_lifecycle.go:233-263,500-508</code></td>
+        <td><code>SessionImpl.java:440-490</code></td>
+      </tr>
+      <tr>
+        <td>#9 Retry oracle — three-value <code>AttemptState</code></td>
+        <td><code>attempt_outcome.go:28-46</code></td>
+        <td><code>VRpc.VRpcResult.State</code> / <code>RetryingVRpc.java:290-311</code></td>
+      </tr>
+      <tr>
+        <td>#11 MatView is read-only</td>
+        <td><code>client.go:415</code> passes <code>openWrite=nil</code></td>
+        <td>Java <code>MaterializedViewAsync</code> exposes no write methods</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="callout good" style="margin-top: 24px;">
+    <p>The <code>session-reviewer</code> agent's instructions say: <em>"If a change would create a deviation from Java, flag as VIOLATION unless the diff explicitly justifies the divergence."</em> The agent has file-system access to the Java checkout and greps locally — no GitHub round-trip.</p>
+  </div>
+</section>
+
+<!-- 6: How muddling is prevented -->
+<section class="slide" data-title="Anti-muddling">
+  <h2>Protection #2 — No cross-component muddling</h2>
+  <h1>Boundaries as MUST rules, grep-checkable.</h1>
+  <p class="lead">Part B of <code>SESSION_COMPONENT_SPEC.md</code> encodes twelve rules that the <code>session-component-review</code> agent enforces. The strongest ones reduce to a single <code>git grep</code>.</p>
+  <div class="grid grid-2" style="margin-top: 22px;">
+    <div class="card">
+      <h4>B1 — Proto-native session package</h4>
+      <p><code>internal/session/**</code> MUST NOT reference <code>bigtable.Row</code>, <code>Mutation</code>, <code>Filter</code>, etc.</p>
+      <pre style="margin-top: 10px; font-size: 12px;">git grep -l 'bigtable\.\(Row\|Mutation\|Filter\)' \
+  bigtable/internal/session/
+# MUST return empty</pre>
+    </div>
+    <div class="card">
+      <h4>B2 — Import direction</h4>
+      <p><code>internal/transport</code> MUST NOT import <code>internal/session</code>. Session depends on transport, never the reverse.</p>
+      <pre style="margin-top: 10px; font-size: 12px;">git grep -l 'internal/session' \
+  bigtable/internal/transport/
+# MUST return empty</pre>
+    </div>
+    <div class="card">
+      <h4>B4 — Diverter is shape-agnostic</h4>
+      <p>One input (<code>SessionLoad</code>), one output (<code>UseSession()</code>). No per-method routing (that's <code>TableShim</code>). No per-row stickiness.</p>
+      <p style="margin-top: 8px;">Adding a new vRPC method requires zero <code>Diverter</code> change.</p>
+    </div>
+    <div class="card">
+      <h4>B6 — Sole config writer</h4>
+      <p><code>Diverter.SetSessionLoad</code> and <code>SessionPoolImpl.UpdateConfig</code> callable only from <code>ClientConfigurationManager</code>.</p>
+      <pre style="margin-top: 10px; font-size: 12px;">git grep -n 'SetSessionLoad\|UpdateConfig' -- \
+  ':!*_test.go' \
+  ':!*_configuration_manager.go'</pre>
+    </div>
+  </div>
+</section>
+
+<!-- 7: Ownership matrix -->
+<section class="slide" data-title="Ownership">
+  <h2>Protection #3 — Ownership matrix</h2>
+  <h1>One concern, one owner.</h1>
+  <p class="lead">Part C names the sole owner of every stateful concern. Duplicating that concern elsewhere (defensive cache, redundant counter) is a rule violation, not an optimization.</p>
+  <table class="compare" style="margin-top: 22px;">
+    <thead>
+      <tr><th>Concern</th><th>Sole owner</th><th>What violation looks like</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Session state (New/…/Closed)</td>
+        <td><code>Session.state</code> (atomic)</td>
+        <td>Pool caches "is-ready" separately; drifts on race</td>
+      </tr>
+      <tr>
+        <td>AFE ID</td>
+        <td><code>Session.peerInfo</code> (set once)</td>
+        <td>Pool holds parallel <code>map[sessionID]afeID</code>; stale after reconnect</td>
+      </tr>
+      <tr>
+        <td>Per-AFE refCount, PeakEwmas</td>
+        <td><code>afeHandle</code></td>
+        <td>Session grows per-AFE fields; pool must iterate every Session to aggregate</td>
+      </tr>
+      <tr>
+        <td>Traffic split ratio</td>
+        <td><code>Diverter.sessionLoadBits</code></td>
+        <td>Application code calls <code>SetSessionLoad</code>; polled config no longer authoritative</td>
+      </tr>
+      <tr>
+        <td>Retry classification</td>
+        <td><code>session_vrpc.go</code> tag sites</td>
+        <td><code>RetryingVRpc</code> invents its own retry decision from raw gRPC codes</td>
+      </tr>
+      <tr>
+        <td>Proto ↔ public-type translation</td>
+        <td><code>TableShim</code> + <code>sessionTable</code></td>
+        <td>Session package references <code>bigtable.Row</code></td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="callout" style="margin-top: 22px;">
+    <p>Each row is a review question: <em>"Did this change add a field or method that duplicates an owner in this matrix?"</em> If yes, either delete the duplicate or update the matrix with justification.</p>
+  </div>
+</section>
+
+<!-- 8: 14 behavioral invariants -->
+<section class="slide" data-title="14 invariants">
+  <h2>SESSION_SPEC.md</h2>
+  <h1>14 runtime-behavior invariants.</h1>
+  <div class="spec-grid" style="grid-template-columns: repeat(5, 1fr);">
+    <div class="spec-cell"><span class="num">#1</span>State machine strictly forward, 6 states, monotonic ordinals.</div>
+    <div class="spec-cell"><span class="num">#2</span>Exactly one in-flight vRPC per session; rpc_id-mismatched responses dropped.</div>
+    <div class="spec-cell"><span class="num">#3</span>PeerInfo/AFE ID resolved synchronously before Ready is announced.</div>
+    <div class="spec-cell"><span class="num">#4</span>Lifecycle hooks fire in fixed order, exactly once each.</div>
+    <div class="spec-cell"><span class="num">#5</span>Close idempotent; graceful drains in-flight; ForceClose does not.</div>
+    <div class="spec-cell"><span class="num">#6</span>GOAWAY does NOT cancel in-flight vRPC.</div>
+    <div class="spec-cell"><span class="num">#7</span>Heartbeat armed only while a vRPC is in flight; 3× interval; unknown frames don't reset.</div>
+    <div class="spec-cell"><span class="num">#8</span>Missed-heartbeat sequence is fixed and observable (5 steps).</div>
+    <div class="spec-cell"><span class="num">#9</span>Server is retry oracle; three-value <code>AttemptState</code>; zero = do-not-retry.</div>
+    <div class="spec-cell"><span class="num">#10</span>Concurrency discipline: Go atomics + <code>sendMu</code>; Java <code>SynchronizationContext</code>.</div>
+    <div class="spec-cell pool"><span class="num">#11</span>Read + write pools per resource; MatView is read-only.</div>
+    <div class="spec-cell pool"><span class="num">#12</span>One shared channel pool per <code>SessionClient</code>; distinct from classic pool.</div>
+    <div class="spec-cell pool"><span class="num">#13</span><code>GetClientConfiguration</code> is authoritative for pool load and shape.</div>
+    <div class="spec-cell pool"><span class="num">#14</span><code>Diverter</code> (policy) + <code>TableShim</code> (mechanism) split traffic session vs classic.</div>
+  </div>
+  <p class="caption" style="margin-top: 20px;">Blue = per-Session behavior (#1–#10). Orange = pool topology + routing (#11–#14). The two are enforced separately and never mixed inside a single component.</p>
+</section>
+
+<!-- 9: 12 boundary rules -->
+<section class="slide" data-title="Boundary rules">
+  <h2>SESSION_COMPONENT_SPEC.md — Part B</h2>
+  <h1>12 boundary MUST rules.</h1>
+  <div class="spec-grid" style="grid-template-columns: repeat(4, 1fr);">
+    <div class="spec-cell bnd"><span class="num">B1</span><code>internal/session/**</code> MUST stay proto-native. No public bigtable types.</div>
+    <div class="spec-cell bnd"><span class="num">B2</span><code>internal/transport/**</code> MUST NOT import <code>internal/session</code>.</div>
+    <div class="spec-cell bnd"><span class="num">B3</span><code>debugview/**</code> reaches state only via <code>SessionDebugProvider</code>.</div>
+    <div class="spec-cell bnd"><span class="num">B4</span><code>Diverter</code> MUST stay RPC-shape-agnostic.</div>
+    <div class="spec-cell bnd"><span class="num">B5</span><code>TableShim</code> MUST NOT reach into <code>Session</code>/pool internals.</div>
+    <div class="spec-cell bnd"><span class="num">B6</span><code>ClientConfigurationManager</code> is the sole writer of pool-shaping config.</div>
+    <div class="spec-cell bnd"><span class="num">B7</span><code>Session</code> MUST NOT hold pool-level counters.</div>
+    <div class="spec-cell bnd"><span class="num">B8</span>Pool → SessionList lock ordering fixed.</div>
+    <div class="spec-cell bnd"><span class="num">B9</span>Retry classification lives at the vRPC boundary, not in Session/pool.</div>
+    <div class="spec-cell bnd"><span class="num">B10</span>z-page code MUST NOT synthesize state computable on the producer.</div>
+    <div class="spec-cell bnd"><span class="num">B11</span>Behavioral invariants MUST NOT be re-implemented in another layer.</div>
+    <div class="spec-cell bnd"><span class="num">B12</span>Session-level and pool-level invariants MUST NOT mix in one component.</div>
+  </div>
+  <div class="callout good" style="margin-top: 24px;">
+    <p>Rules B1, B2, B3, B6 reduce to <code>git grep</code> commands the <code>session-component-review</code> agent runs verbatim on every review. The result is binary: any match on those greps is an immediate <em>DO NOT COMMIT</em>.</p>
+  </div>
+</section>
+
+<!-- 10: The workflow -->
+<section class="slide" data-title="Workflow">
+  <h2>The end-to-end workflow</h2>
+  <h1>Edit → hook → dual review → merge.</h1>
+  <div class="flow" style="grid-template-columns: 1fr auto 1fr auto 1fr auto 1fr; margin-top: 32px;">
+    <div class="flow-node emph">
+      <strong>1. Load</strong>
+      Session starts. <code>CLAUDE.md</code> loads. Claude sees the pointer to both specs and reads them before touching session code.
+    </div>
+    <div class="flow-arrow">▶</div>
+    <div class="flow-node emph">
+      <strong>2. Edit</strong>
+      Change to <code>bigtable/internal/session/table.go</code>. Edit tool returns.
+    </div>
+    <div class="flow-arrow">▶</div>
+    <div class="flow-node emph">
+      <strong>3. Hook</strong>
+      <code>PostToolUse</code> matches path, injects system reminder: "verify against both specs."
+    </div>
+    <div class="flow-arrow">▶</div>
+    <div class="flow-node emph">
+      <strong>4. Dual review</strong>
+      Claude spawns <code>session-reviewer</code> + <code>session-component-review</code> in parallel.
+    </div>
+  </div>
+  <div class="flow" style="grid-template-columns: 1fr 1fr; margin-top: 20px; gap: 20px;">
+    <div class="flow-node good">
+      <strong>5a. All PASS</strong>
+      Both agents report PASS tables. Claude proceeds to commit + push.
+    </div>
+    <div class="flow-node bad">
+      <strong>5b. Any VIOLATION</strong>
+      Agent returns "DO NOT COMMIT" with cited rule + minimum fix. Claude applies the fix, re-runs the reviewer, loops until PASS.
+    </div>
+  </div>
+  <div class="callout" style="margin-top: 26px;">
+    <p><strong>The user is in the loop, not the bottleneck.</strong> The reviewers automate what would otherwise be a "did you check the 14 invariants?" question on every PR. The user reviews the reviewer output, which is dramatically smaller than the diff.</p>
+  </div>
+</section>
+
+<!-- 11: When specs go stale -->
+<section class="slide" data-title="Stale specs">
+  <h2>When a spec becomes stale</h2>
+  <h1>Both agents flag spec edits that lack code, and vice versa.</h1>
+  <p class="lead">The specs are living documents. They MUST evolve — but drift-of-convenience is the failure mode we're preventing.</p>
+  <div class="grid grid-2" style="margin-top: 24px;">
+    <div class="card">
+      <h4>Rule for spec edits</h4>
+      <p>Editing <code>SESSION_SPEC.md</code> requires either:</p>
+      <ul>
+        <li>an accompanying code change that motivates it, or</li>
+        <li>an explicit justification in the PR body (design decision, Java catch-up, protocol update)</li>
+      </ul>
+      <p>Both reviewer agents check this and refuse a "silent" spec edit.</p>
+    </div>
+    <div class="card">
+      <h4>Rule for code changes that appear to violate the spec</h4>
+      <p>Two options:</p>
+      <ol>
+        <li>The code is wrong — fix it.</li>
+        <li>The spec is stale — update the spec in the <em>same PR</em>, cite the reason, get <code>mutianf</code>'s sign-off on human-reviewer PRs.</li>
+      </ol>
+      <p>Never merge code that silently deviates. The spec is either right or updated; there's no "temporarily out of sync."</p>
+    </div>
+  </div>
+  <div class="callout warn" style="margin-top: 26px;">
+    <p>Part A of <code>SESSION_COMPONENT_SPEC.md</code> is the exception — it's the file-path reference map, explicitly labeled "expected to drift." Editing Part A to catch drift is fine and needs no accompanying code change. Editing Part B or Part C without code is a smell.</p>
+  </div>
+</section>
+
+<!-- 12: What this replaces -->
+<section class="slide" data-title="Before/after">
+  <h2>Before / after</h2>
+  <h1>What this replaces.</h1>
+  <div class="two-col" style="margin-top: 22px;">
+    <div>
+      <h3>Before: memory-driven</h3>
+      <ul>
+        <li>Invariants live in the author's head + a scattered <code>~/.claude/plans/</code> collection</li>
+        <li>Each session, Claude re-derives them from grepping the code</li>
+        <li>Java parity checked ad-hoc when someone remembers</li>
+        <li>Cross-component leaks caught in code review, weeks later</li>
+        <li>New teammates onboard by asking "what should I not break?"</li>
+      </ul>
+    </div>
+    <div>
+      <h3>After: spec-driven</h3>
+      <ul>
+        <li>14 behavioral invariants + 12 boundary rules pinned in two files at repo root</li>
+        <li><code>CLAUDE.md</code> loads on every session; Claude reads specs before editing session code</li>
+        <li>Java parity flagged automatically by <code>session-reviewer</code> against local Java checkout</li>
+        <li>Cross-component leaks caught immediately by <code>session-component-review</code> greps</li>
+        <li>New teammates read two files and know the contract</li>
+      </ul>
+    </div>
+  </div>
+  <div class="callout good" style="margin-top: 26px;">
+    <p><strong>Net effect:</strong> Claude's default behavior on session code shifts from "make the tests pass" to "make the tests pass without violating the 14 invariants or the 12 boundaries." That's the whole point.</p>
+  </div>
+</section>
+
+<!-- 13: Summary -->
+<section class="slide" data-title="Summary">
+  <h2>Summary</h2>
+  <h1>Four artifacts. Two axes of enforcement. One live loop.</h1>
+  <div class="grid grid-3" style="margin-top: 30px;">
+    <div class="card">
+      <h4>Artifacts</h4>
+      <p><span class="file-badge">SESSION_SPEC.md</span></p>
+      <p style="margin-top: 8px;"><span class="file-badge good">SESSION_COMPONENT_SPEC.md</span></p>
+      <p style="margin-top: 8px;"><span class="file-badge warn">SESSION_SPEC_TESTS.md</span></p>
+      <p style="margin-top: 8px;"><code>.claude/agents/</code> (2 files)</p>
+      <p style="margin-top: 8px;"><code>.claude/settings.json</code> (hook)</p>
+    </div>
+    <div class="card">
+      <h4>Enforcement axes</h4>
+      <p><strong>Behavior:</strong> <code>session-reviewer</code> against 14 invariants.</p>
+      <p style="margin-top: 8px;"><strong>Structure:</strong> <code>session-component-review</code> against 12 boundary rules + ownership matrix.</p>
+      <p style="margin-top: 8px;">Neither reviews the other's territory.</p>
+    </div>
+    <div class="card">
+      <h4>Loop</h4>
+      <p>1. Load — <code>CLAUDE.md</code></p>
+      <p>2. Trigger — <code>PostToolUse</code> hook</p>
+      <p>3. Verify — both subagents</p>
+      <p>4. Merge — if all PASS</p>
+      <p>5. Evolve — specs update alongside code, never silently</p>
+    </div>
+  </div>
+  <div class="callout" style="margin-top: 32px;">
+    <p><strong>The mechanism is boring on purpose.</strong> There is no clever ML in the loop. Two markdown files, two subagent prompts, one shell hook. Every piece is auditable, editable, and grep-checkable. That's what makes it durable.</p>
+  </div>
+</section>
+
+</div>
+
+<div class="footer">
+  <div><span id="slideNum">1</span> / <span id="slideTotal">13</span> &middot; <span id="slideTitle">Title</span></div>
+  <div class="keys">← → &nbsp;|&nbsp; space next &nbsp;|&nbsp; home/end &nbsp;|&nbsp; f fullscreen</div>
+</div>
+
+<script>
+  const slides = Array.from(document.querySelectorAll('.slide'));
+  let idx = 0;
+  const slideNum = document.getElementById('slideNum');
+  const slideTotal = document.getElementById('slideTotal');
+  const slideTitle = document.getElementById('slideTitle');
+  const progressFill = document.getElementById('progressFill');
+  slideTotal.textContent = slides.length;
+
+  function show(i) {
+    idx = Math.max(0, Math.min(slides.length - 1, i));
+    slides.forEach((s, k) => s.classList.toggle('active', k === idx));
+    slideNum.textContent = idx + 1;
+    slideTitle.textContent = slides[idx].dataset.title || '';
+    progressFill.style.width = ((idx + 1) / slides.length * 100) + '%';
+    history.replaceState(null, '', '#' + (idx + 1));
+  }
+
+  document.addEventListener('keydown', (e) => {
+    switch (e.key) {
+      case 'ArrowRight':
+      case 'PageDown':
+      case ' ':
+        e.preventDefault();
+        show(idx + 1);
+        break;
+      case 'ArrowLeft':
+      case 'PageUp':
+        e.preventDefault();
+        show(idx - 1);
+        break;
+      case 'Home':
+        e.preventDefault();
+        show(0);
+        break;
+      case 'End':
+        e.preventDefault();
+        show(slides.length - 1);
+        break;
+      case 'f':
+      case 'F':
+        if (!document.fullscreenElement) document.documentElement.requestFullscreen();
+        else document.exitFullscreen();
+        break;
+    }
+  });
+
+  // Deep-link support: #3 opens slide 3.
+  const hashIdx = parseInt(location.hash.slice(1), 10);
+  if (!isNaN(hashIdx) && hashIdx >= 1 && hashIdx <= slides.length) show(hashIdx - 1);
+  else show(0);
+</script>
+</body>
+</html>

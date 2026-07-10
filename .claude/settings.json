@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path // empty' | grep -qE 'bigtable/(internal/(transport/session|session/)|table_shim|session_[a-z]+\\.go|SESSION_(SPEC|COMPONENT_SPEC)\\.md)' && { printf 'Session subsystem file just edited. Verify the change against BOTH SESSION_SPEC.md (14 behavioral invariants) and SESSION_COMPONENT_SPEC.md (boundary rules) before continuing. If the edit touched a spec file, ensure the paired change in code (or a follow-up task) exists.\\n' >&2; exit 2; } || exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}
