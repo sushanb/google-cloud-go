@@ -1,6 +1,6 @@
 # Session — Component Topology & Boundary Spec
 
-**Scope.** This file governs the **structural layout** of the Session subsystem: which package/type owns which concern, what MUST NOT import what, and where each responsibility lives. Companion to `SESSION_SPEC.md` (which covers runtime behavior). Read both before any structural refactor.
+**Scope.** This file governs the **structural layout** of the Session subsystem: which package/type owns which concern, what MUST NOT import what, and where each responsibility lives. Companion to the four behavioral specs — `SESSION_SPEC.md` (per-Session lifecycle, 10 invariants), `SESSION_CLIENT_SPEC.md` (SessionClient topology + config + OpenSession envelope, 4 invariants), `SESSION_POOL_SPEC.md` (pool topology + picking + routing + scaling + debug non-blocking, 5 invariants), and `CLIENT_SIDE_METRICS_SPEC.md` (per-attempt metrics field provenance). Read all four before any structural refactor.
 
 **Why this file exists.** The Session subsystem has three natural failure modes: (a) a lower layer starts knowing about a higher layer (session package importing `bigtable.Row`); (b) two peers reach into each other's guts (Diverter reading pool state, or `Session` holding pool-level counters); (c) a "convenient" shortcut collapses two layers into one and cements a design mistake. The rules in Part B forbid each. When they conflict with a change, either (1) the change is wrong, or (2) the rule is stale — update the rule in the same PR, cite the reason.
 
