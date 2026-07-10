@@ -506,9 +506,7 @@ func (s *Session) resetHeartbeatDeadline() {
 // Heartbeats during long-running VRPCs, so an idle session legitimately
 // receives no heartbeats and must not be torn down.
 func (s *Session) heartBeatLoop(ctx context.Context) {
-	deadline := time.Unix(0, s.nextHeartbeatDeadlineNano.Load())
-
-	timer := time.NewTimer(time.Until(deadline))
+	timer := time.NewTimer(time.Until(time.Unix(0, s.nextHeartbeatDeadlineNano.Load())))
 	defer timer.Stop()
 
 	for {
@@ -516,51 +514,50 @@ func (s *Session) heartBeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			if State(s.state.Load()) == StateClosed {
-				return
-			}
-			active := 0
-			if s.activeVRPC() != nil {
-				active = 1
-			}
-			remaining := time.Until(time.Unix(0, s.nextHeartbeatDeadlineNano.Load()))
-			interval := time.Duration(s.heartbeatIntervalNano.Load())
-			// last-frame age = (deadline - now) inverted into "how long
-			// since the last frame extended us" = 3*interval - remaining.
-			lastFrameAge := 3*interval - remaining
+		}
 
-			if active == 0 {
-				// Idle session: no heartbeats are expected. Re-check after
-				// one interval so a freshly-started VRPC is picked up.
-				timer.Reset(interval)
-				continue
-			}
-			if remaining > 0 {
-				// Deadline was pushed out while we were sleeping; re-arm.
-				// Only record when last_frame_age has crossed one interval —
-				// otherwise every healthy session would spam the UI ring
-				// buffer ~3x/second and drown out close/missed events.
-				if lastFrameAge >= interval {
-					s.recordEvent("hb-alive", "in_flight=%d last_frame_age=%v remaining=%v interval=%v",
-						active, lastFrameAge, remaining, interval)
-				}
-				timer.Reset(remaining)
-				continue
-			}
-			// active > 0 and deadline elapsed — half-dead stream (no frames
-			// arriving while we have in-flight work). Log before ForceClose
-			// so we have a definitive marker even if downstream cancel races.
-			recordDebugTag(tagSessionHeartbeatMissed)
-			s.debugf("heartbeat MISSED — forcing close in_flight=%d last_frame_age=%v interval=%v",
-				active, lastFrameAge, interval)
-			s.recordEvent("hb-missed", "in_flight=%d last_frame_age=%v interval=%v",
-				active, lastFrameAge, interval)
-			s.ForceClose(&spb.CloseSessionRequest{
-				Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_MISSED_HEARTBEAT,
-				Description: "client terminated session due to missed server heartbeats",
-			})
+		if s.State() == StateClosed {
 			return
 		}
+		interval := time.Duration(s.heartbeatIntervalNano.Load())
+		if s.activeVRPC() == nil {
+			// Idle session: no heartbeats are expected. Re-check after
+			// one interval so a freshly-started VRPC is picked up.
+			timer.Reset(interval)
+			continue
+		}
+		active := 1 // multiplex=1; kept as %d so a future >1 stays greppable.
+		remaining := time.Until(time.Unix(0, s.nextHeartbeatDeadlineNano.Load()))
+		// last-frame age = (deadline - now) inverted into "how long
+		// since the last frame extended us" = 3*interval - remaining.
+		lastFrameAge := 3*interval - remaining
+
+		if remaining > 0 {
+			// Deadline was pushed out while we were sleeping; re-arm.
+			// Only record when last_frame_age has crossed one interval —
+			// otherwise every healthy session would spam the UI ring
+			// buffer ~3x/second and drown out close/missed events.
+			if lastFrameAge >= interval {
+				s.recordEvent("hb-alive", "in_flight=%d last_frame_age=%v remaining=%v interval=%v",
+					active, lastFrameAge, remaining, interval)
+			}
+			timer.Reset(remaining)
+			continue
+		}
+		// Deadline elapsed with a vRPC in flight — half-dead stream (no
+		// frames arriving while we have in-flight work). Log before
+		// ForceClose so we have a definitive marker even if downstream
+		// cancel races.
+		recordDebugTag(tagSessionHeartbeatMissed)
+		s.debugf("heartbeat MISSED — forcing close in_flight=%d last_frame_age=%v interval=%v",
+			active, lastFrameAge, interval)
+		s.recordEvent("hb-missed", "in_flight=%d last_frame_age=%v interval=%v",
+			active, lastFrameAge, interval)
+		s.ForceClose(&spb.CloseSessionRequest{
+			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_MISSED_HEARTBEAT,
+			Description: "client terminated session due to missed server heartbeats",
+		})
+		return
 	}
 }
 
