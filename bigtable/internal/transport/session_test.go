@@ -19,6 +19,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1051,5 +1053,100 @@ func TestClose_IdempotentAcrossNCalls(t *testing.T) {
 	// it did fire, it must have fired exactly once.
 	if _, _, closed := listener.counts(); closed > 1 {
 		t.Errorf("OnClose fired %d times, want <= 1", closed)
+	}
+}
+
+// TestInvoke_ConcurrentSecondFailsWithMultiplexViolation enforces SESSION_SPEC #2:
+// the single-in-flight-vRPC invariant is guarded by CompareAndSwap(nil, rpc) on
+// activeRPC. A caller that bypasses the pool's per-session checkout gate and
+// enters Invoke while the slot is already claimed MUST get an ErrSessionNotActive
+// error tagged StateUncommitted (retryable — the request never reached the wire)
+// with a diagnostic message naming the multiPlexingLimit=1 violation. This is
+// the CAS-fail path at session_vrpc.go:107; without this test the branch is
+// unreached because Invoke's normal callers never re-enter the slot.
+func TestInvoke_ConcurrentSecondFailsWithMultiplexViolation(t *testing.T) {
+	s, _ := makeActive(t, SessionHooks{})
+
+	// Pin the slot with a placeholder in-flight vRPC. Doesn't need to be a
+	// real RPC — the CAS just needs to see a non-nil pointer.
+	s.activeRPC.Store(&vrpcImpl{id: 999, resultChan: make(chan vrpcResult, 1)})
+
+	_, err := s.Invoke(context.Background(), newRoundTripDesc(), "req")
+	if err == nil {
+		t.Fatal("expected error when Invoke enters with activeRPC already claimed")
+	}
+	if !errors.Is(err, ErrSessionNotActive) {
+		t.Errorf("err = %v, want wrapping ErrSessionNotActive", err)
+	}
+	if got := ClassifyErr(err).State; got != StateUncommitted {
+		t.Errorf("AttemptState = %v, want StateUncommitted (attempt never reached wire → retryable)", got)
+	}
+	if !strings.Contains(err.Error(), "multiPlexingLimit=1") {
+		t.Errorf("err message = %q, want to name the multiPlexingLimit=1 violation for operator grep", err.Error())
+	}
+}
+
+// TestHooks_FiredInSpecOrder enforces SESSION_SPEC #4: lifecycle hooks fire in
+// the fixed order OnStart → OnActive → OnClosing → OnClose, exactly once each,
+// over a session's full lifetime. The prior hookCounts fixture recorded three
+// of the four (no OnClosing) and only asserted counts, not ordering — so a
+// regression that swapped OnClosing and OnClose or fired OnActive after
+// OnClosing would slip through.
+func TestHooks_FiredInSpecOrder(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		order []string
+	)
+	record := func(name string) {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, name)
+	}
+	hooks := SessionHooks{
+		OnStart:   func(context.Context) { record("OnStart") },
+		OnActive:  func(*Session) { record("OnActive") },
+		OnClosing: func(*Session) { record("OnClosing") },
+		OnClose:   func(*Session, error) { record("OnClose") },
+	}
+
+	stream := newFakeStream()
+	s := newTestSession(t, stream, hooks)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx, &spb.OpenSessionRequest{ProtocolVersion: 1}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Drive the handshake to Active.
+	stream.recv <- recvOp{resp: &spb.SessionResponse{
+		Payload: &spb.SessionResponse_OpenSession{OpenSession: &spb.OpenSessionResponse{}},
+	}}
+	waitFor(t, time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(order) >= 2
+	}, "OnStart + OnActive")
+
+	// ForceClose drives OnClosing then OnClose via the closingOnce → closeOnce
+	// safety net (session_lifecycle.go:100-114). Using ForceClose over graceful
+	// Close avoids the stream-EOF wait; the ordering guarantee holds on both
+	// paths.
+	s.ForceClose(&spb.CloseSessionRequest{
+		Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_USER,
+	})
+	waitFor(t, time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(order) == 4
+	}, "OnClosing + OnClose")
+
+	mu.Lock()
+	got := append([]string(nil), order...)
+	mu.Unlock()
+
+	want := []string{"OnStart", "OnActive", "OnClosing", "OnClose"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("hook order = %v, want %v", got, want)
 	}
 }
