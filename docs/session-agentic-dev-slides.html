@@ -276,7 +276,7 @@
   <div class="two-col" style="margin-top: 24px;">
     <div>
       <h3><span class="file-badge">SESSION_SPEC.md</span></h3>
-      <p><strong>16 behavioral invariants.</strong> How each layer must *behave* at runtime.</p>
+      <p><strong>17 behavioral invariants.</strong> How each layer must *behave* at runtime.</p>
       <ul>
         <li>#1–#10: single-Session behavior (state machine, in-flight limit, PeerInfo timing, hooks, close/GOAWAY, heartbeat rules, missed-heartbeat sequence, retry oracle, concurrency)</li>
         <li>#11–#14: pool topology + routing (read/write pool split, shared channel pool, <code>GetClientConfiguration</code> authority, <code>Diverter</code>+<code>TableShim</code>)</li>
@@ -315,7 +315,7 @@
     </div>
     <div class="flow-node emph">
       <strong>3. Behavioral review</strong>
-      <code>session-reviewer</code> subagent. Diff → 16-invariant table → pass/fail/violate with cited spec lines.
+      <code>session-reviewer</code> subagent. Diff → 17-invariant table → pass/fail/violate with cited spec lines.
     </div>
     <div class="flow-node emph">
       <strong>4. Boundary review</strong>
@@ -458,7 +458,7 @@
   </div>
 </section>
 
-<!-- 8: 16 behavioral invariants -->
+<!-- 8: 17 behavioral invariants -->
 <section class="slide" data-title="14 invariants">
   <h2>SESSION_SPEC.md</h2>
   <h1>14 runtime-behavior invariants.</h1>
@@ -479,8 +479,9 @@
     <div class="spec-cell pool"><span class="num">#14</span><code>Diverter</code> (policy) + <code>TableShim</code> (mechanism) split traffic session vs classic.</div>
     <div class="spec-cell pool"><span class="num">#15</span>All <code>/-z</code> debug pages MUST NOT block hot-path latencies.</div>
     <div class="spec-cell pool"><span class="num">#16</span><code>cluster_id</code>/<code>zone_id</code>/transport peer per-attempt on BOTH paths, path-specific sources.</div>
+    <div class="spec-cell pool"><span class="num">#17</span>Pool scaling is server-driven with rate-limiting; scale-down is passive (Java-parity replace-on-close).</div>
   </div>
-  <p class="caption" style="margin-top: 20px;">Blue = per-Session behavior (#1–#10). Orange = pool topology + routing + observability (#11–#16). The two are enforced separately and never mixed inside a single component.</p>
+  <p class="caption" style="margin-top: 20px;">Blue = per-Session behavior (#1–#10). Orange = pool topology + routing + observability + scaling (#11–#17). The two are enforced separately and never mixed inside a single component.</p>
 </section>
 
 <!-- 9: 12 boundary rules -->
@@ -594,7 +595,7 @@
     <div>
       <h3>After: spec-driven</h3>
       <ul>
-        <li>16 behavioral invariants + 12 boundary rules pinned in two files at repo root</li>
+        <li>17 behavioral invariants + 12 boundary rules pinned in two files at repo root</li>
         <li><code>CLAUDE.md</code> loads on every session; Claude reads specs before editing session code</li>
         <li>Java parity flagged automatically by <code>session-reviewer</code> against local Java checkout</li>
         <li>Cross-component leaks caught immediately by <code>session-component-review</code> greps</li>

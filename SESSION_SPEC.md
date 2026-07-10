@@ -188,6 +188,10 @@ Client-side metrics (attribute labels on `attempt_latencies`, `attempt_latencies
 
 Ownership matrix additions live in SESSION_COMPONENT_SPEC.md Part C.
 
+### 17. Session pool scaling is server-driven and MUST NOT overwhelm the control plane
+
+Pool size respects `MinSessionCount` / `MaxSessionCount` and `Headroom` from `GetClientConfiguration` (spec #13), and rate-limits `OpenSession` creation via `NewSessionCreationBudget` + `NewSessionCreationPenalty` back-off + `ConsecutiveSessionFailureThreshold` circuit breaker — so a bad server response cannot trigger a session-creation storm. Scale-down is passive: closed sessions are simply not replaced when the pool has slack above headroom (Java-parity replace-on-close; supersedes any active-reaper approach).
+
 ---
 
 **See `SESSION_COMPONENT_SPEC.md`** for the component reference map and boundary/layering rules that prevent one component's logic from muddling into another's.
