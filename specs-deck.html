@@ -176,7 +176,7 @@
   <section class="slide active" id="s1">
     <header class="rail">
       <span class="rail-l">Bigtable Session subsystem &mdash; spec-driven review</span>
-      <span>Slide 1 of 4</span>
+      <span>Slide 1 of 5</span>
     </header>
     <h1>One-shot prompting &mdash; when the change fits in one breath</h1>
 
@@ -220,13 +220,11 @@
   <section class="slide" id="s2">
     <header class="rail">
       <span class="rail-l">Bigtable Session subsystem &mdash; spec-driven review</span>
-      <span>Slide 2 of 4</span>
+      <span>Slide 2 of 5</span>
     </header>
     <h1>Then came Jetstream &mdash; 30k+ LOC, no shared axis</h1>
 
     <p><strong>The scale problem.</strong> Session lifecycle + AFE picker + Diverter + z-pages + client-side metrics + pool scaling, all in flight. Tests included: <strong>&gt; 30k lines</strong>. A single prompt can&rsquo;t carry the required context. Every code iteration devolves into <em>&ldquo;does this look right?&rdquo;</em> &mdash; there&rsquo;s no shared axis, no way to prove a change <em>preserved</em> an existing rule.</p>
-
-    <div class="callout"><strong>Concrete failure mode.</strong> A one-line &ldquo;fix&rdquo; that cancels the in-flight vRPC on GOAWAY looks harmless in isolation &mdash; but it flips a successful non-idempotent <code>Apply</code> into a client-visible <code>TransportFailure</code>. Nothing in the diff says &ldquo;this invariant existed.&rdquo; The rule lived only in the reviewer&rsquo;s head.</div>
 
     <h2>The fix: write the invariants down, split by concern</h2>
     <p>Five spec files at repo root. Each governs one layer of the subsystem. Each numbered invariant is a MUST-rule with a name, a body, and grep-checkable <code>file:line</code> citations. Reviewer subagents read the spec, walk the diff, and report <code>PASS / VIOLATION / AMBIGUOUS</code> per invariant.</p>
@@ -239,7 +237,7 @@
         <tr>
           <td><code>SESSION_SPEC.md</code></td>
           <td>10</td>
-          <td><strong>#6</strong> &mdash; GOAWAY does <em>NOT</em> cancel the in-flight vRPC (Java parity: <code>SessionImpl.java:689-716</code>). Server may still deliver the response &mdash; critical for non-idempotent <code>Apply</code>.</td>
+          <td><strong>#6</strong> &mdash; On GOAWAY, session transitions <code>Ready &rarr; Closing</code> (Java parity: <code>SessionImpl.java:689-716</code>).</td>
         </tr>
         <tr>
           <td><code>SESSION_CLIENT_SPEC.md</code></td>
@@ -249,7 +247,7 @@
         <tr>
           <td><code>SESSION_POOL_SPEC.md</code></td>
           <td>5</td>
-          <td><strong>#2</strong> &mdash; AFE picker uses <code>e2eEwma</code>, NOT <code>transportEwma</code> (Java parity: <code>LeastLatencyPicker.java:59-60</code>). PeakEwma updates are OK-gated so fast-failing AFEs don&rsquo;t game the picker.</td>
+          <td><strong>#2</strong> &mdash; AFE picker is K-choice with two production strategies: <code>LeastInFlight</code> (fewest active vRPCs) and <code>LeastLatency</code> (min <code>e2eEwma</code>, Java parity: <code>LeastLatencyPicker.java:59-60</code>). PeakEwma updates are OK-gated so fast-failing AFEs can&rsquo;t game the picker.</td>
         </tr>
         <tr>
           <td><code>CLIENT_SIDE_METRICS_SPEC.md</code></td>
@@ -259,7 +257,7 @@
         <tr>
           <td><code>SESSION_COMPONENT_SPEC.md</code></td>
           <td>12 boundary + Part C ownership</td>
-          <td><strong>B2</strong> &mdash; <code>bigtable/internal/transport/**</code> MUST NOT import <code>bigtable/internal/session</code>. Enforced grep: <code>git grep -l 'cloud.google.com/go/bigtable/internal/session' bigtable/internal/transport/</code> returns empty.</td>
+          <td><strong>B2</strong> &mdash; Layer direction: transport is the primitives layer; session composes transport, never the reverse (applies to <code>_test.go</code> files too). Rationale: if transport reaches into session, either transport is doing something it shouldn&rsquo;t or session is exposing something it shouldn&rsquo;t. Enforced at <em>build time</em> by Go&rsquo;s import-cycle detector &mdash; session already imports transport, so any <code>transport&rarr;session</code> import fails to compile. Belt-and-braces grep: <code>git grep -l '.../internal/session' bigtable/internal/transport/</code> MUST be empty.</td>
         </tr>
       </tbody>
     </table>
@@ -271,7 +269,7 @@
   <section class="slide" id="s3">
     <header class="rail">
       <span class="rail-l">Bigtable Session subsystem &mdash; spec-driven review</span>
-      <span>Slide 3 of 4</span>
+      <span>Slide 3 of 5</span>
     </header>
     <h1><code>SESSION_COMPONENT_SPEC.md</code> &mdash; structure, boundaries, ownership</h1>
 
@@ -310,7 +308,6 @@
     <h2>Part C &mdash; Ownership matrix (sole owner per concern)</h2>
     <p>Every mutable concern names exactly one owner. Others read via accessor/interface; no parallel copies.</p>
     <blockquote>
-      <p><strong>In-flight vRPC slot</strong> | <code>Session.activeRPC</code> (atomic CAS) | pool MUST NOT track &ldquo;which session has an outstanding call&rdquo; separately.</p>
       <p><strong>Traffic split ratio (session vs classic)</strong> | <code>Diverter.sessionLoadBits</code> (atomic float64) | driven by <code>ClientConfigurationManager.SessionLoadListener</code>.</p>
       <p><strong>Per-attempt <code>ClusterInfo</code> (session path)</strong> | <code>InvokeResult.ClusterInfo</code> (returned by <code>Session.Invoke</code>) | stamped by <code>sessionTable.stampAttempt</code>; MUST NOT be re-derived from headers.</p>
       <p><strong>Session-tracer OTel histograms</strong> (<code>session.durations</code>, <code>session.open_latencies</code>, <code>session.uptime</code>, <code>transport_latencies</code>) | <code>sessionTracer</code>; registered once by <code>InitializeSessionMetrics</code> | sole writer; <code>transport_latencies</code> only from <code>session_pool.go:650</code> under the positive-delta gate.</p>
@@ -323,7 +320,7 @@
   <section class="slide" id="s4">
     <header class="rail">
       <span class="rail-l">Bigtable Session subsystem &mdash; spec-driven review</span>
-      <span>Slide 4 of 4</span>
+      <span>Slide 4 of 5</span>
     </header>
     <h1>Three prompts, three sizes &mdash; same review mechanism</h1>
 
@@ -343,43 +340,80 @@
     </ul>
     <p>Reviewer PASS confirms the invariant chain end-to-end &mdash; a future contributor cannot bypass the budget with a direct <code>go pool.openSession(...)</code>, and cannot tune the penalty from application code.</p>
 
-    <h2><span class="tag grey">3</span> Big feature &mdash; unified <code>debugview/</code> (7 z-pages behind one Handler)</h2>
-    <div class="prompt">&ldquo;Fold <code>sessionz</code> / <code>afez</code> / <code>loadz</code> / <code>channelz</code> / <code>configz</code> / <code>tcpz</code> / <code>debugtagsz</code> into a single <code>bigtable/debugview/</code> package with one mount point: <code>mux.Handle(&quot;/debug/&quot;, http.StripPrefix(&quot;/debug&quot;, debugview.Handler(client, tcpStats)))</code>. Every z-page reads pool/session/channel/config state <em>only</em> through the three provider interfaces (<code>SessionDebugProvider</code>, <code>ChannelDebugProvider</code>, <code>ConfigDebugProvider</code>) &mdash; no concrete <code>*SessionPoolImpl</code> or <code>*Session</code> imports. Both args nil-safe: nil client &rarr; &ldquo;not enabled&rdquo; state; nil tcpStats &rarr; &ldquo;collector detached&rdquo;. Root <code>/</code> renders a link index. Every view supports <code>?format=json</code>.&rdquo;</div>
-    <p><strong>The seven live pages.</strong> <code>sessionz</code> (per-pool sessions + states + latency histograms + slow-vRPC log + scaling history), <code>afez</code> (per-AFE bucketing: refCount / idle / in-use / EWMAs), <code>loadz</code> (picker decision reasoning + K-choice trace), <code>channelz</code> (gRPC channel pool state), <code>configz</code> (server-driven client configuration), <code>tcpz</code> (per-connection TCP_INFO), <code>debugtagsz</code> (process-global debug-tag counters).</p>
-    <p><strong>Why the specs made this survivable.</strong> The refactor collapsed 7 previously-separate packages (each with their own handler + snapshot code) into one, while preventing the &ldquo;let me just peek into the pool struct&rdquo; shortcut that would&rsquo;ve made every future pool refactor break the UI:</p>
+    <h2><span class="tag grey">3</span> Big feature &mdash; <code>tcpz</code>: per-connection TCP_INFO as a debug page (6 iterative commits)</h2>
+    <div class="prompt">&ldquo;Add a <code>tcpz</code> debug page that exposes TCP_INFO stats for every connection tracked in the client&rsquo;s channel pool. Wire a custom dialer at Client construction to capture each <code>net.Conn</code> into a <code>bigtable.TCPStats</code> collector; the view calls <code>getsockopt(SOL_TCP, TCP_INFO)</code> per socket on render.&rdquo;</div>
+    <p><strong>Why the specs made this survivable.</strong> <code>tcpz</code> introduced something none of the other z-pages did: a <em>fourth</em> kind of state (TCP-level, not pool/session/channel/config) with a Linux-only syscall on the read path. Every one of those choices touched a spec rule:</p>
     <ul>
-      <li><strong><code>SESSION_COMPONENT_SPEC.md B3</code></strong> &mdash; <code>debugview/</code> MUST access pool/session state ONLY via <code>SessionDebugProvider</code> (and siblings); MAY import snapshot DTO types (<code>PoolSnapshot</code>, <code>AfeSnapshotRow</code>, &hellip;) but NOT the concrete <code>*SessionPoolImpl</code>. This rule <em>exists</em> because of this refactor.</li>
-      <li><strong><code>SESSION_POOL_SPEC.md #4</code></strong> &mdash; z-pages MUST NOT block hot-path latencies. Snapshot methods take at most RLock, copy fields, release before returning; z-page holds no lock across the HTTP write. A hung z-page cannot hang the process.</li>
-      <li><strong><code>SESSION_COMPONENT_SPEC.md B10</code></strong> &mdash; z-page code MUST NOT synthesize state that could be computed on the producer. Derived values (session age, in-flight duration) live on the snapshot DTO, not in the HTML template &mdash; so a second consumer (JSON API, test) gets the same values.</li>
-      <li><strong>Interface stability, verified by the reviewer.</strong> Adding a 4th method to <code>SessionDebugProvider</code>? Every fake in <code>afez_test.go</code> / <code>sessionz_test.go</code> / <code>loadz_test.go</code> must implement it. Interface is defensive by design.</li>
+      <li><strong><code>SESSION_COMPONENT_SPEC.md B3</code></strong> &mdash; debugview accesses pool/session state ONLY via the three provider interfaces (<code>SessionDebugProvider</code> / <code>ChannelDebugProvider</code> / <code>ConfigDebugProvider</code>). TCP_INFO isn&rsquo;t any of those &mdash; forced the decision to introduce <code>*bigtable.TCPStats</code> as a fourth first-class Handler arg rather than smuggling it through an existing provider. Part C gained a new ownership row.</li>
+      <li><strong><code>SESSION_POOL_SPEC.md #4</code></strong> &mdash; z-pages MUST NOT block hot-path latencies. <code>getsockopt</code> is a syscall; the collector holds live <code>net.Conn</code> refs. Reviewer checks: snapshot-copy the conn list under RLock, <em>release</em>, then iterate + syscall outside the lock. Otherwise a hung syscall would freeze every subsequent connection registration.</li>
+      <li><strong><code>SESSION_COMPONENT_SPEC.md B10</code></strong> &mdash; z-pages render, they don&rsquo;t compute. The &ldquo;flag sub-1500 PMTU paths&rdquo; column added in commit 3 lives on the DTO producer (<code>tcp_info_linux.go</code>), not in the template &mdash; so the JSON consumer sees the same flag as the HTML view.</li>
+      <li><strong>Nil-safety contract enforced across all 7 z-pages.</strong> <code>debugview.Handler(client, nil)</code> must not panic; <code>/tcpz/</code> renders &ldquo;collector not attached&rdquo;. That contract is why <code>tcpz</code> slotted in without adding a second constructor.</li>
     </ul>
-    <p><strong>What the spec catches on new z-pages.</strong> A future <code>flightz2</code> that reaches into <code>*SessionPoolImpl.waiters</code> directly &mdash; VIOLATION on B3. A template that computes <code>time.Since(sess.OpenedAt())</code> instead of reading a pre-computed <code>Age</code> DTO field &mdash; VIOLATION on B10. A handler that sits on <code>p.mu.RLock()</code> across <code>w.Write(&hellip;)</code> &mdash; VIOLATION on POOL #4. Reviewer catches all three from grep-checkable rules; without the specs each would be &ldquo;hmm, seems fine&rdquo; in code review.</p>
+    <p><strong>Why 6 commits, not one.</strong> Even &ldquo;big&rdquo; features break down under specs. The initial page shipped as one prompt (<code>e8c80cff91 tcpz &mdash; per-conn TCP_INFO debug endpoint</code>); every subsequent field added &mdash; retrans diagnostics, PMTU, flow control, per-peer grouping, auto-refresh throttle &mdash; was its own small one-shot prompt because the base was solid. The specs made incremental additions safe: reviewer confirmed each new field followed B10 (compute on producer), and each new render pass followed POOL #4 (no lock across syscall). Six commits, six clean reviews, no regressions.</p>
 
-    <h2>How reviewers use the specs</h2>
+  </section>
+
+  <!-- ============ SLIDE 5 — Reviewer + test-run mechanism ============ -->
+  <section class="slide" id="s5">
+    <header class="rail">
+      <span class="rail-l">Bigtable Session subsystem &mdash; spec-driven review</span>
+      <span>Slide 5 of 5</span>
+    </header>
+    <h1>How the reviewer verifies specs and runs tests</h1>
+
+    <p>Every session-scope commit goes through the same pipeline: edit &rarr; hook reminder &rarr; two reviewer agents in parallel &rarr; smoke-gate tests &rarr; commit. The two agents split the workload so no single reviewer holds the whole spec set in context at once.</p>
+
     <div class="two-col">
       <div>
-        <h3>Two agents in parallel, per commit</h3>
-        <ol>
-          <li><code>session-reviewer</code> &mdash; reads all 4 behavioral specs, walks the diff, reports one row per touched invariant: <code>Spec | # | PASS / VIOLATION / AMBIGUOUS | Evidence (file:line)</code>.</li>
-          <li><code>session-component-review</code> &mdash; reads <code>SESSION_COMPONENT_SPEC.md</code>, checks boundary rules (B1&ndash;B12) and Part C ownership; runs the grep patterns documented in the spec.</li>
-          <li>PostToolUse hook fires on every edit to a session-scope file &mdash; the reminder is Claude&rsquo;s cue to spawn both agents before <code>git commit</code>.</li>
-        </ol>
+        <h2><code>session-reviewer</code> &mdash; behavioral</h2>
+        <ul>
+          <li><strong>Reads</strong> the 4 behavioral specs: <code>SESSION_SPEC.md</code>, <code>SESSION_CLIENT_SPEC.md</code>, <code>SESSION_POOL_SPEC.md</code>, <code>CLIENT_SIDE_METRICS_SPEC.md</code>.</li>
+          <li><strong>Walks the diff</strong>, opens every cited file, cross-references the invariants each touched line could affect.</li>
+          <li><strong>Reports one row per touched invariant</strong> &mdash; empty report if the diff is scoped to files no invariant governs.</li>
+        </ul>
       </div>
       <div>
-        <h3>What PASS vs VIOLATION mean</h3>
+        <h2><code>session-component-review</code> &mdash; boundaries</h2>
         <ul>
-          <li><strong>PASS</strong> &mdash; the invariant holds after this change; commit.</li>
-          <li><strong>VIOLATION</strong> &mdash; the code contradicts the spec. Either (a) fix the code, OR (b) if the rule is stale, update the spec <em>in the same PR</em> with justification.</li>
-          <li><strong>AMBIGUOUS</strong> &mdash; the reviewer can&rsquo;t decide from the diff alone; needs context (e.g., a Part C row is missing for a sole-owner claim you just added).</li>
+          <li><strong>Reads</strong> <code>SESSION_COMPONENT_SPEC.md</code> &mdash; Part B (12 MUST-rules) + Part C (ownership matrix).</li>
+          <li><strong>Runs the grep patterns</strong> documented in the spec (B1/B2/B6 have explicit greps; others are structural checks).</li>
+          <li><strong>Flags new imports, new call sites, new struct fields</strong> against Part C sole-owner claims.</li>
         </ul>
-        <p class="callout" style="margin-top:8px"><strong>Load-bearing property:</strong> specs are living. When a rule is wrong, you update it in the same PR &mdash; never in a follow-up. That&rsquo;s what keeps the reviewer&rsquo;s citations honest.</p>
       </div>
     </div>
+
+    <h2>Report format &mdash; one row per touched rule</h2>
+<pre><code>| Spec | #  | Verdict    | Evidence                                                    |
+|------|----|------------|-------------------------------------------------------------|
+| SESS | 2  | PASS       | session_vrpc.go:107 CAS enforces multiplex=1                |
+| SESS | 4  | PASS       | session_test.go:1113 asserts OnStart→OnActive→…→OnClose     |
+| POOL | 4  | VIOLATION  | debugview/afez.go:83 holds p.mu.RLock across w.Write        |
+| COMP | B3 | AMBIGUOUS  | debugview/foo.go:12 imports *SessionPoolImpl — Part C gap?  |</code></pre>
+
+    <div class="two-col">
+      <div>
+        <h2>Verdict semantics</h2>
+        <ul>
+          <li><strong>PASS</strong> &mdash; invariant holds after this change; commit.</li>
+          <li><strong>VIOLATION</strong> &mdash; code contradicts spec. Fix the code, OR if the rule is stale, update the spec <em>in the same PR</em> with justification.</li>
+          <li><strong>AMBIGUOUS</strong> &mdash; reviewer can&rsquo;t decide from diff alone; needs context (e.g., a Part C row is missing for a sole-owner claim you just added). Resolve before commit.</li>
+        </ul>
+      </div>
+      <div>
+        <h2>Then run the tests</h2>
+        <p>After reviewers report PASS across the board, the smoke gate:</p>
+<pre><code>go test ./internal/transport/ \
+  -count=1 -short -timeout=90s</code></pre>
+        <p>Bypasses the hanging top-level <code>bigtable</code> integration tests. Coverage-audit slice: 22 behavioral invariants + 12 boundary rules; tests directly enforce a growing subset (e.g., <code>TestInvoke_ConcurrentSecondFailsWithMultiplexViolation</code> covers SESS #2, <code>TestHooks_FiredInSpecOrder</code> covers SESS #4).</p>
+      </div>
+    </div>
+
+    <p class="callout" style="margin-top:12px"><strong>Load-bearing property:</strong> specs are living. When a rule is wrong, you update it in the same PR that changes the code &mdash; never in a follow-up. That&rsquo;s what keeps every reviewer citation honest and every <code>file:line</code> reference resolvable.</p>
   </section>
 
 </div>
 
-<div id="counter">1 / 4</div>
+<div id="counter">1 / 5</div>
 <div id="nav-hint"><span class="kbd">&larr;</span> <span class="kbd">&rarr;</span> or <span class="kbd">Space</span> to navigate &nbsp;&middot;&nbsp; <span class="kbd">F</span> for fullscreen</div>
 
 <script>
