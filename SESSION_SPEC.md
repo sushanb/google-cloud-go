@@ -192,6 +192,8 @@ Ownership matrix additions live in SESSION_COMPONENT_SPEC.md Part C.
 
 Pool size respects `MinSessionCount` / `MaxSessionCount` and `Headroom` from `GetClientConfiguration` (spec #13), and rate-limits `OpenSession` creation via `NewSessionCreationBudget` + `NewSessionCreationPenalty` back-off + `ConsecutiveSessionFailureThreshold` circuit breaker — so a bad server response cannot trigger a session-creation storm. Scale-down is passive: closed sessions are simply not replaced when the pool has slack above headroom (Java-parity replace-on-close; supersedes any active-reaper approach).
 
+**When more sessions are added.** On every `PoolSizer` tick (`pool_sizer.go:161-199`), `DesiredCapacity = clamp(SessionsInUse + IdleHeadroom, MinSessions, MaxSessions)` where `IdleHeadroom = max(minIdleSessions, ceil(SessionsInUse × HeadroomPct))` (default 10%). A scale-up (`Delta > 0`) fires **only** when `DesiredCapacity > EventualCapacity` — i.e., in-use load has grown past what already-open plus already-pending sessions can absorb with headroom. Startup fills to `MinSessions` unconditionally so a fresh pool always has that floor before the first request.
+
 ---
 
 **See `SESSION_COMPONENT_SPEC.md`** for the component reference map and boundary/layering rules that prevent one component's logic from muddling into another's.
