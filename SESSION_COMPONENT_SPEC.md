@@ -47,7 +47,8 @@ Snapshot as of 2026-07-10 against `feat/bigtable-sessionz-debug` (Go) and `~/goo
 | AFE bucket | `afeHandle` — `session_list.go:50` | `SessionList.AfeHandle` — `SessionList.java:381` |
 | Per-session handle | `SessionHandle` — `picker.go:27` | `SessionList.SessionHandle` — `SessionList.java:143` |
 | PeakEwma tracker | `PeakEwma` — `peak_emwa.go:24` | `SessionList.PeakEwma` — `SessionList.java:415` |
-| Pool sizing | `session_pool_scaling.go` + `ScalingEvent` — `:52` | `PoolSizer` — `PoolSizer.java:25` |
+| Pool sizing math | `PoolSizer` — `pool_sizer.go:56` (formula + `ScaleDecision`) | `PoolSizer` — `PoolSizer.java:25` |
+| Pool sizing action | `session_pool_scaling.go` + `ScalingEvent` — `:52` (consumes `ScaleDecision`, drives `openSession` / passive shrink) | inline in `SessionPoolImpl.java` |
 | Creation budget | `SessionThrottler` / `AdaptiveSessionThrottler` — `session_creation_budget.go:24,56` | `SessionCreationBudget` — `SessionCreationBudget.java:32` |
 
 ### Picker
@@ -84,6 +85,31 @@ Snapshot as of 2026-07-10 against `feat/bigtable-sessionz-debug` (Go) and `~/goo
 | z-pages | `debugview/{sessionz,afez,flightz,loadz,configz,channelz,tcpz}.go` + `debugview/handler.go:74` | — |
 | Tracer | `sessionTracer` — `session_tracer.go:121` | `SessionTracer` / `SessionTracerImpl` |
 | Debug tags | `sessionDebug` embedded in `Session` — `session_debug.go:36` | `DebugTagTracer` |
+
+### PoolSizer decision anatomy
+
+`PoolSizer.Decide()` (`pool_sizer.go:154`) is the only place the desired-capacity formula lives. Every intermediate is stamped on `ScaleDecision` so `session_pool_scaling.go`, z-pages, and tests all consume the same numbers instead of recomputing.
+
+Inputs from `PoolStats` (via injected `StatsFetcher` — the sizer never reads pool internals directly): `ReadyCount`, `StartingCount`, `InUseCount`, `PendingCount`. Server-driven config from `ClientConfigurationManager.UpdateConfig` (see `SESSION_CLIENT_SPEC.md #3` for the authoritative field list): `MinSessions`, `MaxSessions`, `HeadroomPct`, `NewSessionQueueLength`. Client-side constant (not server-driven): `MinIdleSessions` — hardcoded to `defaultMinIdleSessions = 1` in `NewPoolSizer` (`pool_sizer.go:68,82`) and never mutated.
+
+Formula (`pool_sizer.go:176-192`):
+
+```
+EffectivePending = ceil(PendingCount / NewSessionQueueLength)
+SessionsInUse    = InUseCount + EffectivePending
+IdleHeadroom     = max(MinIdleSessions, ceil(SessionsInUse × HeadroomPct))
+DesiredRaw       = SessionsInUse + IdleHeadroom
+DesiredCapacity  = clamp(DesiredRaw, MinSessions, MaxSessions)
+```
+
+What each intermediate means:
+
+- **`EffectivePending`** — waiters at the pool boundary converted into *sessions we'd need to drain them*. `NewSessionQueueLength` is the server-advertised per-session vRPC pipeline depth (default 10); 47 waiters at qlen=10 becomes `EffectivePending = 5`, not 47. `ceil` guarantees 1 waiter still triggers 1 new session, not fractional.
+- **`SessionsInUse`** — true current load: sessions actively serving vRPCs plus the sessions we'd have to open to drop `PendingCount` to zero.
+- **`IdleHeadroom`** — cushion of idle sessions on top of load, as a fraction of `SessionsInUse`. Floor via `MinIdleSessions` (default 1) prevents an idle pool from wanting zero sessions (`ceil(0 × pct) = 0` would starve the warmup path).
+- **`DesiredCapacity`** — clamped to server-configured bounds. Startup fills to `MinSessions` unconditionally; SESSION_POOL_SPEC #5 governs when a scale-up actually fires (`DesiredCapacity > EventualCapacity`).
+
+Branch semantics (`scale-up` / `scale-down` / `dead-band` / `no-stats`) compare `DesiredCapacity` against `ImmediateCapacity = ReadyCount` and `EventualCapacity = ReadyCount + StartingCount`. `scale-down` deltas are **advisory** — the pool never proactively kills sessions; `OnClose` reads the delta and declines replacement so the pool shrinks passively as the server ages sessions out (SESSION_POOL_SPEC #5).
 
 ### Two structural divergences worth remembering
 - **Lazy per-op pools (Go-only).** `SessionTable` holds two `*lazyPool` (read + write) opened on first `ReadRow` / `Apply`. Marshal errors surface at first call, not `OpenTable`.
@@ -176,6 +202,8 @@ Every rule is a MUST. Violations are bugs, not preferences.
 | In-flight vRPC slot | `Session.activeRPC` (atomic CAS) | pool MUST NOT track "which session has an outstanding call" separately |
 | Heartbeat deadline | `Session.nextHeartbeatDeadlineNano` (atomic) | pool watchdog MUST NOT independently reset |
 | Session pool composition (min/max/waiters) | `SessionPoolImpl` | driven by `ClientConfigurationManager.UpdateConfig` |
+| Pool sizing formula + `ScaleDecision` | `PoolSizer` (`pool_sizer.go:154`) | `session_pool_scaling.go`, z-pages, tests MUST consume `Decide()`/`ScaleDecision`; MUST NOT recompute `EffectivePending`/`IdleHeadroom`/`DesiredCapacity` from raw `PoolStats` |
+| Sizer inputs (`PoolStats`) | `SessionPoolImpl` via injected `StatsFetcher` | `PoolSizer` reads via fetcher closure; MUST NOT touch pool internals directly |
 | Traffic split ratio (session vs classic) | `Diverter.sessionLoadBits` (atomic float64) | driven by `ClientConfigurationManager.SessionLoadListener` |
 | Server-driven config | `ClientConfigurationManager.currentConfig` (RW-mutex) | pools subscribe via listener |
 | Retry classification (`AttemptState`) | `session_vrpc.go` tag sites | `RetryingVRpc` reads via `ClassifyErr`; MUST NOT re-classify |
