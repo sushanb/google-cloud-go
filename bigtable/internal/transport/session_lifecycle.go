@@ -153,7 +153,7 @@ func (s *Session) Close(ctx context.Context, req *spb.CloseSessionRequest) error
 	// transitioned to Closing above BEFORE observing activeRPC — so the
 	// defer's "check state after clearing" side always signals if we miss
 	// the empty snapshot here.
-	empty := s.activeRPC.Load() == nil
+	empty := s.activeVRPC() == nil
 	if empty {
 		s.signalQuiescent()
 	} else {
@@ -420,7 +420,7 @@ func (s *Session) handleClose(err error) {
 		recordDebugTag(tagSessionAbnormalClose)
 	}
 	inFlight := 0
-	if s.activeRPC.Load() != nil {
+	if s.activeVRPC() != nil {
 		inFlight = 1
 	}
 	age := time.Duration(0)
@@ -520,7 +520,7 @@ func (s *Session) heartBeatLoop(ctx context.Context) {
 				return
 			}
 			active := 0
-			if s.activeRPC.Load() != nil {
+			if s.activeVRPC() != nil {
 				active = 1
 			}
 			remaining := time.Until(time.Unix(0, s.nextHeartbeatDeadlineNano.Load()))

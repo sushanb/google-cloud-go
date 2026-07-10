@@ -207,7 +207,7 @@ func TestNewSession_Defaults(t *testing.T) {
 	if got := s.sessionType; got != SessionTypeAuthorizedView {
 		t.Errorf("sessionType = %v, want SessionTypeAuthorizedView", got)
 	}
-	if s.activeRPC.Load() != nil {
+	if s.activeVRPC() != nil {
 		t.Error("activeRPC slot should start nil")
 	}
 	if s.quiescent == nil {
@@ -465,7 +465,7 @@ func TestHandleGoAway_PreservesInFlightRPC(t *testing.T) {
 	if got := s.State(); got != StateClosing {
 		t.Errorf("state = %v, want StateClosing", got)
 	}
-	if s.activeRPC.Load() != rpc {
+	if s.activeVRPC() != rpc {
 		t.Error("in-flight RPC should remain in slot; GOAWAY must not cancel it")
 	}
 	select {
@@ -651,7 +651,7 @@ func TestInvoke_SendFailureCleansUpMap(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from failed Send")
 	}
-	if s.activeRPC.Load() != nil {
+	if s.activeVRPC() != nil {
 		t.Error("activeRPC slot should be cleared by defer on Send failure")
 	}
 }

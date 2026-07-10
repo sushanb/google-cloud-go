@@ -251,6 +251,9 @@ type Session struct {
 	// Invoke sets it via CompareAndSwap(nil, rpc) — the CAS is the
 	// pool-serialization invariant made explicit: if it fails, someone
 	// bypassed the pool's per-session checkout gate.
+	//
+	// Access via activeVRPC() (Load) and casActiveVRPC(old, next) (CAS);
+	// only tests reach the atomic directly (via Store) for fixture setup.
 	activeRPC atomic.Pointer[vrpcImpl]
 
 	// poolHandle is the back-ref to this session's SessionHandle, stored
@@ -350,6 +353,22 @@ func (s *Session) AfeID() afeID {
 // if the server has not sent one.
 func (s *Session) RefreshConfig() *spb.SessionRefreshConfig {
 	return s.refreshConfig.Load()
+}
+
+// activeVRPC returns the currently in-flight vRPC, or nil if the slot is
+// empty. Thin wrapper around activeRPC.Load — see the field's docstring
+// for the multiplex=1 invariant.
+func (s *Session) activeVRPC() *vrpcImpl {
+	return s.activeRPC.Load()
+}
+
+// casActiveVRPC atomically replaces the in-flight vRPC slot iff its
+// current value equals `old`, returning true on success. All production
+// mutations of activeRPC go through this wrapper; a failed CAS is the
+// signal that the pool's per-session checkout gate was bypassed (see
+// SESSION_SPEC.md #3).
+func (s *Session) casActiveVRPC(old, next *vrpcImpl) bool {
+	return s.activeRPC.CompareAndSwap(old, next)
 }
 
 // transitionTo sets the session state to `to` iff ok(currentState) returns

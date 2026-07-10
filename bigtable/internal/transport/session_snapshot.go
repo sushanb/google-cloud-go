@@ -333,7 +333,7 @@ func (s *Session) Snapshot() SessionSnapshot {
 	hbInterval := time.Duration(s.heartbeatIntervalNano.Load())
 	nextHb := time.Unix(0, s.nextHeartbeatDeadlineNano.Load())
 	activeRpcs := 0
-	if rpc := s.activeRPC.Load(); rpc != nil {
+	if rpc := s.activeVRPC(); rpc != nil {
 		activeRpcs = 1
 	}
 	peer := s.peerInfo.Load()

@@ -104,7 +104,7 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 
 	// Claim the single in-flight slot. See method doc — a losing CAS is
 	// a caller-side serialization bug, not a runtime backoff condition.
-	if !s.activeRPC.CompareAndSwap(nil, rpc) {
+	if !s.casActiveVRPC(nil, rpc) {
 		return result, tagErr(StateUncommitted,
 			unavailable(ErrSessionNotActive,
 				"concurrent Invoke on session %q: multiPlexingLimit=1 violated", s.logName))
@@ -142,7 +142,7 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 // so at least one side signals. signalQuiescent is once-guarded, so a
 // double-signal is harmless.
 func (s *Session) releaseSlot(rpc *vrpcImpl) {
-	s.activeRPC.CompareAndSwap(rpc, nil)
+	s.casActiveVRPC(rpc, nil)
 	if State(s.state.Load()) == StateClosing {
 		s.signalQuiescent()
 	}
@@ -253,7 +253,7 @@ func (s *Session) awaitInvokeResult(ctx context.Context, rpc *vrpcImpl, desc VRp
 // was still holding the slot at cancel time — useful for spotting races
 // between our cancel and a late server response.
 func (s *Session) recordCtxDone(ctx context.Context, rpc *vrpcImpl, method string, sentAt time.Time) {
-	stillActive := s.activeRPC.Load() == rpc
+	stillActive := s.activeVRPC() == rpc
 	sessState := State(s.state.Load())
 	waited := time.Since(sentAt)
 	peer := s.peerInfoSummary()
@@ -274,7 +274,7 @@ func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
 		"vRPC response for rpc_id=%d arrived in state %s", resp.RpcId, st) {
 		return
 	}
-	rpc := s.activeRPC.Load()
+	rpc := s.activeVRPC()
 	if rpc == nil {
 		recordDebugTag(tagSessionVRPCNil)
 		s.debugf("dropping VirtualRpcResponse for rpc_id=%d — no in-flight RPC tracked", resp.RpcId)
@@ -299,7 +299,7 @@ func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 		"vRPC error for rpc_id=%d arrived in state %s", errResp.RpcId, st) {
 		return
 	}
-	rpc := s.activeRPC.Load()
+	rpc := s.activeVRPC()
 	if rpc == nil {
 		recordDebugTag(tagSessionVRPCErrorNil)
 		s.debugf("dropping ErrorResponse for rpc_id=%d — no in-flight RPC tracked", errResp.RpcId)
@@ -362,11 +362,11 @@ func (s *Session) deliver(rpc *vrpcImpl, res vrpcResult) bool {
 // Clear-then-deliver so a racing handleVRPCResponse can't double-deliver
 // on the same slot.
 func (s *Session) cancelActiveRPCs(err error) {
-	rpc := s.activeRPC.Load()
+	rpc := s.activeVRPC()
 	if rpc == nil {
 		return
 	}
-	if !s.activeRPC.CompareAndSwap(rpc, nil) {
+	if !s.casActiveVRPC(rpc, nil) {
 		// Concurrent completion cleared the slot; the caller already
 		// received a result. Nothing to cancel.
 		return
