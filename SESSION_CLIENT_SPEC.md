@@ -8,6 +8,8 @@
 
 **How to use.** Read top-to-bottom before editing files in scope. Cross-references to other specs use `<FILE>.md #N`-style anchors. When a change spans layers (e.g., a config knob that also reshapes pool sizing), verify against every spec in scope.
 
+**How to verify.** Invariants here are enforced by the session reviewer agents (`session-reviewer` for behavioral, `session-component-review` for boundaries) — both auto-invoked by the PostToolUse hook on session-file edits. The unit-test smoke-gate command lives in `CLAUDE.md` → "Known gotchas"; use it instead of `go test ./...` in the top-level `bigtable` package (which hangs on real-backend integration tests).
+
 **Java parity.** Where the two clients differ, both sides are cited. Deviations require an explicit note in the invariant.
 
 ---
