@@ -112,6 +112,12 @@ func (s *Session) notifyClosed(streamErr error) {
 			s.HasErrorRpcs(),
 		)
 		s.hooks.onClose(s, streamErr)
+		// POC: Shutdown the per-session serializer at end-of-teardown.
+		// Safe here — every notifyClosed caller path (ForceClose,
+		// handleClose, Close-driven Send failure, handleGoAway's spawned
+		// Close goroutine) runs OFF the syncCtx runner. Shutdown blocks
+		// on runner exit; calling it from the runner would deadlock.
+		s.syncC.Shutdown()
 	})
 }
 
@@ -377,44 +383,55 @@ func (s *Session) handleSessionRefreshConfig(cfg *spb.SessionRefreshConfig) {
 //
 // A late-arriving GOAWAY from an already terminal session is ignored.
 func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
-	// Sanity-check state BEFORE attempting the transition: GOAWAY landing
-	// on a NEW session is a protocol oddity (server shouldn't send GOAWAY
-	// before the session is Started). The current predicate below would
-	// silently accept it; the assert makes it observable.
-	preState := s.State()
-	if !assertDebugTagf(preState >= StateStarting, tagSessionGoawayBeforeStart,
-		"GOAWAY arrived while session was in %s (want >= Starting)", preState) {
-		return
-	}
-	if _, ok := s.transitionTo(StateClosing, notState(StateClosing, StateWaitServerClose, StateClosed)); !ok {
-		// Session is already terminal (Closing, WaitServerClose, or
-		// Closed). A late GOAWAY here just races our local teardown —
-		// observable but harmless.
-		recordDebugTag(tagSessionGoawayAfterClose)
-		return
-	}
-	// Fire onClosing immediately so the pool can pull this session out of
-	// routing structures. Firing here (not just from Close's transitionTo
-	// below) matters because handleGoAway is the earliest point we know
-	// the session is dying — up to waitServerCloseGrace seconds before
-	// the actual stream close.
-	s.notifyClosing()
-	s.setCloseReason("GoAway")
+	// POC: run the state transition + onClosing fanout on the syncCtx.
+	// ExecuteSync (not Execute) so callers still observe the state
+	// transition synchronously — handleGoAway is called from readLoop, a
+	// distinct goroutine from the syncCtx runner, so this is a two-hop
+	// hand-off, not self-deadlock. Preserves the semantic contract of
+	// pre-POC handleGoAway: after return, state has already advanced.
+	//
+	// The actual s.Close (which calls Send under sendMu, waits on
+	// quiescent, and blocks up to 30s) is spawned off the runner via `go`
+	// — holding the serializer across Send + a drain deadlock would
+	// starve every other syncCtx callback (Invoke slot claims,
+	// subsequent transitions).
+	s.syncC.ExecuteSync(func() {
+		preState := s.State()
+		if !assertDebugTagf(preState >= StateStarting, tagSessionGoawayBeforeStart,
+			"GOAWAY arrived while session was in %s (want >= Starting)", preState) {
+			return
+		}
+		if _, ok := s.transitionTo(StateClosing, notState(StateClosing, StateWaitServerClose, StateClosed)); !ok {
+			// Session is already terminal (Closing, WaitServerClose, or
+			// Closed). A late GOAWAY here just races our local teardown —
+			// observable but harmless.
+			recordDebugTag(tagSessionGoawayAfterClose)
+			return
+		}
+		// Fire onClosing immediately so the pool can pull this session out of
+		// routing structures. Firing here (not just from Close's transitionTo
+		// below) matters because handleGoAway is the earliest point we know
+		// the session is dying — up to waitServerCloseGrace seconds before
+		// the actual stream close.
+		s.notifyClosing()
+		s.setCloseReason("GoAway")
 
-	s.debugf("received GOAWAY reason=%q description=%q",
-		goAway.GetReason(), goAway.GetDescription())
+		s.debugf("received GOAWAY reason=%q description=%q",
+			goAway.GetReason(), goAway.GetDescription())
 
-	// Drive the lifecycle to completion off the readLoop. s.Close
-	// sends CloseSession, transitions to WaitServerClose, and then the
-	// pool's stuck-session monitor or the server's EOF moves us to Closed.
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = s.Close(ctx, &spb.CloseSessionRequest{
-			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_GOAWAY,
-			Description: "client teardown after server GOAWAY",
-		})
-	}()
+		// Drive the lifecycle to completion off both the readLoop AND the
+		// syncCtx. s.Close sends CloseSession, transitions to
+		// WaitServerClose, and then the pool's stuck-session monitor or the
+		// server's EOF moves us to Closed.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_ = s.Close(ctx, &spb.CloseSessionRequest{
+				Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_GOAWAY,
+				Description: "client teardown after server GOAWAY",
+			})
+		}()
+	})
 }
 
 // handleClose is invoked when Recv returns an error. It transitions to

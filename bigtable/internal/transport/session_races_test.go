@@ -144,3 +144,109 @@ func TestRace_R2_InvokeSendsOnSessionRacingToClose(t *testing.T) {
 		t.Fatal("neither Send nor Invoke return within 2s")
 	}
 }
+
+// TestRace_R1a_HandleGoAway_ChecksOutClosingSession exercises the R1a
+// structural guarantee introduced by syncCtx: handleGoAway and Invoke's
+// slot-claim are BOTH scheduled on the same per-session syncCtx, so a
+// GOAWAY-observing Invoke either
+//
+//   - runs BEFORE handleGoAway (claims slot; the vRPC gets its response
+//     during the drain grace period — Java parity), OR
+//   - runs AFTER handleGoAway (observes StateClosing under ExecuteSync
+//     and rejects with ErrSessionNotActive tagged StateUncommitted —
+//     RetryingVRpc silently re-picks a fresh session).
+//
+// The interleaving "state==Ready observed → CAS succeeds → wire send
+// fires while state has moved to Closing" is structurally impossible
+// under the POC: the state read and CAS live inside the same
+// ExecuteSync body, and the only migrated transition path
+// (handleGoAway) queues on the same serializer.
+//
+// Test shape: fire a GOAWAY-triggering handleGoAway callback, then
+// immediately call Invoke and assert the reject. On BASELINE without
+// the syncCtx wiring, handleGoAway transitions state synchronously
+// too (via transitionTo in the readLoop), so this test also passes on
+// baseline — R1a's meaningful win is structural (removes reliance on
+// SendVRpc's sendMu-scoped re-check), not observational. The test
+// nails the STRUCTURAL post-condition: after handleGoAway returns,
+// every subsequent Invoke on the same session rejects, and no vRPC
+// frame reaches the wire.
+func TestRace_R1a_HandleGoAway_ChecksOutClosingSession(t *testing.T) {
+	stream := newFakeStream()
+	t.Cleanup(stream.Close)
+
+	// Signal (via a buffered chan) if a vRPC frame ever hits Send.
+	// Filter for VirtualRpc payload only — CloseSession also flows through
+	// Send (from handleGoAway's spawned Close goroutine) and would
+	// otherwise trip the assertion.
+	sendSignal := make(chan struct{}, 1)
+	stream.sendFn = func(req *spb.SessionRequest) error {
+		if _, ok := req.GetPayload().(*spb.SessionRequest_VirtualRpc); ok {
+			select {
+			case sendSignal <- struct{}{}:
+			default:
+			}
+		}
+		return nil
+	}
+
+	s := newTestSession(t, stream, SessionHooks{})
+	// Reap the per-session syncCtx runner even though the test never
+	// drives notifyClosed (fakeStream never EOFs). Without this the
+	// runner goroutine leaks and shows up under -count=100 -race.
+	t.Cleanup(func() { s.syncC.Shutdown() })
+	s.state.Store(int32(StateReady))
+
+	// Fire handleGoAway. Under the POC wiring this dispatches the state
+	// transition through the syncCtx via ExecuteSync — by the time it
+	// returns, state has advanced to Closing.
+	s.handleGoAway(&spb.GoAwayResponse{
+		Reason:      "test",
+		Description: "R1a: server graceful drain",
+	})
+
+	// State should be non-Ready. Under -count=100 the spawned Close
+	// goroutine has occasionally already advanced Closing→WaitServerClose
+	// by the time we observe — either is fine; the R1a claim is "no longer
+	// eligible for fresh vRPCs," not a specific terminal-bound state.
+	if got := s.State(); got == StateReady {
+		t.Fatalf("post-GOAWAY state = %v; want any non-Ready state", got)
+	}
+
+	desc := &fakeDesc{
+		method: "MutateRow",
+		enc:    func(interface{}) ([]byte, error) { return []byte("mutate"), nil },
+		dec:    func([]byte) (interface{}, error) { return nil, nil },
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	_, err := s.Invoke(ctx, desc, "mutate")
+	if err == nil {
+		t.Fatal("Invoke returned nil err after handleGoAway; want ErrSessionNotActive")
+	}
+	if !errors.Is(err, ErrSessionNotActive) {
+		t.Errorf("Invoke err = %v; want wrap of ErrSessionNotActive", err)
+	}
+	if got := ClassifyErr(err).State; got != StateUncommitted {
+		t.Errorf("Invoke err state tag = %v; want StateUncommitted so RetryingVRpc silently re-picks", got)
+	}
+	// R1a structural post-condition: no vRPC wire send occurred.
+	// (snapshotSent counts every frame including handleGoAway's
+	// CloseSessionRequest, so filter via sendSignal which only fires on
+	// VirtualRpc payloads.)
+	select {
+	case <-sendSignal:
+		t.Error("vRPC Send fired on a session post-handleGoAway; want no vRPC wire traffic")
+	default:
+	}
+	var vrpcFrames int
+	for _, f := range stream.snapshotSent() {
+		if _, ok := f.GetPayload().(*spb.SessionRequest_VirtualRpc); ok {
+			vrpcFrames++
+		}
+	}
+	if vrpcFrames != 0 {
+		t.Errorf("stream vRPC frames = %d; want 0", vrpcFrames)
+	}
+}

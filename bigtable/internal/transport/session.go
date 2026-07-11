@@ -229,6 +229,15 @@ type Session struct {
 
 	sendMu sync.Mutex
 
+	// syncC serializes session-state mutations onto a single goroutine
+	// (POC scope: handleGoAway + Invoke's slot claim). Every callback runs
+	// strictly after the previous one returns, so cross-resource invariants
+	// (state ↔ activeRPC ↔ sessionList) become structurally atomic rather
+	// than prose-enforced. Read paths (State(), activeVRPC(), PeerInfo())
+	// stay lock-free atomics. Runner goroutine exits when Shutdown drains
+	// the queue — notifyClosed calls Shutdown at end-of-teardown.
+	syncC *syncCtx
+
 	logName     string
 	stream      Stream
 	hooks       SessionHooks
@@ -331,6 +340,7 @@ func NewSession(logName string, stream Stream, hooks SessionHooks, sessionType S
 	s.state.Store(int32(StateNew))
 	s.heartbeatIntervalNano.Store(int64(defaultHeartbeatInterval))
 	s.nextHeartbeatDeadlineNano.Store(time.Now().Add(initialHeartbeatGrace).UnixNano())
+	s.syncC = newSyncCtx()
 	for _, o := range opts {
 		o(s)
 	}

@@ -103,12 +103,33 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 		resultChan: make(chan vrpcResult, 1),
 	}
 
-	// Claim the single in-flight slot. See method doc — a losing CAS is
-	// a caller-side serialization bug, not a runtime backoff condition.
-	if !s.casActiveVRPC(nil, rpc) {
+	// POC: pull the (re-)state-check + slot CAS under the syncCtx so
+	// they're atomic w.r.t. any migrated mutator (handleGoAway in this
+	// POC scope). Encode ran outside the serializer to avoid holding it
+	// during arbitrary user marshaling. If handleGoAway ran on syncCtx
+	// during Encode, the ExecuteSync callback observes StateClosing and
+	// rejects — no wire send, no partial commit. The subsequent
+	// SendVRpc (R2 layered defense) stays as-is so migrated + unmigrated
+	// mutators both cover the send window.
+	var claimErr error
+	if ok := s.syncC.ExecuteSync(func() {
+		if st := State(s.state.Load()); st != StateReady {
+			claimErr = tagErr(StateUncommitted,
+				unavailable(ErrSessionNotActive, "session is not active (state: %v)", st))
+			return
+		}
+		if !s.casActiveVRPC(nil, rpc) {
+			claimErr = tagErr(StateUncommitted,
+				unavailable(ErrSessionNotActive,
+					"concurrent Invoke on session %q: multiPlexingLimit=1 violated", s.logName))
+			return
+		}
+	}); !ok {
 		return result, tagErr(StateUncommitted,
-			unavailable(ErrSessionNotActive,
-				"concurrent Invoke on session %q: multiPlexingLimit=1 violated", s.logName))
+			unavailable(ErrSessionNotActive, "session syncCtx already shut down"))
+	}
+	if claimErr != nil {
+		return result, claimErr
 	}
 	defer s.releaseSlot(rpc)
 
