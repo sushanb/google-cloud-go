@@ -35,6 +35,48 @@ import (
 // this gives us a deterministic teardown so OnClose fires and counters move.
 const waitServerCloseGrace = 30 * time.Second
 
+// Close-recording paths (all funnel through s.poolCloseRecorded's
+// CompareAndSwap once-flag, so any two paths racing on the same
+// session record it exactly once):
+//
+//   A. Pool.Close — bulk teardown. Fires recordSessionClose(sh,
+//      "PoolClose") for every snapshotted handle BEFORE spawning the
+//      graceful per-session Close goroutines, so debug counters
+//      reflect retirement promptly instead of lagging the server EOF.
+//   B. OnClose starting-branch — session died before OnActive stamped
+//      a poolHandle. Fires bumpStartingClose → recordSessionClose(s,
+//      "FailedToStart").
+//   C. OnClose main branch — normal end-of-teardown for an
+//      Active-registered session. Fires recordSessionClose(s, ""),
+//      using whatever CloseReason the session already recorded (the
+//      fallback arg only fills in if none was set).
+//
+// sweepStuckSessions does NOT record directly — it calls ForceClose,
+// which drives the session through hooks.OnClose → path C. Same for
+// any other path that reaches notifyClosed: Session.Close on its own
+// ctx timeout goes via ForceClose (session_lifecycle.go), and
+// handleClose on stream EOF transitions to StateClosed and calls
+// notifyClosed directly. End state — path C — is the same; the
+// mechanism into it differs.
+//
+// startingSessions vs poolHandle invariant (steady state):
+//
+//   Every registered session is EITHER in p.startingSessions XOR has
+//   a non-nil s.poolHandle — never both. Transient exception: when
+//   OnActive fires while p.closed=true, it deletes from
+//   startingSessions and dispatches ForceClose WITHOUT stamping
+//   poolHandle — a snapshot after that delete but before OnClose
+//   completes will see "neither." That window is tolerated because
+//   the session is on its way to Closed; no observer needs to route
+//   through the fork.
+//
+//   createSession inserts into startingSessions; OnActive atomically
+//   deletes and stamps poolHandle under p.mu; OnClose reads the fork
+//   under p.mu and routes to the starting-branch (bumpStartingClose)
+//   or the main-branch (removeSession + recordSessionClose). Any new
+//   "did this session ever reach Active?" check should consult
+//   s.poolHandle.Load() != nil under p.mu, not rebuild the fork.
+
 // sampleActiveUptimes snapshots the currently-active session list under
 // the pool lock and records each session's current age into the
 // session.uptime histogram. Sampling happens without the pool lock so
@@ -54,9 +96,10 @@ func (p *SessionPoolImpl) sampleActiveUptimes(ctx context.Context) {
 
 // sweepStuckSessions scans the pool for sessions parked in
 // StateWaitServerClose beyond waitServerCloseGrace and force-closes them.
-// Runs from PerformScaling at the heartbeat cadence; takes p.mu only long
-// enough to snapshot the (handle, last-state-change) tuples then issues
-// ForceClose calls outside the lock.
+// Runs from PerformScaling at the heartbeat cadence. Reads session state
+// through atomics on the snapshot returned by allHandles() and issues
+// ForceClose calls without holding p.mu, so a slow force-close never
+// blocks the hot path.
 func (p *SessionPoolImpl) sweepStuckSessions() {
 	type victim struct {
 		sess     *Session
@@ -100,16 +143,17 @@ func (p *SessionPoolImpl) bumpCloseReason(label string) {
 }
 
 // recordSessionClose marks a session as retired exactly once and bumps
-// sessionsClosed + the close-reason histogram. Called from every removal
-// site (OnClose, CheckoutSession's dead-detect, Pool.Close) so the
-// counter reflects pool-side retirements promptly even when the
-// underlying session's hooks.OnClose hasn't fired yet (e.g. the server
-// hasn't EOFed the stream). The once-flag lives on the Session so it
-// dedupes across paths.
+// sessionsClosed + the close-reason histogram. Called from the two
+// direct recording sites (Pool.Close for bulk teardown, OnClose for
+// per-session end-of-teardown) so the counter reflects pool-side
+// retirement even before the underlying session's hooks.OnClose has
+// fired (e.g. the server hasn't EOFed the stream). The once-flag lives
+// on the Session so it dedupes across the paths documented in the
+// "Close-recording paths" block at the top of this file.
 //
-// fallbackReason is used only when the session itself hasn't recorded a
-// reason yet — e.g. CheckoutSession found a session in StateClosed via
-// a race and needs to attribute the retirement.
+// fallbackReason is used only when the session itself hasn't recorded
+// a reason yet — Pool.Close passes "PoolClose" and OnClose's
+// starting-branch (via bumpStartingClose) passes "FailedToStart".
 func (p *SessionPoolImpl) recordSessionClose(s *Session, fallbackReason string) {
 	if s == nil {
 		return
@@ -169,7 +213,10 @@ func (p *SessionPoolImpl) Close() error {
 	// so the debug counters reflect retirement immediately, even though the
 	// actual graceful Close on each session is still in flight. Also drop
 	// the handles from the AFE-aware sessionList so a concurrent picker
-	// racing with teardown never returns a retired session.
+	// racing with teardown never returns a retired session. Lifetime is
+	// stamped at the "leaves the pool's expected set" moment — mirrors the
+	// OnClosing call site so per-session and bulk teardowns share one
+	// definition of session lifetime.
 	for _, sh := range snapshot {
 		if sh != nil && sh.session != nil {
 			if !sh.createdAt.IsZero() {
@@ -227,10 +274,10 @@ func (p *SessionPoolImpl) OnStart(ctx context.Context) {}
 // OnActive is triggered when a background session finishes its open session req and becomes active.
 // The session is wrapped inside a SessionHandle and registered into the ready sessions list!
 func (p *SessionPoolImpl) OnActive(s *Session) {
-	// Callers hold this method's body under p.mu for the full duration.
-	// Keep new work here allocation-only / atomic-only — anything that
-	// blocks would deadlock the read loop and heartbeat scheduler that
-	// contend for p.mu. See SessionHooks doc: "hooks must not block."
+	// This method holds p.mu for its entire body. Keep new work here
+	// allocation-only / atomic-only — anything that blocks would
+	// deadlock the read loop and heartbeat scheduler that contend for
+	// p.mu. See SessionHooks doc: "hooks must not block."
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -297,6 +344,12 @@ func (p *SessionPoolImpl) OnClosing(s *Session) {
 	if removed == nil {
 		return
 	}
+	// Lifetime is stamped HERE — at "leaves the pool's expected set"
+	// (OnClosing), not at end-of-teardown (OnClose). The waitServerClose
+	// grace window can add tens of seconds of "closing but not yet
+	// closed" that don't reflect useful pool life. Pool.Close's bulk
+	// teardown records the same way, so per-session and bulk paths
+	// share one definition.
 	if !removed.createdAt.IsZero() {
 		p.recordLifetime(time.Since(removed.createdAt))
 	}
@@ -320,6 +373,12 @@ func (p *SessionPoolImpl) OnClosing(s *Session) {
 // *Session → *SessionHandle back-ref is Session.poolHandle, set
 // once in OnActive.
 func (p *SessionPoolImpl) OnClose(s *Session, err error) {
+	// p.mu is released the moment the starting-vs-active fork is
+	// decided. Downstream calls (bumpStartingClose, removeSession,
+	// recordSessionClose, noteAbnormalCloseIfAny) touch atomics,
+	// sl.mu, or waitersMu — none need p.mu, and holding it across
+	// them would serialize sl.mu operations behind the pool mutex on
+	// every session close.
 	p.mu.Lock()
 	if _, starting := p.startingSessions[s]; starting {
 		delete(p.startingSessions, s)

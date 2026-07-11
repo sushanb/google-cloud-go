@@ -86,7 +86,7 @@ Additional invariants:
 - **`Rejected` is terminal** (pool closing, wrong state, no ready AFEs) — the caller sees it, not RetryingVRpc.
 - **GOAWAY does NOT re-classify an in-flight vRPC** — retry oracle fires only on the vRPC's terminal outcome (see #6).
 
-Reference Go tag sites (`session_vrpc.go`): encode err → `Uncommitted:88-94`; session not Ready → `Uncommitted:108`; Send err → `TransportFailure:129`; ctx.Done during Recv → `TransportFailure:213`; server `ErrorResponse` → `ServerResult:225`; response decode err → `ServerResult:240`; `cancelActiveRPCs` (close/goaway/heartbeat) → `TransportFailure:378`.
+Reference Go tag sites (`session_vrpc.go`): session not Ready pre-Encode → `Uncommitted:89`; encode err → `Uncommitted:95`; multiplex CAS-fail → `Uncommitted:109`; session not Ready pre-Send (R2 window — state advanced during Encode/CAS; refused by `SendVRpc`'s under-`sendMu` re-check) → `Uncommitted:141`; Send err → `TransportFailure:143`; ctx.Done during Recv → `TransportFailure:227`; server `ErrorResponse` → `ServerResult:239`; RpcId mismatch → `ServerResult:249`; response decode err → `ServerResult:254`; `cancelActiveRPCs` (close/goaway/heartbeat) → `TransportFailure:392`.
 
 ### 10. Concurrency discipline is model-specific but non-negotiable
 - **Go:** all Session mutable state is `atomic.*` (`state`, `activeRPC`, `peerInfo`, `refreshConfig`, `heartbeat*Nano`, `nextRPCID`, `poolHandle`). The **only** mutex is `sendMu` — `grpc.ClientStream.Send` is not concurrent-safe. `deliver` is cap-1 non-blocking (duplicate deliveries dropped; first wins). Lock ordering: **never take `pool.mu` while holding `sl.mu`**.

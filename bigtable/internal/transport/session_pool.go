@@ -647,7 +647,12 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 		if d := result.TransportLatency - backendDur; d > 0 {
 			transportOverhead = d
 			p.m.transportLatencyHist.record(d)
-			sh.session.RecordTransportOverhead(ctx, desc.Method(), d)
+			// Java-parity: the `method` attribute on
+			// transport_latencies is "Bigtable.<ShortName>" (gax
+			// SpanName format — see MethodInfo.java + BuiltinMetricsTracer
+			// literal "Bigtable.ReadRows"). desc.Method() returns just
+			// the short name so cross-language dashboards can join on it.
+			sh.session.RecordTransportOverhead(ctx, "Bigtable."+desc.Method(), d)
 		}
 	}
 	if latency > p.slowThreshold() {

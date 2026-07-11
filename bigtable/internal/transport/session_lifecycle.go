@@ -196,6 +196,32 @@ func (s *Session) Send(req *spb.SessionRequest) error {
 	return err
 }
 
+// SendVRpc writes a vRPC SessionRequest atomically w.r.t. any concurrent
+// Close-driven send. Returns an error wrapping ErrSessionNotActive when
+// the session is no longer Ready at Send-time. This closes the
+// check→Encode→CAS→Send window in Invoke: s.Close acquires sendMu before
+// writing CloseSessionRequest and only transitions to WaitServerClose
+// after releasing it, so a state check performed under sendMu here is
+// serialized with any Close in progress — we see either Ready (safe to
+// send) or non-Ready (Close finished, must not send).
+//
+// Use for vRPC frames only. OpenSession / CloseSession / Heartbeat go
+// through the plain Send — those requests drive the state and are
+// allowed in any state that permits them.
+func (s *Session) SendVRpc(req *spb.SessionRequest) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	if st := State(s.state.Load()); st != StateReady {
+		return fmt.Errorf("%w (state: %v)", ErrSessionNotActive, st)
+	}
+	err := s.stream.Send(req)
+	if err == nil {
+		s.msgsSent.Add(1)
+		s.msgsSentByType[classifyReq(req)].Add(1)
+	}
+	return err
+}
+
 // readLoop drives the inbound side of the stream until Recv returns an error.
 func (s *Session) readLoop(ctx context.Context) {
 	// Supervisor: if ctx is cancelled, mark the session closed so callers

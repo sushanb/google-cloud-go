@@ -239,12 +239,24 @@ type Session struct {
 	state atomic.Int32
 
 	// closingOnce serializes hooks.OnClosing so it fires exactly once
-	// across the four transition sites that can drive a session out of
-	// Ready (Close, ForceClose, handleGoAway, handleClose). Java parity
-	// with onSessionClosing.
+	// across the four teardown paths that can drive a session out of
+	// Ready (Close, ForceClose, handleGoAway, handleClose). The pool's
+	// OnClosing drops the session from sessionList and records its
+	// lifetime; a double-fire would decrement readyCount twice,
+	// double-count the lifetime histogram, and race a concurrent
+	// OnActive that reused the slot. Any teardown path can call
+	// notifyClosing() blindly — sync.Once picks the first winner. Java
+	// parity with onSessionClosing.
 	closingOnce sync.Once
-	// closeOnce serializes hooks.OnClose and tracer.recordClose so they
-	// fire exactly once even if multiple paths race to close the session.
+	// closeOnce serializes hooks.OnClose + tracer.recordClose so each
+	// fires exactly once even when multiple teardown paths race. A
+	// second OnClose would double-count session.durations and invoke
+	// pool.removeSession twice — the second call would race a
+	// concurrent OnActive for a slot the pool has just reused.
+	// notifyClosed also invokes notifyClosing() inside its Do block as
+	// an ordering safety net so OnClosing is guaranteed to precede
+	// OnClose; that safety-net call remains once-guarded because
+	// closingOnce is a separate Once.
 	closeOnce sync.Once
 
 	// activeRPC holds the single in-flight vRPC (multiPlexingLimit=1).
@@ -272,8 +284,19 @@ type Session struct {
 	// inbound frame extends it via resetHeartbeatDeadline.
 	nextHeartbeatDeadlineNano atomic.Int64
 
-	// quiescent is closed when the in-flight vRPC (if any) has drained
-	// after the session entered StateClosing, or when ForceClose runs.
+	// quiescent is closed once the in-flight vRPC (if any) has drained
+	// so graceful Close can wait for the RPC caller to see its
+	// response before CloseSessionRequest tears the stream down;
+	// close(chan) is the broadcast primitive Close selects on. Multiple
+	// producers may reach the "drain complete" condition — Invoke's
+	// cleanup defer clears activeRPC, ForceClose aborts the wait, Close
+	// itself observes an empty slot at entry — and close() on an
+	// already-closed channel panics, so quiescentOnce wraps
+	// close(quiescent) in signalQuiescent(). Every producer can fire it
+	// blindly; the two Once + one chan are deliberately distinct from
+	// closeOnce because signalQuiescent runs strictly before
+	// notifyClosed in the graceful path (potentially minutes apart
+	// while Close waits for the drain).
 	quiescent     chan struct{}
 	quiescentOnce sync.Once
 

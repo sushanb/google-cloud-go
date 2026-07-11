@@ -16,6 +16,7 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -125,7 +126,20 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 	// downstream metrics can compute client-side blocking latency as
 	// (SentAt - attemptStart) without double-counting encode/setup overhead.
 	result.SentAt = time.Now()
-	if err := s.Send(sessionReq); err != nil {
+	// R2 fix: SendVRpc re-checks state under sendMu. Between the line-87
+	// state check and here, Encode + CAS ran — enough time for a
+	// concurrent handleGoAway → spawned s.Close to advance state to
+	// WaitServerClose. Sending anyway would risk a committed-but-dropped
+	// mutation (server processes the vRPC before seeing CloseSession;
+	// response arrives in WaitServerClose and hits handleVRPCResponse's
+	// defensive drop). SendVRpc closes that window by serializing with
+	// Close's own send-then-transition sequence.
+	if err := s.SendVRpc(sessionReq); err != nil {
+		if errors.Is(err, ErrSessionNotActive) {
+			// State advanced during Encode/CAS. Tag Uncommitted so the
+			// retry oracle silently re-picks a fresh session.
+			return result, tagErr(StateUncommitted, err)
+		}
 		return result, tagErr(StateTransportFailure, fmt.Errorf("send vRPC request: %w", err))
 	}
 
