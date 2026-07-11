@@ -1,6 +1,6 @@
 # SessionPool + Picking — Behavioral Spec
 
-**Scope.** This file governs the **runtime behavior** of code under `bigtable/internal/transport/session_pool*.go`, `session_list.go`, `session_pool_lifecycle.go`, `pool_sizer.go`, `session_creation_budget.go`, all `AfePicker` implementations (`afe_picker.go`, `picker.go`), `bigtable/table_shim.go`, `bigtable/internal/transport/diverter.go`, and `bigtable/debugview/**`. It covers pool topology per resource, the AFE picker + K-choice + PeakEwma discipline, Diverter+TableShim routing, debug-view non-blocking rules, and server-driven pool scaling. Any change to those files MUST be checked against the 5 invariants below.
+**Scope.** This file governs the **runtime behavior** of code under `bigtable/internal/transport/session_pool*.go`, `session_list.go`, `session_pool_lifecycle.go`, `pool_sizer.go`, `session_creation_budget.go`, all `AfePicker` implementations (`afe_picker.go`, `picker.go`), `bigtable/table_shim.go`, `bigtable/internal/transport/diverter.go`, and `bigtable/debugview/**`. It covers pool topology per resource, the AFE picker + K-choice + PeakEwma discipline, Diverter+TableShim routing, debug-view non-blocking rules, server-driven pool scaling, and the sessionList per-handle state machine that underpins all of the above. Any change to those files MUST be checked against the 6 invariants below.
 
 **Sibling behavioral specs.** `SESSION_SPEC.md` (per-Session lifecycle, 10 invariants) · `SESSION_CLIENT_SPEC.md` (SessionClient topology, channel pool, config, OpenSession envelope, 4 invariants) · `CLIENT_SIDE_METRICS_SPEC.md` (per-attempt metrics field provenance).
 
@@ -120,6 +120,50 @@ Every debug view — `sessionz`, `afez`, `flightz`, `loadz`, `channelz`, `config
 Pool size respects `MinSessionCount` / `MaxSessionCount` and `Headroom` from `GetClientConfiguration` (`SESSION_CLIENT_SPEC.md #3`), and rate-limits `OpenSession` creation via `NewSessionCreationBudget` + `NewSessionCreationPenalty` back-off + `ConsecutiveSessionFailureThreshold` circuit breaker — so a bad server response cannot trigger a session-creation storm. Scale-down is passive: closed sessions are simply not replaced when the pool has slack above headroom (Java-parity replace-on-close; supersedes any active-reaper approach).
 
 **When more sessions are added.** On every `PoolSizer` tick (`pool_sizer.go:161-199`), `DesiredCapacity = clamp(SessionsInUse + IdleHeadroom, MinSessions, MaxSessions)` where `IdleHeadroom = max(minIdleSessions, ceil(SessionsInUse × HeadroomPct))` (default 10%). A scale-up (`Delta > 0`) fires **only** when `DesiredCapacity > EventualCapacity` — i.e., in-use load has grown past what already-open plus already-pending sessions can absorb with headroom. Startup fills to `MinSessions` unconditionally so a fresh pool always has that floor before the first request.
+
+### 6. sessionList tracks a strict per-handle state machine — six named invariants gate every mutator
+
+The AFE grouping data structure (`session_list.go`) owns six interdependent pieces of state — `sh.inExpectedCount`, `handleToAfe[sh]`, `afe.sessions`, `afe.refCount`, `sl.readyCount`, `sl.afesWithReady` — and every public method (`OnSessionStarted`, `Checkout`, `ReleaseToPool`, `OnSessionClosing`, `OnSessionClosed`, `ReadyAfes`, `Prune`) MUST preserve the invariants below. The state model is copied verbatim from the file's top-of-file doc block so specs and code cannot drift.
+
+A registered SessionHandle transitions through:
+
+```
+  NotRegistered → Idle → InFlight → Closing → Closed
+                       ↺ ReleaseToPool
+
+  NotRegistered  no entry in handleToAfe.
+  Idle           handleToAfe[sh] = afe, sh in afe.sessions, inExpectedCount=true.
+  InFlight       handleToAfe[sh] = afe, sh NOT in afe.sessions, inExpectedCount=true.
+  Closing        handleToAfe[sh] = afe, sh NOT in afe.sessions, inExpectedCount=false.
+  Closed         handleToAfe has no entry for sh.
+```
+
+Transitions:
+
+| From | To | Method |
+|---|---|---|
+| NotRegistered | Idle | `OnSessionStarted` |
+| Idle | InFlight | `Checkout` |
+| InFlight | Idle | `ReleaseToPool` (only if `inExpectedCount`) |
+| {Idle, InFlight} | Closing | `OnSessionClosing` |
+| {Idle, InFlight, Closing} | Closed | `OnSessionClosed` |
+
+Invariants (all guarded by `sl.mu`):
+
+- **I1** `sh.inExpectedCount == true` ⇒ `handleToAfe[sh] != nil`
+- **I2** `readyCount` == count of `sh` in `handleToAfe` with `inExpectedCount==true`
+- **I3** `afesWithReady == { afe : len(afe.sessions) > 0 }`, as a set (order irrelevant)
+- **I4** `afe.refCount` == count of `sh` in `handleToAfe` pointing at `afe` (idle + inFlight + closing)
+- **I5** `sh in afe.sessions` ⇒ `handleToAfe[sh] == afe` AND `inExpectedCount==true`
+- **I6** `refCount` is decremented ONLY on `OnSessionClosed` (Closing keeps the slot warm)
+
+**Lock order.** `sl.mu` is always innermost. `pool.mu` MUST NOT be taken while holding `sl.mu` (also stated in `SESSION_COMPONENT_SPEC.md §B8`). Every `sessionList` method takes `sl.mu` itself; production callers never hold both mutexes.
+
+**Why I5 is load-bearing — WaitServerClose retry storm.** `ReleaseToPool` MUST early-return when `!sh.inExpectedCount`. Omitting this guard causes the following: a GOAWAY landing on an in-flight session fires `OnSessionClosing` (drops the handle from the expected set via I2, flips `inExpectedCount=false`) while the RPC is still running. When the RPC's defer then calls `ReleaseToPool`, without the guard the drained handle gets re-appended to `afe.sessions` — violating I5. The next `CheckoutSession` picks it, `Session.Invoke` returns `Unavailable("session is not active (state: WaitServerClose)")`, and callers see a retry storm where the same session ID reappears at attempts 2 and 3. Regression coverage lives in `session_list_test.go` (state-machine unit tests) and `session_pool_lifecycle_test.go:*OnClosing*` (end-to-end accounting).
+
+**Why I6 matters — sizer stability across the close handshake.** `refCount` decrementing only on `OnSessionClosed` (never on `OnSessionClosing`) keeps the AFE bucket's capacity accounting stable during the ~ waitServerCloseGrace window between GOAWAY and the actual `CloseSession` reply. The sizer (`SESSION_POOL_SPEC #5`) reads `refCount`-derived counts; premature decrement would cause a scale-up burst on every server-driven session recycle.
+
+**Invariant IDs appear as inline comments** on every mutator in `session_list.go` (e.g. `// I2`, `// I5`) so a reader stepping through a method can jump to this spec to see the rule being maintained.
 
 ---
 
