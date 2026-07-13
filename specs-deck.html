@@ -280,18 +280,17 @@
     </header>
     <h1>What a SPEC actually looks like</h1>
 
-    <p>One invariant from <code>SESSION_SPEC.md</code> &mdash; the GOAWAY-handling rule (<strong>#6</strong>). Every invariant follows the same shape: title, prose contract, numbered order-of-operations, and cross-language parity notes with <code>file:line</code> citations.</p>
+    <p>One invariant from <code>SESSION_SPEC.md</code> &mdash; the GOAWAY-handling rule (<strong>#6</strong>), written in plain language. Every invariant follows the same shape: title, prose contract, and a numbered order-of-operations any reviewer can walk step by step.</p>
 
     <blockquote>
       <h3>#6 &mdash; GOAWAY does NOT cancel the in-flight vRPC</h3>
-      <p>Server-initiated <code>GoAwayResponse</code> carries <code>{reason, description, last_rpc_id_admitted}</code>. On receipt, <code>handleGoAway</code> (<code>session_lifecycle.go:331-392</code>) does exactly the following, in order:</p>
       <ol>
-        <li><strong>Precondition assert.</strong> <code>preState &ge; StateStarting</code>; a GOAWAY on a still-NEW session is a protocol oddity &mdash; recorded via <code>tagSessionGoawayBeforeStart</code> and the frame is dropped.</li>
-        <li><strong>Ready &rarr; Closing</strong> via <code>transitionTo(StateClosing, notState(Closing, WaitServerClose, Closed))</code>. Late GOAWAY on terminal session is a no-op.</li>
-        <li><strong><code>OnClosing</code> / <code>onGoAway</code> fires immediately</strong> so the pool pulls the session out of <code>sessionList</code> routing structures. Up to 30s earlier than actual stream close.</li>
-        <li><strong><code>"GoAway"</code> wins the close-reason CAS</strong> &mdash; beats any later <code>StreamEnd:*</code> classification.</li>
-        <li><strong>In-flight vRPC is NOT canceled.</strong> Java parity: <code>SessionImpl.java:689-716</code>. If server sends the vRPC response before dropping the stream, the RPC completes successfully.</li>
-        <li><strong>Off-loop <code>Close</code> driver</strong> &mdash; goroutine calls <code>s.Close(ctx, {Reason: CLOSE_SESSION_REASON_GOAWAY})</code> under a 30s bounded ctx.</li>
+        <li>If the server sends a GOAWAY before the session has even finished starting up, treat it as a protocol oddity, record it, and ignore the frame.</li>
+        <li>Move the session from ready to closing &mdash; but only if it isn&rsquo;t already in a terminal state, so a late GOAWAY on a finished session is a no-op.</li>
+        <li>Tell the pool immediately that this session is going away, so it stops routing new work to it well before the underlying stream actually closes.</li>
+        <li>Lock in &ldquo;GoAway&rdquo; as the close reason; later, more generic close classifications must not overwrite it.</li>
+        <li>Do not cancel the in-flight request &mdash; if the server delivers the response before dropping the stream, the request still completes successfully.</li>
+        <li>Kick off the graceful shutdown from a background task under a bounded deadline, so the caller&rsquo;s path is never blocked by the close.</li>
       </ol>
     </blockquote>
 
@@ -349,8 +348,7 @@
         <tr><td><strong>B4</strong></td><td><code>Diverter</code> gaining per-method or per-key routing (MUST stay shape-agnostic)</td><td>Reviewer agent surface check.</td></tr>
         <tr><td><strong>B6</strong></td><td>Anyone other than <code>ClientConfigurationManager</code> calling <code>SetSessionLoad</code> / <code>UpdateConfig</code></td><td>Grep hits are new sites to review.</td></tr>
         <tr><td><strong>B7</strong></td><td><code>Session</code> holding pool-level state (waiters, picker, sizer, pickHistory&hellip;)</td><td>Reviewer agent struct inspection.</td></tr>
-        <tr><td><strong>B8</strong></td><td>Lock inversion: <code>sl.mu</code> before <code>pool.mu</code> (or re-entrant <code>p.mu</code>)</td><td>Manual review; <code>-race -count=1000</code> operational surrogate.</td></tr>
-        <tr><td><em>&hellip;</em></td><td colspan="2"><em>4 more cover Diverter/TableShim surfaces (B5), retry-boundary discipline (B9), z-page non-computation (B10), and two meta-rules on not re-implementing behavioral invariants (B11, B12).</em></td></tr>
+        <tr><td><em>&hellip;</em></td><td colspan="2"><em>The rest cover Diverter/TableShim surfaces (B5), retry-boundary discipline (B9), z-page non-computation (B10), and two meta-rules on not re-implementing behavioral invariants (B11, B12).</em></td></tr>
       </tbody>
     </table>
 
