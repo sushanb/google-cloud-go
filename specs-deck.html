@@ -10,6 +10,8 @@
     --blue-soft: #e8f0fe;
     --green: #34a853;
     --green-soft: #f1f8f4;
+    --red: #d93025;
+    --red-soft: #fce8e6;
     --grey-900: #202124;
     --grey-700: #3c4043;
     --grey-500: #5f6368;
@@ -147,6 +149,7 @@
   }
   .tag.green { background: var(--green-soft); color: var(--green); }
   .tag.grey  { background: var(--grey-100);  color: var(--grey-700); }
+  .tag.red   { background: var(--red-soft);  color: var(--red); }
   .callout {
     background: #fff8e1;
     border-left: 3px solid #f9ab00;
@@ -155,14 +158,33 @@
     font-size: 0.9em;
     color: #5f4d00;
   }
+  .callout.red {
+    background: var(--red-soft);
+    border-left-color: var(--red);
+    color: #8c1e14;
+  }
   .prompt {
     background: var(--grey-50);
     border: 1px solid var(--grey-300);
+    border-left: 3px solid var(--blue);
     border-radius: 6px;
     padding: 10px 14px;
     margin: 8px 0;
-    font-style: italic;
-    color: var(--grey-700);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--grey-900);
+    white-space: pre-wrap;
+  }
+  .prompt-label {
+    display: block;
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--blue);
+    margin-bottom: 4px;
   }
   a { color: var(--blue); text-decoration: none; }
   a:hover { text-decoration: underline; }
@@ -176,11 +198,11 @@
   <section class="slide active" id="s1">
     <header class="rail">
       <span class="rail-l">Bigtable Session subsystem &mdash; spec-driven review</span>
-      <span>Slide 1 of 5</span>
+      <span>Slide 1 of 9</span>
     </header>
     <h1>One-shot prompting &mdash; when the change fits in one breath</h1>
 
-    <p><strong>Definition.</strong> A single 3&ndash;4 sentence prompt with enough context to land a bounded refactor in one iteration &mdash; no back-and-forth, no plan mode, no subagent orchestration. The reviewer&rsquo;s question is simple: <em>&ldquo;does this look right?&rdquo;</em>, and the diff is small enough to answer.</p>
+    <p><strong>Definition.</strong> A single 3&ndash;4 sentence prompt with enough context to land a bounded refactor in one iteration &mdash; no back-and-forth, no plan mode, no subagent orchestration.</p>
 
     <h2>Three PRs that shipped this way</h2>
     <table>
@@ -191,102 +213,141 @@
         <tr>
           <td class="pr-link"><a href="https://github.com/googleapis/google-cloud-go/pull/19987" target="_blank">#19987</a></td>
           <td><strong>Modularize DirectAccessChecker</strong></td>
-          <td>DirectPath was hard-wired into the unary channel-pool path. Extracted the check into a <code>DirectAccessChecker</code> interface with a <code>pingAndWarmDirectAccessChecker</code> impl, so a session-side sibling (<code>getClientConfigDirectAccessChecker</code>) can plug in later.</td>
+          <td>Extracted DirectPath check from the unary channel-pool path into a <code>DirectAccessChecker</code> interface with a <code>pingAndWarmDirectAccessChecker</code> impl. Sibling <code>getClientConfigDirectAccessChecker</code> plugs in for session pool.</td>
         </tr>
         <tr>
           <td class="pr-link"><a href="https://github.com/googleapis/google-cloud-go/pull/20027" target="_blank">#20027</a></td>
           <td><strong>Modularize ChannelPrimer</strong></td>
-          <td>Per-connection Prime was coupled to the unary channel pool. Extracted into a <code>ChannelPrimer</code> interface with a <code>pingAndWarmChannelPrimer</code> impl. A <code>nil</code> primer becomes the session pool&rsquo;s &ldquo;no priming&rdquo; mode.</td>
+          <td>Extracted per-connection Prime into a <code>ChannelPrimer</code> interface with <code>pingAndWarmChannelPrimer</code> impl. <code>nil</code> primer becomes the session pool&rsquo;s &ldquo;no priming&rdquo; mode.</td>
         </tr>
         <tr>
           <td class="pr-link"><a href="https://github.com/googleapis/google-cloud-go/pull/20099" target="_blank">#20099</a></td>
           <td><strong>Client-side metrics decoupled from unary</strong></td>
-          <td>Metrics stamping assumed a gRPC unary interceptor context (headers/trailers, <code>OutPayload</code> stats event). Extracted the per-attempt stamp interface so the session (vRPC) path can source the same labels from a typed <code>InvokeResult</code> instead of gRPC callbacks.</td>
+          <td>Extracted per-attempt stamp interface so the session (vRPC) path can source labels from typed <code>InvokeResult</code> instead of gRPC callbacks.</td>
         </tr>
       </tbody>
     </table>
 
     <h2>Why one-shot worked here</h2>
     <ul>
-      <li><strong>One concept per PR.</strong> Each extracted a single implicitly-unary abstraction into an interface. The scope was crisp; the prompt fit in a paragraph.</li>
-      <li><strong>Behavior preserved by construction.</strong> The unary caller kept its concrete impl; the interface was a pure extraction. No semantics changed.</li>
-      <li><strong>Reviewer can hold the whole diff in head.</strong> A ~200-line PR with one new interface + one impl + one call-site rewire is checkable end-to-end.</li>
+      <li><strong>Prompting: detailed, no unknowns.</strong> Each PR was 3&ndash;4 sentences of prompt describing the <em>target interface</em> plus the <em>two impls</em> to wire up. The model had the shape it needed to land the change on first pass.</li>
+      <li><strong>Behavior: no behavior change.</strong> The interface was a pure extraction &mdash; the code kept the same runtime behavior. Reviewer only had to check &ldquo;same shape, same call graph.&rdquo;</li>
+      <li><strong>Common shape: extract the interface, then inject the logic.</strong> Every PR followed the same template &mdash; define type, move body into impl, rewire call site, remove the coupling. Repeatable.</li>
     </ul>
 
-    <p><strong>Common shape.</strong> Extract-then-inject. Each PR was 3&ndash;4 sentences of prompt describing the target interface + the two impls to wire up. That&rsquo;s the ceiling for what one-shot can carry &mdash; and it stops carrying the moment the change spans invariants that live in the reviewer&rsquo;s head instead of on paper.</p>
+    <div class="callout red">
+      <strong>Caution &mdash; prompting made the biggest difference.</strong>
+      &ldquo;Decouple X from Y&rdquo; on its own did <em>not</em> work. The model produced plausible-looking scaffolding that broke on the second call site or invented an interface with the wrong seams. What worked was naming the target interface, both impls, and the specific coupling to remove &mdash; effectively handing the model the answer it needed to write down.
+    </div>
   </section>
 
-  <!-- ============ SLIDE 2 — Jetstream breaks one-shot; enter SPECs ============ -->
+  <!-- ============ SLIDE 2 — Session Client scale problem + 5-step fix ============ -->
   <section class="slide" id="s2">
     <header class="rail">
       <span class="rail-l">Bigtable Session subsystem &mdash; spec-driven review</span>
-      <span>Slide 2 of 5</span>
+      <span>Slide 2 of 9</span>
     </header>
-    <h1>Then came Jetstream &mdash; 30k+ LOC, no shared axis</h1>
+    <h1>Session Client &mdash; 30k+ LOC, no shared axis</h1>
 
-    <p><strong>The scale problem.</strong> Session lifecycle + AFE picker + Diverter + z-pages + client-side metrics + pool scaling, all in flight. Tests included: <strong>&gt; 30k lines</strong>. A single prompt can&rsquo;t carry the required context. Every code iteration devolves into <em>&ldquo;does this look right?&rdquo;</em> &mdash; there&rsquo;s no shared axis, no way to prove a change <em>preserved</em> an existing rule.</p>
+    <h2>The scale problem</h2>
+    <p><strong>Client is robust.</strong> The Bigtable Go client already carries production traffic, retry logic, client-side metrics, mixed-mode routing, and 7 debug pages. Session Client is an API change <em>plus</em> a family of new components that must land <em>without</em> regressing any of that.</p>
 
-    <h2>The fix: write the invariants down, split by concern</h2>
-    <p>Five spec files at repo root. Each governs one layer of the subsystem. Each numbered invariant is a MUST-rule with a name, a body, and grep-checkable <code>file:line</code> citations. Reviewer subagents read the spec, walk the diff, and report <code>PASS / VIOLATION / AMBIGUOUS</code> per invariant.</p>
+    <p>Two technical questions kept re-surfacing in review, and neither had a single owner in the codebase:</p>
+    <ol>
+      <li><strong>How does client-side metrics work in unison for session and unary?</strong> Classic path sources <code>cluster_id</code>/<code>zone_id</code>/peer from gRPC response headers/trailers; session path sources them from typed <code>ClusterInformation</code> + <code>PeerInfo</code>. Same OTel histograms, two providers.</li>
+      <li><strong>Where does each component live &mdash; the one that diverts traffic between session and unary?</strong> <code>Diverter</code> owns the split ratio, <code>TableShim</code> owns the per-op decision, <code>ClientConfigurationManager</code> owns the server-driven configuration. No single file describes their contract.</li>
+    </ol>
+
+    <div class="callout">
+      <strong>The one-shot toolkit stops here.</strong> Session Client is &gt;&gt;&gt; an API change &mdash; ~30k lines of code, &gt;10 components/layers. A single prompt cannot carry the required context, and every iteration devolves into &ldquo;does this look right?&rdquo; with no shared axis.
+    </div>
+
+    <h2>The fix</h2>
+    <ol>
+      <li><strong>For each subcomponent, write the major non-negotiable spec.</strong> Not the whole design &mdash; the rules that MUST hold. Five spec files at repo root; one per layer.</li>
+      <li><strong>Each spec has a list of invariants that need to be true.</strong> Numbered. Named. Every invariant carries grep-checkable <code>file:line</code> citations.</li>
+      <li><strong>Set up a review system that ensures the code it touches follows the spec.</strong> <code>PostToolUse</code> hook on session-file edits fires two reviewer subagents automatically &mdash; no manual invocation, no forgotten step.</li>
+      <li><strong>Reviewer subagents read the spec, walk the diff, and report <code>PASS</code> / <code>VIOLATION</code> / <code>AMBIGUOUS</code> per invariant.</strong> One row per invariant the diff touches; empty report if the diff is scoped to files no invariant governs.</li>
+      <li><strong>Specs are a living doc &mdash; Specs mutate with human in the loop.</strong> When a rule is wrong, update it in the same PR as the code, with justification. Never in a follow-up.</li>
+    </ol>
 
     <table>
-      <thead>
-        <tr><th style="width:260px">Spec file</th><th style="width:100px">Invariants</th><th>Example rule</th></tr>
-      </thead>
+      <thead><tr><th style="width:280px">Spec file</th><th style="width:110px">Invariants</th><th>Governs</th></tr></thead>
       <tbody>
-        <tr>
-          <td><code>SESSION_SPEC.md</code></td>
-          <td>10</td>
-          <td><strong>#6</strong> &mdash; On GOAWAY, session transitions <code>Ready &rarr; Closing</code> (Java parity: <code>SessionImpl.java:689-716</code>).</td>
-        </tr>
-        <tr>
-          <td><code>SESSION_CLIENT_SPEC.md</code></td>
-          <td>4</td>
-          <td><strong>#3</strong> &mdash; <code>GetClientConfiguration</code> is the authoritative source for pool sizing / LB / traffic split.</td>
-        </tr>
-        <tr>
-          <td><code>SESSION_POOL_SPEC.md</code></td>
-          <td>5</td>
-          <td><strong>#2</strong> &mdash; AFE picker is K-choice with two production strategies: <code>LeastInFlight</code> (fewest active vRPCs) and <code>LeastLatency</code> (min <code>e2eEwma</code>, Java parity: <code>LeastLatencyPicker.java:59-60</code>). PeakEwma updates are OK-gated so fast-failing AFEs can&rsquo;t game the picker.</td>
-        </tr>
-        <tr>
-          <td><code>CLIENT_SIDE_METRICS_SPEC.md</code></td>
-          <td>3</td>
-          <td><strong>#2</strong> &mdash; Session-path latency labels sourced <em>only</em> from <code>InvokeResult</code>; <code>sessionTable.stampAttempt</code> is the single writer. Classic path uses gRPC callbacks; must not be simulated on session side.</td>
-        </tr>
-        <tr>
-          <td><code>SESSION_COMPONENT_SPEC.md</code></td>
-          <td>12 boundary + Part C ownership</td>
-          <td><strong>B2</strong> &mdash; Layer direction: transport is the primitives layer; session composes transport, never the reverse (applies to <code>_test.go</code> files too). Rationale: if transport reaches into session, either transport is doing something it shouldn&rsquo;t or session is exposing something it shouldn&rsquo;t. Enforced at <em>build time</em> by Go&rsquo;s import-cycle detector &mdash; session already imports transport, so any <code>transport&rarr;session</code> import fails to compile. Belt-and-braces grep: <code>git grep -l '.../internal/session' bigtable/internal/transport/</code> MUST be empty.</td>
-        </tr>
+        <tr><td><code>SESSION_SPEC.md</code></td><td>10</td><td>One Session&rsquo;s lifecycle &mdash; state machine, one-in-flight vRPC, hooks, GOAWAY, heartbeat, retry oracle.</td></tr>
+        <tr><td><code>SESSION_CLIENT_SPEC.md</code></td><td>4</td><td>SessionClient topology, shared channel pool, <code>GetClientConfiguration</code>, <code>OpenSessionRequest</code> envelope.</td></tr>
+        <tr><td><code>SESSION_POOL_SPEC.md</code></td><td>5</td><td>Read/write pools, AFE picker, Diverter+TableShim routing, debug non-blocking, scaling.</td></tr>
+        <tr><td><code>CLIENT_SIDE_METRICS_SPEC.md</code></td><td>3</td><td>Per-attempt metrics field provenance (classic vs session).</td></tr>
+        <tr><td><code>SESSION_COMPONENT_SPEC.md</code></td><td>12 boundary + Part C ownership</td><td>Structural layout &mdash; who owns what, what MUST NOT import what.</td></tr>
       </tbody>
     </table>
-
-    <p><strong>Why this shape.</strong> The spec is <em>living</em> &mdash; updated in the same PR as the code it governs. Java-parity notes make cross-language drift visible. Numbered invariants become the shared axis reviewers were missing.</p>
   </section>
 
-  <!-- ============ SLIDE 3 — SESSION_COMPONENT_SPEC ============ -->
+  <!-- ============ SLIDE 3 — Example of a SPEC ============ -->
   <section class="slide" id="s3">
     <header class="rail">
       <span class="rail-l">Bigtable Session subsystem &mdash; spec-driven review</span>
-      <span>Slide 3 of 5</span>
+      <span>Slide 3 of 9</span>
     </header>
-    <h1><code>SESSION_COMPONENT_SPEC.md</code> &mdash; structure, boundaries, ownership</h1>
+    <h1>What a SPEC actually looks like</h1>
 
-    <p>The component spec is different from the four behavioral specs. It governs <em>structural layout</em> &mdash; who owns what, what MUST NOT import what, where responsibilities live. Three parts:</p>
+    <p>One invariant from <code>SESSION_SPEC.md</code> &mdash; the GOAWAY-handling rule (<strong>#6</strong>). Every invariant follows the same shape: title, prose contract, numbered order-of-operations, and cross-language parity notes with <code>file:line</code> citations.</p>
+
+    <blockquote>
+      <h3>#6 &mdash; GOAWAY does NOT cancel the in-flight vRPC</h3>
+      <p>Server-initiated <code>GoAwayResponse</code> carries <code>{reason, description, last_rpc_id_admitted}</code>. On receipt, <code>handleGoAway</code> (<code>session_lifecycle.go:331-392</code>) does exactly the following, in order:</p>
+      <ol>
+        <li><strong>Precondition assert.</strong> <code>preState &ge; StateStarting</code>; a GOAWAY on a still-NEW session is a protocol oddity &mdash; recorded via <code>tagSessionGoawayBeforeStart</code> and the frame is dropped.</li>
+        <li><strong>Ready &rarr; Closing</strong> via <code>transitionTo(StateClosing, notState(Closing, WaitServerClose, Closed))</code>. Late GOAWAY on terminal session is a no-op.</li>
+        <li><strong><code>OnClosing</code> / <code>onGoAway</code> fires immediately</strong> so the pool pulls the session out of <code>sessionList</code> routing structures. Up to 30s earlier than actual stream close.</li>
+        <li><strong><code>"GoAway"</code> wins the close-reason CAS</strong> &mdash; beats any later <code>StreamEnd:*</code> classification.</li>
+        <li><strong>In-flight vRPC is NOT canceled.</strong> Java parity: <code>SessionImpl.java:689-716</code>. If server sends the vRPC response before dropping the stream, the RPC completes successfully.</li>
+        <li><strong>Off-loop <code>Close</code> driver</strong> &mdash; goroutine calls <code>s.Close(ctx, {Reason: CLOSE_SESSION_REASON_GOAWAY})</code> under a 30s bounded ctx.</li>
+      </ol>
+    </blockquote>
+
+    <h2>What makes this a useful spec</h2>
+    <ul>
+      <li><strong>Behavior is specified as an order, not a wish.</strong> Reviewer can walk the diff line-by-line against the six steps &mdash; a re-ordering is a mechanical <code>VIOLATION</code>, not a judgment call.</li>
+      <li><strong>Java parity note names the file.</strong> When Go and Java differ, the reviewer surfaces it and the human decides. When they agree, drift becomes visible on the next Java update.</li>
+      <li><strong>Every citation is grep-checkable.</strong> <code>session_lifecycle.go:331-392</code>, <code>SessionImpl.java:689-716</code>. If the citation stops resolving, the spec is stale &mdash; the reviewer catches it.</li>
+      <li><strong>Deprecation lives in the spec, not a comment.</strong> The <code>LastRpcIdAdmitted</code> retry oracle was originally specced; when we deferred it, the spec was updated in the same PR that removed the code path.</li>
+    </ul>
+
+    <p><strong>The point.</strong> A spec isn&rsquo;t architecture prose &mdash; it&rsquo;s a checklist a reviewer can mechanically verify. That&rsquo;s what lets the subagent pipeline scale beyond &ldquo;does this look right?&rdquo;</p>
+  </section>
+
+  <!-- ============ SLIDE 4 — Component Restrictions ============ -->
+  <section class="slide" id="s4">
+    <header class="rail">
+      <span class="rail-l">Bigtable Session subsystem &mdash; spec-driven review</span>
+      <span>Slide 4 of 9</span>
+    </header>
+    <h1>Component Restrictions &mdash; keeping logic in its owner</h1>
+
+    <p><strong>The pattern we noticed.</strong> Claude is very smart at fixing things. It reaches for the smallest local change &mdash; usually an <code>if/else</code> right where the symptom shows up &mdash;</p>
+    <pre><code>// pseudocode of the shape Claude keeps drifting toward
+if isSessionPath(ctx) {
+    // do the session thing here in Diverter
+} else {
+    // classic path
+}</code></pre>
+    <p>As we iterated on Session Client, the components started to look <em>muddled</em>. The logic was leaking &mdash; Diverter learned about metrics, the pool learned about the shim, z-pages started reaching into pool internals. Each change was locally correct; the aggregate was a mess.</p>
+
+    <p><strong>Fix: define the layout as strictly as the behavior.</strong> <code>SESSION_COMPONENT_SPEC.md</code> is three parts &mdash; a descriptive map, a prescriptive rule set, and an ownership matrix.</p>
 
     <h2>Part A &mdash; Layer map (descriptive, drifts with code)</h2>
-    <p>Seven layers, bottom-up. Reviewer uses this as a starting point for grep, not as authoritative citations.</p>
+    <p>Seven layers, bottom-up. Reviewer uses this as a starting point so we keep logic in the actual component owner.</p>
     <table>
       <thead><tr><th style="width:34px">#</th><th style="width:220px">Layer</th><th>Location</th></tr></thead>
       <tbody>
         <tr><td>1</td><td>Transport primitives</td><td><code>bigtable/internal/transport/</code> &mdash; <code>Stream</code>, <code>State</code>, <code>AttemptState</code></td></tr>
         <tr><td>2</td><td>Session</td><td><code>internal/transport/session*.go</code> &mdash; <code>Session</code>, <code>SessionHooks</code>, <code>afeID</code></td></tr>
-        <tr><td>3</td><td>Pool + Picker</td><td><code>internal/transport/session_pool*.go</code>, <code>afe_picker.go</code> &mdash; <code>SessionPoolImpl</code>, <code>sessionList</code>, <code>afeHandle</code>, <code>PoolSizer</code></td></tr>
+        <tr><td>3</td><td>Pool + Picker</td><td><code>session_pool*.go</code>, <code>afe_picker.go</code> &mdash; <code>SessionPoolImpl</code>, <code>sessionList</code>, <code>afeHandle</code>, <code>PoolSizer</code></td></tr>
         <tr><td>4</td><td>Session client + tables</td><td><code>bigtable/internal/session/</code> &mdash; <code>SessionClient</code>, <code>SessionTableApi</code>, <code>lazyPool</code>, <code>ClientConfigurationManager</code></td></tr>
-        <tr><td>5</td><td>Routing shim + diverter</td><td><code>table_shim.go</code>, <code>internal/transport/diverter.go</code> (Go-only mixed-mode)</td></tr>
+        <tr><td>5</td><td>Routing shim + diverter</td><td><code>table_shim.go</code>, <code>internal/transport/diverter.go</code></td></tr>
         <tr><td>6</td><td>Public bigtable API</td><td><code>bigtable/</code> &mdash; <code>Client</code>, <code>Table</code>, <code>Mutation</code>, <code>Row</code></td></tr>
-        <tr><td>7</td><td>Observability tier</td><td><code>bigtable/debugview/</code>, <code>*_snapshot.go</code> &mdash; provider interfaces + snapshot DTOs + 7 z-pages</td></tr>
+        <tr><td>7</td><td>Observability tier</td><td><code>bigtable/debugview/</code>, <code>*_snapshot.go</code> &mdash; provider interfaces + 7 z-pages</td></tr>
       </tbody>
     </table>
 
@@ -297,123 +358,216 @@
         <tr><td><strong>B1</strong></td><td><code>internal/session/</code> importing public bigtable types (<code>Row</code>, <code>Mutation</code>, <code>Filter</code>, &hellip;)</td><td>Grep in spec; import cycle blocks the top-level package.</td></tr>
         <tr><td><strong>B2</strong></td><td><code>internal/transport/</code> importing <code>internal/session/</code></td><td>Go&rsquo;s cycle detector at build time (session already imports transport).</td></tr>
         <tr><td><strong>B3</strong></td><td><code>debugview/</code> importing concrete pool/session types</td><td>Reviewer agent grep.</td></tr>
-        <tr><td><strong>B4</strong></td><td><code>Diverter</code> gaining per-method or per-key routing (must stay shape-agnostic)</td><td>Reviewer agent surface check.</td></tr>
+        <tr><td><strong>B4</strong></td><td><code>Diverter</code> gaining per-method or per-key routing (MUST stay shape-agnostic)</td><td>Reviewer agent surface check.</td></tr>
         <tr><td><strong>B6</strong></td><td>Anyone other than <code>ClientConfigurationManager</code> calling <code>SetSessionLoad</code> / <code>UpdateConfig</code></td><td>Grep hits are new sites to review.</td></tr>
         <tr><td><strong>B7</strong></td><td><code>Session</code> holding pool-level state (waiters, picker, sizer, pickHistory&hellip;)</td><td>Reviewer agent struct inspection.</td></tr>
-        <tr><td><strong>B8</strong></td><td>Lock inversion: <code>sl.mu</code> before <code>pool.mu</code> (or re-entrant <code>p.mu</code>)</td><td>Manual review; <code>-race -count=1000</code> as operational surrogate.</td></tr>
-        <tr><td><em>&hellip;</em></td><td colspan="2"><em>4 more rules cover Diverter/TableShim surfaces (B5), retry-boundary discipline (B9), z-page non-computation (B10), and two meta-rules on not re-implementing behavioral invariants (B11, B12).</em></td></tr>
+        <tr><td><strong>B8</strong></td><td>Lock inversion: <code>sl.mu</code> before <code>pool.mu</code> (or re-entrant <code>p.mu</code>)</td><td>Manual review; <code>-race -count=1000</code> operational surrogate.</td></tr>
+        <tr><td><em>&hellip;</em></td><td colspan="2"><em>4 more cover Diverter/TableShim surfaces (B5), retry-boundary discipline (B9), z-page non-computation (B10), and two meta-rules on not re-implementing behavioral invariants (B11, B12).</em></td></tr>
       </tbody>
     </table>
 
     <h2>Part C &mdash; Ownership matrix (sole owner per concern)</h2>
-    <p>Every mutable concern names exactly one owner. Others read via accessor/interface; no parallel copies.</p>
+    <p><strong>Every mutable concern names exactly one owner. Others read via accessor/interface; no parallel copies.</strong></p>
     <blockquote>
-      <p><strong>Traffic split ratio (session vs classic)</strong> | <code>Diverter.sessionLoadBits</code> (atomic float64) | driven by <code>ClientConfigurationManager.SessionLoadListener</code>.</p>
-      <p><strong>Per-attempt <code>ClusterInfo</code> (session path)</strong> | <code>InvokeResult.ClusterInfo</code> (returned by <code>Session.Invoke</code>) | stamped by <code>sessionTable.stampAttempt</code>; MUST NOT be re-derived from headers.</p>
-      <p><strong>Session-tracer OTel histograms</strong> (<code>session.durations</code>, <code>session.open_latencies</code>, <code>session.uptime</code>, <code>transport_latencies</code>) | <code>sessionTracer</code>; registered once by <code>InitializeSessionMetrics</code> | sole writer; <code>transport_latencies</code> only from <code>session_pool.go:650</code> under the positive-delta gate.</p>
+      <p><strong>Traffic split ratio (session vs classic)</strong> &mdash; owned by <code>Diverter.sessionLoadBits</code> (atomic float64); driven by <code>ClientConfigurationManager.SessionLoadListener</code>.</p>
+      <p><strong>Per-attempt <code>ClusterInfo</code> (session path)</strong> &mdash; owned by <code>InvokeResult.ClusterInfo</code>; stamped by <code>sessionTable.stampAttempt</code>; MUST NOT be re-derived from headers.</p>
+      <p><strong>Session-tracer OTel histograms</strong> &mdash; owned by <code>sessionTracer</code>; registered once by <code>InitializeSessionMetrics</code>; sole writer for <code>transport_latencies</code> under the positive-delta gate at <code>session_pool.go:650</code>.</p>
     </blockquote>
 
-    <p><strong>Why three parts, not one.</strong> Part A drifts with the code and everyone knows it. Part B is the durable prescriptive layer &mdash; violations block PRs. Part C names sole owners so a future contributor can&rsquo;t innocently add a second writer that silently drifts labels or state.</p>
+    <p><strong>Why three parts, not one.</strong> Part A drifts and everyone knows it. Part B is the durable prescriptive layer &mdash; violations block PRs. Part C names sole owners so a future <code>if/else</code> can&rsquo;t innocently add a second writer that silently drifts labels or state.</p>
   </section>
 
-  <!-- ============ SLIDE 4 — Three prompt shapes + review flow ============ -->
-  <section class="slide" id="s4">
-    <header class="rail">
-      <span class="rail-l">Bigtable Session subsystem &mdash; spec-driven review</span>
-      <span>Slide 4 of 5</span>
-    </header>
-    <h1>Three prompts, three sizes &mdash; same review mechanism</h1>
-
-    <p>The spec + hook + reviewer pattern scales across change size. What varies is <em>how much reviewing</em> happens; the mechanism is identical.</p>
-
-    <h2><span class="tag grey">1</span> Simple refactor &mdash; typed accessors for an atomic field</h2>
-    <div class="prompt">&ldquo;Add a getter and CAS wrapper for <code>Session.activeRPC</code> (<code>atomic.Pointer[vrpcImpl]</code>) so call sites don&rsquo;t reach the atomic directly. Route all 11 production <code>.Load()</code> and <code>.CompareAndSwap()</code> sites through the wrappers; leave test <code>.Store()</code> sites direct (fixture setup only).&rdquo;</div>
-    <p><strong>Flow.</strong> Pure passthrough refactor. Hook fires per edit. Before commit &rarr; <code>session-reviewer</code> confirms the CAS invariant (<code>SESSION_SPEC.md #2</code>) is preserved bit-for-bit; <code>session-component-review</code> confirms no boundary crossings and no ownership change (Part C row for &ldquo;In-flight vRPC slot&rdquo; unchanged). Both PASS &rarr; commit.</p>
-
-    <h2><span class="tag grey">2</span> Logic addition &mdash; adaptive session-creation throttler (Java-parity budget)</h2>
-    <div class="prompt">&ldquo;Add adaptive session-creation throttling. New <code>SessionThrottler</code> interface with an <code>AdaptiveSessionThrottler</code> impl: a semaphore bounds concurrent <code>OpenSession</code> attempts; on failure the released slot pays a <code>NewSessionCreationPenalty</code> before re-entering the concurrency pool. Match Java <code>SessionCreationBudget.java</code>. Wire into <code>SessionPoolImpl.openSession</code>. Three server-driven knobs: <code>NewSessionCreationBudget</code>, <code>NewSessionCreationPenalty</code>, <code>ConsecutiveSessionFailureThreshold</code> (circuit breaker).&rdquo;</div>
-    <p><strong>Flow.</strong> Touches <code>session_creation_budget.go</code> (new impl), <code>session_pool.go</code> (Acquire/Release around <code>OpenSession</code>), <code>client_configuration_manager.go</code> (proto parsing + <code>UpdateConfig</code>). Multi-file, spans several invariants:</p>
-    <ul>
-      <li><strong><code>SESSION_POOL_SPEC.md #5</code></strong> &mdash; the &ldquo;server-driven scaling MUST NOT overwhelm the control plane&rdquo; invariant <em>exists</em> because of this throttler. Reviewer checks: budget acquired before <code>OpenSession</code>? Failed release pays the penalty (`RetryingVRpc`-style hint from server not honored elsewhere)? Consecutive-failure circuit breaker trips at threshold?</li>
-      <li><strong><code>SESSION_CLIENT_SPEC.md #3</code></strong> &mdash; the three knobs come from <code>GetClientConfiguration</code>; throttler MUST be tuned via <code>UpdateConfig</code>, not locally.</li>
-      <li><strong><code>SESSION_COMPONENT_SPEC.md B6</code></strong> &mdash; <code>throttler.UpdateConfig</code> called only from <code>ClientConfigurationManager</code>&rsquo;s listener. Grep-checkable.</li>
-    </ul>
-    <p>Reviewer PASS confirms the invariant chain end-to-end &mdash; a future contributor cannot bypass the budget with a direct <code>go pool.openSession(...)</code>, and cannot tune the penalty from application code.</p>
-
-    <h2><span class="tag grey">3</span> Big feature &mdash; <code>tcpz</code>: per-connection TCP_INFO as a debug page (6 iterative commits)</h2>
-    <div class="prompt">&ldquo;Add a <code>tcpz</code> debug page that exposes TCP_INFO stats for every connection tracked in the client&rsquo;s channel pool. Wire a custom dialer at Client construction to capture each <code>net.Conn</code> into a <code>bigtable.TCPStats</code> collector; the view calls <code>getsockopt(SOL_TCP, TCP_INFO)</code> per socket on render.&rdquo;</div>
-    <p><strong>Why the specs made this survivable.</strong> <code>tcpz</code> introduced something none of the other z-pages did: a <em>fourth</em> kind of state (TCP-level, not pool/session/channel/config) with a Linux-only syscall on the read path. Every one of those choices touched a spec rule:</p>
-    <ul>
-      <li><strong><code>SESSION_COMPONENT_SPEC.md B3</code></strong> &mdash; debugview accesses pool/session state ONLY via the three provider interfaces (<code>SessionDebugProvider</code> / <code>ChannelDebugProvider</code> / <code>ConfigDebugProvider</code>). TCP_INFO isn&rsquo;t any of those &mdash; forced the decision to introduce <code>*bigtable.TCPStats</code> as a fourth first-class Handler arg rather than smuggling it through an existing provider. Part C gained a new ownership row.</li>
-      <li><strong><code>SESSION_POOL_SPEC.md #4</code></strong> &mdash; z-pages MUST NOT block hot-path latencies. <code>getsockopt</code> is a syscall; the collector holds live <code>net.Conn</code> refs. Reviewer checks: snapshot-copy the conn list under RLock, <em>release</em>, then iterate + syscall outside the lock. Otherwise a hung syscall would freeze every subsequent connection registration.</li>
-      <li><strong><code>SESSION_COMPONENT_SPEC.md B10</code></strong> &mdash; z-pages render, they don&rsquo;t compute. The &ldquo;flag sub-1500 PMTU paths&rdquo; column added in commit 3 lives on the DTO producer (<code>tcp_info_linux.go</code>), not in the template &mdash; so the JSON consumer sees the same flag as the HTML view.</li>
-      <li><strong>Nil-safety contract enforced across all 7 z-pages.</strong> <code>debugview.Handler(client, nil)</code> must not panic; <code>/tcpz/</code> renders &ldquo;collector not attached&rdquo;. That contract is why <code>tcpz</code> slotted in without adding a second constructor.</li>
-    </ul>
-    <p><strong>Why 6 commits, not one.</strong> Even &ldquo;big&rdquo; features break down under specs. The initial page shipped as one prompt (<code>e8c80cff91 tcpz &mdash; per-conn TCP_INFO debug endpoint</code>); every subsequent field added &mdash; retrans diagnostics, PMTU, flow control, per-peer grouping, auto-refresh throttle &mdash; was its own small one-shot prompt because the base was solid. The specs made incremental additions safe: reviewer confirmed each new field followed B10 (compute on producer), and each new render pass followed POOL #4 (no lock across syscall). Six commits, six clean reviews, no regressions.</p>
-
-  </section>
-
-  <!-- ============ SLIDE 5 — Reviewer + test-run mechanism ============ -->
+  <!-- ============ SLIDE 5 — Small task: refactor ============ -->
   <section class="slide" id="s5">
     <header class="rail">
       <span class="rail-l">Bigtable Session subsystem &mdash; spec-driven review</span>
-      <span>Slide 5 of 5</span>
+      <span>Slide 5 of 9</span>
     </header>
-    <h1>How the reviewer verifies specs and runs tests</h1>
+    <h1><span class="tag grey">Small</span> Refactor &mdash; typed accessors for an atomic field</h1>
 
-    <p>Every session-scope commit goes through the same pipeline: edit &rarr; hook reminder &rarr; two reviewer agents in parallel &rarr; smoke-gate tests &rarr; commit. The two agents split the workload so no single reviewer holds the whole spec set in context at once.</p>
+    <p>Simplest shape: pure passthrough refactor. No behavior change, one file, one reviewer pass.</p>
 
-    <div class="two-col">
-      <div>
-        <h2><code>session-reviewer</code> &mdash; behavioral</h2>
-        <ul>
-          <li><strong>Reads</strong> the 4 behavioral specs: <code>SESSION_SPEC.md</code>, <code>SESSION_CLIENT_SPEC.md</code>, <code>SESSION_POOL_SPEC.md</code>, <code>CLIENT_SIDE_METRICS_SPEC.md</code>.</li>
-          <li><strong>Walks the diff</strong>, opens every cited file, cross-references the invariants each touched line could affect.</li>
-          <li><strong>Reports one row per touched invariant</strong> &mdash; empty report if the diff is scoped to files no invariant governs.</li>
-        </ul>
-      </div>
-      <div>
-        <h2><code>session-component-review</code> &mdash; boundaries</h2>
-        <ul>
-          <li><strong>Reads</strong> <code>SESSION_COMPONENT_SPEC.md</code> &mdash; Part B (12 MUST-rules) + Part C (ownership matrix).</li>
-          <li><strong>Runs the grep patterns</strong> documented in the spec (B1/B2/B6 have explicit greps; others are structural checks).</li>
-          <li><strong>Flags new imports, new call sites, new struct fields</strong> against Part C sole-owner claims.</li>
-        </ul>
-      </div>
+    <h2>Prompt</h2>
+    <div class="prompt"><span class="prompt-label">Small-task prompt</span>Add a getter and CAS wrapper for <code>Session.activeRPC</code> (<code>atomic.Pointer[vrpcImpl]</code>) so call sites don&rsquo;t reach the atomic directly. Route all 11 production <code>.Load()</code> and <code>.CompareAndSwap()</code> sites through the wrappers; leave test <code>.Store()</code> sites direct (fixture setup only).</div>
+
+    <h2>Flow</h2>
+    <ol>
+      <li><strong>Edit.</strong> Add <code>(*Session).LoadActiveVRPC()</code> + <code>(*Session).CASActiveVRPC(old, new)</code>. Rewire 11 call sites via <code>gopls</code> rename.</li>
+      <li><strong>Hook fires.</strong> <code>PostToolUse</code> on any <code>session_*.go</code> edit auto-invokes both reviewer subagents in parallel.</li>
+      <li><strong><code>session-reviewer</code></strong> confirms <code>SESSION_SPEC.md #2</code> (one-in-flight vRPC via CAS) is preserved bit-for-bit &mdash; wrappers are identity; the CAS still fails only for caller (pool) bugs, never backpressure.</li>
+      <li><strong><code>session-component-review</code></strong> confirms no boundary crossings and Part C row for &ldquo;In-flight vRPC slot&rdquo; still names <code>Session.activeRPC</code> as sole owner. No ownership change.</li>
+      <li><strong>Smoke gate.</strong> <code>go test -race -count=1 -short -timeout=90s ./internal/transport/</code> green.</li>
+      <li><strong>Commit.</strong> Both reports PASS; ship it.</li>
+    </ol>
+
+    <div class="callout">
+      <strong>Why this fits the small bucket.</strong> One concept, one file, one invariant to preserve. The prompt names the target interface, both call-site classes (production vs test), and the exact rewire &mdash; leaving nothing for the model to invent.
     </div>
+  </section>
 
-    <h2>Report format &mdash; one row per touched rule</h2>
-<pre><code>| Spec | #  | Verdict    | Evidence                                                    |
-|------|----|------------|-------------------------------------------------------------|
-| SESS | 2  | PASS       | session_vrpc.go:107 CAS enforces multiplex=1                |
-| SESS | 4  | PASS       | session_test.go:1113 asserts OnStart→OnActive→…→OnClose     |
-| POOL | 4  | VIOLATION  | debugview/afez.go:83 holds p.mu.RLock across w.Write        |
-| COMP | B3 | AMBIGUOUS  | debugview/foo.go:12 imports *SessionPoolImpl — Part C gap?  |</code></pre>
+  <!-- ============ SLIDE 6 — Medium task: logic addition ============ -->
+  <section class="slide" id="s6">
+    <header class="rail">
+      <span class="rail-l">Bigtable Session subsystem &mdash; spec-driven review</span>
+      <span>Slide 6 of 9</span>
+    </header>
+    <h1><span class="tag grey">Medium</span> Logic addition &mdash; adaptive session-creation throttler</h1>
 
-    <div class="two-col">
-      <div>
-        <h2>Verdict semantics</h2>
+    <p>Multi-file change that adds real behavior, spans three or four invariants, but still one commit / one PR.</p>
+
+    <h2>Prompt</h2>
+    <div class="prompt"><span class="prompt-label">Medium-task prompt</span>Add adaptive session-creation throttling. New <code>SessionThrottler</code> interface with an <code>AdaptiveSessionThrottler</code> impl: a semaphore bounds concurrent <code>OpenSession</code> attempts; on failure the released slot pays a <code>NewSessionCreationPenalty</code> before re-entering the concurrency pool. Match Java <code>SessionCreationBudget.java</code>. Wire into <code>SessionPoolImpl.openSession</code>. Three server-driven knobs from <code>GetClientConfiguration</code>: <code>NewSessionCreationBudget</code>, <code>NewSessionCreationPenalty</code>, <code>ConsecutiveSessionFailureThreshold</code> (circuit breaker). Tune only via <code>ClientConfigurationManager.UpdateConfig</code>.</div>
+
+    <h2>Flow</h2>
+    <ol>
+      <li><strong>Edit.</strong> New <code>session_creation_budget.go</code> (impl). Modify <code>session_pool.go</code> (Acquire/Release around <code>OpenSession</code>). Modify <code>client_configuration_manager.go</code> (proto parsing + <code>UpdateConfig</code> plumbing).</li>
+      <li><strong>Hook fires.</strong> Both reviewers run in parallel because the edit spans transport + session-client layers.</li>
+      <li><strong><code>session-reviewer</code>: cross-invariant walk</strong>
         <ul>
-          <li><strong>PASS</strong> &mdash; invariant holds after this change; commit.</li>
-          <li><strong>VIOLATION</strong> &mdash; code contradicts spec. Fix the code, OR if the rule is stale, update the spec <em>in the same PR</em> with justification.</li>
-          <li><strong>AMBIGUOUS</strong> &mdash; reviewer can&rsquo;t decide from diff alone; needs context (e.g., a Part C row is missing for a sole-owner claim you just added). Resolve before commit.</li>
+          <li><strong><code>SESSION_POOL_SPEC.md #5</code></strong> &mdash; &ldquo;server-driven scaling MUST NOT overwhelm control plane.&rdquo; Reviewer checks: budget acquired before <code>OpenSession</code>? Failed release pays the penalty? Circuit breaker trips at threshold?</li>
+          <li><strong><code>SESSION_CLIENT_SPEC.md #3</code></strong> &mdash; three knobs come from <code>GetClientConfiguration</code>; MUST be tuned via <code>UpdateConfig</code>, not locally.</li>
         </ul>
-      </div>
-      <div>
-        <h2>Then run the tests</h2>
-        <p>After reviewers report PASS across the board, the smoke gate:</p>
-<pre><code>go test ./internal/transport/ \
-  -count=1 -short -timeout=90s</code></pre>
-        <p>Bypasses the hanging top-level <code>bigtable</code> integration tests. Coverage-audit slice: 22 behavioral invariants + 12 boundary rules; tests directly enforce a growing subset (e.g., <code>TestInvoke_ConcurrentSecondFailsWithMultiplexViolation</code> covers SESS #2, <code>TestHooks_FiredInSpecOrder</code> covers SESS #4).</p>
-      </div>
+      </li>
+      <li><strong><code>session-component-review</code>: boundary check</strong>
+        <ul>
+          <li><strong><code>B6</code></strong> &mdash; <code>throttler.UpdateConfig</code> called only from <code>ClientConfigurationManager</code>&rsquo;s listener. <code>git grep -n UpdateConfig bigtable/</code> &mdash; every hit is either the manager or a test.</li>
+          <li><strong><code>B7</code></strong> &mdash; throttler lives on the pool, not on <code>Session</code>. No per-session state added.</li>
+        </ul>
+      </li>
+      <li><strong>Smoke gate.</strong> Race stress on the new semaphore path: <code>-race -count=100 -run 'TestThrottler'</code>.</li>
+      <li><strong>Commit.</strong> PASS across the invariant chain &mdash; a future contributor cannot bypass the budget with a direct <code>go pool.openSession(...)</code> and cannot tune the penalty from application code.</li>
+    </ol>
+  </section>
+
+  <!-- ============ SLIDE 7 — Large task: tcpz feature ============ -->
+  <section class="slide" id="s7">
+    <header class="rail">
+      <span class="rail-l">Bigtable Session subsystem &mdash; spec-driven review</span>
+      <span>Slide 7 of 9</span>
+    </header>
+    <h1><span class="tag grey">Large</span> Feature &mdash; <code>tcpz</code>: per-conn TCP_INFO as a debug page</h1>
+
+    <p>Introduces something none of the other 6 z-pages did: a <em>fourth</em> kind of state (TCP-level, not pool/session/channel/config), a Linux-only syscall on the read path, and a new first-class Handler arg.</p>
+
+    <h2>Prompt</h2>
+    <div class="prompt"><span class="prompt-label">Large-task prompt</span>Add a <code>tcpz</code> debug page that exposes TCP_INFO stats for every connection tracked in the client&rsquo;s channel pool. Wire a custom dialer at Client construction to capture each <code>net.Conn</code> into a <code>bigtable.TCPStats</code> collector; the view calls <code>getsockopt(SOL_TCP, TCP_INFO)</code> per socket on render. Must be nil-safe: <code>debugview.Handler(client, nil)</code> renders &ldquo;collector not attached&rdquo; on <code>/tcpz/</code>. Six incremental commits: page skeleton, retrans diagnostics, PMTU column, flow control, per-peer grouping, auto-refresh throttle.</div>
+
+    <h2>Flow &mdash; why the specs made this survivable</h2>
+    <ul>
+      <li><strong><code>SESSION_COMPONENT_SPEC.md B3</code></strong> &mdash; debugview accesses pool/session state ONLY via the three provider interfaces (<code>SessionDebugProvider</code> / <code>ChannelDebugProvider</code> / <code>ConfigDebugProvider</code>). TCP_INFO isn&rsquo;t any of those &mdash; forced the decision to introduce <code>*bigtable.TCPStats</code> as a <em>fourth</em> first-class Handler arg rather than smuggling it through an existing provider. Part C gained a new ownership row in the same PR.</li>
+      <li><strong><code>SESSION_POOL_SPEC.md #4</code></strong> &mdash; z-pages MUST NOT block hot-path latencies. <code>getsockopt</code> is a syscall; the collector holds live <code>net.Conn</code> refs. Reviewer enforced: snapshot-copy the conn list under RLock, <em>release</em>, then iterate + syscall outside the lock. Otherwise a hung syscall would freeze every subsequent connection registration.</li>
+      <li><strong><code>SESSION_COMPONENT_SPEC.md B10</code></strong> &mdash; z-pages render, they don&rsquo;t compute. The &ldquo;flag sub-1500 PMTU paths&rdquo; column added in commit 3 lives on the DTO producer (<code>tcp_info_linux.go</code>), not in the template &mdash; so the JSON consumer sees the same flag as the HTML view.</li>
+      <li><strong>Nil-safety contract enforced across all 7 z-pages.</strong> <code>debugview.Handler(client, nil)</code> must not panic. That contract is why <code>tcpz</code> slotted in without adding a second constructor.</li>
+    </ul>
+
+    <h2>Six commits, six clean reviews</h2>
+    <p><strong>Why 6 commits, not one.</strong> The initial page shipped as one prompt (<code>e8c80cff91 tcpz &mdash; per-conn TCP_INFO debug endpoint</code>); every subsequent field &mdash; retrans diagnostics, PMTU, flow control, per-peer grouping, auto-refresh throttle &mdash; was its own small one-shot prompt because the base was solid. Specs made incremental additions safe: reviewer confirmed each new field followed <code>B10</code> (compute on producer), and each render pass followed <code>POOL #4</code> (no lock across syscall). Six commits, six clean reviews, no regressions.</p>
+
+    <div class="callout">
+      <strong>Big features break down under specs.</strong> The specs didn&rsquo;t just gate the initial commit &mdash; they made the next five commits landable as small tasks.
     </div>
+  </section>
+
+  <!-- ============ SLIDE 8 — Large task: A/B experiment ============ -->
+  <section class="slide" id="s8">
+    <header class="rail">
+      <span class="rail-l">Bigtable Session subsystem &mdash; spec-driven review</span>
+      <span>Slide 8 of 9</span>
+    </header>
+    <h1><span class="tag grey">Large</span> A/B perf experiment &mdash; SynchronizationContext POC</h1>
+
+    <p>Different shape from <code>tcpz</code>: we don&rsquo;t know if the change is worth landing. The prompt has to produce the <em>data</em> to make that call, not the shipping code.</p>
+
+    <h2>Prompt (design doc + POC + A/B, one brief)</h2>
+    <div class="prompt"><span class="prompt-label">A/B-experiment prompt</span>design doc for session synchronization context
+
+<span style="color: var(--grey-500)">&rarr; entered plan mode &rarr; produced </span><code>~/.claude/plans/ethereal-moseying-dragon.md</code><span style="color: var(--grey-500)">, a two-phase brief:</span>
+
+<strong>Phase 1 &mdash; Design doc</strong> at <code>~/.claude/plans/session-sync-context-design.md</code> (10 substantive sections, no TBDs): problem statement with R1/R2 file:line citations, per-Session serial executor solution, API sketch, 5-PR migration plan, alternatives, verification protocol, risks, open questions for mutianf.
+
+<strong>Phase 2 &mdash; POC</strong> on dedicated branch <code>experiment/session-sync-context-poc</code> (not merge-intended; A/B artifact only). Deliberately narrow scope &mdash; migrate 2 code paths: <code>handleGoAway</code> (R1 site) and <code>Invoke</code>&rsquo;s state-check + slot-claim (R2 leg-1 site). Everything else stays on old model.
+
+<strong>New files:</strong> <code>syncctx.go</code> (primitive, ~120 LOC), <code>syncctx_test.go</code>, <code>session_syncctx_bench_test.go</code> (<code>BenchmarkInvokeMicro</code> with sequential + parallel-contended variants, <code>ReportAllocs</code>).
+
+<strong>A/B commands:</strong>
+<code>go test -bench=BenchmarkInvokeMicro -benchmem -benchtime=3s -count=10 ./internal/transport</code>
+<code>go test -race -count=1000 -run '^TestRace' -timeout=120s ./internal/transport</code>
+<code>benchstat /tmp/invokemicro-{old,new}.txt</code>
+
+<strong>Decision matrix:</strong>
+&nbsp;&nbsp;&bull; &lt;10% regression &rarr; proceed with 5-PR migration
+&nbsp;&nbsp;&bull; 10&ndash;25% &rarr; profile taskCh contention, tune, retry
+&nbsp;&nbsp;&bull; &gt;25% or race tests fail &rarr; abandon</div>
+
+    <h2>Flow</h2>
+    <ol>
+      <li><strong>Plan mode.</strong> User&rsquo;s literal prompt was 5 words. The model entered plan mode, explored the codebase, drafted the two-phase brief, and asked for approval before touching code. Plan was saved as <code>ethereal-moseying-dragon.md</code>.</li>
+      <li><strong>Execute Phase 1.</strong> Design doc lands first &mdash; something concrete for mutianf to react to while the POC runs.</li>
+      <li><strong>Execute Phase 2.</strong> Cut branch, write primitive + tests, migrate the 2 sites, add bench, run A/B via benchstat.</li>
+      <li><strong>Verify honestly.</strong> Both reviewer subagents run against the POC diff &mdash; they cleared behavioral (<code>SESSION_SPEC</code>) and boundary (<code>SESSION_COMPONENT_SPEC</code>) invariants.</li>
+      <li><strong>Report</strong> at <code>~/.claude/plans/session-sync-context-ab-results.md</code> with benchstat table, race summary, verdict.</li>
+    </ol>
+
+    <h2>Result &mdash; the point of running the experiment</h2>
+    <table>
+      <thead><tr><th>Benchmark</th><th>Baseline</th><th>POC</th><th>Delta</th></tr></thead>
+      <tbody>
+        <tr><td><code>InvokeMicro/sequential</code></td><td>1.264 &micro;s</td><td>1.976 &micro;s</td><td class="tag red">+56%</td></tr>
+        <tr><td><code>InvokeMicro/parallel-contended</code></td><td>203 ns</td><td>1274 ns</td><td class="tag red">+528%</td></tr>
+        <tr><td><code>SyncCtxOverhead</code> (isolated)</td><td>&mdash;</td><td>616 ns/op</td><td>2 goroutine hops</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Verdict:</strong> per the decision matrix &mdash; &gt;25% regression &rarr; <strong>abandon full migration.</strong> Land the R2 <code>SendVRpc</code> fix (already in baseline) + R1 <code>CheckoutSession</code> re-check as separate small PRs; skip the primitive. The A/B saved us from a 3-week, 5-PR migration that would have made every Invoke 56% slower.</p>
+  </section>
+
+  <!-- ============ SLIDE 9 — Plan-Flush-Execute + Limitations ============ -->
+  <section class="slide" id="s9">
+    <header class="rail">
+      <span class="rail-l">Bigtable Session subsystem &mdash; spec-driven review</span>
+      <span>Slide 9 of 9</span>
+    </header>
+    <h1>Plan &mdash; Flush &mdash; Execute (and where the model still struggles)</h1>
+
+    <h2>The workflow that emerged</h2>
+    <ol>
+      <li><strong>Plan.</strong> For anything above a small refactor, enter plan mode. The model explores the codebase, drafts a written plan (saved to <code>~/.claude/plans/*.md</code>), and asks for approval before writing code.</li>
+      <li><strong>Flush the plan.</strong> Human read of the plan &mdash; usually the point where scope shrinks. &ldquo;Do the 2-site POC, not the full migration&rdquo; came from flushing, not from the model.</li>
+      <li><strong>Execute.</strong> Only after the plan is signed off. Reviewer hooks + specs enforce that the executed diff matches the approved shape.</li>
+    </ol>
+    <p><strong>Why this order.</strong> The plan file becomes a durable artifact &mdash; the reviewer subagents cite it, the A/B report references it, and future sessions resume against it. Without a written plan, every session re-derives context from scratch.</p>
+
+    <h2>Limitations &mdash; where Claude still struggles</h2>
+    <table>
+      <thead><tr><th style="width:36%">Failure mode</th><th>What it looks like</th><th style="width:28%">Mitigation</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>1. Race conditions.</strong></td>
+          <td>Concurrency bugs that require holding 3+ atomics/locks in your head &mdash; the model finds the local fix but misses the cross-resource invariant. R1&rsquo;s three variants and R2&rsquo;s two legs (state, <code>activeRPC</code>, <code>sendMu</code>, <code>sessionList</code>) were all in this bucket.</td>
+          <td>Write races out as numbered scenarios with <code>file:line</code>. Force a <code>-race -count=1000</code> stress run. Match Java-side invariants explicitly. Do NOT trust &ldquo;looks fine to me.&rdquo;</td>
+        </tr>
+        <tr>
+          <td><strong>2. <code>if/else</code> fixes instead of scoped ones.</strong></td>
+          <td>The model reaches for the smallest local branch &mdash; usually right at the symptom site &mdash; rather than following the ownership matrix. Diverter grows an <code>if isSessionPath</code>; z-page grows an <code>if collector != nil</code> inline instead of at the constructor.</td>
+          <td>Part C ownership matrix + boundary reviewer flag any new writer/consumer that isn&rsquo;t the sole owner. Force the fix to move to the owner, not the caller.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>What actually shipped from this workflow</h2>
+    <ul>
+      <li><strong>3 one-shot PRs</strong> (#19987, #20027, #20099) landed clean.</li>
+      <li><strong>5 spec files</strong> at repo root, 22 behavioral invariants + 12 boundary rules, all with <code>file:line</code> citations.</li>
+      <li><strong>2 reviewer subagents</strong> auto-invoked by <code>PostToolUse</code> on session-file edits.</li>
+      <li><strong>1 A/B experiment</strong> that saved us from a 3-week regression.</li>
+      <li><strong>~30k LOC</strong> under active session work, still reviewable one commit at a time.</li>
+    </ul>
 
     <p class="callout" style="margin-top:12px"><strong>Load-bearing property:</strong> specs are living. When a rule is wrong, you update it in the same PR that changes the code &mdash; never in a follow-up. That&rsquo;s what keeps every reviewer citation honest and every <code>file:line</code> reference resolvable.</p>
   </section>
 
 </div>
 
-<div id="counter">1 / 5</div>
+<div id="counter">1 / 9</div>
 <div id="nav-hint"><span class="kbd">&larr;</span> <span class="kbd">&rarr;</span> or <span class="kbd">Space</span> to navigate &nbsp;&middot;&nbsp; <span class="kbd">F</span> for fullscreen</div>
 
 <script>
@@ -450,7 +604,6 @@
     }
   });
 
-  // Click to advance (right side) / back (left side)
   document.getElementById('deck').addEventListener('click', function (e) {
     var w = window.innerWidth;
     if (e.clientX > w * 0.7) show(idx + 1);
