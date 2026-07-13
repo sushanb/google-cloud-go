@@ -402,7 +402,7 @@
     <p>Multi-file change that adds real behavior, spans three or four invariants, but still one commit / one PR.</p>
 
     <h2>Prompt</h2>
-    <div class="prompt"><span class="prompt-label">Medium-task prompt</span>Add adaptive session-creation throttling. New <code>SessionThrottler</code> interface with an <code>AdaptiveSessionThrottler</code> impl: a semaphore bounds concurrent <code>OpenSession</code> attempts; on failure the released slot pays a <code>NewSessionCreationPenalty</code> before re-entering the concurrency pool. Match Java <code>SessionCreationBudget.java</code>. Wire into <code>SessionPoolImpl.openSession</code>. Three server-driven knobs from <code>GetClientConfiguration</code>: <code>NewSessionCreationBudget</code>, <code>NewSessionCreationPenalty</code>, <code>ConsecutiveSessionFailureThreshold</code> (circuit breaker). Tune only via <code>ClientConfigurationManager.UpdateConfig</code>.</div>
+    <div class="prompt"><span class="prompt-label">Medium-task prompt</span>Create an adaptive session-creation throttler based on three server-driven knobs from <code>GetClientConfiguration</code>: <code>NewSessionCreationBudget</code>, <code>NewSessionCreationPenalty</code>, <code>ConsecutiveSessionFailureThreshold</code> (circuit breaker).</div>
 
     <h2>Flow</h2>
     <ol>
