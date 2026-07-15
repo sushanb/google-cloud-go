@@ -52,29 +52,24 @@ func TestSessionDataValidation_ReadRowParity(t *testing.T) {
 		t.Skip("Skip: requires live Bigtable sandbox instance")
 	}
 
-	const (
-		project  = "autonomous-mote-782"
-		instance = "test-sushanb"
-		table    = "sushanb"
-		family   = "cf12"
-		endpoint = "test-bigtable.sandbox.googleapis.com:443"
-	)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	classic, err := NewClientWithConfig(ctx, project, instance,
+	t.Logf("Using vRPC sandbox: project=%s instance=%s table=%s endpoint=%s",
+		sessionSandboxProject, sessionSandboxInstance, sessionSandboxTable, sessionSandboxEndpoint)
+
+	classic, err := NewClientWithConfig(ctx, sessionSandboxProject, sessionSandboxInstance,
 		ClientConfig{EnableSessionPool: false},
-		option.WithEndpoint(endpoint),
+		option.WithEndpoint(sessionSandboxEndpoint),
 	)
 	if err != nil {
 		t.Fatalf("classic NewClientWithConfig: %v", err)
 	}
 	defer classic.Close()
 
-	sessionCli, err := NewClientWithConfig(ctx, project, instance,
+	sessionCli, err := NewClientWithConfig(ctx, sessionSandboxProject, sessionSandboxInstance,
 		ClientConfig{EnableSessionPool: true, SessionPoolMin: 1, SessionPoolMax: 2},
-		option.WithEndpoint(endpoint),
+		option.WithEndpoint(sessionSandboxEndpoint),
 	)
 	if err != nil {
 		t.Fatalf("session NewClientWithConfig: %v", err)
@@ -87,8 +82,8 @@ func TestSessionDataValidation_ReadRowParity(t *testing.T) {
 	waitForSessionPoolReady(t, sessionCli, 15*time.Second)
 	sessionCli.diverter.SetSessionLoad(1.0)
 
-	classicTbl := classic.OpenTable(table)
-	sessionTbl := sessionCli.OpenTable(table)
+	classicTbl := classic.OpenTable(sessionSandboxTable)
+	sessionTbl := sessionCli.OpenTable(sessionSandboxTable)
 
 	// Unique per-run row-key prefix so parallel/repeat runs don't collide.
 	runID := time.Now().UnixNano()
@@ -179,7 +174,7 @@ func TestSessionDataValidation_ReadRowParity(t *testing.T) {
 			// Seed via classic path.
 			mut := NewMutation()
 			for _, w := range tc.writes {
-				mut.Set(family, w.col, w.ts, w.val)
+				mut.Set(sessionSandboxFamily, w.col, w.ts, w.val)
 			}
 			if err := classicTbl.Apply(ctx, rowKey, mut); err != nil {
 				t.Fatalf("classic Apply: %v", err)
@@ -222,8 +217,8 @@ func TestSessionDataValidation_ReadRowParity(t *testing.T) {
 		rowKey := rk("reverse")
 		sessionCli.diverter.SetSessionLoad(1.0)
 		mut := NewMutation()
-		mut.Set(family, "c1", 5_000_000, []byte("seeded-via-session"))
-		mut.Set(family, "c2", 5_000_000, []byte("second"))
+		mut.Set(sessionSandboxFamily, "c1", 5_000_000, []byte("seeded-via-session"))
+		mut.Set(sessionSandboxFamily, "c2", 5_000_000, []byte("second"))
 		if err := sessionTbl.Apply(ctx, rowKey, mut); err != nil {
 			t.Fatalf("session Apply: %v", err)
 		}
