@@ -15,6 +15,7 @@
 package internal
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -207,6 +208,30 @@ func TestOnClosing_ThenOnClose_UsesPoolHandle(t *testing.T) {
 
 	if got := p.m.sessionsClosed.Load(); got != 1 {
 		t.Errorf("sessionsClosed = %d, want 1", got)
+	}
+}
+
+func TestPoolClose_RecordsLifetimeOncePerSession(t *testing.T) {
+	// Regression: Phase-1 of Pool.Close records lifetime up-front for every
+	// snapshotted handle. Phase-2 then fires s.Close per session, which
+	// drives notifyClosing → p.OnClosing → recordLifetime again unless
+	// Phase-1 has cleared s.poolHandle to trip OnClosing's nil-guard.
+	// Without the clear, the lifetimes ring double-counts every session
+	// torn down during pool teardown.
+	p := newTestPool(t, 1, 10)
+	const n = 3
+	for i := 0; i < n; i++ {
+		injectActiveSession(t, p, fmt.Sprintf("s%d", i), time.Now().Add(-time.Second))
+	}
+
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close returned err = %v", err)
+	}
+
+	// Pool.Close waits on wg for all Phase-2 s.Close goroutines, and s.Close
+	// fires notifyClosing synchronously → OnClosing has run by return.
+	if got := len(p.snapshotLifetimes()); got != n {
+		t.Errorf("lifetimes len = %d, want %d (one per session, not double-counted)", got, n)
 	}
 }
 

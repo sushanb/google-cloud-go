@@ -170,12 +170,20 @@ func (p *SessionPoolImpl) Close() error {
 	// actual graceful Close on each session is still in flight. Also drop
 	// the handles from the AFE-aware sessionList so a concurrent picker
 	// racing with teardown never returns a retired session.
+	//
+	// Clear s.poolHandle after recording so the callback chain fired by the
+	// Phase-2 s.Close (notifyClosing → p.OnClosing, closeOnce → p.OnClose)
+	// short-circuits on its poolHandle.Load()==nil guard. Without this,
+	// OnClosing would re-run recordLifetime for every session and OnClose
+	// would call removeSession a second time — sessionList tolerates it
+	// (idempotent), but the lifetimes ring gets 2× the correct entries.
 	for _, sh := range snapshot {
 		if sh != nil && sh.session != nil {
 			if !sh.createdAt.IsZero() {
 				p.recordLifetime(time.Since(sh.createdAt))
 			}
 			p.recordSessionClose(sh.session, "PoolClose")
+			sh.session.poolHandle.Store(nil)
 		}
 		p.removeSession(sh)
 	}
@@ -318,7 +326,8 @@ func (p *SessionPoolImpl) OnClosing(s *Session) {
 // finalizes: drop the AFE handle from sl (refCount → 0, out of
 // handleToAfe) and record the close in the reason ledger. The
 // *Session → *SessionHandle back-ref is Session.poolHandle, set
-// once in OnActive.
+// in OnActive and cleared by Pool.Close's Phase-1 teardown loop
+// (so callbacks fired from a pool-driven s.Close short-circuit).
 func (p *SessionPoolImpl) OnClose(s *Session, err error) {
 	p.mu.Lock()
 	if _, starting := p.startingSessions[s]; starting {
