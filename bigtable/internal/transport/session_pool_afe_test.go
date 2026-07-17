@@ -164,14 +164,16 @@ func TestPool_LeastLatency_IgnoresFailingAFELatency(t *testing.T) {
 		counts[sh.session.AfeID()]++
 	}
 
-	// The failing AFE has E2eCost == 0 (no OK samples), the healthy
-	// AFE has E2eCost == ~10ms. With K=2 (both candidates every pick)
-	// and min-cost, the failing AFE actually wins on cost — but the
-	// point of THIS test is confirming the OK-gate: the failing AFE's
-	// PeakEwma stays 0, not 1ns. Either winner is fine; what we assert
-	// is that the failing AFE's tracker didn't get polluted.
-	if got := p.sl.afeHandles[1].e2eEwma.Value(); got != 0 {
-		t.Errorf("failing-AFE e2eEwma = %g, want 0 (OK-gate broken?)", got)
+	// The failing AFE has E2eCost == afeE2eEwmaSeed (no OK samples ever
+	// landed, so the seed is untouched), the healthy AFE has
+	// E2eCost == ~10ms. With the seed at 1ms both AFEs look plausible
+	// to LeastLatencyPicker on first pick — but the point of THIS test
+	// is confirming the OK-gate: the failing AFE's PeakEwma stays at
+	// the seed, not 1ns. Either winner is fine; what we assert is that
+	// the failing AFE's tracker didn't get polluted by the non-OK
+	// samples.
+	if got, want := p.sl.afeHandles[1].e2eEwma.Value(), float64(afeE2eEwmaSeed); got != want {
+		t.Errorf("failing-AFE e2eEwma = %g, want %g (seed unchanged; OK-gate broken?)", got, want)
 	}
 	if got := p.sl.afeHandles[2].e2eEwma.Value(); got == 0 {
 		t.Errorf("healthy-AFE e2eEwma = 0, want > 0 (OK samples not recorded)")

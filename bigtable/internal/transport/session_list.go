@@ -151,8 +151,8 @@ func (sl *sessionList) OnSessionStarted(sh *SessionHandle) {
 	if afe == nil {
 		afe = &afeHandle{
 			id:            id,
-			transportEwma: NewPeakEwma(afePeakEwmaTau),
-			e2eEwma:       NewPeakEwma(afePeakEwmaTau),
+			transportEwma: NewPeakEwmaSeeded(afePeakEwmaTau, afeTransportEwmaSeed),
+			e2eEwma:       NewPeakEwmaSeeded(afePeakEwmaTau, afeE2eEwmaSeed),
 		}
 		sl.afeHandles[id] = afe
 	}

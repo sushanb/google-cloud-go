@@ -51,10 +51,17 @@ func (s *Session) Start(ctx context.Context, req *spb.OpenSessionRequest) error 
 		return fmt.Errorf("send open session request: %w", err)
 	}
 
+	// Fire onStart BEFORE spawning readLoop/heartBeatLoop so hook
+	// ordering (SESSION_SPEC #4) is enforced by construction: on a fast
+	// handshake, readLoop can Recv the OpenSessionResponse and fire
+	// onActive before Start returns; if we spawned the loops first, the
+	// race would let onActive land before onStart. OnStart is defined as
+	// a pure notification with no dependency on readLoop, so the reorder
+	// is safe.
+	s.hooks.onStart(ctx)
+
 	go s.readLoop(ctx)
 	go s.heartBeatLoop(ctx)
-
-	s.hooks.onStart(ctx)
 	return nil
 }
 

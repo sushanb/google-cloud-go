@@ -182,9 +182,11 @@ func TestSessionList_RecordVRpcOutcome_SkipsNonOK(t *testing.T) {
 
 	// Non-OK response with a very fast (fake) latency must NOT update
 	// EWMA — Java parity, so a fast-failing AFE can't look fastest.
+	// afeHandle constructs its e2eEwma via NewPeakEwmaSeeded(afeE2eEwmaSeed),
+	// so the untouched value is afeE2eEwmaSeed (1ms), not zero.
 	sl.RecordVRpcOutcome(h, 1*time.Nanosecond, 0, false)
-	if got := sl.afeHandles[1].e2eEwma.Value(); got != 0 {
-		t.Errorf("e2eEwma = %g, want 0 after non-OK record", got)
+	if got, want := sl.afeHandles[1].e2eEwma.Value(), float64(afeE2eEwmaSeed); got != want {
+		t.Errorf("e2eEwma = %g, want %g (seed unchanged) after non-OK record", got, want)
 	}
 
 	// OK response updates.
