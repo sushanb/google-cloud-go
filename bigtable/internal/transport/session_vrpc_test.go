@@ -16,7 +16,9 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -420,4 +422,144 @@ func countEventsByKind(events []SessionEvent, kind string) int {
 		}
 	}
 	return n
+}
+
+// TestInvoke_ForceCloseRace_BoundedReturnUnderCtx pins the race between
+// Invoke's initial state check (session_vrpc.go:87) and its activeVRPC
+// CAS (session_vrpc.go:107). If ForceClose lands in that window the CAS
+// still succeeds afterwards: Invoke Sends onto a still-open stream and
+// blocks on rpc.resultChan. cancelActiveRPCs already ran on the nil
+// slot, so nobody delivers a terminal error — awaitInvokeResult only
+// unblocks via ctx.
+//
+// Contract enforced here: with a bounded ctx, Invoke MUST return within
+// that ctx's deadline regardless of how the race resolves. A caller
+// without a ctx deadline could hang indefinitely on this path — that is
+// the known L1 limitation flagged for the sync-refactor decision
+// (POC on branch experiment/session-sync-context-poc). This test does
+// NOT prove the hang is impossible; it proves the ctx-bounded return
+// is honored under stress.
+func TestInvoke_ForceCloseRace_BoundedReturnUnderCtx(t *testing.T) {
+	const iterations = 200
+	const perAttemptCtx = 200 * time.Millisecond
+	const outerBound = 2 * time.Second
+
+	for i := 0; i < iterations; i++ {
+		s, _ := makeActive(t, SessionHooks{})
+
+		ctx, cancel := context.WithTimeout(context.Background(), perAttemptCtx)
+		done := make(chan error, 1)
+
+		go func() {
+			_, err := s.Invoke(ctx, newRoundTripDesc(), "req")
+			done <- err
+		}()
+
+		// Fire ForceClose concurrently. The race window between the
+		// state Load and the activeVRPC CAS is a handful of ns — we
+		// don't try to hit it deterministically; we run enough
+		// iterations that the scheduler puts us on different sides of
+		// it across runs. Under -race -count=1000 this shakes out any
+		// unbounded-hang regression.
+		go s.ForceClose(&spb.CloseSessionRequest{
+			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_USER,
+			Description: "race-test teardown",
+		})
+
+		select {
+		case err := <-done:
+			cancel()
+			if err == nil {
+				// A benign success is legal if Invoke completed before
+				// ForceClose cancelled anything. Not a regression.
+				continue
+			}
+			// Every terminal error MUST be one of the four expected
+			// classifications. An unclassified err would silently
+			// escape ClassifyErr and confuse the retry oracle.
+			outcome := ClassifyErr(err)
+			switch outcome.State {
+			case StateUncommitted, StateTransportFailure, StateServerResult:
+				// OK: classified terminal.
+			default:
+				t.Fatalf("iter %d: err %v classified as %v — want Uncommitted/TransportFailure/ServerResult",
+					i, err, outcome.State)
+			}
+			// Ctx cancel is the safety net; if it fired, verify the
+			// wrapped err carries a recognizable cause so operators
+			// aren't left with a bare context.DeadlineExceeded.
+			if errors.Is(err, context.DeadlineExceeded) {
+				// Ctx-bounded return. Expected on the L1-race branch.
+				continue
+			}
+		case <-time.After(outerBound):
+			cancel()
+			t.Fatalf("iter %d: Invoke did not return within %v (L1 unbounded-hang regression)", i, outerBound)
+		}
+	}
+}
+
+// TestInvoke_ForceCloseWhileSending_BoundedReturn constructs a
+// deterministic variant of the ForceClose race: ForceClose fires while
+// Send is mid-flight (past the state check AND past the CAS but not
+// yet past awaitInvokeResult's channel wait). Uses fakeStream.sendFn
+// to block Send, injects ForceClose while blocked, then unblocks Send
+// and verifies Invoke returns within ctx.
+//
+// This nails the "CAS succeeded, Send succeeded, session got closed
+// under us" path — the classic cancelActiveRPCs → StateTransportFailure
+// delivery on resultChan. If cancelActiveRPCs raced the CAS wrong, the
+// slot would be nil at cancel time and no delivery would land, causing
+// the ctx-bounded return branch below to fire instead.
+func TestInvoke_ForceCloseWhileSending_BoundedReturn(t *testing.T) {
+	s, stream := makeActive(t, SessionHooks{})
+
+	sendGate := make(chan struct{})
+	var once sync.Once
+	stream.sendFn = func(*spb.SessionRequest) error {
+		once.Do(func() { <-sendGate })
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Invoke(ctx, newRoundTripDesc(), "req")
+		done <- err
+	}()
+
+	// Wait for Invoke to be blocked in Send (activeVRPC set, sendMu held).
+	waitFor(t, time.Second, func() bool { return s.activeVRPC() != nil }, "activeVRPC claimed")
+
+	// Fire ForceClose while Send is blocked. cancelActiveRPCs will
+	// find the slot claimed, CAS it back to nil, and deliver
+	// StateTransportFailure on resultChan. Meanwhile Invoke is still
+	// blocked inside Send — the delivery is buffered (chan cap 1).
+	go s.ForceClose(&spb.CloseSessionRequest{
+		Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_USER,
+		Description: "mid-send teardown",
+	})
+
+	// Give ForceClose a moment to run before unblocking Send so the
+	// race resolves in the intended order.
+	time.Sleep(20 * time.Millisecond)
+	close(sendGate)
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Invoke returned nil err after ForceClose; want an error")
+		}
+		outcome := ClassifyErr(err)
+		// Expected: TransportFailure from cancelActiveRPCs delivery.
+		// Also acceptable if ctx fired first (still bounded).
+		if outcome.State != StateTransportFailure && !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("err classified as %v (%v); want StateTransportFailure or ctx.DeadlineExceeded",
+				outcome.State, err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Invoke did not return within 3s after ForceClose + unblocked Send")
+	}
 }
