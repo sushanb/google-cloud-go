@@ -299,9 +299,12 @@ func (s *Session) RecordTransportOverhead(ctx context.Context, method string, ov
 // Retries returns the number of vRPCs Invoke processed with AttemptNumber > 1.
 func (s *Session) Retries() int64 { return s.retries.Load() }
 
-// OpenedAt returns when the session reached StateReady (zero until then).
-func (s *Session) OpenedAt() time.Time {
-	return s.tracer.openedAtSnapshot()
+// StartedAt returns the wall-clock time the session was constructed —
+// the single anchor for every session-scoped metric and the ancestor of
+// "session age" in debug views. Immutable after NewSession, safe to
+// read lock-free.
+func (s *Session) StartedAt() time.Time {
+	return s.tracer.StartedAt()
 }
 
 // HasOkRpcs reports whether the session served at least one successful vRPC.

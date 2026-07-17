@@ -89,10 +89,10 @@ Four OTel histograms live on a **separate tracer type** — `sessionTracer` (`bi
 
 | OTel name | When recorded | Recorder | Value | Labels |
 |---|---|---|---|---|
-| `session.open_latencies` | after `handleOpenSession` (success OR failure) | `sessionTracer.recordOpen` (`session_tracer.go:189-210`) | `msSince(startTime)` | `transport_type`, `status`, `session_type`, `afe_location`, `session_name` |
-| `session.durations` | at terminal Close (any reason, including pre-open close) | `sessionTracer.recordClose` (`session_tracer.go:221-250`) | `msSince(openedAt)` if `Ready` was reached; else `msSince(startTime)` | above + `closing_reason`, `vrpcs` (`none`/`all_ok`/`all_error`/`some_ok`), `ready` (bool) |
-| `session.uptime` | periodic sample from pool scaling loop (`session_pool_scaling.go:114` calls `p.sampleActiveUptimes(ctx)`) | `sessionTracer.sampleUptime` (`session_tracer.go:272-287`) | `msSince(openedAt)` per still-active session | `transport_type`, `session_type`, `ready`, `afe_location`, `session_name` |
-| `transport_latencies` | per-vRPC on OK response with valid backend latency (positive delta) | `sessionTracer.recordTransportOverhead` (`session_tracer.go:299-311`) | `TransportLatency − Stats.BackendLatency` in ms | above + `method` |
+| `session.open_latencies` | after `handleOpenSession` (success OR failure) | `sessionTracer.recordOpen` (`session_tracer.go:196-217`) | `msSince(startTime)` | `transport_type`, `status`, `session_type`, `afe_location`, `session_name` |
+| `session.durations` | at terminal Close (any reason, including pre-open close) | `sessionTracer.recordClose` (`session_tracer.go:227-253`) | `msSince(startTime)` (single anchor, matches Java `SessionTracerImpl.uptime.elapsed()`; the `ready` label distinguishes sessions that reached `Ready` from pre-open deaths) | above + `closing_reason`, `vrpcs` (`none`/`all_ok`/`all_error`/`some_ok`), `ready` (bool) |
+| `session.uptime` | periodic sample from pool scaling loop (`session_pool_scaling.go:114` calls `p.sampleActiveUptimes(ctx)`) | `sessionTracer.sampleUptime` (`session_tracer.go:277-291`) | `msSince(startTime)` per still-active session; `ready` label sourced from the tracer's `opened` flag | `transport_type`, `session_type`, `ready`, `afe_location`, `session_name` |
+| `transport_latencies` | per-vRPC on OK response with valid backend latency (positive delta) | `sessionTracer.recordTransportOverhead` (`session_tracer.go:304-316`) | `TransportLatency − Stats.BackendLatency` in ms | above + `method` |
 
 **Label discipline.**
 - **`session_name` is the pool-scoped name (bounded cardinality — one per pool per process)**, matching Java's `SessionPoolInfo.name`. It is NOT `Session.LogName` (which is per-session and unbounded — a fatal cardinality bug if ever stamped as a label).

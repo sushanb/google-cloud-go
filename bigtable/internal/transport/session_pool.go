@@ -662,9 +662,7 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 			TransportLatency: transportOverhead,
 			RpcIDOnSession:   result.RpcIDOnSession,
 		}
-		if openedAt := sh.session.OpenedAt(); !openedAt.IsZero() {
-			ev.SessionAge = start.Sub(openedAt)
-		}
+		ev.SessionAge = start.Sub(sh.session.StartedAt())
 		// Capture the session's PeerInfo so cohort patterns (e.g. every
 		// Unavailable failure on AFE X) are visible directly in the
 		// slow-vRPC table instead of requiring a per-session cross-ref.

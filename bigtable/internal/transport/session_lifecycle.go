@@ -430,10 +430,7 @@ func (s *Session) handleClose(err error) {
 	if s.activeVRPC() != nil {
 		inFlight = 1
 	}
-	age := time.Duration(0)
-	if openedAt := s.OpenedAt(); !openedAt.IsZero() {
-		age = time.Since(openedAt)
-	}
+	age := time.Since(s.StartedAt())
 	lastRPC := s.nextRPCID.Load()
 	peer := s.peerInfoSummary()
 	s.recordEvent("close", "reason=%s age=%v in_flight=%d last_rpc_id=%d %s raw_err=%v",
