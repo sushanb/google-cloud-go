@@ -76,11 +76,13 @@ type InvokeResult struct {
 //
 // The caller MUST have exclusive access to this Session for the duration
 // of the call — the pool guarantees this via CheckoutSession's per-session
-// idle-slot gate. The single-in-flight invariant is enforced with a
-// CompareAndSwap on activeRPC; a failing CAS means the caller bypassed
-// the pool gate and is a programming error, not a runtime condition. This
-// replaces a golang.org/x/sync/semaphore that added two channel ops per
-// call on the hot path.
+// idle-slot gate. The single-in-flight invariant is enforced by claimSlot
+// under slotMu; a losing claim returns StateUncommitted so the retry
+// oracle can steer to another session (Java SessionImpl.startRpc
+// L420-444 parity). The slot is released only by handleVRPCResponse /
+// handleVRPCErrorResponse (successful drain), cancelActiveRPCs (session
+// teardown), or the Send-failure path below — caller ctx.Done leaves
+// the slot claimed and marks it via markCancelled.
 func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface{}) (result InvokeResult, err error) {
 	startTime := time.Now()
 
@@ -102,14 +104,15 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 		resultChan: make(chan vrpcResult, 1),
 	}
 
-	// Claim the single in-flight slot. See method doc — a losing CAS is
-	// a caller-side serialization bug, not a runtime backoff condition.
-	if !s.casActiveVRPC(nil, rpc) {
+	// Claim the single in-flight slot. Java SessionImpl.startRpc L423
+	// parity: a losing claim means a prior vRPC on this session has
+	// not drained on the wire yet — return Uncommitted so the retryer
+	// picks another session.
+	if !s.claimSlot(rpc) {
 		return result, tagErr(StateUncommitted,
 			unavailable(ErrSessionNotActive,
-				"concurrent Invoke on session %q: multiPlexingLimit=1 violated", s.logName))
+				"session %q busy: prior vRPC has not drained on the wire", s.logName))
 	}
-	defer s.releaseSlot(rpc)
 
 	// Reset the heartbeat deadline whenever we send an outbound frame: the
 	// server's keepalive clock is implicitly reset by our activity.
@@ -125,27 +128,21 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 	// downstream metrics can compute client-side blocking latency as
 	// (SentAt - attemptStart) without double-counting encode/setup overhead.
 	result.SentAt = time.Now()
-	if err := s.Send(sessionReq); err != nil {
-		return result, tagErr(StateTransportFailure, fmt.Errorf("send vRPC request: %w", err))
+	if sendErr := s.Send(sessionReq); sendErr != nil {
+		// Synchronous Send failed: no server response is ever coming,
+		// so this call must free the slot itself. Java doesn't need
+		// this branch — sendMessage there is async and failures come
+		// back through the response observer — but Go's Send is
+		// synchronous, so an early drain is on the Invoke path.
+		s.drainSlot(rpc)
+		if State(s.state.Load()) == StateClosing {
+			s.signalQuiescent()
+		}
+		return result, tagErr(StateTransportFailure, fmt.Errorf("send vRPC request: %w", sendErr))
 	}
 
 	err = s.awaitInvokeResult(ctx, rpc, desc, &result)
 	return result, err
-}
-
-// releaseSlot clears the active-RPC slot and signals quiescence when the
-// session is closing. Runs from Invoke's defer; safe to call after any
-// completion path (success, error, cancel, panic).
-//
-// Order matters: clear the slot first, THEN check state. Close()
-// transitions to StateClosing first and only then observes activeRPC —
-// so at least one side signals. signalQuiescent is once-guarded, so a
-// double-signal is harmless.
-func (s *Session) releaseSlot(rpc *vrpcImpl) {
-	s.casActiveVRPC(rpc, nil)
-	if State(s.state.Load()) == StateClosing {
-		s.signalQuiescent()
-	}
 }
 
 // currentAttempt reads the retry-interceptor's attempt tag from ctx. Calls
@@ -203,49 +200,64 @@ func buildInvokeRequest(rpcID int64, reqBytes []byte, attempt int64, startTime t
 // delivers a result on rpc.resultChan. Populates the tail of result
 // (TransportLatency, ClusterInfo, Stats, Response) and returns a
 // fully-tagged error on failure. res.err from resultChan is already
-// tagged StateTransportFailure at the source (cancelActiveRPCs); server
-// error frames arrive as res.errResp and are unpacked here into a
-// StateServerResult-tagged error.
+// tagged at the source (cancelActiveRPCs → StateTransportFailure);
+// server error frames arrive as res.errResp and are unpacked here into
+// a StateServerResult-tagged error.
+//
+// ctx.Done branch: check resultChan non-blockingly first so a server
+// response that landed in the same tick as the ctx cancellation isn't
+// dropped. Otherwise mark the slot as cancelled — Java parity leaves
+// activeRPC set so a concurrent Invoke fails claimSlot with Uncommitted
+// rather than racing to id-mismatch the abandoned response.
 func (s *Session) awaitInvokeResult(ctx context.Context, rpc *vrpcImpl, desc VRpcDescriptor, result *InvokeResult) error {
 	select {
 	case <-ctx.Done():
+		select {
+		case res := <-rpc.resultChan:
+			return s.processResult(rpc, desc, result, res)
+		default:
+		}
 		s.recordCtxDone(ctx, rpc, desc.Method(), result.SentAt)
-		return tagErr(StateTransportFailure, ctx.Err())
+		cancelErr := tagErr(StateTransportFailure, ctx.Err())
+		s.markCancelled(rpc, vrpcResult{err: cancelErr})
+		return cancelErr
 	case res := <-rpc.resultChan:
-		result.TransportLatency = time.Since(result.SentAt)
-		ci := res.ClusterInfo()
-		result.ClusterInfo = ci
-		if ci != nil {
-			s.recordCluster(ci.GetClusterId())
-		}
-		if res.err != nil {
-			return res.err
-		}
-		if res.errResp != nil {
-			return tagErr(StateServerResult, errorResponseToErr(res.errResp))
-		}
-		if res.resp.RpcId != rpc.id {
-			// This is a bookkeeping bug: deliver() only publishes into
-			// resultChan for the matching activeRPC, so a mismatch here
-			// means state got out from under us. Counter separate from
-			// handleVRPC*'s id-mismatch tag so we can distinguish "wrong
-			// response reached deliver" from "wrong response dropped
-			// earlier."
-			recordDebugTagAt(lvl.Error, tagSessionVRPCIDMismatch)
-			return tagErr(StateServerResult,
-				fmt.Errorf("internal: response RpcId %d does not match request RpcId %d", res.resp.RpcId, rpc.id))
-		}
-		respMsg, decodeErr := desc.Decode(res.resp.Payload)
-		if decodeErr != nil {
-			return tagErr(StateServerResult, fmt.Errorf("decode vRPC response: %w", decodeErr))
-		}
-		result.Response = respMsg
-		result.Stats = res.resp.Stats
-		if res.resp.Stats != nil && res.resp.Stats.BackendLatency != nil {
-			s.recordLatency(res.resp.Stats.BackendLatency.AsDuration())
-		}
-		return nil
+		return s.processResult(rpc, desc, result, res)
 	}
+}
+
+// processResult unpacks a resultChan payload into result and returns
+// the tagged error (nil on success). Extracted so awaitInvokeResult's
+// ctx.Done race-guard can share the same success path when a response
+// beat the cancellation into resultChan by a tick.
+//
+// The res.resp.RpcId == rpc.id check that used to live here is gone:
+// under slotMu, handleVRPCResponse gates the id match BEFORE drainSlot,
+// so deliver can only ever put a matching-id response into resultChan.
+func (s *Session) processResult(rpc *vrpcImpl, desc VRpcDescriptor, result *InvokeResult, res vrpcResult) error {
+	result.TransportLatency = time.Since(result.SentAt)
+	ci := res.ClusterInfo()
+	result.ClusterInfo = ci
+	if ci != nil {
+		s.recordCluster(ci.GetClusterId())
+	}
+	if res.err != nil {
+		return res.err
+	}
+	if res.errResp != nil {
+		return tagErr(StateServerResult, errorResponseToErr(res.errResp))
+	}
+	respMsg, decodeErr := desc.Decode(res.resp.Payload)
+	if decodeErr != nil {
+		return tagErr(StateServerResult, fmt.Errorf("decode vRPC response: %w", decodeErr))
+	}
+	result.Response = respMsg
+	result.Stats = res.resp.Stats
+	if res.resp.Stats != nil && res.resp.Stats.BackendLatency != nil {
+		s.recordLatency(res.resp.Stats.BackendLatency.AsDuration())
+	}
+	_ = rpc // rpc kept in signature for future per-rpc metrics; no reads today.
+	return nil
 }
 
 // recordCtxDone emits the debug + sessionz event for a ctx cancellation
@@ -264,7 +276,10 @@ func (s *Session) recordCtxDone(ctx context.Context, rpc *vrpcImpl, method strin
 }
 
 // handleVRPCResponse delivers a server VirtualRpcResponse to the waiting
-// Invoke caller, if any.
+// Invoke caller, or drains a cancelled slot if the caller already
+// abandoned the RPC via ctx.Done (Java SessionImpl.handleVRpcResponse
+// L567-614 parity — the cancel branch there discards the response
+// tracer-side; here we just count it).
 func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
 	// A vRPC response is only expected while the session is Ready or
 	// Closing (drain window). Any other state means either a bug in
@@ -285,14 +300,30 @@ func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
 		s.debugf("dropping VirtualRpcResponse rpc_id=%d != in-flight rpc_id=%d", resp.RpcId, rpc.id)
 		return
 	}
+	drained, cancel, ok := s.drainSlot(rpc)
+	if !ok {
+		// Racing cancelActiveRPCs (session teardown) drained the slot
+		// between the id-match above and our drainSlot call. Its
+		// deliver already fired the terminal error; nothing to do.
+		return
+	}
 	s.okRpcs.Add(1)
-	if !s.deliver(rpc, vrpcResult{resp: resp}) {
-		recordDebugTag(tagSessionVRPCDuplicateResult)
+	if cancel != nil {
+		// Caller already returned via ctx.Done — no one is waiting on
+		// resultChan. Just count the drain for observability.
+		recordDebugTag(tagSessionVRPCCancelledDrained)
+	} else {
+		s.deliver(drained, vrpcResult{resp: resp})
+	}
+	if State(s.state.Load()) == StateClosing {
+		s.signalQuiescent()
 	}
 }
 
 // handleVRPCErrorResponse routes per-vRPC errors to the waiting caller.
 // Session-level errors (rpc_id == 0) are handled in handleSessionResponse.
+// Mirrors handleVRPCResponse's Java-parity drain path — a cancelled
+// slot drains without deliver.
 func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 	st := s.State()
 	if !assertDebugTagf(st == StateReady || st == StateClosing, tagSessionVRPCResponseWrongState,
@@ -310,9 +341,18 @@ func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 		s.debugf("dropping ErrorResponse rpc_id=%d != in-flight rpc_id=%d", errResp.RpcId, rpc.id)
 		return
 	}
+	drained, cancel, ok := s.drainSlot(rpc)
+	if !ok {
+		return
+	}
 	s.errorRpcs.Add(1)
-	if !s.deliver(rpc, vrpcResult{errResp: errResp}) {
-		recordDebugTag(tagSessionVRPCDuplicateResult)
+	if cancel != nil {
+		recordDebugTag(tagSessionVRPCCancelledDrained)
+	} else {
+		s.deliver(drained, vrpcResult{errResp: errResp})
+	}
+	if State(s.state.Load()) == StateClosing {
+		s.signalQuiescent()
 	}
 }
 
@@ -336,44 +376,42 @@ func errorResponseToErr(errResp *spb.ErrorResponse) error {
 	return st.Err()
 }
 
-// deliver writes a result onto the RPC's buffered (cap 1) channel and
-// returns true. Returns false if the slot is already full (a duplicate
-// frame or a cancel racing a completion) — the first wins, subsequent
-// ones are dropped. Every default-branch drop is stamped into the
-// per-session event ring ("dup-deliver") so operators can see the race
-// in sessionz regardless of which caller lost. Callers on the
-// server-frame path additionally tag it as a metric
-// (tagSessionVRPCDuplicateResult); cancelActiveRPCs ignores false
-// because a filled slot means the completion already landed and no
-// metric warning is warranted.
-func (s *Session) deliver(rpc *vrpcImpl, res vrpcResult) bool {
-	select {
-	case rpc.resultChan <- res:
-		return true
-	default:
-		s.debugf("duplicate result for rpc_id=%d (%s) dropped", rpc.id, rpc.method)
-		s.recordEvent("dup-deliver", "rpc_id=%d method=%s dropped (channel full)", rpc.id, rpc.method)
-		return false
-	}
+// deliver writes a result onto the RPC's buffered (cap 1) channel.
+// Under slotMu, exactly one caller ever holds a drained rpc (the
+// winning drainSlot inside handleVRPCResponse / handleVRPCErrorResponse
+// / cancelActiveRPCs), so the two-writers race on resultChan is
+// impossible in production. The cap-1 buffer is retained as defense
+// against the awaitInvokeResult ctx.Done-vs-response tick race — the
+// send must not block if the reader stopped listening.
+func (s *Session) deliver(rpc *vrpcImpl, res vrpcResult) {
+	rpc.resultChan <- res
 }
 
 // cancelActiveRPCs cancels the in-flight vRPC (if any) with the given
 // error. With multiPlexingLimit=1 there is at most one such vRPC.
-// Clear-then-deliver so a racing handleVRPCResponse can't double-deliver
-// on the same slot.
+// Called from session teardown paths (Close, ForceClose, handleGoAway,
+// handleClose, heartbeat miss) — the "server will never respond" cases
+// where the slot must be freed even under Java-parity claim-until-drain.
+// If the caller already abandoned via ctx.Done, the drain returns a
+// cancel handle and we skip the deliver (no reader on resultChan).
 func (s *Session) cancelActiveRPCs(err error) {
 	rpc := s.activeVRPC()
 	if rpc == nil {
 		return
 	}
-	if !s.casActiveVRPC(rpc, nil) {
-		// Concurrent completion cleared the slot; the caller already
-		// received a result. Nothing to cancel.
+	drained, cancel, ok := s.drainSlot(rpc)
+	if !ok {
+		// Concurrent handleVRPCResponse / handleVRPCErrorResponse
+		// cleared the slot; that caller already delivered.
+		return
+	}
+	if cancel != nil {
+		// Caller already returned via ctx.Done; no one to deliver to.
 		return
 	}
 	// Session-side cancellation: session died / GoAway / heartbeat missed
 	// / benign shutdown while an RPC was in-flight. Server may or may not
 	// have processed — TransportFailure classification lets idempotent ops
 	// retry and prevents non-idempotent ones from double-applying.
-	s.deliver(rpc, vrpcResult{err: tagErr(StateTransportFailure, err)})
+	s.deliver(drained, vrpcResult{err: tagErr(StateTransportFailure, err)})
 }

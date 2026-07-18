@@ -142,11 +142,25 @@ const (
 	tagSessionCloseNoReason         = "session_close_no_reason"
 
 	// vRPC dispatch observations.
+	//
+	// tagSessionVRPCNil / tagSessionVRPCErrorNil / tagSessionVRPCIDMismatch
+	// are all unreachable in production under the slotMu Java-parity
+	// slot lifecycle (SessionImpl.java:420-614 parity) — the slot is
+	// only cleared by response handlers or session teardown, both of
+	// which serialize via drainSlot. They survive as canary counters
+	// for wire corruption / bookkeeping bugs and as pins for tests
+	// that inject responses out-of-band.
 	tagSessionVRPCNil                = "session_vrpc_nil"
 	tagSessionVRPCErrorNil           = "session_vrpc_error_nil"
 	tagSessionVRPCIDMismatch         = "session_vrpc_id_mismatch"
 	tagSessionVRPCResponseWrongState = "session_vrpc_response_wrong_state"
-	tagSessionVRPCDuplicateResult    = "session_vrpc_duplicate_result"
+	// tagSessionVRPCCancelledDrained fires when a server response
+	// arrives for a slot the caller already abandoned via ctx.Done
+	// (markCancelled set currentCancel before drainSlot ran).
+	// Bookkeeping-only signal — no user impact — but a rising rate
+	// under steady load usually means tail-latency spikes are pushing
+	// more callers onto the ctx.Done branch.
+	tagSessionVRPCCancelledDrained = "session_vrpc_cancelled_drained"
 
 	// Pool-scoped anomalies.
 	tagSessionPoolStuckSessionSwept          = "session_pool_stuck_session_swept"

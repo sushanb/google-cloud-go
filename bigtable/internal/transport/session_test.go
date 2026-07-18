@@ -374,7 +374,7 @@ func TestHandleVRPCResponse_RoutesByRpcID(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 
 	rpc := &vrpcImpl{id: 7, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
-	s.activeRPC.Store(rpc)
+	s.setSlotForTest(rpc)
 
 	resp := &spb.VirtualRpcResponse{RpcId: 7, Payload: []byte("p")}
 	s.handleVRPCResponse(resp)
@@ -398,7 +398,7 @@ func TestHandleVRPCErrorResponse_RoutesByRpcID(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 
 	rpc := &vrpcImpl{id: 3, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
-	s.activeRPC.Store(rpc)
+	s.setSlotForTest(rpc)
 
 	errResp := &spb.ErrorResponse{
 		RpcId:  3,
@@ -428,7 +428,7 @@ func TestHandleErrorResponse_SessionFatalForcesClose(t *testing.T) {
 
 	// Pre-existing in-flight RPC; should be cancelled by ForceClose.
 	rpc := &vrpcImpl{id: 11, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
-	s.activeRPC.Store(rpc)
+	s.setSlotForTest(rpc)
 
 	s.handleErrorResponse(&spb.ErrorResponse{
 		RpcId:  0,
@@ -462,7 +462,7 @@ func TestHandleGoAway_PreservesInFlightRPC(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 
 	rpc := &vrpcImpl{id: 1, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
-	s.activeRPC.Store(rpc)
+	s.setSlotForTest(rpc)
 	s.handleGoAway(&spb.GoAwayResponse{Reason: "test"})
 	if got := s.State(); got != StateClosing {
 		t.Errorf("state = %v, want StateClosing", got)
@@ -679,7 +679,7 @@ func TestForceClose_Idempotent(t *testing.T) {
 func TestForceClose_CancelsInflightWithReason(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 	rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
-	s.activeRPC.Store(rpc)
+	s.setSlotForTest(rpc)
 
 	s.ForceClose(&spb.CloseSessionRequest{
 		Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_MISSED_HEARTBEAT,
@@ -739,7 +739,7 @@ func TestClose_CtxCancelDuringDrainForceCloses(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 	// Pin an in-flight RPC so the drain loop is forced to wait.
 	rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
-	s.activeRPC.Store(rpc)
+	s.setSlotForTest(rpc)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancelDone := make(chan struct{})
@@ -775,7 +775,7 @@ func TestClose_CtxCancelDuringDrainForceCloses(t *testing.T) {
 func TestHeartBeatLoop_ForceClosesOnMissedHeartbeat(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 	rpc := &vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)}
-	s.activeRPC.Store(rpc)
+	s.setSlotForTest(rpc)
 	s.nextHeartbeatDeadlineNano.Store(time.Now().Add(-time.Second).UnixNano()) // already missed
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -805,7 +805,7 @@ func TestHeartBeatLoop_HeartbeatsKeepInflightVRPCAlive(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 	s.heartbeatIntervalNano.Store(int64(30 * time.Millisecond))
 	s.nextHeartbeatDeadlineNano.Store(time.Now().Add(90 * time.Millisecond).UnixNano()) // 3 * interval
-	s.activeRPC.Store(&vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)})
+	s.setSlotForTest(&vrpcImpl{id: 1, resultChan: make(chan vrpcResult, 1)})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1056,20 +1056,22 @@ func TestClose_IdempotentAcrossNCalls(t *testing.T) {
 	}
 }
 
-// TestInvoke_ConcurrentSecondFailsWithMultiplexViolation enforces SESSION_SPEC #2:
-// the single-in-flight-vRPC invariant is guarded by CompareAndSwap(nil, rpc) on
-// activeRPC. A caller that bypasses the pool's per-session checkout gate and
-// enters Invoke while the slot is already claimed MUST get an ErrSessionNotActive
-// error tagged StateUncommitted (retryable — the request never reached the wire)
-// with a diagnostic message naming the multiPlexingLimit=1 violation. This is
-// the CAS-fail path at session_vrpc.go:107; without this test the branch is
-// unreached because Invoke's normal callers never re-enter the slot.
-func TestInvoke_ConcurrentSecondFailsWithMultiplexViolation(t *testing.T) {
+// TestInvoke_ConcurrentSecondFailsWithSlotBusy enforces SESSION_SPEC #2:
+// the single-in-flight-vRPC invariant is guarded by claimSlot under slotMu
+// (Java SessionImpl.startRpc L423 parity — currentRpc != null → immediate
+// reject). A caller that enters Invoke while the slot is still claimed
+// (e.g. by a prior ctx.Done'd RPC whose server response has not drained)
+// MUST get an ErrSessionNotActive error tagged StateUncommitted (retryable
+// — the request never reached the wire) with a diagnostic message naming
+// the "session busy" condition so the retry oracle steers to another
+// session. Without this test the losing-claim branch at session_vrpc.go
+// is unreached because Invoke's normal callers never re-enter the slot.
+func TestInvoke_ConcurrentSecondFailsWithSlotBusy(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
 
 	// Pin the slot with a placeholder in-flight vRPC. Doesn't need to be a
-	// real RPC — the CAS just needs to see a non-nil pointer.
-	s.activeRPC.Store(&vrpcImpl{id: 999, resultChan: make(chan vrpcResult, 1)})
+	// real RPC — claimSlot just needs to see a non-nil pointer.
+	s.setSlotForTest(&vrpcImpl{id: 999, resultChan: make(chan vrpcResult, 1)})
 
 	_, err := s.Invoke(context.Background(), newRoundTripDesc(), "req")
 	if err == nil {
@@ -1081,8 +1083,8 @@ func TestInvoke_ConcurrentSecondFailsWithMultiplexViolation(t *testing.T) {
 	if got := ClassifyErr(err).State; got != StateUncommitted {
 		t.Errorf("AttemptState = %v, want StateUncommitted (attempt never reached wire → retryable)", got)
 	}
-	if !strings.Contains(err.Error(), "multiPlexingLimit=1") {
-		t.Errorf("err message = %q, want to name the multiPlexingLimit=1 violation for operator grep", err.Error())
+	if !strings.Contains(err.Error(), "busy") {
+		t.Errorf("err message = %q, want to name the session-busy condition for operator grep", err.Error())
 	}
 }
 

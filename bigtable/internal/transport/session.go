@@ -247,14 +247,28 @@ type Session struct {
 	// fire exactly once even if multiple paths race to close the session.
 	closeOnce sync.Once
 
-	// activeRPC holds the single in-flight vRPC (multiPlexingLimit=1).
-	// Invoke sets it via CompareAndSwap(nil, rpc) — the CAS is the
-	// pool-serialization invariant made explicit: if it fails, someone
-	// bypassed the pool's per-session checkout gate.
+	// slotMu serializes the (activeRPC, currentCancel) pair — the Go
+	// analog of Java's sessionSyncContext for the one-in-flight slot.
+	// Held only across pointer assignments; no I/O, no chan ops, no
+	// nested locks. Innermost in the session-subsystem lock order.
 	//
-	// Access via activeVRPC() (Load) and casActiveVRPC(old, next) (CAS);
-	// only tests reach the atomic directly (via Store) for fixture setup.
-	activeRPC atomic.Pointer[vrpcImpl]
+	// activeRPC holds the single in-flight vRPC (multiPlexingLimit=1).
+	// Claimed by Invoke via claimSlot; released only by
+	// handleVRPCResponse / handleVRPCErrorResponse (successful drain)
+	// or cancelActiveRPCs (session teardown). Caller ctx.Done marks
+	// currentCancel via markCancelled and leaves activeRPC set — Java
+	// SessionImpl.cancelRpc parity (SessionImpl.java:448-457).
+	//
+	// currentCancel is the Java-parity companion: first-cancel-wins,
+	// consulted by the drain to decide "was this response caller-
+	// abandoned before it arrived?"
+	//
+	// Read snapshots via activeVRPC(); all mutations go through
+	// claimSlot / markCancelled / drainSlot. Tests seed the slot via
+	// setSlotForTest — no direct field access outside this file.
+	slotMu        sync.Mutex
+	activeRPC     *vrpcImpl
+	currentCancel *vrpcResult
 
 	// poolHandle is the back-ref to this session's SessionHandle, stored
 	// once by SessionPoolImpl.OnActive right after the handle is minted.
@@ -356,19 +370,68 @@ func (s *Session) RefreshConfig() *spb.SessionRefreshConfig {
 }
 
 // activeVRPC returns the currently in-flight vRPC, or nil if the slot is
-// empty. Thin wrapper around activeRPC.Load — see the field's docstring
-// for the multiplex=1 invariant.
+// empty. Snapshot read under slotMu — see the field's docstring for the
+// multiplex=1 invariant and the slot's Java-parity lifecycle.
 func (s *Session) activeVRPC() *vrpcImpl {
-	return s.activeRPC.Load()
+	s.slotMu.Lock()
+	rpc := s.activeRPC
+	s.slotMu.Unlock()
+	return rpc
 }
 
-// casActiveVRPC atomically replaces the in-flight vRPC slot iff its
-// current value equals `old`, returning true on success. All production
-// mutations of activeRPC go through this wrapper; a failed CAS is the
-// signal that the pool's per-session checkout gate was bypassed (see
-// SESSION_SPEC.md #3).
-func (s *Session) casActiveVRPC(old, next *vrpcImpl) bool {
-	return s.activeRPC.CompareAndSwap(old, next)
+// claimSlot assigns rpc to the empty slot. Returns false if the slot
+// still holds a prior vRPC (Java SessionImpl.startRpc L423 parity —
+// concurrent claims are rejected as UNCOMMITTED at the call site).
+func (s *Session) claimSlot(rpc *vrpcImpl) bool {
+	s.slotMu.Lock()
+	defer s.slotMu.Unlock()
+	if s.activeRPC != nil {
+		return false
+	}
+	s.activeRPC = rpc
+	return true
+}
+
+// markCancelled records ctx.Done cancellation of rpc without freeing
+// the slot — the caller returns, but activeRPC stays until the server
+// response arrives to drain it. Java SessionImpl.cancelRpc L448-457
+// parity (first-cancel-wins; a racing drain that clears activeRPC
+// makes this a no-op).
+func (s *Session) markCancelled(rpc *vrpcImpl, res vrpcResult) {
+	s.slotMu.Lock()
+	defer s.slotMu.Unlock()
+	if s.activeRPC != rpc {
+		return
+	}
+	if s.currentCancel == nil {
+		s.currentCancel = &res
+	}
+}
+
+// drainSlot atomically clears the (activeRPC, currentCancel) pair iff
+// activeRPC == expect, returning what was there. Java
+// SessionImpl.handleVRpcResponse L599-602 parity. Used by response
+// handlers (after id-match) and by cancelActiveRPCs (session teardown);
+// ok=false means a racing drain got here first.
+func (s *Session) drainSlot(expect *vrpcImpl) (rpc *vrpcImpl, cancel *vrpcResult, ok bool) {
+	s.slotMu.Lock()
+	defer s.slotMu.Unlock()
+	if s.activeRPC != expect {
+		return nil, nil, false
+	}
+	rpc = s.activeRPC
+	cancel = s.currentCancel
+	s.activeRPC = nil
+	s.currentCancel = nil
+	return rpc, cancel, true
+}
+
+// setSlotForTest seeds the in-flight slot with rpc for fixture setup in
+// same-package tests. Production code MUST use claimSlot.
+func (s *Session) setSlotForTest(rpc *vrpcImpl) {
+	s.slotMu.Lock()
+	s.activeRPC = rpc
+	s.slotMu.Unlock()
 }
 
 // transitionTo sets the session state to `to` iff ok(currentState) returns
