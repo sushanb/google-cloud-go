@@ -135,6 +135,12 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 		// back through the response observer — but Go's Send is
 		// synchronous, so an early drain is on the Invoke path.
 		s.drainSlot(rpc)
+		// v3: drain is the sole "session became free" signal. Fire the
+		// pool wake here as well — ReleaseToPool's inExpectedCount guard
+		// (see SESSION_POOL_SPEC #6, I5) drops the re-enqueue if
+		// OnSessionClosing already dropped this handle in the teardown
+		// that the Send failure typically kicks off.
+		s.notifySlotDrained()
 		if State(s.state.Load()) == StateClosing {
 			s.signalQuiescent()
 		}
@@ -312,10 +318,15 @@ func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
 		// Caller already returned via ctx.Done — no one is waiting on
 		// resultChan. Just count the drain for observability.
 		recordDebugTag(tagSessionVRPCCancelledDrained)
-		s.notifySlotDrained()
 	} else {
 		s.deliver(drained, vrpcResult{resp: resp})
 	}
+	// v3: drainSlot success is the sole "session became free" signal.
+	// Fires on every drain (not just the cancelled branch) so the pool
+	// re-enqueues the session in its AFE idle queue and wakes one
+	// parked Checkout waiter. Invoke's return path in the pool no
+	// longer performs the re-enqueue or the wake.
+	s.notifySlotDrained()
 	if State(s.state.Load()) == StateClosing {
 		s.signalQuiescent()
 	}
@@ -349,10 +360,12 @@ func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 	s.errorRpcs.Add(1)
 	if cancel != nil {
 		recordDebugTag(tagSessionVRPCCancelledDrained)
-		s.notifySlotDrained()
 	} else {
 		s.deliver(drained, vrpcResult{errResp: errResp})
 	}
+	// v3: every drainSlot success is a "session became free" signal.
+	// See handleVRPCResponse's mirror call for the full rationale.
+	s.notifySlotDrained()
 	if State(s.state.Load()) == StateClosing {
 		s.signalQuiescent()
 	}

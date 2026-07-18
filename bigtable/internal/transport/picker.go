@@ -42,13 +42,18 @@ type SessionHandle struct {
 	// do not touch outside sl methods. Java-parity: SessionList.java's
 	// inExpectedCount field.
 	inExpectedCount bool
-	// onSlotDrained is set by the pool at registerActive time to
-	// p.signalFree — so a server response draining a caller-abandoned
-	// slot (Java-parity claim-until-drain) can wake a parked Checkout
-	// waiter that would otherwise wait for the next unrelated Invoke
-	// return to fire signalFree. Nil for handles built by tests that
-	// bypass the pool. Session calls it from the cancelled-drained
-	// branches of handleVRPCResponse / handleVRPCErrorResponse.
+	// onSlotDrained is set by SessionPoolImpl.OnActive to a closure
+	// that runs releaseSession(sh) + signalFree() — under v3
+	// (SESSION_SPEC.md #2 + SESSION_POOL_SPEC.md #6), this callback is
+	// the sole "session became free" signal from Session to pool: it
+	// re-enqueues the session in its AFE idle queue AND wakes one
+	// parked Checkout waiter. Fires from every drainSlot success in
+	// Session — normal handleVRPCResponse deliver, normal
+	// handleVRPCErrorResponse deliver, cancelled-drained branches,
+	// and the Send-failure branch of Invoke — but NOT from
+	// cancelActiveRPCs (session teardown; OnSessionClosing/OnSessionClosed
+	// handle cleanup). Nil for handles built by tests that bypass the
+	// pool; Session's notifySlotDrained is nil-safe.
 	onSlotDrained func()
 }
 

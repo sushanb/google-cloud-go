@@ -266,11 +266,16 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 	}
 
 	sh := NewSessionHandle(s, time.Now())
-	// Drain-time wake: server response draining a caller-abandoned slot
-	// (Java-parity claim-until-drain) fires this so a parked Checkout
-	// waiter doesn't stall waiting for an unrelated Invoke return.
-	// Same wake channel as the regular free signal — safe to double-fire.
-	sh.onSlotDrained = p.signalFree
+	// Drain is the sole "session became free" signal under Java-parity
+	// slot lifecycle (v3): re-enqueue in the AFE idle queue AND wake
+	// one parked Checkout waiter. Invoke's return path no longer does
+	// either — the pre-refactor releaseSlot-in-defer semantics conflated
+	// "slot empty" with "session available"; drain-driven signaling
+	// separates them. Callback captures p and sh once at OnActive.
+	sh.onSlotDrained = func() {
+		p.releaseSession(sh)
+		p.signalFree()
+	}
 	s.poolHandle.Store(sh)
 	p.m.sessionsOpened.Add(1)
 

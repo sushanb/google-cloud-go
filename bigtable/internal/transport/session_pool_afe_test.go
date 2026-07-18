@@ -45,9 +45,12 @@ func injectActiveOnAfe(t *testing.T, p *SessionPoolImpl, name string, afe afeID)
 }
 
 // checkoutAndRelease drives one round-trip through the two-tier picker:
-// CheckoutSession → simulated Invoke defer (DecOutstanding + ReleaseToPool
-// + optional latency record). Skips the real Invoke path so tests don't
-// depend on a fake vRPC responder.
+// CheckoutSession → simulated Invoke return (DecOutstanding + latency
+// record) plus simulated drainSlot effects (ReleaseToPool + signalFree —
+// what SessionHandle.onSlotDrained would fire in production under v3).
+// These tests bypass Session entirely (no real activeRPC slot to drain),
+// so the simulator collapses both phases into one call. Skips the real
+// Invoke path so tests don't depend on a fake vRPC responder.
 func checkoutAndRelease(t *testing.T, p *SessionPoolImpl, recordLatency time.Duration, ok bool) *SessionHandle {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
