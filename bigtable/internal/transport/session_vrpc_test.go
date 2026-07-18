@@ -412,6 +412,91 @@ func TestDeliver_CancelRacingCompletion_FlagsEvent(t *testing.T) {
 	}
 }
 
+// TestHandleVRPCResponse_LateResponseAfterCtxDone_FlagsNilSlot pins the
+// dominant real-world trigger of tagSessionVRPCNil: the caller's ctx
+// expires (or is canceled) before the server response lands on the read
+// loop. Sequence exercised:
+//
+//  1. Invoke's CAS(nil, rpc) fills activeRPC and Send goes out.
+//  2. ctx deadline fires; awaitInvokeResult returns via <-ctx.Done().
+//  3. defer releaseSlot clears activeRPC.
+//  4. The server's response for that rpc_id lands moments later —
+//     handleVRPCResponse observes activeVRPC() == nil and drops the
+//     frame with tagSessionVRPCNil.
+//
+// Not a bug: the vRPC protocol has no "unsubscribe rpc_id" primitive,
+// so the server keeps sending. The counter is a canary — a rising rate
+// under steady load usually means tail-latency spikes are pushing more
+// callers onto the ctx.Done branch. This test locks in that the drop
+// is counted (dashboard-visible) and does NOT double-emit any of the
+// sibling vRPC tags (id-mismatch / duplicate-result / wrong-state).
+func TestHandleVRPCResponse_LateResponseAfterCtxDone_FlagsNilSlot(t *testing.T) {
+	resetDebugTagCountsForTest()
+
+	s, stream := makeActive(t, SessionHooks{})
+	desc := newRoundTripDesc()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Invoke(ctx, desc, "req")
+		done <- err
+	}()
+
+	// Wait for the request to hit the wire so we know CAS(nil,rpc) filled
+	// the slot and rpc_id is knowable from the sent frame.
+	waitFor(t, time.Second, func() bool { return len(stream.snapshotSent()) > 0 }, "Send called")
+	sent := stream.snapshotSent()[0].GetVirtualRpc()
+	if sent == nil {
+		t.Fatal("sent frame was not a VirtualRpcRequest")
+	}
+
+	// Let ctx expire; Invoke must return with DeadlineExceeded.
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Invoke err = %v, want DeadlineExceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Invoke did not return within outer bound")
+	}
+
+	// Precondition for the drop: defer releaseSlot cleared activeRPC.
+	if got := s.activeVRPC(); got != nil {
+		t.Fatalf("activeVRPC = %p, want nil after Invoke returned via ctx.Done", got)
+	}
+
+	// Snapshot the counter just before the late-response injection so we
+	// isolate the drop from any prior emissions.
+	before := snapshotDebugTagCounts()
+
+	// The server's response finally arrives — after releaseSlot cleared
+	// the slot. This is the exact race the counter names.
+	s.handleVRPCResponse(&spb.VirtualRpcResponse{
+		RpcId:   sent.RpcId,
+		Payload: []byte("ok"),
+	})
+
+	after := snapshotDebugTagCounts()
+	if delta := after[tagSessionVRPCNil] - before[tagSessionVRPCNil]; delta != 1 {
+		t.Errorf("tagSessionVRPCNil delta = %d, want 1 (late server response after ctx.Done should be dropped and counted)", delta)
+	}
+	// Sibling vRPC-drop tags must stay flat — the drop reason is
+	// "no in-flight RPC tracked", not id-mismatch, duplicate-result, or
+	// wrong-state.
+	for _, tag := range []string{
+		tagSessionVRPCIDMismatch,
+		tagSessionVRPCDuplicateResult,
+		tagSessionVRPCResponseWrongState,
+	} {
+		if delta := after[tag] - before[tag]; delta != 0 {
+			t.Errorf("%s delta = %d, want 0 (only nil-slot tag should fire on this race)", tag, delta)
+		}
+	}
+}
+
 // countEventsByKind returns how many SessionEvents in events have the
 // given Kind. Small helper used by the dup-deliver tests above.
 func countEventsByKind(events []SessionEvent, kind string) int {
