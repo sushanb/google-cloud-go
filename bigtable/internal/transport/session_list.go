@@ -166,24 +166,51 @@ func (sl *sessionList) OnSessionStarted(sh *SessionHandle) {
 	sl.readyCount++ // I2
 }
 
-// Checkout dequeues one idle session from afe (Idle → InFlight). Returns
-// nil when afe is nil or its queue is empty — a legitimate race with a
-// concurrent Checkout or an OnSessionClosing that just drained the last
-// idle handle. Callers should have picked from ReadyAfes() first.
+// Checkout dequeues one idle session with an empty in-flight slot from
+// afe (Idle → InFlight). Returns nil when afe is nil, its queue is
+// empty, or every queued session has a still-claimed slot (Java-parity
+// claim-until-drain: a caller-abandoned RPC leaves the slot occupied
+// until the server response drains it — such a session must NOT be
+// handed to a new caller).
+//
+// Skipped busy sessions are re-enqueued at the tail so they remain
+// checkoutable once their slot drains; the drain path (handleVRPCResponse
+// cancel branch) wakes a parked Checkout waiter via
+// SessionHandle.onSlotDrained so no polling is required. Bounded by the
+// snapshotted queue length so a fleet where every session is busy
+// terminates in O(n) rather than looping.
+//
+// Java parity: SessionList.java's AfeHandle.tryAcquire skips sessions
+// with currentRpc != null at the same layer.
 func (sl *sessionList) Checkout(afe *afeHandle) *SessionHandle {
 	if afe == nil {
 		return nil
 	}
 	sl.mu.Lock()
 	defer sl.mu.Unlock()
-	sh, nowEmpty := afe.dequeueLocked()
-	if sh == nil {
-		return nil
+	// Snapshot queue length up front — bounds the loop even if
+	// enqueueLocked repeatedly puts busy sessions back at the tail.
+	tries := len(afe.sessions)
+	for i := 0; i < tries; i++ {
+		sh, nowEmpty := afe.dequeueLocked()
+		if sh == nil {
+			return nil
+		}
+		if sh.session.activeVRPC() == nil {
+			if nowEmpty { // afe leaves the ready set (I3)
+				sl.removeFromReadyLocked(afe)
+			}
+			return sh
+		}
+		// Slot still claimed by a prior caller-abandoned vRPC. Put at
+		// the tail; do NOT toggle afesWithReady membership — the queue
+		// stays non-empty across this rotation.
+		afe.enqueueLocked(sh)
 	}
-	if nowEmpty { // afe leaves the ready set (I3)
-		sl.removeFromReadyLocked(afe)
-	}
-	return sh
+	// Every session in this AFE is busy. AFE stays in the ready set
+	// (queue is non-empty); the drain-path wake will re-invite a
+	// Checkout retry once any slot drains.
+	return nil
 }
 
 // ReleaseToPool re-appends sh to its AFE's idle queue (InFlight → Idle),

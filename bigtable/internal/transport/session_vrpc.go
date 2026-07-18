@@ -312,6 +312,7 @@ func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
 		// Caller already returned via ctx.Done — no one is waiting on
 		// resultChan. Just count the drain for observability.
 		recordDebugTag(tagSessionVRPCCancelledDrained)
+		s.notifySlotDrained()
 	} else {
 		s.deliver(drained, vrpcResult{resp: resp})
 	}
@@ -348,6 +349,7 @@ func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 	s.errorRpcs.Add(1)
 	if cancel != nil {
 		recordDebugTag(tagSessionVRPCCancelledDrained)
+		s.notifySlotDrained()
 	} else {
 		s.deliver(drained, vrpcResult{errResp: errResp})
 	}

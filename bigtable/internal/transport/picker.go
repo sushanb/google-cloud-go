@@ -42,6 +42,14 @@ type SessionHandle struct {
 	// do not touch outside sl methods. Java-parity: SessionList.java's
 	// inExpectedCount field.
 	inExpectedCount bool
+	// onSlotDrained is set by the pool at registerActive time to
+	// p.signalFree — so a server response draining a caller-abandoned
+	// slot (Java-parity claim-until-drain) can wake a parked Checkout
+	// waiter that would otherwise wait for the next unrelated Invoke
+	// return to fire signalFree. Nil for handles built by tests that
+	// bypass the pool. Session calls it from the cancelled-drained
+	// branches of handleVRPCResponse / handleVRPCErrorResponse.
+	onSlotDrained func()
 }
 
 // Picks returns the number of times this handle has been picked by the pool's
