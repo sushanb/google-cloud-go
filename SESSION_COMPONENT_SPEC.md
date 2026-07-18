@@ -200,6 +200,7 @@ Every rule is a MUST. Violations are bugs, not preferences.
 | Per-AFE refCount, idle queue, PeakEwmas | `afeHandle` | pool interacts only via `sessionList` methods |
 | Ready AFE set | `sessionList` | `SessionPoolImpl` reads via `sl.ReadyAfes()` |
 | In-flight vRPC slot | `Session.(activeRPC, currentCancel)` under `slotMu` — Java `SessionImpl.currentRpc/currentCancel` parity | pool MUST NOT track "which session has an outstanding call" separately |
+| Session→pool "slot drained" signal | `Session.notifySlotDrained` → `SessionHandle.onSlotDrained` callback (installed by `SessionPoolImpl.OnActive`) | callback fires `sl.ReleaseToPool` + `p.signalFree`; the pool's `Invoke` return path MUST NOT re-enqueue the session in the AFE idle queue OR wake a `Checkout` waiter (both live at the drain site only, so `Idle` queue membership stays coupled 1:1 with slot vacancy — see `SESSION_POOL_SPEC.md #6` transition table) |
 | Heartbeat deadline | `Session.nextHeartbeatDeadlineNano` (atomic) | pool watchdog MUST NOT independently reset |
 | Session pool composition (min/max/waiters) | `SessionPoolImpl` | driven by `ClientConfigurationManager.UpdateConfig` |
 | Pool sizing formula + `ScaleDecision` | `PoolSizer` (`pool_sizer.go:154`) | `session_pool_scaling.go`, z-pages, tests MUST consume `Decide()`/`ScaleDecision`; MUST NOT recompute `EffectivePending`/`IdleHeadroom`/`DesiredCapacity` from raw `PoolStats` |

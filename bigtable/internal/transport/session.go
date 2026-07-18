@@ -434,14 +434,18 @@ func (s *Session) setSlotForTest(rpc *vrpcImpl) {
 	s.slotMu.Unlock()
 }
 
-// notifySlotDrained wakes any parked pool Checkout waiter after a
-// caller-abandoned slot finally drained on the wire. Under Java-parity
-// claim-until-drain, the ctx.Done caller's Invoke has already returned
-// and fired the pool's normal signalFree — but by the time this drain
-// arrives, some later waiter might be parked with no other Invoke in
-// flight to wake it. Route through the pool's SessionHandle callback
-// (installed at OnActive); nil-safe for sessions built by tests that
-// bypass the pool.
+// notifySlotDrained tells the pool the slot just drained on the wire.
+// Under v3 (Java-parity slot lifecycle + drain-as-sole-free-signal),
+// this is the ONLY path that re-enqueues the session in its AFE idle
+// queue and wakes one parked Checkout waiter — the pool's Invoke
+// return path no longer does either. Fires from every drainSlot
+// success: normal deliver, cancelled-drain (ctx.Done caller already
+// returned), and the Send-failure Invoke branch. Route through the
+// pool's SessionHandle callback (installed at OnActive); nil-safe for
+// sessions built by tests that bypass the pool. cancelActiveRPCs
+// (session teardown) intentionally does NOT call this — the session
+// is on its way out; OnSessionClosing/OnSessionClosed handle its
+// removal from the routing structures.
 func (s *Session) notifySlotDrained() {
 	if sh := s.poolHandle.Load(); sh != nil && sh.onSlotDrained != nil {
 		sh.onSlotDrained()

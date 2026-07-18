@@ -434,9 +434,11 @@ func (p *SessionPoolImpl) removeWaiter(w *waiter) {
 
 // signalFree wakes exactly one parked CheckoutSession waiter — the
 // FIFO queue head. No-op when the queue is empty. Called from
-// Invoke's defer (session-freed) and OnActive (new session became
-// ready). Never blocks: the wake channel is dedicated per-waiter, so
-// there's no cap-1 collapse to worry about.
+// OnActive (new session became ready) and from the drain-driven
+// SessionHandle.onSlotDrained callback (installed at OnActive; fires
+// from every drainSlot success in Session, per SESSION_SPEC.md #2).
+// Never blocks: the wake channel is dedicated per-waiter, so there's
+// no cap-1 collapse to worry about.
 func (p *SessionPoolImpl) signalFree() {
 	p.waitersMu.Lock()
 	if e := p.waiters.Front(); e != nil {
@@ -602,10 +604,18 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 	// wait from the slow-vRPC log.
 	start := checkoutStart
 	// Track invokeErr / backendDur / latency across the defer so the
-	// per-AFE PeakEwma update sees the actual outcome. The pool wakes
-	// a waiter centrally here (rather than from DecOutstanding) so a
-	// released session is guaranteed back in its AFE queue before the
-	// wake fires.
+	// per-AFE PeakEwma update sees the actual outcome. Under Java-parity
+	// slot lifecycle (v3), drainSlot success is the sole "session free"
+	// signal — the session's response handler fires notifySlotDrained →
+	// onSlotDrained (installed at OnActive) which does the AFE-queue
+	// re-enqueue AND the Checkout waiter wake. So this defer no longer
+	// touches sl.ReleaseToPool or signalFree; it stays only for the
+	// per-caller in-flight counter and the outcome-known EWMA update.
+	// One consequence: the wake fires from the response handler BEFORE
+	// this defer runs, so a picker on another goroutine may see the
+	// pre-update EWMAs for this AFE for one tick. Accepted — EWMAs lag
+	// by definition, and the same one-tick window ships in v2 for the
+	// ctx.Done'd-then-drained path.
 	var (
 		invokeErr  error
 		backendDur time.Duration
@@ -613,9 +623,7 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 	)
 	defer func() {
 		sh.DecOutstanding()
-		p.releaseSession(sh)
 		p.recordVRpcOutcome(sh, latency, backendDur, invokeErr == nil)
-		p.signalFree()
 	}()
 
 	var result InvokeResult

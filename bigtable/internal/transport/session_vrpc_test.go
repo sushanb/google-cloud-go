@@ -522,6 +522,160 @@ func TestInvoke_SecondInvokeAfterCtxDoneRejectedUncommitted(t *testing.T) {
 	}
 }
 
+// TestHandleVRPCResponse_NormalDrain_FiresSlotDrainedCallback pins the v3
+// invariant: EVERY successful drainSlot fires notifySlotDrained →
+// SessionHandle.onSlotDrained — not just the cancelled-drain branch.
+// Under v3 this callback is the sole "session became free" signal (the
+// pool's Invoke return path no longer re-enqueues or wakes), so
+// dropping the fire on the normal branch would leave the AFE queue
+// with a stale outstanding-in-flight session and starve parked
+// Checkout waiters. Sequence exercised:
+//
+//  1. Invoke's claimSlot fills activeRPC and Send goes out.
+//  2. The server responds cleanly for that rpc_id — drainSlot returns
+//     cancel=nil (normal happy path), deliver fires, Invoke returns.
+//  3. notifySlotDrained runs via the SessionHandle callback exactly
+//     once (never zero — starves the pool; never twice — a double-add
+//     to the AFE queue).
+func TestHandleVRPCResponse_NormalDrain_FiresSlotDrainedCallback(t *testing.T) {
+	s, stream := makeActive(t, SessionHooks{})
+	desc := newRoundTripDesc()
+
+	// Wire a SessionHandle with a counting onSlotDrained. Same pattern
+	// SessionPoolImpl.OnActive uses — a real pool would point this at
+	// releaseSession+signalFree; here we count fires to prove the wire
+	// is live for the normal-drain branch, not just cancelled-drain.
+	fires := make(chan struct{}, 4)
+	sh := NewSessionHandle(s, time.Time{})
+	sh.onSlotDrained = func() { fires <- struct{}{} }
+	s.poolHandle.Store(sh)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Invoke(context.Background(), desc, "req")
+		done <- err
+	}()
+
+	waitFor(t, time.Second, func() bool { return len(stream.snapshotSent()) > 0 }, "Send called")
+	sent := stream.snapshotSent()[0].GetVirtualRpc()
+	if sent == nil {
+		t.Fatal("sent frame was not a VirtualRpcRequest")
+	}
+
+	s.handleVRPCResponse(&spb.VirtualRpcResponse{
+		RpcId:   sent.RpcId,
+		Payload: []byte("ok"),
+	})
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Invoke err = %v, want nil (normal-drain path)", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Invoke did not return after normal drain")
+	}
+
+	// Exactly one fire — the normal-drain branch MUST call
+	// notifySlotDrained (v3), and MUST NOT double-fire.
+	select {
+	case <-fires:
+	case <-time.After(time.Second):
+		t.Fatal("onSlotDrained did not fire on normal-drain branch; v3 invariant violated (pool would never learn the session is free)")
+	}
+	select {
+	case <-fires:
+		t.Error("onSlotDrained fired twice for a single drainSlot success; would double-enqueue in the AFE queue")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestHandleVRPCErrorResponse_NormalDrain_FiresSlotDrainedCallback
+// mirrors the response test on the error-frame branch — a definitive
+// server ErrorResponse also drains the slot and MUST fire
+// onSlotDrained under v3. Regression coverage: dropping the fire on
+// the error branch would create a subtle asymmetry where sessions
+// that see a server ErrorResponse never come back to the AFE queue.
+func TestHandleVRPCErrorResponse_NormalDrain_FiresSlotDrainedCallback(t *testing.T) {
+	s, stream := makeActive(t, SessionHooks{})
+	desc := newRoundTripDesc()
+
+	fires := make(chan struct{}, 4)
+	sh := NewSessionHandle(s, time.Time{})
+	sh.onSlotDrained = func() { fires <- struct{}{} }
+	s.poolHandle.Store(sh)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Invoke(context.Background(), desc, "req")
+		done <- err
+	}()
+
+	waitFor(t, time.Second, func() bool { return len(stream.snapshotSent()) > 0 }, "Send called")
+	sent := stream.snapshotSent()[0].GetVirtualRpc()
+	if sent == nil {
+		t.Fatal("sent frame was not a VirtualRpcRequest")
+	}
+
+	s.handleVRPCErrorResponse(&spb.ErrorResponse{
+		RpcId:  sent.RpcId,
+		Status: &rpcstatus.Status{Code: int32(codes.FailedPrecondition), Message: "boom"},
+	})
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Invoke err = nil on ErrorResponse; want non-nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Invoke did not return after ErrorResponse drain")
+	}
+
+	select {
+	case <-fires:
+	case <-time.After(time.Second):
+		t.Fatal("onSlotDrained did not fire on error-drain branch; v3 invariant violated")
+	}
+	select {
+	case <-fires:
+		t.Error("onSlotDrained fired twice for a single error drainSlot success")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestInvoke_SendFailure_FiresSlotDrainedCallback pins that the
+// Send-failure Invoke branch fires notifySlotDrained after drainSlot.
+// This is the third drainSlot site under v3; without the fire, a
+// pool with all sessions on a broken stream would silently starve
+// parked Checkout waiters (ReleaseToPool would still no-op via the
+// inExpectedCount guard once OnSessionClosing fired, but the
+// signalFree side of the callback matters for the waiter that was
+// parked before the stream broke).
+func TestInvoke_SendFailure_FiresSlotDrainedCallback(t *testing.T) {
+	stream := newFakeStream()
+	stream.sendFn = func(req *spb.SessionRequest) error {
+		return fmt.Errorf("network down")
+	}
+	s := newTestSession(t, stream, SessionHooks{})
+	s.state.Store(int32(StateReady))
+
+	fires := make(chan struct{}, 2)
+	sh := NewSessionHandle(s, time.Time{})
+	sh.onSlotDrained = func() { fires <- struct{}{} }
+	s.poolHandle.Store(sh)
+
+	_, err := s.Invoke(context.Background(), newRoundTripDesc(), "req")
+	if err == nil {
+		t.Fatal("Invoke: expected err from failing Send")
+	}
+
+	select {
+	case <-fires:
+	case <-time.After(time.Second):
+		t.Fatal("onSlotDrained did not fire on Send-failure branch; v3 requires drain-driven wake here too")
+	}
+}
+
 // TestInvoke_ForceCloseRace_BoundedReturnUnderCtx pins the race between
 // Invoke's initial state check (session_vrpc.go:87) and its activeVRPC
 // CAS (session_vrpc.go:107). If ForceClose lands in that window the CAS
