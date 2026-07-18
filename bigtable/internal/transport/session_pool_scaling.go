@@ -27,6 +27,7 @@ package internal
 import (
 	"context"
 	"fmt"
+	"log"
 	"math/rand/v2"
 	"strings"
 	"sync"
@@ -284,7 +285,7 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 		OnActive:  p.OnActive,
 		OnClosing: p.OnClosing,
 		OnClose:   p.OnClose,
-	}, p.sessionType, WithSessionPoolName(p.poolName))
+	}, p.sessionType, WithSessionPoolName(p.poolName), WithSessionLogger(log.Default()))
 	if hint := int(pickedChannel.Load()); hint >= 0 {
 		s.SetChannelIndex(hint)
 	}
