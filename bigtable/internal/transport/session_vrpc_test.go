@@ -321,116 +321,30 @@ func TestInvoke_RetryInfoPackedIntoStatus(t *testing.T) {
 	}
 }
 
-// TestHandleVRPCResponse_DuplicateFrame_FlagsDuplicate depicts a
-// protocol violation: the server sends two VirtualRpcResponse frames
-// with the same rpc_id while the first hasn't been consumed. The
-// second delivery hits deliver's default branch (channel already full).
-// Two signals must fire: the metric tag tagSessionVRPCDuplicateResult
-// from the receive-loop caller (dashboard-visible) and the "dup-deliver"
-// per-session event from deliver itself (sessionz-visible).
-func TestHandleVRPCResponse_DuplicateFrame_FlagsDuplicate(t *testing.T) {
-	resetDebugTagCountsForTest()
-	s, _ := makeActive(t, SessionHooks{})
-	rpc := &vrpcImpl{id: 3, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
-	s.activeRPC.Store(rpc)
-
-	resp1 := &spb.VirtualRpcResponse{RpcId: 3}
-	resp2 := &spb.VirtualRpcResponse{RpcId: 3}
-	s.handleVRPCResponse(resp1)
-	s.handleVRPCResponse(resp2)
-
-	if got := snapshotDebugTagCounts()[tagSessionVRPCDuplicateResult]; got != 1 {
-		t.Errorf("tagSessionVRPCDuplicateResult count = %d, want 1 (server double-frame should be tagged)", got)
-	}
-	if got := countEventsByKind(s.snapshotEvents(), "dup-deliver"); got != 1 {
-		t.Errorf("dup-deliver events = %d, want 1", got)
-	}
-
-	// First delivery wins; second is dropped.
-	select {
-	case res := <-rpc.resultChan:
-		if res.resp != resp1 {
-			t.Errorf("got resp %p, want first %p (duplicate should not overwrite)", res.resp, resp1)
-		}
-	default:
-		t.Fatal("no result on resultChan")
-	}
-	select {
-	case res := <-rpc.resultChan:
-		t.Errorf("channel had a second value: %+v — deliver's cap-1 guard failed", res)
-	default:
-	}
-}
-
-// TestDeliver_CancelRacingCompletion_FlagsEvent depicts the race
-// between a completion delivered by the receive loop and
-// cancelActiveRPCs firing before Invoke's deferred releaseSlot has
-// cleared activeRPC. Both paths call deliver on the same
-// rpc.resultChan; the second hits the default branch. Per the deliver
-// invariant ("first wins, subsequent ones are dropped"), the loser
-// must be surfaced somewhere so an operator investigating an
-// unexpectedly-torn-down session in sessionz can see the race.
+// TestHandleVRPCResponse_LateResponseAfterCtxDone_FlagsCancelledDrained
+// pins Java-parity slot-lifecycle: the caller's ctx expires before the
+// server response lands, but the slot stays claimed (markCancelled
+// records the cancel; drainSlot does NOT run in Invoke's return path).
+// The eventual server response drains the slot as a bookkeeping-only
+// tagSessionVRPCCancelledDrained. Sequence exercised:
 //
-// Cancel path duplicates are benign (not a server bug), so we do NOT
-// emit the tagSessionVRPCDuplicateResult metric — that stays scoped to
-// the server-frame paths. Instead deliver stamps a "dup-deliver"
-// event on the per-session ring, which shows up in sessionz's recent-
-// events column for this session and its containing pool.
-func TestDeliver_CancelRacingCompletion_FlagsEvent(t *testing.T) {
-	resetDebugTagCountsForTest()
-	s, _ := makeActive(t, SessionHooks{})
-	rpc := &vrpcImpl{id: 5, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
-	s.activeRPC.Store(rpc)
-
-	// Receive loop: server delivers a real success frame, filling the
-	// resultChan cap-1 slot.
-	s.handleVRPCResponse(&spb.VirtualRpcResponse{RpcId: 5})
-
-	// Cancel path: session tear-down fires while activeRPC still points
-	// to rpc (Invoke has not consumed / defer-released). cancel's
-	// CAS(rpc, nil) succeeds; deliver hits the full channel → default
-	// branch → dup-deliver event fires.
-	s.cancelActiveRPCs(unavailable(ErrUnavailableSessionError, "server-reported"))
-
-	if got := countEventsByKind(s.snapshotEvents(), "dup-deliver"); got != 1 {
-		t.Errorf("dup-deliver events = %d, want 1 (cancel-vs-completion loser should be flagged)", got)
-	}
-	// Benign race: no metric tag from this path.
-	if got := snapshotDebugTagCounts()[tagSessionVRPCDuplicateResult]; got != 0 {
-		t.Errorf("tagSessionVRPCDuplicateResult count = %d, want 0 (cancel-path drop is not a server bug)", got)
-	}
-
-	// Whichever path lost, the winning delivery must survive on the
-	// channel — a duplicate must never overwrite a landed result.
-	select {
-	case res := <-rpc.resultChan:
-		if res.resp == nil || res.resp.RpcId != 5 {
-			t.Errorf("channel value = %+v, want the receive-loop VirtualRpcResponse (id=5)", res)
-		}
-	default:
-		t.Fatal("no result on resultChan — the winner's delivery was lost")
-	}
-}
-
-// TestHandleVRPCResponse_LateResponseAfterCtxDone_FlagsNilSlot pins the
-// dominant real-world trigger of tagSessionVRPCNil: the caller's ctx
-// expires (or is canceled) before the server response lands on the read
-// loop. Sequence exercised:
-//
-//  1. Invoke's CAS(nil, rpc) fills activeRPC and Send goes out.
-//  2. ctx deadline fires; awaitInvokeResult returns via <-ctx.Done().
-//  3. defer releaseSlot clears activeRPC.
+//  1. Invoke's claimSlot fills activeRPC and Send goes out.
+//  2. ctx deadline fires; awaitInvokeResult returns via <-ctx.Done()
+//     after markCancelled records the cancel result.
+//  3. activeVRPC() is STILL non-nil — Java parity, unlike the pre-
+//     slotMu behavior where a defer releaseSlot cleared it.
 //  4. The server's response for that rpc_id lands moments later —
-//     handleVRPCResponse observes activeVRPC() == nil and drops the
-//     frame with tagSessionVRPCNil.
+//     handleVRPCResponse calls drainSlot, sees currentCancel != nil,
+//     records tagSessionVRPCCancelledDrained, and does NOT deliver
+//     (no reader on resultChan).
 //
 // Not a bug: the vRPC protocol has no "unsubscribe rpc_id" primitive,
 // so the server keeps sending. The counter is a canary — a rising rate
 // under steady load usually means tail-latency spikes are pushing more
-// callers onto the ctx.Done branch. This test locks in that the drop
-// is counted (dashboard-visible) and does NOT double-emit any of the
-// sibling vRPC tags (id-mismatch / duplicate-result / wrong-state).
-func TestHandleVRPCResponse_LateResponseAfterCtxDone_FlagsNilSlot(t *testing.T) {
+// callers onto the ctx.Done branch. This test locks in that the drain
+// is counted (dashboard-visible) and does NOT emit any of the
+// sibling vRPC tags (nil / id-mismatch / wrong-state).
+func TestHandleVRPCResponse_LateResponseAfterCtxDone_FlagsCancelledDrained(t *testing.T) {
 	resetDebugTagCountsForTest()
 
 	s, stream := makeActive(t, SessionHooks{})
@@ -445,7 +359,7 @@ func TestHandleVRPCResponse_LateResponseAfterCtxDone_FlagsNilSlot(t *testing.T) 
 		done <- err
 	}()
 
-	// Wait for the request to hit the wire so we know CAS(nil,rpc) filled
+	// Wait for the request to hit the wire so we know claimSlot filled
 	// the slot and rpc_id is knowable from the sent frame.
 	waitFor(t, time.Second, func() bool { return len(stream.snapshotSent()) > 0 }, "Send called")
 	sent := stream.snapshotSent()[0].GetVirtualRpc()
@@ -463,50 +377,149 @@ func TestHandleVRPCResponse_LateResponseAfterCtxDone_FlagsNilSlot(t *testing.T) 
 		t.Fatal("Invoke did not return within outer bound")
 	}
 
-	// Precondition for the drop: defer releaseSlot cleared activeRPC.
-	if got := s.activeVRPC(); got != nil {
-		t.Fatalf("activeVRPC = %p, want nil after Invoke returned via ctx.Done", got)
+	// Java-parity precondition: slot STAYS claimed even after Invoke
+	// returned via ctx.Done. This is the observable divergence from
+	// the pre-slotMu behavior — any future PR that reverts to
+	// client-side release must fail this assertion.
+	if got := s.activeVRPC(); got == nil {
+		t.Fatal("activeVRPC = nil after Invoke returned via ctx.Done; want the slot to stay claimed (Java-parity: only drainSlot releases it)")
 	}
 
 	// Snapshot the counter just before the late-response injection so we
-	// isolate the drop from any prior emissions.
+	// isolate the drain tick from any prior emissions.
 	before := snapshotDebugTagCounts()
 
-	// The server's response finally arrives — after releaseSlot cleared
-	// the slot. This is the exact race the counter names.
+	// The server's response finally arrives — the drain path checks
+	// currentCancel, sees it set, and records the cancelled-drained tag.
 	s.handleVRPCResponse(&spb.VirtualRpcResponse{
 		RpcId:   sent.RpcId,
 		Payload: []byte("ok"),
 	})
 
 	after := snapshotDebugTagCounts()
-	if delta := after[tagSessionVRPCNil] - before[tagSessionVRPCNil]; delta != 1 {
-		t.Errorf("tagSessionVRPCNil delta = %d, want 1 (late server response after ctx.Done should be dropped and counted)", delta)
+	if delta := after[tagSessionVRPCCancelledDrained] - before[tagSessionVRPCCancelledDrained]; delta != 1 {
+		t.Errorf("tagSessionVRPCCancelledDrained delta = %d, want 1 (server response for a cancelled slot should drain and count)", delta)
 	}
-	// Sibling vRPC-drop tags must stay flat — the drop reason is
-	// "no in-flight RPC tracked", not id-mismatch, duplicate-result, or
+	// Sibling vRPC-drop tags must stay flat — the drain reason is
+	// "caller abandoned via ctx.Done", not nil-slot / id-mismatch /
 	// wrong-state.
 	for _, tag := range []string{
+		tagSessionVRPCNil,
 		tagSessionVRPCIDMismatch,
-		tagSessionVRPCDuplicateResult,
 		tagSessionVRPCResponseWrongState,
 	} {
 		if delta := after[tag] - before[tag]; delta != 0 {
-			t.Errorf("%s delta = %d, want 0 (only nil-slot tag should fire on this race)", tag, delta)
+			t.Errorf("%s delta = %d, want 0 (only cancelled-drained tag should fire on this race)", tag, delta)
 		}
+	}
+
+	// Post-drain: slot must be empty so the next Invoke can claim.
+	if got := s.activeVRPC(); got != nil {
+		t.Errorf("activeVRPC = %p, want nil after drainSlot ran on the late server response", got)
 	}
 }
 
-// countEventsByKind returns how many SessionEvents in events have the
-// given Kind. Small helper used by the dup-deliver tests above.
-func countEventsByKind(events []SessionEvent, kind string) int {
-	n := 0
-	for _, ev := range events {
-		if ev.Kind == kind {
-			n++
-		}
+// TestInvoke_SecondInvokeAfterCtxDoneRejectedUncommitted pins the
+// Java-parity claim rejection (SessionImpl.startRpc L423 —
+// currentRpc != null → INTERNAL "RPC multiplexing not supported").
+// Sequence exercised:
+//
+//  1. Invoke #1 → claimSlot → Send(rpc_A).
+//  2. ctx#1 expires → Invoke #1 returns → markCancelled leaves slot claimed.
+//  3. Invoke #2 → claimSlot returns false → immediate Uncommitted error,
+//     Send is never called (no rpc_B on the wire, no rpc_id burned).
+//  4. Server response for rpc_A drains the slot.
+//  5. A fresh Invoke #3 can now claim and proceed normally.
+//
+// This is the Java-parity replacement for the pre-slotMu
+// TestHandleVRPCResponse_LateResponseAfterCtxDoneAndNewInvoke_FlagsIDMismatch
+// (which pinned the client-only slot-release divergence). Any future PR
+// that reverts to client-side release must break this test — the second
+// Invoke would succeed and race to an id-mismatch drop instead.
+func TestInvoke_SecondInvokeAfterCtxDoneRejectedUncommitted(t *testing.T) {
+	resetDebugTagCountsForTest()
+
+	s, stream := makeActive(t, SessionHooks{})
+	desc := newRoundTripDesc()
+
+	// --- Invoke #1: run to ctx.Done. ---
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel1()
+
+	done1 := make(chan error, 1)
+	go func() {
+		_, err := s.Invoke(ctx1, desc, "req-A")
+		done1 <- err
+	}()
+
+	waitFor(t, time.Second, func() bool { return len(stream.snapshotSent()) > 0 }, "Invoke #1 Send")
+	sentA := stream.snapshotSent()[0].GetVirtualRpc()
+	if sentA == nil {
+		t.Fatal("Invoke #1 sent frame was not a VirtualRpcRequest")
 	}
-	return n
+
+	select {
+	case err := <-done1:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Invoke #1 err = %v, want DeadlineExceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Invoke #1 did not return within outer bound")
+	}
+
+	// Slot still claimed — Java parity.
+	if got := s.activeVRPC(); got == nil {
+		t.Fatal("activeVRPC = nil after Invoke #1 returned via ctx.Done; want slot held")
+	}
+
+	// --- Invoke #2: must fail immediately with Uncommitted. ---
+	sentBefore := len(stream.snapshotSent())
+	_, err := s.Invoke(context.Background(), desc, "req-B")
+	if err == nil {
+		t.Fatal("Invoke #2 succeeded with slot busy; want Uncommitted error")
+	}
+	if outcome := ClassifyErr(err); outcome.State != StateUncommitted {
+		t.Errorf("Invoke #2 err classified as %v, want StateUncommitted (Java parity: retryer must be free to pick another session)", outcome.State)
+	}
+	if got := len(stream.snapshotSent()); got != sentBefore {
+		t.Errorf("Invoke #2 sent %d frames beyond Invoke #1; want 0 (Send must not fire on a losing claim, or rpc_id burn / wire noise ensues)", got-sentBefore)
+	}
+
+	// --- Step 4: drain the slot with the late rpc_A response. ---
+	s.handleVRPCResponse(&spb.VirtualRpcResponse{
+		RpcId:   sentA.RpcId,
+		Payload: []byte("stale-A"),
+	})
+	if got := s.activeVRPC(); got != nil {
+		t.Fatalf("activeVRPC = %p after draining rpc_A; want nil", got)
+	}
+
+	// --- Step 5: a fresh Invoke succeeds. ---
+	done3 := make(chan struct {
+		res InvokeResult
+		err error
+	}, 1)
+	go func() {
+		res, err := s.Invoke(context.Background(), desc, "req-C")
+		done3 <- struct {
+			res InvokeResult
+			err error
+		}{res, err}
+	}()
+	waitFor(t, time.Second, func() bool { return len(stream.snapshotSent()) > sentBefore }, "Invoke #3 Send")
+	sentC := stream.snapshotSent()[len(stream.snapshotSent())-1].GetVirtualRpc()
+	if sentC == nil {
+		t.Fatal("Invoke #3 sent frame was not a VirtualRpcRequest")
+	}
+	s.handleVRPCResponse(&spb.VirtualRpcResponse{RpcId: sentC.RpcId, Payload: []byte("ok-C")})
+	select {
+	case r := <-done3:
+		if r.err != nil {
+			t.Fatalf("Invoke #3 err = %v, want nil after fresh claim", r.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Invoke #3 did not return after rpc_C delivered")
+	}
 }
 
 // TestInvoke_ForceCloseRace_BoundedReturnUnderCtx pins the race between

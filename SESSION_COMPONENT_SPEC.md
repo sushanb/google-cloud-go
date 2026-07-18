@@ -199,7 +199,7 @@ Every rule is a MUST. Violations are bugs, not preferences.
 | AFE ID | `Session.peerInfo` (set once by `handleOpenSession`) | pool reads via `Session.AfeID()`; pool MUST NOT cache |
 | Per-AFE refCount, idle queue, PeakEwmas | `afeHandle` | pool interacts only via `sessionList` methods |
 | Ready AFE set | `sessionList` | `SessionPoolImpl` reads via `sl.ReadyAfes()` |
-| In-flight vRPC slot | `Session.activeRPC` (atomic CAS) | pool MUST NOT track "which session has an outstanding call" separately |
+| In-flight vRPC slot | `Session.(activeRPC, currentCancel)` under `slotMu` — Java `SessionImpl.currentRpc/currentCancel` parity | pool MUST NOT track "which session has an outstanding call" separately |
 | Heartbeat deadline | `Session.nextHeartbeatDeadlineNano` (atomic) | pool watchdog MUST NOT independently reset |
 | Session pool composition (min/max/waiters) | `SessionPoolImpl` | driven by `ClientConfigurationManager.UpdateConfig` |
 | Pool sizing formula + `ScaleDecision` | `PoolSizer` (`pool_sizer.go:154`) | `session_pool_scaling.go`, z-pages, tests MUST consume `Decide()`/`ScaleDecision`; MUST NOT recompute `EffectivePending`/`IdleHeadroom`/`DesiredCapacity` from raw `PoolStats` |

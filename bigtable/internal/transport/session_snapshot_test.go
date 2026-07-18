@@ -28,18 +28,18 @@ func TestSession_CountsOkAndErrorRpcs(t *testing.T) {
 
 	for _, id := range []int64{1, 2, 3} {
 		rpc := &vrpcImpl{id: id, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
-		s.activeRPC.Store(rpc)
+		s.setSlotForTest(rpc)
 		s.handleVRPCResponse(&spb.VirtualRpcResponse{RpcId: id, Payload: []byte("p")})
-		s.activeRPC.Store(nil)
+		s.setSlotForTest(nil)
 	}
 	for _, id := range []int64{10, 11} {
 		rpc := &vrpcImpl{id: id, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
-		s.activeRPC.Store(rpc)
+		s.setSlotForTest(rpc)
 		s.handleVRPCErrorResponse(&spb.ErrorResponse{
 			RpcId:  id,
 			Status: &rpcstatus.Status{Code: int32(codes.Unavailable), Message: "boom"},
 		})
-		s.activeRPC.Store(nil)
+		s.setSlotForTest(nil)
 	}
 
 	if got := s.OkRpcs(); got != 3 {
