@@ -266,6 +266,11 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 	}
 
 	sh := NewSessionHandle(s, time.Now())
+	// Drain-time wake: server response draining a caller-abandoned slot
+	// (Java-parity claim-until-drain) fires this so a parked Checkout
+	// waiter doesn't stall waiting for an unrelated Invoke return.
+	// Same wake channel as the regular free signal — safe to double-fire.
+	sh.onSlotDrained = p.signalFree
 	s.poolHandle.Store(sh)
 	p.m.sessionsOpened.Add(1)
 

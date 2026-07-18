@@ -121,6 +121,72 @@ func TestSessionList_Checkout_EmptyAfeReturnsNil(t *testing.T) {
 	}
 }
 
+// TestPool_CheckoutSkipsSessionWithUndrainedSlot pins the Java-parity
+// checkout gate: sessionList.Checkout MUST NOT hand out a session
+// whose activeVRPC slot is still claimed (caller-abandoned RPC waiting
+// for its server response to drain). Skipped busy sessions are
+// re-enqueued at the tail so they remain eligible once their slot
+// drains via handleVRPCResponse / handleVRPCErrorResponse.
+//
+// This is the pool-side complement to the slotMu refactor: without it,
+// Invoke's defer re-adds a session with a still-claimed slot back to
+// the idle queue, the next Checkout hands it out, and claimSlot fails
+// with "session busy: prior vRPC has not drained on the wire" — the
+// log line that surfaced in the sandbox and motivated v2.
+//
+// Java parity: SessionList.java's AfeHandle.tryAcquire skips sessions
+// with currentRpc != null at the same layer.
+func TestPool_CheckoutSkipsSessionWithUndrainedSlot(t *testing.T) {
+	sl := newSessionList()
+	h1 := makeHandleWithAfe(t, 1)
+	h2 := makeHandleWithAfe(t, 1)
+	sl.OnSessionStarted(h1)
+	sl.OnSessionStarted(h2)
+	afe := sl.afeHandles[1]
+
+	// Pin h1's slot with a placeholder vRPC — simulates a caller-
+	// abandoned RPC whose server response has not yet drained.
+	h1.session.setSlotForTest(&vrpcImpl{id: 42, resultChan: make(chan vrpcResult, 1)})
+
+	// Checkout MUST skip h1 and return h2. The AFE stays in the ready
+	// set because h1 is still in the queue (just at the tail now).
+	got := sl.Checkout(afe)
+	if got == nil {
+		t.Fatal("Checkout returned nil; want h2 (the idle-slot session)")
+	}
+	if got != h2 {
+		t.Fatalf("Checkout returned %p, want h2 %p (should skip busy h1)", got, h2)
+	}
+	if len(afe.sessions) != 1 || afe.sessions[0] != h1 {
+		t.Errorf("afe.sessions = %v, want [h1] (busy session re-enqueued at tail)", afe.sessions)
+	}
+	if len(sl.afesWithReady) != 1 {
+		t.Errorf("afesWithReady len = %d, want 1 (AFE stays ready — queue still non-empty)", len(sl.afesWithReady))
+	}
+
+	// While h1's slot stays claimed, Checkout again on this AFE with
+	// only h1 in the queue must return nil (all-busy case).
+	if got := sl.Checkout(afe); got != nil {
+		t.Errorf("Checkout with only busy h1 = %p, want nil (all-busy)", got)
+	}
+	// h1 must still be in the queue after the all-busy sweep — it stays
+	// eligible for the next drain-triggered retry.
+	if len(afe.sessions) != 1 || afe.sessions[0] != h1 {
+		t.Errorf("afe.sessions after all-busy Checkout = %v, want [h1] (busy session must NOT be orphaned)", afe.sessions)
+	}
+
+	// Drain h1's slot (simulates handleVRPCResponse's drainSlot success)
+	// and confirm Checkout now returns it, with the AFE dropping from
+	// the ready set as the queue empties.
+	h1.session.setSlotForTest(nil)
+	if got := sl.Checkout(afe); got != h1 {
+		t.Fatalf("Checkout after draining h1 = %p, want h1 %p", got, h1)
+	}
+	if len(sl.afesWithReady) != 0 {
+		t.Errorf("afesWithReady len = %d, want 0 (AFE queue emptied on last checkout)", len(sl.afesWithReady))
+	}
+}
+
 func TestSessionList_OnSessionClosing_RemovesIdleFromQueue(t *testing.T) {
 	sl := newSessionList()
 	h1 := makeHandleWithAfe(t, 1)

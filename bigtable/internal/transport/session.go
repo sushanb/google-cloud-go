@@ -434,6 +434,20 @@ func (s *Session) setSlotForTest(rpc *vrpcImpl) {
 	s.slotMu.Unlock()
 }
 
+// notifySlotDrained wakes any parked pool Checkout waiter after a
+// caller-abandoned slot finally drained on the wire. Under Java-parity
+// claim-until-drain, the ctx.Done caller's Invoke has already returned
+// and fired the pool's normal signalFree — but by the time this drain
+// arrives, some later waiter might be parked with no other Invoke in
+// flight to wake it. Route through the pool's SessionHandle callback
+// (installed at OnActive); nil-safe for sessions built by tests that
+// bypass the pool.
+func (s *Session) notifySlotDrained() {
+	if sh := s.poolHandle.Load(); sh != nil && sh.onSlotDrained != nil {
+		sh.onSlotDrained()
+	}
+}
+
 // transitionTo sets the session state to `to` iff ok(currentState) returns
 // true. Returns the previous state and whether the transition was applied.
 // Retries on CAS failure so a losing racer with a still-valid current state
