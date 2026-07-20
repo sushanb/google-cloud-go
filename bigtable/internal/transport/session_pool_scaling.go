@@ -65,12 +65,6 @@ type ScalingEvent struct {
 	// Decision.WouldDelta != 0) are also recorded so cooldown activity
 	// is visible.
 	Decision ScaleDecision
-
-	// Deprecated: kept temporarily for JSON back-compat. FromCount mirrors
-	// Before; ToCount and Delta are no longer populated meaningfully.
-	FromCount int
-	ToCount   int
-	Delta     int
 }
 
 // maxScalingHistory caps the per-pool ring buffer length. Picked so that at
@@ -168,13 +162,6 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 			Launched:  actual,
 			Reason:    reason,
 			Decision:  decision,
-			// Back-compat: keep the legacy fields populated so JSON
-			// consumers that already parse FromCount/ToCount/Delta don't
-			// break. ToCount mirrors Before because scale-up genuinely
-			// hasn't grown the live pool by the time the defer fires.
-			FromCount: currentSessions,
-			ToCount:   currentSessions + actual,
-			Delta:     delta,
 		})
 	}()
 
