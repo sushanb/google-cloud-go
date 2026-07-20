@@ -286,6 +286,18 @@ type Session struct {
 	// inbound frame extends it via resetHeartbeatDeadline.
 	nextHeartbeatDeadlineNano atomic.Int64
 
+	// heartbeatWake nudges heartBeatLoop to re-evaluate its Timer after
+	// the atomic deadline moves. Cap-1 non-blocking channel: a burst of
+	// resets coalesces to one wake, so hot-path frame handling stays
+	// allocation-free. Without this, the Timer stays armed to whatever
+	// duration it was built with — critically, the 30-min bootstrap set
+	// at NewSession never shrinks, so SessionParameters shortening the
+	// interval or the first server frame collapsing the deadline down
+	// from initialHeartbeatGrace would go unnoticed until the initial
+	// arm expired. Wake fires from resetHeartbeatDeadline (all sites)
+	// and from handleSessionParameters after the interval store.
+	heartbeatWake chan struct{}
+
 	// quiescent is closed when the in-flight vRPC (if any) has drained
 	// after the session entered StateClosing, or when ForceClose runs.
 	quiescent     chan struct{}
@@ -312,11 +324,12 @@ type SessionOption func(*Session)
 // SessionHooks if you don't need lifecycle callbacks.
 func NewSession(logName string, stream Stream, hooks SessionHooks, sessionType SessionType, opts ...SessionOption) *Session {
 	s := &Session{
-		logName:     logName,
-		stream:      stream,
-		hooks:       hooks,
-		quiescent:   make(chan struct{}),
-		sessionType: sessionType,
+		logName:       logName,
+		stream:        stream,
+		hooks:         hooks,
+		quiescent:     make(chan struct{}),
+		sessionType:   sessionType,
+		heartbeatWake: make(chan struct{}, 1),
 	}
 	s.sessionDebug.init(sessionType)
 	s.state.Store(int32(StateNew))

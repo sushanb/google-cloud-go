@@ -325,6 +325,11 @@ func (s *Session) handleSessionParameters(params *spb.SessionParametersResponse)
 	}
 	s.heartbeatIntervalNano.Store(int64(interval))
 	s.nextHeartbeatDeadlineNano.Store(time.Now().Add(3 * interval).UnixNano())
+	// Wake the watchdog: this is the sole path that changes the interval
+	// itself (not just the deadline), so the Timer must re-evaluate
+	// against 3×interval instead of the initialHeartbeatGrace bootstrap
+	// it was armed to at NewSession.
+	s.wakeHeartbeatLoop()
 }
 
 // handleSessionRefreshConfig stores the server-provided refresh configuration
@@ -499,9 +504,24 @@ func isAbnormalCloseReason(reason string) bool {
 
 // resetHeartbeatDeadline pushes out the watchdog to (3 * heartbeatInterval)
 // from now. The 3x multiplier follows the protocol guidance of tolerating two
-// missed heartbeats. Two atomic loads + one atomic store on the hot path.
+// missed heartbeats. Two atomic loads + one atomic store on the hot path,
+// plus a non-blocking wake to heartBeatLoop so its Timer picks up the new
+// deadline immediately (otherwise the initial 30-min bootstrap arm keeps
+// the loop sleeping past atomic shortenings — SESSION_SPEC.md #7).
 func (s *Session) resetHeartbeatDeadline() {
 	s.nextHeartbeatDeadlineNano.Store(time.Now().Add(3 * time.Duration(s.heartbeatIntervalNano.Load())).UnixNano())
+	s.wakeHeartbeatLoop()
+}
+
+// wakeHeartbeatLoop signals heartBeatLoop to re-evaluate its Timer.
+// Non-blocking send on a cap-1 channel: bursts coalesce into a single
+// pending wake, so hot-path frame handlers stay allocation-free and
+// contention-free even under high frame arrival rates.
+func (s *Session) wakeHeartbeatLoop() {
+	select {
+	case s.heartbeatWake <- struct{}{}:
+	default:
+	}
 }
 
 // heartBeatLoop watches the session's heartbeat deadline using a single Timer
@@ -518,6 +538,17 @@ func (s *Session) heartBeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+			// Timer fired: fall through to re-evaluate.
+		case <-s.heartbeatWake:
+			// Atomic deadline moved (interval change, initial-grace
+			// collapse on first server frame, etc). Drain the pending
+			// Timer so the Reset below is safe per time.Timer docs.
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 		}
 
 		if s.State() == StateClosed {
