@@ -40,7 +40,7 @@ const waitServerCloseGrace = 30 * time.Second
 // session.uptime histogram. Sampling happens without the pool lock so
 // tracer work never blocks CheckoutSession / OnClose.
 func (p *SessionPoolImpl) sampleActiveUptimes(ctx context.Context) {
-	handles := p.allHandles()
+	handles := p.sl.AllHandles()
 	for _, sh := range handles {
 		if sh == nil || sh.session == nil {
 			continue
@@ -64,7 +64,7 @@ func (p *SessionPoolImpl) sweepStuckSessions() {
 	}
 	var victims []victim
 
-	for _, sh := range p.allHandles() {
+	for _, sh := range p.sl.AllHandles() {
 		if sh == nil || sh.session == nil {
 			continue
 		}
@@ -163,7 +163,7 @@ func (p *SessionPoolImpl) Close() error {
 	// Snapshot AFTER marking closed so any OnActive races have either
 	// (a) already added to sl, in which case we see them, or (b) will
 	// see p.closed and route straight to ForceClose without registering.
-	snapshot := p.allHandles()
+	snapshot := p.sl.AllHandles()
 
 	// Record the closes up-front (with PoolClose as the fallback reason)
 	// so the debug counters reflect retirement immediately, even though the
@@ -175,7 +175,7 @@ func (p *SessionPoolImpl) Close() error {
 	// Phase-2 s.Close (notifyClosing → p.OnClosing, closeOnce → p.OnClose)
 	// short-circuits on its poolHandle.Load()==nil guard. Without this,
 	// OnClosing would re-run recordLifetime for every session and OnClose
-	// would call removeSession a second time — sessionList tolerates it
+	// would call sl.OnSessionClosed a second time — sessionList tolerates it
 	// (idempotent), but the lifetimes ring gets 2× the correct entries.
 	for _, sh := range snapshot {
 		if sh != nil && sh.session != nil {
@@ -185,7 +185,7 @@ func (p *SessionPoolImpl) Close() error {
 			p.recordSessionClose(sh.session, "PoolClose")
 			sh.session.poolHandle.Store(nil)
 		}
-		p.removeSession(sh)
+		p.sl.OnSessionClosed(sh)
 	}
 
 	// Phase 2: kick off graceful Close for every session with a bounded ctx
@@ -273,7 +273,7 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 	// "slot empty" with "session available"; drain-driven signaling
 	// separates them. Callback captures p and sh once at OnActive.
 	sh.onSlotDrained = func() {
-		p.releaseSession(sh)
+		p.sl.ReleaseToPool(sh)
 		p.signalFree()
 	}
 	s.poolHandle.Store(sh)
@@ -282,7 +282,7 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 	// Register the newly-Active session in its AFE bucket. PeerInfo is
 	// guaranteed populated at this point — handleOpenSession parses it
 	// synchronously before firing onActive (see session_lifecycle.go).
-	p.registerActive(sh)
+	p.sl.OnSessionStarted(sh)
 
 	// New session is immediately idle. Post a wake-up so a waiting
 	// worker can grab it without waiting out the 50ms safety timer.
@@ -323,9 +323,9 @@ func (p *SessionPoolImpl) OnClosing(s *Session) {
 	// alive (in-flight vRPCs still complete via the session) until
 	// OnClose fires and drops the handle entirely. This also decrements
 	// sl.readyCount, freeing a slot in the scale-up budget.
-	p.markClosing(removed)
+	p.sl.OnSessionClosing(removed)
 
-	if p.readyCount() < p.maxSessions {
+	if p.sl.ReadyCount() < p.maxSessions {
 		go p.PerformScaling(p.poolCtx)
 	}
 }
@@ -357,7 +357,7 @@ func (p *SessionPoolImpl) OnClose(s *Session, err error) {
 	p.mu.Unlock()
 
 	if handle := s.poolHandle.Load(); handle != nil {
-		p.removeSession(handle)
+		p.sl.OnSessionClosed(handle)
 	}
 	// recordSessionClose is once-guarded via s.poolCloseRecorded — safe
 	// to call even when OnClosing already invoked it.
@@ -427,7 +427,7 @@ func (p *SessionPoolImpl) StartAfePrune(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				p.pruneAfes(time.Now())
+				p.sl.Prune(time.Now())
 			}
 		}
 	}()

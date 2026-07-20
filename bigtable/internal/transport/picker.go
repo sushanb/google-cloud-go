@@ -43,7 +43,7 @@ type SessionHandle struct {
 	// inExpectedCount field.
 	inExpectedCount bool
 	// onSlotDrained is set by SessionPoolImpl.OnActive to a closure
-	// that runs releaseSession(sh) + signalFree() — under v3
+	// that runs sl.ReleaseToPool(sh) + signalFree() — under v3
 	// (SESSION_SPEC.md #2 + SESSION_POOL_SPEC.md #6), this callback is
 	// the sole "session became free" signal from Session to pool: it
 	// re-enqueues the session in its AFE idle queue AND wakes one

@@ -275,7 +275,7 @@ type TimeSeriesSample struct {
 }
 
 func (p *SessionPoolImpl) recordTimeSeries() {
-	handles := p.allHandles()
+	handles := p.sl.AllHandles()
 	totalSessions := len(handles)
 	inUse := 0
 	var okTotal, errTotal int64

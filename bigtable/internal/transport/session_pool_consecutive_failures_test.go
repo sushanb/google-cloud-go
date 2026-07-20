@@ -82,7 +82,7 @@ func TestConsecutiveFailures_ResetOnSuccessfulVRpc(t *testing.T) {
 
 	// Inject a live handle and record an ok outcome on it.
 	sh := injectActiveSession(t, p, "healthy", time.Now())
-	p.recordVRpcOutcome(sh, time.Millisecond, time.Millisecond, true)
+	p.noteVRpcOutcome(sh, time.Millisecond, time.Millisecond, true)
 
 	if got := p.consecutiveFailures.Load(); got != 0 {
 		t.Fatalf("after ok vRPC = %d, want 0", got)
@@ -94,7 +94,7 @@ func TestConsecutiveFailures_FailedVRpcDoesNotReset(t *testing.T) {
 	abnormalOnCloseFor(t, p, true)
 
 	sh := injectActiveSession(t, p, "sad", time.Now())
-	p.recordVRpcOutcome(sh, time.Millisecond, time.Millisecond, false)
+	p.noteVRpcOutcome(sh, time.Millisecond, time.Millisecond, false)
 
 	if got := p.consecutiveFailures.Load(); got != 1 {
 		t.Fatalf("failed vRPC changed counter to %d, want 1", got)
