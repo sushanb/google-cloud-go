@@ -16,578 +16,20 @@ package bigtable
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
-	"net"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
-	"google.golang.org/api/option"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
-
-// fakeBigtableServer is an in-process Bigtable server used to exercise the
-// vRPC session path at the wire level. It implements just enough of the
-// BigtableServer surface to handle OpenTable handshakes, PingAndWarm,
-// GetClientConfiguration (returning SessionLoad=1.0 so the Diverter routes
-// traffic through the session path), and VirtualRpc requests for ReadRow /
-// MutateRow.
-//
-// Every VirtualRpcRequest is captured (full proto, under mutex) so tests can
-// assert on Deadline, Metadata.AttemptNumber, Metadata.AttemptStart, and the
-// payload shape. A configurable hook (firstAttemptErr) makes the first vRPC
-// per stream fail with a chosen status — enabling retry tests without per-test
-// server boilerplate.
-type fakeBigtableServer struct {
-	btpb.UnimplementedBigtableServer
-
-	mu                 sync.Mutex
-	vrpcRequests       []*btpb.VirtualRpcRequest
-	openSessionCnt     int
-	closeSessionCnt    int
-	getClientConfigCnt int
-
-	// attemptErrs is a queue: each incoming VirtualRpcRequest pops one
-	// entry and (if non-nil) returns the encoded SessionResponse_Error to
-	// the client. Empty queue = every request succeeds normally.
-	attemptErrs []fakeAttemptErr
-
-	// responseDelay is applied before every reply frame (success or error).
-	// Used to force deadline / cancellation to fire mid-flight.
-	responseDelay time.Duration
-
-	// readRowResponse holds the TableResponse to send for ReadRow vRPCs.
-	// Overridable via setReadRowResponse — the encoded bytes cache is
-	// re-marshaled on set so a "row: nil" reply is representable.
-	readRowResponseBytes []byte
-	// mutateRowResponse is the proto-encoded TableResponse payload returned
-	// for MutateRow virtual RPCs.
-	mutateRowResponseBytes []byte
-
-	// peerInfoHeaderBase is used as a template for the bigtable-peer-info
-	// stream header. If per-session AFE IDs are configured via
-	// setPeerInfoRotation, the fake stamps an increasing ApplicationFrontendId
-	// onto a clone of this template per session; otherwise every session
-	// receives the same base header.
-	peerInfoHeaderBase *btpb.PeerInfo
-	// peerInfoAfeRotation, when non-empty, provides ApplicationFrontendId
-	// values to rotate through on successive OpenTable streams. Guarded by mu.
-	peerInfoAfeRotation []int64
-	// nextPeerInfoIdx is the index into peerInfoAfeRotation for the next
-	// stream. atomic to keep the OpenTable read cheap.
-	nextPeerInfoIdx atomic.Int64
-
-	// poolMinCount/poolMaxCount stamp the SessionPoolConfiguration returned
-	// from GetClientConfiguration. The client's ClientConfigurationManager
-	// treats server-supplied values as authoritative and overwrites the
-	// per-pool min/max — so tests must set these to match the
-	// ClientConfig.SessionPoolMin/Max the harness passes, otherwise the
-	// server defaults (5/400) fill the pool with far more sessions than
-	// the test expects. Defaults align with the harness (1/2).
-	poolMinCount int32
-	poolMaxCount int32
-}
-
-// fakeAttemptErr is one queued reply for a VirtualRpcRequest. RetryInfo is
-// optional; when non-nil, it is packed into the ErrorResponse envelope so
-// the client's retry classifier sees an explicit server go-ahead.
-type fakeAttemptErr struct {
-	Status    *rpcstatus.Status
-	RetryInfo *errdetails.RetryInfo
-}
-
-// getClientConfigCount returns the number of GetClientConfiguration RPCs the
-// server has answered. Used by the harness to wait for the initial poll to
-// land (which is what flips the Diverter to SessionLoad=1.0).
-func (s *fakeBigtableServer) getClientConfigCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.getClientConfigCnt
-}
-
-func newFakeBigtableServer(t *testing.T) *fakeBigtableServer {
-	t.Helper()
-	srv := &fakeBigtableServer{
-		// Match newSessionTestHarness's ClientConfig defaults. Tests that
-		// override SessionPoolMin/Max on the client MUST also call
-		// setSessionPoolSizing on the fake, otherwise the config manager's
-		// UpdateConfig overwrites the client values with these defaults.
-		poolMinCount: 1,
-		poolMaxCount: 2,
-	}
-
-	// Default ReadRow response: row "test-row" with one cell containing
-	// "test-value" under family "fam1", qualifier "col1".
-	rrResp := &btpb.TableResponse{
-		Payload: &btpb.TableResponse_ReadRow{
-			ReadRow: &btpb.SessionReadRowResponse{
-				Row: &btpb.Row{
-					Key: []byte("test-row"),
-					Families: []*btpb.Family{{
-						Name: "fam1",
-						Columns: []*btpb.Column{{
-							Qualifier: []byte("col1"),
-							Cells: []*btpb.Cell{{
-								Value:           []byte("test-value"),
-								TimestampMicros: 1000,
-							}},
-						}},
-					}},
-				},
-			},
-		},
-	}
-	b, err := proto.Marshal(rrResp)
-	if err != nil {
-		t.Fatalf("proto.Marshal ReadRow response: %v", err)
-	}
-	srv.readRowResponseBytes = b
-
-	mrResp := &btpb.TableResponse{
-		Payload: &btpb.TableResponse_MutateRow{
-			MutateRow: &btpb.SessionMutateRowResponse{},
-		},
-	}
-	b, err = proto.Marshal(mrResp)
-	if err != nil {
-		t.Fatalf("proto.Marshal MutateRow response: %v", err)
-	}
-	srv.mutateRowResponseBytes = b
-	return srv
-}
-
-// snapshotVRpcs returns a copy of every VirtualRpcRequest the server has seen.
-func (s *fakeBigtableServer) snapshotVRpcs() []*btpb.VirtualRpcRequest {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]*btpb.VirtualRpcRequest, len(s.vrpcRequests))
-	copy(out, s.vrpcRequests)
-	return out
-}
-
-// setFirstAttemptErr arms the server so the next VirtualRpcRequest is met
-// with the given status (no server-supplied RetryInfo). The arming is
-// cleared after one use. Prefer queueAttemptErrs when the test needs
-// multiple errors or an attached RetryInfo.
-func (s *fakeBigtableServer) setFirstAttemptErr(st *rpcstatus.Status) {
-	s.queueAttemptErrs(fakeAttemptErr{Status: st})
-}
-
-// queueAttemptErrs pushes N errors onto the reply queue. The next N
-// VirtualRpcRequests will each pop one entry (in order) and receive it as
-// a SessionResponse_Error, optionally carrying the supplied RetryInfo.
-// After the queue drains, subsequent requests succeed normally.
-func (s *fakeBigtableServer) queueAttemptErrs(errs ...fakeAttemptErr) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.attemptErrs = append(s.attemptErrs, errs...)
-}
-
-// queuedAttemptErrCount returns how many queued replies remain unused. A
-// zero return after a call means the server consumed every armed error.
-func (s *fakeBigtableServer) queuedAttemptErrCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.attemptErrs)
-}
-
-// setResponseDelay makes the fake sleep this long before sending each
-// reply frame. Used to force ctx deadline / cancel to fire mid-flight.
-func (s *fakeBigtableServer) setResponseDelay(d time.Duration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.responseDelay = d
-}
-
-// setReadRowResponse overrides the TableResponse the fake returns for
-// ReadRow vRPCs. Encodes to bytes once; subsequent requests use the
-// cached slice under mu.
-func (s *fakeBigtableServer) setReadRowResponse(t *testing.T, resp *btpb.TableResponse) {
-	t.Helper()
-	b, err := proto.Marshal(resp)
-	if err != nil {
-		t.Fatalf("proto.Marshal ReadRow override: %v", err)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.readRowResponseBytes = b
-}
-
-// setPeerInfoRotation configures the fake to stamp
-// PeerInfo.ApplicationFrontendId with the values in `ids`, rotating one
-// per OpenTable stream (i.e. one per session). Call before session pool
-// starts opening streams. Non-thread-safe once traffic is flowing.
-func (s *fakeBigtableServer) setPeerInfoRotation(ids []int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.peerInfoAfeRotation = append([]int64(nil), ids...)
-	if s.peerInfoHeaderBase == nil {
-		s.peerInfoHeaderBase = &btpb.PeerInfo{
-			TransportType: btpb.PeerInfo_TRANSPORT_TYPE_SESSION_DIRECT_ACCESS,
-		}
-	}
-}
-
-// setSessionPoolSizing sets the min/max the fake advertises in
-// GetClientConfiguration. Call this BEFORE the harness's
-// waitForSessionRouting completes so the first config poll delivers the
-// intended sizing to the pool.
-func (s *fakeBigtableServer) setSessionPoolSizing(min, max int32) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.poolMinCount = min
-	s.poolMaxCount = max
-}
-
-// closeSessionCount returns how many CloseSession frames the server has
-// received across all streams.
-func (s *fakeBigtableServer) closeSessionCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.closeSessionCnt
-}
-
-// openSessionCount returns how many OpenSession handshakes the server has
-// completed. Bumped once per bidi stream.
-func (s *fakeBigtableServer) openSessionCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.openSessionCnt
-}
-
-// peerInfoHeaderFor returns the base64-encoded PeerInfo header value to
-// stamp onto the OpenTable stream. Returns "" when no peer info is
-// configured (older behaviour — sessions get AfeID=0).
-func (s *fakeBigtableServer) peerInfoHeaderFor(streamIdx int64) string {
-	s.mu.Lock()
-	base := s.peerInfoHeaderBase
-	rot := s.peerInfoAfeRotation
-	s.mu.Unlock()
-	if base == nil {
-		return ""
-	}
-	pi := proto.Clone(base).(*btpb.PeerInfo)
-	if len(rot) > 0 {
-		pi.ApplicationFrontendId = rot[int(streamIdx)%len(rot)]
-	}
-	raw, err := proto.Marshal(pi)
-	if err != nil {
-		return ""
-	}
-	return base64.RawURLEncoding.EncodeToString(raw)
-}
-
-func (s *fakeBigtableServer) PingAndWarm(ctx context.Context, req *btpb.PingAndWarmRequest) (*btpb.PingAndWarmResponse, error) {
-	return &btpb.PingAndWarmResponse{}, nil
-}
-
-func (s *fakeBigtableServer) GetClientConfiguration(ctx context.Context, req *btpb.GetClientConfigurationRequest) (*btpb.ClientConfiguration, error) {
-	s.mu.Lock()
-	s.getClientConfigCnt++
-	minC, maxC := s.poolMinCount, s.poolMaxCount
-	s.mu.Unlock()
-	// SessionLoad: 1.0 pins the Diverter to the session path so every
-	// ReadRow/Apply on the TableShim routes through SessionTable. Note: the
-	// AddSessionLoadListener listener is invoked at registration time with
-	// the manager's *default* config (SessionLoad=0), and is only flipped to
-	// 1.0 once this RPC's response is parsed by the configManager. Tests
-	// must wait for that to happen before issuing data calls — see
-	// waitForSessionRouting in the harness.
-	//
-	// Explicit SessionPool sizing is included because ClientConfigurationManager
-	// treats server values as authoritative and overwrites the per-pool
-	// min/max the client asked for. Leaving SessionPool unset here means the
-	// manager's built-in default (Min=5, Max=400) fills the pool with far
-	// more sessions than tests expect. See setSessionPoolSizing.
-	return &btpb.ClientConfiguration{
-		SessionConfiguration: &btpb.SessionClientConfiguration{
-			SessionLoad: 1.0,
-			SessionPoolConfiguration: &btpb.SessionClientConfiguration_SessionPoolConfiguration{
-				MinSessionCount: minC,
-				MaxSessionCount: maxC,
-			},
-		},
-	}, nil
-}
-
-// OpenTable handles the bidi stream: completes the OpenSession handshake,
-// then for every VirtualRpcRequest decodes the inner TableRequest, captures
-// the full proto, and replies with the appropriate TableResponse (or an
-// error popped from the queue). Also honors an optional response delay so
-// tests can drive deadline / cancel semantics deterministically.
-func (s *fakeBigtableServer) OpenTable(stream btpb.Bigtable_OpenTableServer) error {
-	// Handshake: first message must be OpenSession.
-	first, err := stream.Recv()
-	if err != nil {
-		return err
-	}
-	if first.GetOpenSession() == nil {
-		return fmt.Errorf("fakeBigtableServer: expected OpenSession as first frame, got %T", first.GetPayload())
-	}
-	// Stamp per-stream state before the reply so handleOpenSession sees a
-	// consistent OpenSession count when it lands.
-	streamIdx := s.nextPeerInfoIdx.Add(1) - 1
-	s.mu.Lock()
-	s.openSessionCnt++
-	s.mu.Unlock()
-
-	// If configured, send the bigtable-peer-info header BEFORE the first
-	// response so the client's handleOpenSession parses it synchronously.
-	if hdr := s.peerInfoHeaderFor(streamIdx); hdr != "" {
-		if err := stream.SendHeader(metadata.Pairs("bigtable-peer-info", hdr)); err != nil {
-			return err
-		}
-	}
-
-	if err := stream.Send(&btpb.SessionResponse{
-		Payload: &btpb.SessionResponse_OpenSession{
-			OpenSession: &btpb.OpenSessionResponse{},
-		},
-	}); err != nil {
-		return err
-	}
-
-	for {
-		req, err := stream.Recv()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		// CloseSession ends the stream cleanly.
-		if req.GetCloseSession() != nil {
-			s.mu.Lock()
-			s.closeSessionCnt++
-			s.mu.Unlock()
-			return nil
-		}
-		vrpc := req.GetVirtualRpc()
-		if vrpc == nil {
-			// Ignore other oneof variants (heartbeats etc) — not used here.
-			continue
-		}
-
-		// Capture the full vRPC request and pop one queued error (if any)
-		// under a single lock so ordering is deterministic under load.
-		s.mu.Lock()
-		s.vrpcRequests = append(s.vrpcRequests, vrpc)
-		var armed *fakeAttemptErr
-		if len(s.attemptErrs) > 0 {
-			armed = &s.attemptErrs[0]
-			s.attemptErrs = s.attemptErrs[1:]
-		}
-		delay := s.responseDelay
-		s.mu.Unlock()
-
-		if delay > 0 {
-			select {
-			case <-time.After(delay):
-			case <-stream.Context().Done():
-				return stream.Context().Err()
-			}
-		}
-
-		if armed != nil {
-			errResp := &btpb.SessionResponse{
-				Payload: &btpb.SessionResponse_Error{
-					Error: &btpb.ErrorResponse{
-						RpcId:     vrpc.RpcId,
-						Status:    armed.Status,
-						RetryInfo: armed.RetryInfo,
-					},
-				},
-			}
-			if err := stream.Send(errResp); err != nil {
-				return err
-			}
-			continue
-		}
-
-		// Decode the inner TableRequest to pick the right response shape.
-		var tableReq btpb.TableRequest
-		if err := proto.Unmarshal(vrpc.Payload, &tableReq); err != nil {
-			return fmt.Errorf("fakeBigtableServer: unmarshal TableRequest: %v", err)
-		}
-
-		s.mu.Lock()
-		readBytes := s.readRowResponseBytes
-		writeBytes := s.mutateRowResponseBytes
-		s.mu.Unlock()
-
-		var payload []byte
-		switch tableReq.Payload.(type) {
-		case *btpb.TableRequest_ReadRow:
-			payload = readBytes
-		case *btpb.TableRequest_MutateRow:
-			payload = writeBytes
-		default:
-			return fmt.Errorf("fakeBigtableServer: unsupported TableRequest payload %T", tableReq.Payload)
-		}
-
-		resp := &btpb.SessionResponse{
-			Payload: &btpb.SessionResponse_VirtualRpc{
-				VirtualRpc: &btpb.VirtualRpcResponse{
-					RpcId: vrpc.RpcId,
-					ClusterInfo: &btpb.ClusterInformation{
-						ClusterId: "fake-c1",
-						ZoneId:    "fake-z1",
-					},
-					Stats: &btpb.SessionRequestStats{
-						BackendLatency: durationpb.New(7 * time.Millisecond),
-					},
-					Payload: payload,
-				},
-			},
-		}
-		if err := stream.Send(resp); err != nil {
-			return err
-		}
-	}
-}
-
-// sessionTestHarness wires a fakeBigtableServer to a bufconn-backed grpc.Server
-// and dials it through a real *grpc.ClientConn. Tests then build a Client over
-// that conn with EnableSessionPool=true, which makes ReadRow / Apply traverse
-// the SessionTable → SessionPoolImpl → vRPC plumbing end-to-end.
-//
-// Why a fake server (not bttest):
-// bttest returns Unimplemented for OpenTable, so it cannot drive the
-// session/vRPC path at all. A small inline fake is also faster (no real
-// network) and lets us inspect every VirtualRpcRequest the client sent —
-// which is exactly what we need to assert deadline/metadata plumbing.
-//
-// Why the higher-level Client path (not direct transport.NewSession):
-// We want to verify the full chain — TableShim → SessionTable → SessionPoolImpl
-// → Session → wire frames — actually wires up correctly with EnableSessionPool
-// set on a real client. Passing option.WithGRPCConn(conn) sets
-// enableBigtableConnPool=false (see client.go:175-182), which keeps the dial
-// inside the simple gtransport.DialPool branch and avoids the
-// BigtableChannelPool factory machinery that doesn't play nicely with
-// bufconn. SessionPoolMin=1 / SessionPoolMax=2 keeps the test fleet small.
-type sessionTestHarness struct {
-	t      *testing.T
-	server *fakeBigtableServer
-	grpc   *grpc.Server
-	lis    *bufconn.Listener
-	conn   *grpc.ClientConn
-	client *Client
-}
-
-func newSessionTestHarness(t *testing.T) *sessionTestHarness {
-	t.Helper()
-	lis := bufconn.Listen(1 << 20)
-	grpcSrv := grpc.NewServer()
-	fakeSrv := newFakeBigtableServer(t)
-	btpb.RegisterBigtableServer(grpcSrv, fakeSrv)
-	go func() {
-		// Serve returns when grpcSrv.Stop is called by the test cleanup.
-		_ = grpcSrv.Serve(lis)
-	}()
-
-	dialer := func(ctx context.Context, _ string) (net.Conn, error) {
-		return lis.DialContext(ctx)
-	}
-	conn, err := grpc.NewClient("passthrough:///bufnet",
-		grpc.WithContextDialer(dialer),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		grpcSrv.Stop()
-		t.Fatalf("grpc.NewClient: %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	client, err := NewClientWithConfig(ctx, "test-project", "test-instance", ClientConfig{
-		MetricsProvider:   NoopMetricsProvider{},
-		EnableSessionPool: true,
-		SessionPoolMin:    1,
-		SessionPoolMax:    2,
-	},
-		option.WithGRPCConn(conn),
-		option.WithoutAuthentication(),
-	)
-	if err != nil {
-		_ = conn.Close()
-		grpcSrv.Stop()
-		t.Fatalf("NewClientWithConfig: %v", err)
-	}
-
-	h := &sessionTestHarness{
-		t:      t,
-		server: fakeSrv,
-		grpc:   grpcSrv,
-		lis:    lis,
-		conn:   conn,
-		client: client,
-	}
-	t.Cleanup(h.Close)
-	// Block until the initial configManager poll has landed and flipped the
-	// Diverter to SessionLoad=1.0. Without this, the TableShim consults a
-	// Diverter that still carries the listener's bootstrap value (0.0, set
-	// when the listener was registered with the default config) and routes
-	// to the classic path, which our fake server does not implement.
-	h.waitForSessionRouting(5 * time.Second)
-	return h
-}
-
-// waitForSessionRouting polls the client's Diverter (and the server's
-// GetClientConfiguration counter as a backstop) until both confirm that
-// session routing is enabled. Returns once UseSession() reports true; fails
-// the test on timeout.
-func (h *sessionTestHarness) waitForSessionRouting(timeout time.Duration) {
-	h.t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if h.server.getClientConfigCount() >= 1 && h.client.diverter.UseSession() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	h.t.Fatalf("timed out waiting for Diverter to flip to session routing (getClientConfigCount=%d, useSession=%t)",
-		h.server.getClientConfigCount(), h.client.diverter.UseSession())
-}
-
-func (h *sessionTestHarness) Close() {
-	// Close in dependency order: bigtable.Client first (drains session pool
-	// cleanly), then the gRPC conn, then the server.
-	_ = h.client.Close()
-	_ = h.conn.Close()
-	h.grpc.Stop()
-	_ = h.lis.Close()
-}
-
-// waitForVRpcs polls until the server has captured at least `want` VRpcs or
-// the deadline fires. It returns the snapshot at the time of success so
-// callers can assert on it without racing against late deliveries.
-func waitForVRpcs(t *testing.T, srv *fakeBigtableServer, want int, timeout time.Duration) []*btpb.VirtualRpcRequest {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		got := srv.snapshotVRpcs()
-		if len(got) >= want {
-			return got
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timed out after %v waiting for %d vRPCs (saw %d)", timeout, want, len(srv.snapshotVRpcs()))
-	return nil
-}
 
 // TestIntegration_SessionVRpc_ReadRow exercises ReadRow end-to-end through the
 // vRPC session path and asserts the row arrives back from the fake server.
@@ -619,7 +61,7 @@ func TestIntegration_SessionVRpc_ReadRow(t *testing.T) {
 	}
 	// Confirm the payload was a ReadRow TableRequest.
 	var tr btpb.TableRequest
-	if err := proto.Unmarshal(vrpcs[0].Payload, &tr); err != nil {
+	if err := proto.Unmarshal(vrpcs[0].req.Payload, &tr); err != nil {
 		t.Fatalf("decode captured TableRequest: %v", err)
 	}
 	if tr.GetReadRow() == nil {
@@ -651,7 +93,7 @@ func TestIntegration_SessionVRpc_Apply(t *testing.T) {
 		t.Errorf("server saw %d vRPCs, want exactly 1", len(vrpcs))
 	}
 	var tr btpb.TableRequest
-	if err := proto.Unmarshal(vrpcs[0].Payload, &tr); err != nil {
+	if err := proto.Unmarshal(vrpcs[0].req.Payload, &tr); err != nil {
 		t.Fatalf("decode captured TableRequest: %v", err)
 	}
 	if tr.GetMutateRow() == nil {
@@ -677,7 +119,7 @@ func TestIntegration_SessionVRpc_RequestCarriesDeadline(t *testing.T) {
 	}
 
 	vrpcs := waitForVRpcs(t, h.server, 1, 2*time.Second)
-	v := vrpcs[0]
+	v := vrpcs[0].req
 	if v.Deadline == nil {
 		t.Fatal("VirtualRpcRequest.Deadline = nil, want non-nil")
 	}
@@ -702,7 +144,7 @@ func TestIntegration_SessionVRpc_RequestCarriesMetadata(t *testing.T) {
 	}
 
 	vrpcs := waitForVRpcs(t, h.server, 1, 2*time.Second)
-	v := vrpcs[0]
+	v := vrpcs[0].req
 	if v.Metadata == nil {
 		t.Fatal("VirtualRpcRequest.Metadata = nil")
 	}
@@ -772,7 +214,7 @@ func TestIntegration_SessionVRpc_RetriesOnUnavailable(t *testing.T) {
 	// that Invoke subsequently reads via VRpcAttempt(ctx).
 	wantAttempts := []int64{1, 2}
 	for i, want := range wantAttempts {
-		v := vrpcs[i]
+		v := vrpcs[i].req
 		if v.GetMetadata() == nil {
 			t.Errorf("vrpcs[%d].Metadata = nil, want non-nil", i)
 			continue
@@ -784,7 +226,7 @@ func TestIntegration_SessionVRpc_RetriesOnUnavailable(t *testing.T) {
 	// Sanity: at least one frame must be a ReadRow (both should be, but
 	// the second is what we care about for retry semantics).
 	var tr btpb.TableRequest
-	if err := proto.Unmarshal(vrpcs[1].Payload, &tr); err != nil {
+	if err := proto.Unmarshal(vrpcs[1].req.Payload, &tr); err != nil {
 		t.Fatalf("decode retry TableRequest: %v", err)
 	}
 	if tr.GetReadRow() == nil {
@@ -1120,62 +562,20 @@ func TestIntegration_SessionVRpc_ConcurrentLoad(t *testing.T) {
 // multiple sessions, then snapshots SessionDebug and asserts BOTH AFE IDs
 // appear on live sessions. Exercises PeerInfo extraction + AFE grouping.
 func TestIntegration_SessionVRpc_PeerInfoParsedIntoAfeID(t *testing.T) {
-	// Build the fake + harness manually so we can pre-load PeerInfo before
-	// the pool starts opening streams. The standard harness starts session
-	// polling in NewClientWithConfig, so the rotation must be set beforehand
-	// via a small hand-rolled variant of newSessionTestHarness.
-	lis := bufconn.Listen(1 << 20)
-	grpcSrv := grpc.NewServer()
-	fakeSrv := newFakeBigtableServer(t)
-	// Match the ClientConfig sizing below (Min=2, Max=4) so the config
-	// manager doesn't overwrite them with its 5/400 defaults.
-	fakeSrv.setSessionPoolSizing(2, 4)
-	fakeSrv.setPeerInfoRotation([]int64{4242, 8484})
-	btpb.RegisterBigtableServer(grpcSrv, fakeSrv)
-	go func() { _ = grpcSrv.Serve(lis) }()
-	t.Cleanup(func() { grpcSrv.Stop(); _ = lis.Close() })
-
-	dialer := func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }
-	conn, err := grpc.NewClient("passthrough:///bufnet",
-		grpc.WithContextDialer(dialer),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	// SessionPoolMin=2 forces both AFE-tagged sessions to open eagerly;
+	// setPeerInfoRotation must run before Serve so the fake stamps distinct
+	// AFE IDs onto successive streams.
+	h := newSessionTestHarness(t,
+		withPoolSize(2, 4),
+		withFakeSetup(func(s *fakeBigtableServer) { s.setPeerInfoRotation([]int64{4242, 8484}) }),
 	)
-	if err != nil {
-		t.Fatalf("grpc.NewClient: %v", err)
-	}
-	t.Cleanup(func() { _ = conn.Close() })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	client, err := NewClientWithConfig(ctx, "test-project", "test-instance", ClientConfig{
-		MetricsProvider:   NoopMetricsProvider{},
-		EnableSessionPool: true,
-		SessionPoolMin:    2, // force 2 sessions up front so both AFE IDs land
-		SessionPoolMax:    4,
-	},
-		option.WithGRPCConn(conn),
-		option.WithoutAuthentication(),
-	)
-	if err != nil {
-		t.Fatalf("NewClientWithConfig: %v", err)
-	}
-	t.Cleanup(func() { _ = client.Close() })
-
-	// Wait for routing to flip.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if fakeSrv.getClientConfigCount() >= 1 && client.diverter.UseSession() {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !client.diverter.UseSession() {
-		t.Fatalf("timed out waiting for session routing")
-	}
 
 	// Drive a read so the read pool opens (lazy). SessionPoolMin=2 guarantees
 	// both AFE-tagged sessions get created for the read pool.
-	tbl := client.OpenTable("test-table")
+	tbl := h.client.OpenTable("test-table")
 	if _, err := tbl.ReadRow(ctx, "test-row"); err != nil {
 		t.Fatalf("ReadRow: %v", err)
 	}
@@ -1183,7 +583,7 @@ func TestIntegration_SessionVRpc_PeerInfoParsedIntoAfeID(t *testing.T) {
 	// Poll the debug snapshot briefly — session opens are asynchronous with
 	// SessionPoolMin fills, so the second session may not be Ready yet at
 	// the moment the first ReadRow returns.
-	prov := client.SessionDebug()
+	prov := h.client.SessionDebug()
 	if prov == nil {
 		t.Fatal("client.SessionDebug() = nil")
 	}
@@ -1214,54 +614,263 @@ func TestIntegration_SessionVRpc_PeerInfoParsedIntoAfeID(t *testing.T) {
 	}
 }
 
-// TestIntegration_SessionVRpc_ClientCloseSendsCloseSession asserts that
-// tearing down the Client triggers a CloseSession frame per session — the
-// polite shutdown path the server expects for accounting.
-func TestIntegration_SessionVRpc_ClientCloseSendsCloseSession(t *testing.T) {
-	// Manual harness — we need to close the Client mid-test rather than
-	// letting t.Cleanup do it, so we can observe the effect.
-	lis := bufconn.Listen(1 << 20)
-	grpcSrv := grpc.NewServer()
-	fakeSrv := newFakeBigtableServer(t)
-	btpb.RegisterBigtableServer(grpcSrv, fakeSrv)
-	go func() { _ = grpcSrv.Serve(lis) }()
-	t.Cleanup(func() { grpcSrv.Stop(); _ = lis.Close() })
-
-	dialer := func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }
-	conn, err := grpc.NewClient("passthrough:///bufnet",
-		grpc.WithContextDialer(dialer),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		t.Fatalf("grpc.NewClient: %v", err)
-	}
-	t.Cleanup(func() { _ = conn.Close() })
+// TestIntegration_SessionVRpc_ServerErrorRetriesOnDifferentSession pins
+// down the "don't wait for ctx, retry on a different session" contract
+// (SESSION_SPEC.md invariants 5, 8, 9): when the server terminates the
+// session while a vRPC is in flight, the client MUST force-close that
+// session, cancel the in-flight attempt with StateTransportFailure, and
+// let the retry oracle re-pick a peer — completing well before the
+// caller's ctx deadline.
+//
+// This test uses a session-level ErrorResponse (rpc_id=0) as the
+// trigger. That's the same client-side path the missed-heartbeat
+// watchdog reaches (handleErrorResponse → ForceClose →
+// cancelActiveRPCs); the watchdog itself can't be exercised from an
+// integration test because heartBeatLoop arms its timer to
+// initialHeartbeatGrace (30 min) at spawn and doesn't reschedule when a
+// later SessionParameters frame shortens the interval.
+//
+// Setup:
+//   - Pool sized Min=2/Max=4 so a second Ready session exists when the
+//     first one is force-closed. Min=1 would work but adds jitter from
+//     on-demand pool refill.
+//   - queueSessionLevelErrs(Unavailable) makes the first vRPC to arrive
+//     be answered with a session-level error; the fake then closes that
+//     stream. Subsequent vRPCs (retries) hit a different session and
+//     succeed normally.
+//   - Caller ctx = 10s. The test asserts wall-clock elapsed is well
+//     under that — proving the retry did not sit on the caller's ctx.
+func TestIntegration_SessionVRpc_ServerErrorRetriesOnDifferentSession(t *testing.T) {
+	// SessionPoolMin=2 guarantees a Ready peer exists for the retry to land
+	// on the moment the failed session force-closes.
+	h := newSessionTestHarness(t, withPoolSize(2, 4))
+	fakeSrv, tbl := h.server, h.client.OpenTable("test-table")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	client, err := NewClientWithConfig(ctx, "test-project", "test-instance", ClientConfig{
-		MetricsProvider:   NoopMetricsProvider{},
-		EnableSessionPool: true,
-		SessionPoolMin:    1,
-		SessionPoolMax:    2,
-	},
-		option.WithGRPCConn(conn),
-		option.WithoutAuthentication(),
-	)
-	if err != nil {
-		t.Fatalf("NewClientWithConfig: %v", err)
-	}
 
-	// Wait for routing so at least one session is open.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if fakeSrv.getClientConfigCount() >= 1 && client.diverter.UseSession() {
+	if _, err := tbl.ReadRow(ctx, "warmup"); err != nil {
+		t.Fatalf("warmup ReadRow: %v", err)
+	}
+	// Wait until at least 2 sessions have completed the OpenSession
+	// handshake — a retry-ready peer must exist before we arm the fault.
+	pollDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(pollDeadline) {
+		if fakeSrv.openSessionCount() >= 2 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	if got := fakeSrv.openSessionCount(); got < 2 {
+		t.Fatalf("openSessionCount = %d after warmup, want >= 2 (need a retry-ready peer)", got)
+	}
+	warmupVRpcs := len(fakeSrv.snapshotVRpcs())
+
+	// ForceClose (triggered by the session-level error path) sends NO
+	// CloseSessionRequest — stream is presumed dead. Snapshot before, and
+	// re-check after ReadRow returns (before test cleanup Close() bumps it).
+	closesBefore := fakeSrv.closeSessionCount()
+
+	// Arm one session-level Unavailable and fire the real ReadRow.
+	fakeSrv.queueSessionLevelErrs(fakeAttemptErr{
+		Status: &rpcstatus.Status{
+			Code:    int32(codes.Unavailable),
+			Message: "simulated server-side session teardown",
+		},
+	})
+	start := time.Now()
+	row, err := tbl.ReadRow(ctx, "test-row")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("ReadRow after session-level error: %v (elapsed=%v)", err, elapsed)
+	}
+	if row == nil {
+		t.Fatal("ReadRow returned nil row after retry")
+	}
+	if got := string(row["fam1"][0].Value); got != "test-value" {
+		t.Errorf("cell value = %q, want %q", got, "test-value")
+	}
+
+	// The whole retry — force-close, pool re-pick, second attempt —
+	// should complete in tens of ms; the 3s bound is generous slack. If
+	// the retry regressed to waiting for the caller's ctx, this bound
+	// trips first, catching the regression the test exists to guard.
+	if elapsed > 3*time.Second {
+		t.Errorf("elapsed = %v, want < 3s (retry must fire off the server's session-level error, not the caller's ctx deadline)", elapsed)
+	}
+
+	// EXACTLY two attempts landed on the wire past warmup: the failed
+	// one (captured before the session-level error came back) and the
+	// successful retry. Requiring exact count guards against a regression
+	// in the I5 (ReleaseToPool inExpectedCount) gate that could re-queue
+	// a drained session and trigger extra attempts.
+	vrpcs := waitForVRpcs(t, fakeSrv, warmupVRpcs+2, 3*time.Second)
+	got := vrpcs[warmupVRpcs:]
+	if len(got) != 2 {
+		t.Fatalf("post-warmup vRPCs = %d, want exactly 2", len(got))
+	}
+	wantAttempts := []int64{1, 2}
+	for i, want := range wantAttempts {
+		if got[i].req.GetMetadata().GetAttemptNumber() != want {
+			t.Errorf("post-warmup vrpcs[%d].AttemptNumber = %d, want %d",
+				i, got[i].req.GetMetadata().GetAttemptNumber(), want)
+		}
+	}
+	for i, v := range got[:2] {
+		var tr btpb.TableRequest
+		if err := proto.Unmarshal(v.req.Payload, &tr); err != nil {
+			t.Fatalf("decode vrpcs[%d]: %v", warmupVRpcs+i, err)
+		}
+		if tr.GetReadRow() == nil {
+			t.Errorf("vrpcs[%d] was not a ReadRow: %T", warmupVRpcs+i, tr.Payload)
+		}
+	}
+
+	// Prove the retry hopped sessions: stream index of the second
+	// attempt must differ from the first. Both indexes come from the
+	// same snapshot as the requests above, so an in-flight append can't
+	// misalign this assertion against a fresh vRPC arriving.
+	if got[0].streamIdx == got[1].streamIdx {
+		t.Errorf("retry landed on the same stream (idx %d) as the failed attempt; want different session",
+			got[0].streamIdx)
+	}
+
+	// ForceClose (session-level error path) sends NO CloseSessionRequest
+	// — stream is presumed dead. If closeSessionCount grew, the client
+	// took the graceful-close branch instead, violating SESSION_SPEC #5/#8.
+	if got := fakeSrv.closeSessionCount(); got != closesBefore {
+		t.Errorf("closeSessionCount grew from %d to %d during force-close path; want no CloseSession frame on ForceClose",
+			closesBefore, got)
+	}
+}
+
+// TestIntegration_SessionVRpc_HeartbeatWatchdogReactiveToSessionParameters
+// proves the reactive coupling between the heartbeat atomic and the
+// heartBeatLoop Timer. See SESSION_SPEC.md #7 ("Any frame in either
+// direction resets the deadline"): SessionParameters shortens
+// `heartbeatIntervalNano` AND `nextHeartbeatDeadlineNano`; the wake on
+// `heartbeatWake` reshuffles the Timer so a stalled vRPC in the first
+// 30 min of a session is caught by the missed-heartbeat watchdog — NOT
+// by the caller's ctx deadline. Without the wake, the Timer stays armed
+// to the `initialHeartbeatGrace = 30 min` bootstrap set at NewSession,
+// and no atomic shortening reshuffles it.
+//
+// Setup:
+//   - Pool sized to 2 (min=max) so both sessions are open before ReadRow.
+//   - Fake negotiates KeepAlive=100ms → atomic deadline = now + 300ms.
+//   - queueVRpcStalls(1) makes ONLY the first incoming vRPC hang; the
+//     retry that lands on the second session sees an empty stall queue
+//     and returns the normal ReadRow response.
+//   - Caller ctx = 3 s. If the watchdog WERE non-reactive, the first
+//     vRPC would stall until ctx expiry (retry loop never fires because
+//     ctx is done inside attempt 1), and ReadRow would return
+//     context.DeadlineExceeded near the 3-s mark.
+//
+// Assertions:
+//   - err == nil — retry landed on a healthy session and succeeded.
+//   - Elapsed <= 1.5 s — the first attempt was killed by the watchdog
+//     (~300ms) plus retry backoff (~10ms), not by the 3-s caller ctx.
+//   - SessionDebug shows exactly one session with
+//     CloseReason=="MissedHeartbeat" — the stalled first session.
+//   - closeSessionCount stays 0 for the missed-heartbeat path (ForceClose
+//     skips the graceful CloseSession frame — SESSION_SPEC #5/#8).
+//
+// If someone removes wakeHeartbeatLoop from handleSessionParameters (or
+// from resetHeartbeatDeadline), this test flips back to failing with a
+// ~3-s DeadlineExceeded — that regression is exactly what the reactive
+// coupling exists to prevent.
+func TestIntegration_SessionVRpc_HeartbeatWatchdogReactiveToSessionParameters(t *testing.T) {
+	// min=max=2 keeps both sessions open before ReadRow so the retry after
+	// ForceClose has an immediately-available peer to land on (no wait on
+	// pool replacement open). withReverseCloseOrder is mandatory here —
+	// client.Close would otherwise hang on the graceful CloseSession
+	// exchange the stall prevents the fake from processing.
+	h := newSessionTestHarness(t,
+		withPoolSize(2, 2),
+		withFakeSetup(func(s *fakeBigtableServer) {
+			// 100 ms KeepAlive → atomic heartbeat deadline = now + 300 ms
+			// after any inbound/outbound frame. With the Timer reactive to
+			// the atomic (via heartbeatWake), the watchdog fires ~300 ms
+			// into a stalled vRPC — before the caller's 3-s ctx does.
+			s.setSessionParamsKeepAlive(100 * time.Millisecond)
+			// ONLY the first vRPC stalls; the retry sees an empty stall
+			// queue and gets the standard ReadRow response. That's what
+			// turns "did the watchdog fire?" into an observable
+			// success/failure split: reactive → retry succeeds;
+			// non-reactive → ctx times out on attempt #1.
+			s.queueVRpcStalls(1)
+		}),
+		withReverseCloseOrder(),
+	)
+	fakeSrv := h.server
+	tbl := h.client.OpenTable("test-table")
+
+	// Caller ctx has plenty of slack (3 s ≫ 300 ms). If the watchdog is
+	// non-reactive, the first attempt stalls until this ctx expires; if
+	// reactive, the watchdog kills attempt #1 in ~300 ms and the retry
+	// completes well inside the ctx.
+	callCtx, callCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer callCancel()
+
+	start := time.Now()
+	_, err := tbl.ReadRow(callCtx, "test-row")
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("ReadRow returned err=%v (elapsed=%v); expected success on retry after watchdog force-closed the stalled first session. If elapsed is near the 3-s ctx, the watchdog Timer likely stopped reacting to the SessionParameters atomic — check wakeHeartbeatLoop wiring in handleSessionParameters.",
+			err, elapsed)
+	}
+
+	// Timing gate: elapsed must be near 300 ms + backoff (~10-50 ms), NOT
+	// near the 3-s ctx. 1.5 s leaves generous slack for CI jitter while
+	// still catching a "watchdog stopped firing" regression.
+	if elapsed > 1500*time.Millisecond {
+		t.Errorf("elapsed = %v, want <= 1.5s (watchdog should have fired at ~300 ms and let the retry succeed; a value near the 3-s ctx means the reactive-watchdog path is broken)",
+			elapsed)
+	}
+
+	// The stalled session must show up in the pool's CloseReasons
+	// aggregate as "MissedHeartbeat" — the per-session snapshot rows are
+	// pruned as soon as sessionList drops the closed handle, but the
+	// pool's lifetime counter survives. Non-zero here is definitive
+	// proof that heartBeatLoop reached its ForceClose branch, and not
+	// some other error path (transport drop, ctx cancel) that would
+	// also fail the first attempt.
+	var missedCount int64
+	if prov := h.client.SessionDebug(); prov != nil {
+		for _, pool := range prov.Snapshot() {
+			missedCount += pool.CloseReasons["MissedHeartbeat"]
+		}
+	}
+	if missedCount == 0 {
+		t.Error("PoolSnapshot.CloseReasons has no MissedHeartbeat entry — retry succeeded but not via the watchdog path this test is meant to exercise")
+	}
+
+	// ForceClose on missed-heartbeat MUST NOT send a graceful CloseSession
+	// frame (SESSION_SPEC #5/#8: ForceClose presumes the stream is dead).
+	// Zero here proves the watchdog took the ForceClose branch, not a
+	// graceful Close.
+	if got := fakeSrv.closeSessionCount(); got != 0 {
+		t.Errorf("closeSessionCount = %d, want 0 (missed-heartbeat force-close must not emit a CloseSession frame)", got)
+	}
+}
+
+// TestIntegration_SessionVRpc_ClientCloseSendsCloseSession asserts that
+// tearing down the Client triggers a CloseSession frame per session — the
+// polite shutdown path the server expects for accounting.
+func TestIntegration_SessionVRpc_ClientCloseSendsCloseSession(t *testing.T) {
+	// Uses the standard harness (waitForRouting fires, so at least one
+	// session is open by the time we snapshot). We call client.Close mid-
+	// test to observe the effect; the harness's own Close later is a safe
+	// no-op double-close.
+	h := newSessionTestHarness(t)
+	fakeSrv := h.server
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	// Force one ReadRow so the read pool opens (lazy).
-	if _, err := client.OpenTable("test-table").ReadRow(ctx, "test-row"); err != nil {
+	if _, err := h.client.OpenTable("test-table").ReadRow(ctx, "test-row"); err != nil {
 		t.Fatalf("ReadRow: %v", err)
 	}
 
@@ -1275,11 +884,11 @@ func TestIntegration_SessionVRpc_ClientCloseSendsCloseSession(t *testing.T) {
 	// The race is benign — the frame is enqueued before conn shutdown — so
 	// we log but don't fail on it. What we care about is the ordering: at
 	// least ONE CloseSession frame reached the server before the socket died.
-	if err := client.Close(); err != nil {
+	if err := h.client.Close(); err != nil {
 		t.Logf("client.Close returned (non-fatal): %v", err)
 	}
 
-	deadline = time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if fakeSrv.closeSessionCount() >= 1 {
 			break
