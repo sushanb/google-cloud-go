@@ -246,7 +246,7 @@ func TestSessionClient_BuildLazyOpener_NilPayloadReturnsNil(t *testing.T) {
 	sc := newTestClient(t, nil, Config{})
 	defer sc.Close()
 
-	got := sc.buildLazyOpener("projects/p/instances/i/materializedViews/v", nil, nil, nil, "mv:v:write")
+	got := sc.buildLazyOpener("projects/p/instances/i/materializedViews/v", nil, nil, nil, poolKey{"mv:v", permissionWrite})
 	if got != nil {
 		t.Errorf("buildLazyOpener(payload=nil) = non-nil, want nil (MV write side)")
 	}

@@ -116,6 +116,46 @@ type managedPool struct {
 	unregister func()
 }
 
+// permission is the read/write axis of a pool's identity. Kept as a
+// typed enum (not a string suffix on the map key) so getOrCreatePool
+// doesn't have to reverse-parse the key to label the pool.
+type permission int
+
+const (
+	permissionRead permission = iota
+	permissionWrite
+)
+
+// display returns the label used in pool display names (e.g. "READ").
+func (p permission) display() string {
+	switch p {
+	case permissionRead:
+		return "READ"
+	case permissionWrite:
+		return "WRITE"
+	}
+	return ""
+}
+
+// poolKey identifies one pool inside sessionClient.pools. Resource is
+// the caller-supplied short name ("table:foo", "av:t:v", "mv:v");
+// permission separates the read pool from the write pool for the same
+// resource. Struct keys let the map dedup on both axes without string
+// concatenation.
+type poolKey struct {
+	resource string
+	perm     permission
+}
+
+// less orders poolKeys for stable snapshot rendering (resource first,
+// then permission).
+func (k poolKey) less(other poolKey) bool {
+	if k.resource != other.resource {
+		return k.resource < other.resource
+	}
+	return k.perm < other.perm
+}
+
 // sessionClient is the internal implementation of the SessionClient
 // interface. Owns the channel pool + gRPC stub + configuration
 // manager, and vends per-resource SessionTableApi instances.
@@ -132,7 +172,7 @@ type sessionClient struct {
 	backgroundCancel context.CancelFunc // release when Close() runs
 
 	poolsMu    sync.Mutex
-	pools      map[string]*managedPool
+	pools      map[poolKey]*managedPool
 	nextPoolID atomic.Uint64
 }
 
@@ -267,7 +307,7 @@ func newSessionClientFromParts(channelPool ChannelPool, stub btpb.BigtableClient
 		channelPool:    channelPool,
 		stub:           stub,
 		metricsFactory: metricsFactory,
-		pools:          make(map[string]*managedPool),
+		pools:          make(map[poolKey]*managedPool),
 	}
 	if stub != nil {
 		sc.configManager = btransport.NewClientConfigurationManager(
@@ -344,74 +384,40 @@ func (sc *sessionClient) MetricsFactory() *metrics.Factory {
 // OpenSessionTable returns a SessionTableApi for a standard table.
 func (sc *sessionClient) OpenSessionTable(tableName string) SessionTableApi {
 	fullName := sc.fullTableName(tableName)
-	openRead := sc.buildLazyOpener(
-		fullName,
-		btransport.TABLE_SESSION,
-		func(ctx context.Context) (btransport.Stream, error) { return sc.stub.OpenTable(ctx) },
-		&btpb.OpenTableRequest{
-			TableName:    fullName,
-			AppProfileId: sc.cfg.AppProfile,
-			Permission:   btpb.OpenTableRequest_PERMISSION_READ,
-		},
-		fmt.Sprintf("table:%s:read", tableName),
-	)
-	openWrite := sc.buildLazyOpener(
-		fullName,
-		btransport.TABLE_SESSION,
-		func(ctx context.Context) (btransport.Stream, error) { return sc.stub.OpenTable(ctx) },
-		&btpb.OpenTableRequest{
-			TableName:    fullName,
-			AppProfileId: sc.cfg.AppProfile,
-			Permission:   btpb.OpenTableRequest_PERMISSION_WRITE,
-		},
-		fmt.Sprintf("table:%s:write", tableName),
-	)
+	streamFactory := func(ctx context.Context) (btransport.Stream, error) { return sc.stub.OpenTable(ctx) }
+	resource := "table:" + tableName
+	openRead := sc.buildLazyOpener(fullName, btransport.TABLE_SESSION, streamFactory,
+		&btpb.OpenTableRequest{TableName: fullName, AppProfileId: sc.cfg.AppProfile, Permission: btpb.OpenTableRequest_PERMISSION_READ},
+		poolKey{resource, permissionRead})
+	openWrite := sc.buildLazyOpener(fullName, btransport.TABLE_SESSION, streamFactory,
+		&btpb.OpenTableRequest{TableName: fullName, AppProfileId: sc.cfg.AppProfile, Permission: btpb.OpenTableRequest_PERMISSION_WRITE},
+		poolKey{resource, permissionWrite})
 	return newSessionTable(fullName, openRead, openWrite, btransport.READ_ROW, btransport.MUTATE_ROW, sc.perResourceMetadata(fullName, "table_name", fullName), sc.metricsFactory)
 }
 
 // OpenAuthorizedView returns a SessionTableApi for an authorized view.
 func (sc *sessionClient) OpenAuthorizedView(table, view string) SessionTableApi {
 	fullName := sc.fullAuthorizedViewName(table, view)
-	openRead := sc.buildLazyOpener(
-		fullName,
-		btransport.AUTHORIZED_VIEW_SESSION,
-		func(ctx context.Context) (btransport.Stream, error) { return sc.stub.OpenAuthorizedView(ctx) },
-		&btpb.OpenAuthorizedViewRequest{
-			AuthorizedViewName: fullName,
-			AppProfileId:       sc.cfg.AppProfile,
-			Permission:         btpb.OpenAuthorizedViewRequest_PERMISSION_READ,
-		},
-		fmt.Sprintf("av:%s:%s:read", table, view),
-	)
-	openWrite := sc.buildLazyOpener(
-		fullName,
-		btransport.AUTHORIZED_VIEW_SESSION,
-		func(ctx context.Context) (btransport.Stream, error) { return sc.stub.OpenAuthorizedView(ctx) },
-		&btpb.OpenAuthorizedViewRequest{
-			AuthorizedViewName: fullName,
-			AppProfileId:       sc.cfg.AppProfile,
-			Permission:         btpb.OpenAuthorizedViewRequest_PERMISSION_WRITE,
-		},
-		fmt.Sprintf("av:%s:%s:write", table, view),
-	)
+	streamFactory := func(ctx context.Context) (btransport.Stream, error) { return sc.stub.OpenAuthorizedView(ctx) }
+	resource := fmt.Sprintf("av:%s:%s", table, view)
+	openRead := sc.buildLazyOpener(fullName, btransport.AUTHORIZED_VIEW_SESSION, streamFactory,
+		&btpb.OpenAuthorizedViewRequest{AuthorizedViewName: fullName, AppProfileId: sc.cfg.AppProfile, Permission: btpb.OpenAuthorizedViewRequest_PERMISSION_READ},
+		poolKey{resource, permissionRead})
+	openWrite := sc.buildLazyOpener(fullName, btransport.AUTHORIZED_VIEW_SESSION, streamFactory,
+		&btpb.OpenAuthorizedViewRequest{AuthorizedViewName: fullName, AppProfileId: sc.cfg.AppProfile, Permission: btpb.OpenAuthorizedViewRequest_PERMISSION_WRITE},
+		poolKey{resource, permissionWrite})
 	return newSessionTable(fullName, openRead, openWrite, btransport.READ_ROW_AUTH_VIEW, btransport.MUTATE_ROW_AUTH_VIEW, sc.perResourceMetadata(fullName, "authorized_view_name", fullName), sc.metricsFactory)
 }
 
 // OpenMaterializedView returns a read-only SessionTableApi for a
-// materialized view. Write pool closure stays nil so MutateRow
-// errors cleanly.
+// materialized view. Only a read pool is opened; MutateRow errors
+// cleanly via the nil openWrite passed to newSessionTable.
 func (sc *sessionClient) OpenMaterializedView(view string) SessionTableApi {
 	fullName := sc.fullMaterializedViewName(view)
-	openRead := sc.buildLazyOpener(
-		fullName,
-		btransport.MATERIALIZED_VIEW_SESSION,
+	openRead := sc.buildLazyOpener(fullName, btransport.MATERIALIZED_VIEW_SESSION,
 		func(ctx context.Context) (btransport.Stream, error) { return sc.stub.OpenMaterializedView(ctx) },
-		&btpb.OpenMaterializedViewRequest{
-			MaterializedViewName: fullName,
-			AppProfileId:         sc.cfg.AppProfile,
-		},
-		fmt.Sprintf("mv:%s:read", view),
-	)
+		&btpb.OpenMaterializedViewRequest{MaterializedViewName: fullName, AppProfileId: sc.cfg.AppProfile},
+		poolKey{"mv:" + view, permissionRead})
 	return newSessionTable(fullName, openRead, nil, btransport.READ_ROW_MAT_VIEW, nil, sc.perResourceMetadata(fullName, "materialized_view_name", fullName), sc.metricsFactory)
 }
 
@@ -457,7 +463,7 @@ func (sc *sessionClient) buildLazyOpener(
 	sessionDesc *btransport.SessionDescriptor,
 	streamFactory func(ctx context.Context) (btransport.Stream, error),
 	payload proto.Message,
-	key string,
+	key poolKey,
 ) func() (Invoker, error) {
 	if payload == nil {
 		return nil
@@ -483,7 +489,7 @@ func (sc *sessionClient) createPoolForPayload(
 	sessionDesc *btransport.SessionDescriptor,
 	streamFactory func(ctx context.Context) (btransport.Stream, error),
 	payload proto.Message,
-	key string,
+	key poolKey,
 ) (*btransport.SessionPoolImpl, error) {
 	if payload == nil {
 		return nil, nil
@@ -534,7 +540,7 @@ func (sc *sessionClient) createPoolForPayload(
 // dedups on key, mints a display name, constructs the pool, wires
 // the config listener + background loops.
 func (sc *sessionClient) getOrCreatePool(
-	key string,
+	key poolKey,
 	min, max int,
 	streamFactory func(ctx context.Context) (btransport.Stream, error),
 	openSessionRequest *btpb.OpenSessionRequest,
@@ -548,18 +554,12 @@ func (sc *sessionClient) getOrCreatePool(
 		return mp.pool
 	}
 	id := sc.nextPoolID.Add(1)
-	permission := ""
-	if strings.HasSuffix(key, ":read") {
-		permission = "READ"
-	} else if strings.HasSuffix(key, ":write") {
-		permission = "WRITE"
-	}
 	poolName := fmt.Sprintf("%sPool-%d", sessionType.ProtoName(), id)
 	if shortName != "" {
 		poolName += " (" + shortName + ")"
 	}
-	if permission != "" {
-		poolName += " [" + permission + "]"
+	if label := key.perm.display(); label != "" {
+		poolName += " [" + label + "]"
 	}
 	pool := btransport.NewSessionPoolImpl(poolName, min, max, streamFactory, openSessionRequest, md, sessionType)
 	pool.SetPoolID(id)
@@ -652,22 +652,9 @@ func (sc *sessionClient) ConfigManager() *btransport.ClientConfigurationManager 
 // pool key for stable rendering. Same lock discipline as
 // SessionManager.ManagerSnapshot.
 func (sc *sessionClient) PoolSnapshots() []btransport.PoolSnapshot {
-	sc.poolsMu.Lock()
-	type entry struct {
-		key  string
-		pool *btransport.SessionPoolImpl
-	}
-	entries := make([]entry, 0, len(sc.pools))
-	for k, mp := range sc.pools {
-		entries = append(entries, entry{key: k, pool: mp.pool})
-	}
-	sc.poolsMu.Unlock()
-	sort.Slice(entries, func(i, j int) bool { return entries[i].key < entries[j].key })
+	entries := sc.orderedPoolEntries()
 	out := make([]btransport.PoolSnapshot, 0, len(entries))
 	for _, e := range entries {
-		if e.pool == nil {
-			continue
-		}
 		out = append(out, e.pool.PoolSnapshot())
 	}
 	return out
@@ -676,25 +663,35 @@ func (sc *sessionClient) PoolSnapshots() []btransport.PoolSnapshot {
 // LoadBalancingSnapshots returns per-pool picker + pick-history
 // snapshots for loadz. Ordered by pool key.
 func (sc *sessionClient) LoadBalancingSnapshots() []btransport.LoadBalancingSnapshot {
-	sc.poolsMu.Lock()
-	type entry struct {
-		key  string
-		pool *btransport.SessionPoolImpl
-	}
-	entries := make([]entry, 0, len(sc.pools))
-	for k, mp := range sc.pools {
-		entries = append(entries, entry{key: k, pool: mp.pool})
-	}
-	sc.poolsMu.Unlock()
-	sort.Slice(entries, func(i, j int) bool { return entries[i].key < entries[j].key })
+	entries := sc.orderedPoolEntries()
 	out := make([]btransport.LoadBalancingSnapshot, 0, len(entries))
 	for _, e := range entries {
-		if e.pool == nil {
-			continue
-		}
 		out = append(out, e.pool.LoadBalancingSnapshot())
 	}
 	return out
+}
+
+// poolEntry is the internal (key, pool) tuple used by snapshot methods
+// so they can sort by poolKey without duplicating the collection loop.
+type poolEntry struct {
+	key  poolKey
+	pool *btransport.SessionPoolImpl
+}
+
+// orderedPoolEntries snapshots the pools map under lock and returns
+// its non-nil entries sorted by poolKey.
+func (sc *sessionClient) orderedPoolEntries() []poolEntry {
+	sc.poolsMu.Lock()
+	entries := make([]poolEntry, 0, len(sc.pools))
+	for k, mp := range sc.pools {
+		if mp == nil || mp.pool == nil {
+			continue
+		}
+		entries = append(entries, poolEntry{key: k, pool: mp.pool})
+	}
+	sc.poolsMu.Unlock()
+	sort.Slice(entries, func(i, j int) bool { return entries[i].key.less(entries[j].key) })
+	return entries
 }
 
 // ChannelPool returns the *btransport.BigtableChannelPool the
