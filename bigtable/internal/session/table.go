@@ -24,11 +24,18 @@ import (
 	"cloud.google.com/go/bigtable/internal/metrics"
 	btransport "cloud.google.com/go/bigtable/internal/transport"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
 )
 
 // ErrWriteNotSupported is returned by MutateRow when the resource has
 // no write pool — e.g. materialized views, which are read-only.
 var ErrWriteNotSupported = errors.New("bigtable/session: write operations not supported on this resource")
+
+// errReadPoolNil is returned when the READ lazy pool resolves to nil.
+// Unreachable in practice — every resource has a read side. Distinct
+// from ErrWriteNotSupported so a stray occurrence is diagnosable
+// instead of silently misclassified as a write-side failure.
+var errReadPoolNil = errors.New("bigtable/session: read pool is nil (unreachable — every resource has a read side)")
 
 // sessionTable implements SessionTableApi. Read and write session
 // pools open lazily on first call (see lazyPool). No classic
@@ -81,58 +88,17 @@ func (t *sessionTable) ReadRow(ctx context.Context, req *btpb.SessionReadRowRequ
 	if req == nil {
 		return nil, errors.New("bigtable/session: SessionReadRowRequest is nil")
 	}
-	readPool, poolErr := t.readPool.get()
-	if poolErr != nil {
-		return nil, fmt.Errorf("session read pool open: %w", poolErr)
-	}
-	if readPool == nil {
-		return nil, ErrWriteNotSupported // reused for "no read support" — unreachable in practice since every resource has a read side
-	}
-
-	ctx = attachOutgoingMetadata(ctx, t.md)
-	ctx, mt, ownedTracer := t.ensureTracer(ctx, "ReadRow")
-	if ownedTracer {
-		defer mt.RecordOperationCompletion()
-	}
-
-	retryInterceptor := btransport.RetryingVRpc(btransport.RetryingOptions{
-		MaxAttempts:       10,
-		InitialBackoff:    10 * time.Millisecond,
-		MaxBackoff:        32 * time.Second,
-		BackoffMultiplier: 1.5,
-		Idempotent:        true,
+	return dispatch[btransport.ReadRowArgs, btpb.SessionReadRowResponse, *btpb.SessionReadRowResponse](ctx, t, opSpec[btransport.ReadRowArgs, btpb.SessionReadRowResponse, *btpb.SessionReadRowResponse]{
+		method:     "ReadRow",
+		pool:       t.readPool,
+		desc:       t.readVRpcDesc,
+		idempotent: true,
+		args: btransport.ReadRowArgs{
+			RowKey: string(req.GetKey()),
+			Filter: req.GetFilter(),
+		},
+		errNoPool: errReadPoolNil,
 	})
-
-	args := btransport.ReadRowArgs{
-		RowKey: string(req.GetKey()),
-		Filter: req.GetFilter(),
-	}
-	baseHandler := func(attemptCtx context.Context, request interface{}) (interface{}, error) {
-		attemptTracer := metrics.FromContext(attemptCtx)
-		attemptTracer.RecordAttemptStart()
-		result, err := readPool.Invoke(attemptCtx, t.readVRpcDesc, request)
-		stampAttempt(attemptCtx, result)
-		attemptTracer.RecordAttemptCompletion(nil, nil, err)
-		if err != nil {
-			return nil, err
-		}
-		return result.Response, nil
-	}
-
-	ctx = btransport.WithVRpcMetadata(ctx, t.readVRpcDesc.Method(), 0)
-	chained := btransport.ChainInterceptors(retryInterceptor)
-	res, err := chained(ctx, args, baseHandler)
-	if ownedTracer {
-		mt.SetCurrOpStatus(metrics.GrpcCodeOf(err))
-	}
-	if err != nil {
-		return nil, fmt.Errorf("session ReadRow vRPC: %w", err)
-	}
-	resp, ok := res.(*btpb.SessionReadRowResponse)
-	if !ok || resp == nil {
-		return nil, fmt.Errorf("session ReadRow: missing response payload (%T)", res)
-	}
-	return resp, nil
 }
 
 // MutateRow dispatches a proto-native MutateRow through a lazily-
@@ -146,16 +112,58 @@ func (t *sessionTable) MutateRow(ctx context.Context, req *btpb.SessionMutateRow
 	if req == nil {
 		return nil, errors.New("bigtable/session: SessionMutateRowRequest is nil")
 	}
-	writePool, poolErr := t.writePool.get()
+	return dispatch[btransport.MutateRowArgs, btpb.SessionMutateRowResponse, *btpb.SessionMutateRowResponse](ctx, t, opSpec[btransport.MutateRowArgs, btpb.SessionMutateRowResponse, *btpb.SessionMutateRowResponse]{
+		method:     "MutateRow",
+		pool:       t.writePool,
+		desc:       t.writeVRpcDesc,
+		idempotent: mutationsAreRetryable(req.GetMutations()),
+		args: btransport.MutateRowArgs{
+			RowKey:    string(req.GetKey()),
+			Mutations: req.GetMutations(),
+		},
+		errNoPool: ErrWriteNotSupported,
+	})
+}
+
+// opSpec parameterises dispatch over the six axes that used to differ
+// between ReadRow and MutateRow: RPC method label (for tracer + error
+// context), pool, descriptor, idempotence, encoded args, and the
+// error to return when the lazy pool resolves to nil.
+//
+// Resp is constrained to *R (a pointer type whose element implements
+// proto.Message) so the response type-assertion stays compile-time
+// safe AND `resp == nil` remains a legal comparison inside dispatch.
+type opSpec[Args any, R any, Resp interface {
+	*R
+	proto.Message
+}] struct {
+	method     string
+	pool       *lazyPool
+	desc       btransport.VRpcDescriptor
+	idempotent bool
+	args       Args
+	errNoPool  error
+}
+
+// dispatch is the shared body that ReadRow/MutateRow (and any future
+// per-op session RPC — Scan, ReadModifyWrite when they land) reduce
+// to. Return type is the caller-instantiated Resp so the response
+// coerce stays compile-time safe.
+func dispatch[Args any, R any, Resp interface {
+	*R
+	proto.Message
+}](ctx context.Context, t *sessionTable, spec opSpec[Args, R, Resp]) (Resp, error) {
+	var zero Resp
+	pool, poolErr := spec.pool.get()
 	if poolErr != nil {
-		return nil, fmt.Errorf("session write pool open: %w", poolErr)
+		return zero, fmt.Errorf("session %s pool open: %w", spec.method, poolErr)
 	}
-	if writePool == nil {
-		return nil, ErrWriteNotSupported
+	if pool == nil {
+		return zero, spec.errNoPool
 	}
 
 	ctx = attachOutgoingMetadata(ctx, t.md)
-	ctx, mt, ownedTracer := t.ensureTracer(ctx, "MutateRow")
+	ctx, mt, ownedTracer := t.ensureTracer(ctx, spec.method)
 	if ownedTracer {
 		defer mt.RecordOperationCompletion()
 	}
@@ -165,17 +173,13 @@ func (t *sessionTable) MutateRow(ctx context.Context, req *btpb.SessionMutateRow
 		InitialBackoff:    10 * time.Millisecond,
 		MaxBackoff:        32 * time.Second,
 		BackoffMultiplier: 1.5,
-		Idempotent:        mutationsAreRetryable(req.GetMutations()),
+		Idempotent:        spec.idempotent,
 	})
 
-	args := btransport.MutateRowArgs{
-		RowKey:    string(req.GetKey()),
-		Mutations: req.GetMutations(),
-	}
 	baseHandler := func(attemptCtx context.Context, request interface{}) (interface{}, error) {
 		attemptTracer := metrics.FromContext(attemptCtx)
 		attemptTracer.RecordAttemptStart()
-		result, err := writePool.Invoke(attemptCtx, t.writeVRpcDesc, request)
+		result, err := pool.Invoke(attemptCtx, spec.desc, request)
 		stampAttempt(attemptCtx, result)
 		attemptTracer.RecordAttemptCompletion(nil, nil, err)
 		if err != nil {
@@ -184,18 +188,18 @@ func (t *sessionTable) MutateRow(ctx context.Context, req *btpb.SessionMutateRow
 		return result.Response, nil
 	}
 
-	ctx = btransport.WithVRpcMetadata(ctx, t.writeVRpcDesc.Method(), 0)
+	ctx = btransport.WithVRpcMetadata(ctx, spec.desc.Method(), 0)
 	chained := btransport.ChainInterceptors(retryInterceptor)
-	res, err := chained(ctx, args, baseHandler)
+	res, err := chained(ctx, spec.args, baseHandler)
 	if ownedTracer {
 		mt.SetCurrOpStatus(metrics.GrpcCodeOf(err))
 	}
 	if err != nil {
-		return nil, fmt.Errorf("session MutateRow vRPC: %w", err)
+		return zero, fmt.Errorf("session %s vRPC: %w", spec.method, err)
 	}
-	resp, ok := res.(*btpb.SessionMutateRowResponse)
+	resp, ok := res.(Resp)
 	if !ok || resp == nil {
-		return nil, fmt.Errorf("session MutateRow: missing response payload (%T)", res)
+		return zero, fmt.Errorf("session %s: missing response payload (%T)", spec.method, res)
 	}
 	return resp, nil
 }
