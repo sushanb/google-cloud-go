@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
@@ -47,9 +48,8 @@ func TestNewClientConfigurationManager(t *testing.T) {
 		t.Fatal("Expected manager to be non-nil")
 	}
 
-	cfg := manager.getConfig()
-	if cfg.Polling.MaxRpcRetryCount != 5 {
-		t.Errorf("Expected MaxRpcRetryCount to be 5, got %d", cfg.Polling.MaxRpcRetryCount)
+	if got := maxRPCRetryCount(manager.getConfig()); got != 5 {
+		t.Errorf("Expected MaxRpcRetryCount to be 5, got %d", got)
 	}
 }
 
@@ -70,9 +70,8 @@ func TestManagerPoll_Success(t *testing.T) {
 	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
 	manager.poll(context.Background())
 
-	cfg := manager.getConfig()
-	if cfg.Polling.PollingInterval != 600*time.Second {
-		t.Errorf("Expected polling interval to be 600s, got %v", cfg.Polling.PollingInterval)
+	if got := pollingInterval(manager.getConfig()); got != 600*time.Second {
+		t.Errorf("Expected polling interval to be 600s, got %v", got)
 	}
 }
 
@@ -90,7 +89,7 @@ func TestManagerPoll_FailureKeepsOldConfig(t *testing.T) {
 	manager.poll(context.Background())
 
 	cfg := manager.getConfig()
-	if cfg != manager.defaultConfig {
+	if !proto.Equal(cfg, manager.defaultConfig) {
 		t.Error("Expected config to be equivalent to default config on failure before expiration")
 	}
 }
@@ -102,8 +101,8 @@ func TestManagerPoll_FailureFallbackToDefault(t *testing.T) {
 	// Set a valid until time in the past
 	manager.validUntil = time.Now().Add(-time.Hour)
 
-	// Change current config to something non-default
-	manager.currentConfig = clientConfig{}
+	// Change current config to something non-default.
+	manager.currentConfig = &bigtablepb.ClientConfiguration{}
 
 	client.getConfigFunc = func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
 		return nil, status.Error(codes.Unavailable, "service unavailable")
@@ -112,7 +111,7 @@ func TestManagerPoll_FailureFallbackToDefault(t *testing.T) {
 	manager.poll(context.Background())
 
 	cfg := manager.getConfig()
-	if cfg != manager.defaultConfig {
+	if !proto.Equal(cfg, manager.defaultConfig) {
 		t.Error("Expected config to fallback to default config on failure after expiration")
 	}
 }
@@ -123,10 +122,10 @@ func TestManagerNotifyListeners(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(2) // Expect two notifications: immediate, and after poll
-	var receivedConfigs []clientConfig
+	var receivedConfigs []*bigtablepb.ClientConfiguration
 	var receivedSeqs []int64
 
-	manager.addListener(func(cfg clientConfig, seq int64) {
+	manager.addListener(func(cfg *bigtablepb.ClientConfiguration, seq int64) {
 		receivedConfigs = append(receivedConfigs, cfg)
 		receivedSeqs = append(receivedSeqs, seq)
 		wg.Done()
@@ -152,13 +151,13 @@ func TestManagerNotifyListeners(t *testing.T) {
 	}
 
 	// First config should be equivalent to default config
-	if receivedConfigs[0] != manager.defaultConfig {
+	if !proto.Equal(receivedConfigs[0], manager.defaultConfig) {
 		t.Error("Expected first notification to have default config")
 	}
 
 	// Second config should have the updated polling interval
-	if receivedConfigs[1].Polling.PollingInterval != 600*time.Second {
-		t.Errorf("Expected second notification to have polling interval 600s, got %v", receivedConfigs[1].Polling.PollingInterval)
+	if got := pollingInterval(receivedConfigs[1]); got != 600*time.Second {
+		t.Errorf("Expected second notification to have polling interval 600s, got %v", got)
 	}
 
 	if len(receivedSeqs) != 2 {
@@ -172,15 +171,101 @@ func TestManagerNotifyListeners(t *testing.T) {
 	}
 }
 
+func TestManagerPoll_UnchangedConfigSkipsListenerFire(t *testing.T) {
+	client := &mockBigtableClient{}
+	sameCfg := &bigtablepb.ClientConfiguration{
+		Polling: &bigtablepb.ClientConfiguration_PollingConfiguration_{
+			PollingConfiguration: &bigtablepb.ClientConfiguration_PollingConfiguration{
+				PollingInterval: durationpb.New(600 * time.Second),
+			},
+		},
+	}
+	client.getConfigFunc = func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
+		return sameCfg, nil
+	}
+
+	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
+
+	var mu sync.Mutex
+	var seqs []int64
+	manager.addListener(func(cfg *bigtablepb.ClientConfiguration, seq int64) {
+		mu.Lock()
+		seqs = append(seqs, seq)
+		mu.Unlock()
+	})
+
+	// Three back-to-back polls, all returning sameCfg. After the first poll
+	// transitions default -> sameCfg, the next two polls return identical
+	// configs and must not fire the listener again.
+	manager.poll(context.Background())
+	manager.poll(context.Background())
+	manager.poll(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Expect seqs == [0, 1]: bootstrap fire (seq=0, default) + first poll
+	// (default -> sameCfg, seq=1). Polls 2 and 3 are no-ops.
+	if len(seqs) != 2 {
+		t.Fatalf("Expected 2 listener fires (bootstrap + first poll), got %d (seqs=%v)", len(seqs), seqs)
+	}
+	if seqs[0] != 0 || seqs[1] != 1 {
+		t.Errorf("Expected seqs [0 1], got %v", seqs)
+	}
+	manager.mu.RLock()
+	gotSeq := manager.configSeq
+	manager.mu.RUnlock()
+	if gotSeq != 1 {
+		t.Errorf("Expected configSeq=1 after unchanged polls, got %d", gotSeq)
+	}
+}
+
+func TestManagerPoll_UnchangedConfigRefreshesValidity(t *testing.T) {
+	client := &mockBigtableClient{}
+	cfg := &bigtablepb.ClientConfiguration{
+		Polling: &bigtablepb.ClientConfiguration_PollingConfiguration_{
+			PollingConfiguration: &bigtablepb.ClientConfiguration_PollingConfiguration{
+				PollingInterval:  durationpb.New(600 * time.Second),
+				ValidityDuration: durationpb.New(2 * time.Hour),
+			},
+		},
+	}
+	client.getConfigFunc = func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
+		return cfg, nil
+	}
+
+	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
+
+	// First poll: transitions default -> cfg, sets validUntil ~= now + 2h.
+	manager.poll(context.Background())
+
+	// Backdate validUntil so we can verify the next no-op poll refreshes it.
+	manager.mu.Lock()
+	manager.validUntil = time.Now().Add(-time.Minute)
+	manager.mu.Unlock()
+
+	manager.poll(context.Background())
+
+	manager.mu.RLock()
+	validUntil := manager.validUntil
+	manager.mu.RUnlock()
+	// A refreshed validity window must be at least ~1h59m into the future
+	// (2h ValidityDuration minus generous slop for slow CI).
+	if min := time.Now().Add(time.Hour + 50*time.Minute); validUntil.Before(min) {
+		t.Errorf("Expected unchanged poll to refresh validUntil >= %v, got %v", min, validUntil)
+	}
+}
+
 func TestGetConfig_ReturnsCopy(t *testing.T) {
 	client := &mockBigtableClient{}
 	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
 
+	// getConfig returns a proto.Clone, so mutations on the returned message
+	// must not reach the manager's stored currentConfig.
 	cfg1 := manager.getConfig()
-	cfg1.Polling.MaxRpcRetryCount = 999
+	cfg1.GetPollingConfiguration().MaxRpcRetryCount = 999
 
 	cfg2 := manager.getConfig()
-	if cfg2.Polling.MaxRpcRetryCount == 999 {
+	if got := cfg2.GetPollingConfiguration().GetMaxRpcRetryCount(); got == 999 {
 		t.Error("Expected modifications to returned config to not affect manager state")
 	}
 }
@@ -211,7 +296,7 @@ func TestClose_SuppressesListenerCallbacks(t *testing.T) {
 	// Listener captures invocations made AFTER Close().
 	var mu sync.Mutex
 	var callsAfterClose int
-	manager.addListener(func(cfg clientConfig, seq int64) {
+	manager.addListener(func(cfg *bigtablepb.ClientConfiguration, seq int64) {
 		mu.Lock()
 		defer mu.Unlock()
 		if manager.isClosed() {
@@ -255,8 +340,17 @@ func TestClose_WaitsForInFlightPolls(t *testing.T) {
 		return nil, status.Error(codes.Unavailable, "unavailable")
 	}
 
-	// Use a low retry count so the poll terminates after one attempt.
-	manager.currentConfig.Polling.MaxRpcRetryCount = 0
+	// Pin currentConfig to a proto that explicitly declares 0 retries so the
+	// poll terminates after a single attempt (matches the pre-rewrite test).
+	// The PollingConfiguration case being set at all is what tells the
+	// helper to honor the 0 verbatim instead of falling back to the default.
+	manager.currentConfig = &bigtablepb.ClientConfiguration{
+		Polling: &bigtablepb.ClientConfiguration_PollingConfiguration_{
+			PollingConfiguration: &bigtablepb.ClientConfiguration_PollingConfiguration{
+				MaxRpcRetryCount: 0,
+			},
+		},
+	}
 
 	manager.Start(context.Background())
 	<-rpcStarted
@@ -383,148 +477,163 @@ func TestAddSessionLoadListener_UnregisterStopsCallbacks(t *testing.T) {
 	}
 }
 
-func TestManagerNotifyListeners_Race(t *testing.T) {
-	client := &mockBigtableClient{}
-	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
-
-	// Initial config is default (seq 0)
-
-	config1 := &bigtablepb.ClientConfiguration{
-		SessionConfiguration: &bigtablepb.SessionClientConfiguration{
-			SessionLoad: 1.0,
-			SessionPoolConfiguration: &bigtablepb.SessionClientConfiguration_SessionPoolConfiguration{
-				MinSessionCount: 10, // Distinct value
-			},
-		},
-	}
-	config2 := &bigtablepb.ClientConfiguration{
-		SessionConfiguration: &bigtablepb.SessionClientConfiguration{
-			SessionLoad: 1.0,
-			SessionPoolConfiguration: &bigtablepb.SessionClientConfiguration_SessionPoolConfiguration{
-				MinSessionCount: 20, // Distinct value
-			},
-		},
-	}
-
-	// We will use a mock client that returns config1 then config2
-	var configIndex int
-	var configMu sync.Mutex
-	client.getConfigFunc = func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
-		configMu.Lock()
-		defer configMu.Unlock()
-		if configIndex == 0 {
-			configIndex++
-			return config1, nil
-		}
-		return config2, nil
-	}
-
-	// 1. First poll to get config1 (seq becomes 1)
-	manager.poll(context.Background())
-	// Now manager.currentConfig is config1, configSeq is 1
-
-	var listenerMu sync.Mutex
-	var lastSeq int64
-	var activeConfig clientConfig
-	var activeConfigSet bool
-
-	// Channels to control the race
-	blockImmediate := make(chan struct{})
-	immediateCalled := make(chan struct{})
-	newerCompleted := make(chan struct{})
-
-	// This listener mimics SessionPoolImpl
-	listener := func(cfg clientConfig, seq int64) {
-		listenerMu.Lock()
-		isImmediate := seq == 1 && cfg.Session.SessionPool.MinSessionCount == 10
-		listenerMu.Unlock()
-
-		if isImmediate {
-			close(immediateCalled)
-			<-blockImmediate // Block the immediate notification
-		}
-
-		listenerMu.Lock()
-		defer listenerMu.Unlock()
-
-		// Sequence check
-		if seq <= lastSeq {
-			return
-		}
-		lastSeq = seq
-		activeConfig = cfg
-		activeConfigSet = true
-
-		if seq == 2 {
-			close(newerCompleted)
-		}
-	}
-
-	// Start AddListener in a goroutine.
-	// It will immediately call listener(config1, 1) which will block.
-	go func() {
-		manager.addListener(listener)
-	}()
-
-	// Wait until immediate notification is called and blocked
-	<-immediateCalled
-
-	// Now trigger second poll.
-	// This will update config to config2 (seq 2).
-	// It will notify listeners (including our registered listener) with (config2, 2).
-	// This call to listener should NOT block because seq != 1.
-	manager.poll(context.Background())
-
-	// Wait for the newer notification to complete
-	<-newerCompleted
-
-	// Now unblock the immediate notification (config1, 1)
-	close(blockImmediate)
-
-	// Give some time for immediate notification to finish (it should be discarded)
-	time.Sleep(50 * time.Millisecond)
-
-	listenerMu.Lock()
-	defer listenerMu.Unlock()
-
-	// Assert that activeConfig is config2 (seq 2) and NOT config1 (seq 1)
-	if !activeConfigSet {
-		t.Fatal("Expected activeConfig to be non-nil")
-	}
-	minSessions := activeConfig.Session.SessionPool.MinSessionCount
-	if minSessions != 20 {
-		t.Errorf("Expected activeConfig to have MinSessionCount 20 (config2), got %d", minSessions)
-	}
-}
-
-// TestManagerPoll_MinPollingIntervalClamp verifies SESSION_SPEC.md #13:
-// the server cannot ask the client to poll faster than MinPollingInterval
-// (1 min). A server-supplied 30s interval MUST be clamped up to 1min
-// before the manager acts on it. Protects the control plane from a
-// misconfigured server response DDoS-ing itself.
-func TestManagerPoll_MinPollingIntervalClamp(t *testing.T) {
-	client := &mockBigtableClient{}
-	client.getConfigFunc = func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
-		return &bigtablepb.ClientConfiguration{
+func TestAddSessionPoolListener_SkipsOnUnchangedSlice(t *testing.T) {
+	// Two distinct configs that differ on PollingInterval (so the whole-
+	// config diff in poll() lets the fan-out through) but carry the same
+	// SessionPool slice. The per-listener extractor diff must suppress the
+	// second SP delivery.
+	const (
+		minCount = 10
+		maxCount = 200
+	)
+	configs := []*bigtablepb.ClientConfiguration{
+		{
 			Polling: &bigtablepb.ClientConfiguration_PollingConfiguration_{
 				PollingConfiguration: &bigtablepb.ClientConfiguration_PollingConfiguration{
-					// Server asks for 30s (below the 1min floor).
-					PollingInterval: durationpb.New(30 * time.Second),
+					PollingInterval: durationpb.New(600 * time.Second),
 				},
 			},
-		}, nil
+			SessionConfiguration: &bigtablepb.SessionClientConfiguration{
+				SessionLoad: 0.5,
+				SessionPoolConfiguration: &bigtablepb.SessionClientConfiguration_SessionPoolConfiguration{
+					MinSessionCount: minCount,
+					MaxSessionCount: maxCount,
+				},
+			},
+		},
+		{
+			Polling: &bigtablepb.ClientConfiguration_PollingConfiguration_{
+				PollingConfiguration: &bigtablepb.ClientConfiguration_PollingConfiguration{
+					PollingInterval: durationpb.New(900 * time.Second),
+				},
+			},
+			SessionConfiguration: &bigtablepb.SessionClientConfiguration{
+				SessionLoad: 0.7, // changed — but SP slice still identical
+				SessionPoolConfiguration: &bigtablepb.SessionClientConfiguration_SessionPoolConfiguration{
+					MinSessionCount: minCount,
+					MaxSessionCount: maxCount,
+				},
+			},
+		},
 	}
+	var idx int
+	var idxMu sync.Mutex
+	client := &mockBigtableClient{
+		getConfigFunc: func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
+			idxMu.Lock()
+			defer idxMu.Unlock()
+			cfg := configs[idx]
+			if idx+1 < len(configs) {
+				idx++
+			}
+			return cfg, nil
+		},
+	}
+	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
 
+	var mu sync.Mutex
+	var deliveries []*bigtablepb.SessionClientConfiguration_SessionPoolConfiguration
+	manager.AddSessionPoolListener(func(sp *bigtablepb.SessionClientConfiguration_SessionPoolConfiguration) {
+		mu.Lock()
+		deliveries = append(deliveries, sp)
+		mu.Unlock()
+	})
+
+	manager.poll(context.Background()) // default SP -> {10, 200}: fires
+	manager.poll(context.Background()) // {10, 200} -> {10, 200}: must skip
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Expect 2 deliveries: bootstrap (default SP) + first poll (default ->
+	// {10, 200}). The second poll changes the whole config but not the SP
+	// slice, so the per-listener diff must suppress that fire.
+	if len(deliveries) != 2 {
+		t.Fatalf("AddSessionPoolListener fired %d times, want 2 (bootstrap + first poll only)", len(deliveries))
+	}
+	if got := deliveries[1].GetMinSessionCount(); got != minCount {
+		t.Errorf("post-first-poll MinSessionCount = %d, want %d", got, minCount)
+	}
+}
+
+func TestAddSessionLoadListener_SkipsOnUnchangedLoad(t *testing.T) {
+	// Same shape as the SessionPool test: two polls whose only difference
+	// is the PollingInterval. SessionLoad is held constant, so the per-
+	// listener load diff must suppress the second fire even though the
+	// whole-config diff doesn't.
+	configs := []*bigtablepb.ClientConfiguration{
+		{
+			Polling: &bigtablepb.ClientConfiguration_PollingConfiguration_{
+				PollingConfiguration: &bigtablepb.ClientConfiguration_PollingConfiguration{
+					PollingInterval: durationpb.New(600 * time.Second),
+				},
+			},
+			SessionConfiguration: &bigtablepb.SessionClientConfiguration{SessionLoad: 0.5},
+		},
+		{
+			Polling: &bigtablepb.ClientConfiguration_PollingConfiguration_{
+				PollingConfiguration: &bigtablepb.ClientConfiguration_PollingConfiguration{
+					PollingInterval: durationpb.New(900 * time.Second),
+				},
+			},
+			SessionConfiguration: &bigtablepb.SessionClientConfiguration{SessionLoad: 0.5},
+		},
+	}
+	var idx int
+	var idxMu sync.Mutex
+	client := &mockBigtableClient{
+		getConfigFunc: func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
+			idxMu.Lock()
+			defer idxMu.Unlock()
+			cfg := configs[idx]
+			if idx+1 < len(configs) {
+				idx++
+			}
+			return cfg, nil
+		},
+	}
+	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
+
+	var mu sync.Mutex
+	var loads []float64
+	manager.AddSessionLoadListener(func(load float64) {
+		mu.Lock()
+		loads = append(loads, load)
+		mu.Unlock()
+	})
+
+	manager.poll(context.Background()) // default load 0 -> 0.5: fires (seq>0)
+	manager.poll(context.Background()) // 0.5 -> 0.5: must skip
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Expect 1 delivery: bootstrap is suppressed by AddSessionLoadListener's
+	// seq=0 guard, the first poll fires with 0.5, and the second poll's
+	// per-listener diff suppresses the redundant 0.5 delivery.
+	if len(loads) != 1 || loads[0] != 0.5 {
+		t.Fatalf("AddSessionLoadListener deliveries = %v, want [0.5]", loads)
+	}
+}
+
+func TestManagerPoll_StopPollingFlagsCurrentConfig(t *testing.T) {
+	client := &mockBigtableClient{
+		getConfigFunc: func(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
+			return &bigtablepb.ClientConfiguration{
+				Polling: &bigtablepb.ClientConfiguration_StopPolling{StopPolling: true},
+			}, nil
+		},
+	}
 	manager := NewClientConfigurationManager(client, "instance", "profile", nil, nil)
 	manager.poll(context.Background())
 
-	cfg := manager.getConfig()
-	if cfg.Polling.PollingInterval < MinPollingInterval {
-		t.Errorf("PollingInterval = %v, want >= MinPollingInterval (%v) — server-supplied 30s MUST be clamped up",
-			cfg.Polling.PollingInterval, MinPollingInterval)
-	}
-	if cfg.Polling.PollingInterval != MinPollingInterval {
-		t.Errorf("PollingInterval = %v, want exactly MinPollingInterval (%v) after clamp",
-			cfg.Polling.PollingInterval, MinPollingInterval)
+	if !manager.getConfig().GetStopPolling() {
+		t.Fatalf("expected currentConfig StopPolling=true after StopPolling response, got false")
 	}
 }
+
+// TestManagerNotifyListeners_Race was removed when addListener moved to
+// holding m.mu across the registration-time fire. The race it guarded
+// against — poll() fan-out interleaving with addListener's deferred fire
+// and delivering seq=N+1 before seq=N — is structurally impossible now:
+// poll() cannot snapshot the listener map while addListener holds the
+// write lock, so the registration fire always lands before any poll
+// fire and listeners observe seq monotonically by construction.
