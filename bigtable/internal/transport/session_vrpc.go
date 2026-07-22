@@ -17,6 +17,7 @@ package internal
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
@@ -287,49 +288,8 @@ func (s *Session) recordCtxDone(ctx context.Context, rpc *vrpcImpl, method strin
 // L567-614 parity — the cancel branch there discards the response
 // tracer-side; here we just count it).
 func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
-	// A vRPC response is only expected while the session is Ready or
-	// Closing (drain window). Any other state means either a bug in
-	// state tracking or a server retransmit after teardown — drop.
-	st := s.State()
-	if !assertDebugTagf(st == StateReady || st == StateClosing, tagSessionVRPCResponseWrongState,
-		"vRPC response for rpc_id=%d arrived in state %s", resp.RpcId, st) {
-		return
-	}
-	rpc := s.activeVRPC()
-	if rpc == nil {
-		recordDebugTag(tagSessionVRPCNil)
-		s.debugf("dropping VirtualRpcResponse for rpc_id=%d — no in-flight RPC tracked", resp.RpcId)
-		return
-	}
-	if rpc.id != resp.RpcId {
-		recordDebugTag(tagSessionVRPCIDMismatch)
-		s.debugf("dropping VirtualRpcResponse rpc_id=%d != in-flight rpc_id=%d", resp.RpcId, rpc.id)
-		return
-	}
-	drained, cancel, ok := s.drainSlot(rpc)
-	if !ok {
-		// Racing cancelActiveRPCs (session teardown) drained the slot
-		// between the id-match above and our drainSlot call. Its
-		// deliver already fired the terminal error; nothing to do.
-		return
-	}
-	s.okRpcs.Add(1)
-	if cancel != nil {
-		// Caller already returned via ctx.Done — no one is waiting on
-		// resultChan. Just count the drain for observability.
-		recordDebugTag(tagSessionVRPCCancelledDrained)
-	} else {
-		s.deliver(drained, vrpcResult{resp: resp})
-	}
-	// v3: drainSlot success is the sole "session became free" signal.
-	// Fires on every drain (not just the cancelled branch) so the pool
-	// re-enqueues the session in its AFE idle queue and wakes one
-	// parked Checkout waiter. Invoke's return path in the pool no
-	// longer performs the re-enqueue or the wake.
-	s.notifySlotDrained()
-	if State(s.state.Load()) == StateClosing {
-		s.signalQuiescent()
-	}
+	s.routeVRPCFrame(resp.RpcId, "VirtualRpcResponse", tagSessionVRPCNil,
+		&s.okRpcs, vrpcResult{resp: resp})
 }
 
 // handleVRPCErrorResponse routes per-vRPC errors to the waiting caller.
@@ -337,34 +297,61 @@ func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
 // Mirrors handleVRPCResponse's Java-parity drain path — a cancelled
 // slot drains without deliver.
 func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
+	s.routeVRPCFrame(errResp.RpcId, "ErrorResponse", tagSessionVRPCErrorNil,
+		&s.errorRpcs, vrpcResult{errResp: errResp})
+}
+
+// routeVRPCFrame is the shared skeleton for handleVRPCResponse /
+// handleVRPCErrorResponse. All Java-parity gating (state check, active-
+// vRPC nil guard, id-match, drain-vs-cancel branching, notifySlotDrained
+// on every drain, quiescence signalling in Closing) lives here so the
+// two call sites can't drift.
+//
+// A vRPC frame is only expected while the session is Ready or Closing
+// (drain window). Any other state means either a bug in state tracking
+// or a server retransmit after teardown — drop.
+//
+// The two call sites differ only in:
+//   - frameName / nilTag / counter — labels + which atomic bumps
+//   - result — vrpcResult{resp:} vs vrpcResult{errResp:} handed to deliver
+//
+// drainSlot returning !ok means cancelActiveRPCs (session teardown)
+// won the slot between the id-match above and our drainSlot call. Its
+// deliver already fired the terminal error; nothing to do.
+func (s *Session) routeVRPCFrame(rpcID int64, frameName, nilTag string, counter *atomic.Int64, result vrpcResult) {
 	st := s.State()
 	if !assertDebugTagf(st == StateReady || st == StateClosing, tagSessionVRPCResponseWrongState,
-		"vRPC error for rpc_id=%d arrived in state %s", errResp.RpcId, st) {
+		"%s for rpc_id=%d arrived in state %s", frameName, rpcID, st) {
 		return
 	}
 	rpc := s.activeVRPC()
 	if rpc == nil {
-		recordDebugTag(tagSessionVRPCErrorNil)
-		s.debugf("dropping ErrorResponse for rpc_id=%d — no in-flight RPC tracked", errResp.RpcId)
+		recordDebugTag(nilTag)
+		s.debugf("dropping %s for rpc_id=%d — no in-flight RPC tracked", frameName, rpcID)
 		return
 	}
-	if rpc.id != errResp.RpcId {
+	if rpc.id != rpcID {
 		recordDebugTag(tagSessionVRPCIDMismatch)
-		s.debugf("dropping ErrorResponse rpc_id=%d != in-flight rpc_id=%d", errResp.RpcId, rpc.id)
+		s.debugf("dropping %s rpc_id=%d != in-flight rpc_id=%d", frameName, rpcID, rpc.id)
 		return
 	}
 	drained, cancel, ok := s.drainSlot(rpc)
 	if !ok {
 		return
 	}
-	s.errorRpcs.Add(1)
+	counter.Add(1)
 	if cancel != nil {
+		// Caller already returned via ctx.Done — no one is waiting on
+		// resultChan. Just count the drain for observability.
 		recordDebugTag(tagSessionVRPCCancelledDrained)
 	} else {
-		s.deliver(drained, vrpcResult{errResp: errResp})
+		s.deliver(drained, result)
 	}
-	// v3: every drainSlot success is a "session became free" signal.
-	// See handleVRPCResponse's mirror call for the full rationale.
+	// v3: drainSlot success is the sole "session became free" signal.
+	// Fires on every drain (not just the cancelled branch) so the pool
+	// re-enqueues the session in its AFE idle queue and wakes one
+	// parked Checkout waiter. Invoke's return path in the pool no
+	// longer performs the re-enqueue or the wake.
 	s.notifySlotDrained()
 	if State(s.state.Load()) == StateClosing {
 		s.signalQuiescent()
