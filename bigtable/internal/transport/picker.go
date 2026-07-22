@@ -30,10 +30,11 @@ type SessionHandle struct {
 	lastActivity int64 // UnixNano timestamp of the last completed call
 	picks        int64 // Number of times the picker has picked this handle.
 	// createdAt is the wall-clock time this handle joined the pool
-	// (from OnActive). Read by recordLifetime and Pool.Close to bucket
-	// per-session lifetimes into the ring buffer. Zero for
-	// test-constructed handles that never went through OnActive — code
-	// paths that consume this must handle the zero-time case.
+	// (stamped in createSession after the handle is minted). Read by
+	// recordLifetime and Pool.Close to bucket per-session lifetimes
+	// into the ring buffer. Zero for test-constructed handles that
+	// never went through the pool — code paths that consume this must
+	// handle the zero-time case.
 	createdAt time.Time
 	// inExpectedCount tracks whether this handle currently counts toward
 	// sessionList.readyCount (the scale-up budget). Set true in
@@ -42,19 +43,21 @@ type SessionHandle struct {
 	// do not touch outside sl methods. Java-parity: SessionList.java's
 	// inExpectedCount field.
 	inExpectedCount bool
-	// onSlotDrained is set by SessionPoolImpl.OnActive to a closure
-	// that runs sl.ReleaseToPool(sh) + signalFree() — under v3
-	// (SESSION_SPEC.md #2 + SESSION_POOL_SPEC.md #6), this callback is
-	// the sole "session became free" signal from Session to pool: it
-	// re-enqueues the session in its AFE idle queue AND wakes one
-	// parked Checkout waiter. Fires from every drainSlot success in
-	// Session — normal handleVRPCResponse deliver, normal
-	// handleVRPCErrorResponse deliver, cancelled-drained branches,
-	// and the Send-failure branch of Invoke — but NOT from
-	// cancelActiveRPCs (session teardown; OnSessionClosing/OnSessionClosed
-	// handle cleanup). Nil for handles built by tests that bypass the
-	// pool; Session's notifySlotDrained is nil-safe.
-	onSlotDrained func()
+	// activated / closingRecorded / closeRecorded are one-shot dedup
+	// flags for the pool's per-session hook chain. They replace the
+	// prior Session→SessionHandle back-ref (Session.poolHandle) whose
+	// nil-ness was abused as an "already handled" signal.
+	//
+	// activated fires exactly once across p.onActive calls (defensive
+	// against a hook chain that re-enters onActive).
+	//
+	// closingRecorded and closeRecorded gate the double-fire path Pool.Close
+	// otherwise would trigger: Phase-1 records lifetime + sl.OnSessionClosed
+	// eagerly and flips both flags, so Phase-2's s.Close driving the hook
+	// chain finds them tripped and short-circuits.
+	activated        atomic.Bool
+	closingRecorded  atomic.Bool
+	closeRecorded    atomic.Bool
 }
 
 // Picks returns the number of times this handle has been picked by the pool's

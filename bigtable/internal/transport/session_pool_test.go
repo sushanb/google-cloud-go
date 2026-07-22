@@ -55,23 +55,23 @@ func newStubStreamFactory() (factory func(context.Context) (Stream, error), clos
 // wraps it in a SessionHandle, and registers it with the pool's
 // sessionList. Bypasses the real Start/handshake path so tests can
 // exercise pool-level logic in milliseconds. Since sl is now the sole
-// store of active handles, this mirrors OnActive's minimum required
-// state: poolHandle stamp + sl.OnSessionStarted. PeerInfo stays nil,
-// so the handle lands in the AfeID=0 bucket — fine for pool-level
-// tests that don't care about AFE fanout.
+// store of active handles, this mirrors createSession + onActive's
+// minimum required state: build sh, wire hook closures, register into
+// sl. PeerInfo stays nil, so the handle lands in the AfeID=0 bucket —
+// fine for pool-level tests that don't care about AFE fanout.
 func injectActiveSession(t testing.TB, p *SessionPoolImpl, name string, createdAt time.Time) *SessionHandle {
 	t.Helper()
 	stream := newFakeStream()
+	sh := NewSessionHandle(nil, createdAt)
 	s := NewSession(name, stream, SessionHooks{
 		OnStart:   p.OnStart,
-		OnActive:  p.OnActive,
-		OnClosing: p.OnClosing,
-		OnClose:   p.OnClose,
+		OnActive:  func(_ *Session) { p.onActive(sh) },
+		OnClosing: func(_ *Session) { p.onClosing(sh) },
+		OnClose:   func(_ *Session, err error) { p.onClose(sh, err) },
 	}, SessionTypeTable)
 	s.state.Store(int32(StateReady))
+	sh.session = s
 
-	sh := NewSessionHandle(s, createdAt)
-	s.poolHandle.Store(sh)
 	p.sl.OnSessionStarted(sh)
 	return sh
 }

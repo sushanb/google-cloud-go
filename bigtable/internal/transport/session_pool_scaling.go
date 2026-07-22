@@ -266,24 +266,42 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 	atomic.AddUint64(&p.nextSessionID, 1)
 	p.mu.Unlock()
 
-	// Create and start new session wrapper passing pool pointer as the lifecycle hooks target.
-	s := NewSession(sessionName, stream, SessionHooks{
+	// Mint the SessionHandle BEFORE NewSession so the per-session hook
+	// closures can capture it directly — no Session→SessionHandle
+	// back-ref needed. Java parity: SessionPoolImpl.java:424-448 wires
+	// per-session listeners at construction time with the handle in
+	// scope. sh.session and sh.createdAt are backfilled two statements
+	// down; the closures don't fire until Session.Start runs.
+	sh := &SessionHandle{}
+	hooks := SessionHooks{
 		OnStart:   p.OnStart,
-		OnActive:  p.OnActive,
-		OnClosing: p.OnClosing,
-		OnClose:   p.OnClose,
-	}, p.sessionType, WithSessionPoolName(p.poolName), WithSessionLogger(log.Default()))
+		OnActive:  func(_ *Session) { p.onActive(sh) },
+		OnClosing: func(_ *Session) { p.onClosing(sh) },
+		OnClose:   func(_ *Session, err error) { p.onClose(sh, err) },
+	}
+	s := NewSession(sessionName, stream, hooks, p.sessionType,
+		WithSessionPoolName(p.poolName), WithSessionLogger(log.Default()))
+	// Slot-drained callback fires from every successful drainSlot;
+	// captures sh so it doesn't need to walk back through Session.
+	s.setSlotDrainedCallback(func() {
+		p.sl.ReleaseToPool(sh)
+		p.signalFree()
+	})
 	if hint := int(pickedChannel.Load()); hint >= 0 {
 		s.SetChannelIndex(hint)
 	}
 
+	// Backfill the handle now that the Session exists.
+	sh.session = s
+	sh.createdAt = time.Now()
+
 	p.mu.Lock()
-	p.startingSessions[s] = true
+	p.startingSessions[sh] = struct{}{}
 	p.mu.Unlock()
 
 	if err := s.Start(dialCtx, p.openSessionRequest); err != nil {
 		p.mu.Lock()
-		delete(p.startingSessions, s)
+		delete(p.startingSessions, sh)
 		p.mu.Unlock()
 		btopt.Debugf(nil, "POOL %p createSession Start failed for %s: %v", p, sessionName, err)
 		return fmt.Errorf("failed to start session: %w", err)

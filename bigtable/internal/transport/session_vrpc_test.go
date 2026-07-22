@@ -541,14 +541,12 @@ func TestHandleVRPCResponse_NormalDrain_FiresSlotDrainedCallback(t *testing.T) {
 	s, stream := makeActive(t, SessionHooks{})
 	desc := newRoundTripDesc()
 
-	// Wire a SessionHandle with a counting onSlotDrained. Same pattern
-	// SessionPoolImpl.OnActive uses — a real pool would point this at
-	// releaseSession+signalFree; here we count fires to prove the wire
-	// is live for the normal-drain branch, not just cancelled-drain.
+	// Install a counting slot-drained callback. Same pattern
+	// SessionPoolImpl.createSession uses — a real pool wires this to
+	// sl.ReleaseToPool + signalFree; here we count fires to prove the
+	// wire is live for the normal-drain branch, not just cancelled-drain.
 	fires := make(chan struct{}, 4)
-	sh := NewSessionHandle(s, time.Time{})
-	sh.onSlotDrained = func() { fires <- struct{}{} }
-	s.poolHandle.Store(sh)
+	s.setSlotDrainedCallback(func() { fires <- struct{}{} })
 
 	done := make(chan error, 1)
 	go func() {
@@ -601,9 +599,7 @@ func TestHandleVRPCErrorResponse_NormalDrain_FiresSlotDrainedCallback(t *testing
 	desc := newRoundTripDesc()
 
 	fires := make(chan struct{}, 4)
-	sh := NewSessionHandle(s, time.Time{})
-	sh.onSlotDrained = func() { fires <- struct{}{} }
-	s.poolHandle.Store(sh)
+	s.setSlotDrainedCallback(func() { fires <- struct{}{} })
 
 	done := make(chan error, 1)
 	go func() {
@@ -660,9 +656,7 @@ func TestInvoke_SendFailure_FiresSlotDrainedCallback(t *testing.T) {
 	s.state.Store(int32(StateReady))
 
 	fires := make(chan struct{}, 2)
-	sh := NewSessionHandle(s, time.Time{})
-	sh.onSlotDrained = func() { fires <- struct{}{} }
-	s.poolHandle.Store(sh)
+	s.setSlotDrainedCallback(func() { fires <- struct{}{} })
 
 	_, err := s.Invoke(context.Background(), newRoundTripDesc(), "req")
 	if err == nil {

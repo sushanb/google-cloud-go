@@ -270,12 +270,13 @@ type Session struct {
 	activeRPC     *vrpcImpl
 	currentCancel *vrpcResult
 
-	// poolHandle is the back-ref to this session's SessionHandle, stored
-	// once by SessionPoolImpl.OnActive right after the handle is minted.
-	// OnClose reads it to hand the handle to sl.OnSessionClosed without a
-	// per-pool bookkeeping map. Nil for sessions never promoted from
-	// starting → active or for tests that bypass the pool.
-	poolHandle atomic.Pointer[SessionHandle]
+	// slotDrainedFn fires from notifySlotDrained on every successful
+	// drainSlot. Set once at construction (via setSlotDrainedCallback,
+	// called from SessionPoolImpl.createSession); nil for sessions built
+	// by tests that bypass the pool. Replaces the prior back-ref through
+	// SessionHandle.onSlotDrained, so the hot path skips one atomic load
+	// and a pointer chase.
+	slotDrainedFn func()
 
 	// heartbeatIntervalNano is the server-negotiated keep-alive interval
 	// (ns). handleSessionParameters mutates it from readLoop while the
@@ -453,16 +454,26 @@ func (s *Session) setSlotForTest(rpc *vrpcImpl) {
 // queue and wakes one parked Checkout waiter — the pool's Invoke
 // return path no longer does either. Fires from every drainSlot
 // success: normal deliver, cancelled-drain (ctx.Done caller already
-// returned), and the Send-failure Invoke branch. Route through the
-// pool's SessionHandle callback (installed at OnActive); nil-safe for
-// sessions built by tests that bypass the pool. cancelActiveRPCs
-// (session teardown) intentionally does NOT call this — the session
-// is on its way out; OnSessionClosing/OnSessionClosed handle its
-// removal from the routing structures.
+// returned), and the Send-failure Invoke branch. The callback is
+// installed once at construction by SessionPoolImpl.createSession via
+// setSlotDrainedCallback; nil-safe for sessions built by tests that
+// bypass the pool. cancelActiveRPCs (session teardown) intentionally
+// does NOT call this — the session is on its way out;
+// OnSessionClosing/OnSessionClosed handle its removal from the routing
+// structures.
 func (s *Session) notifySlotDrained() {
-	if sh := s.poolHandle.Load(); sh != nil && sh.onSlotDrained != nil {
-		sh.onSlotDrained()
+	if s.slotDrainedFn != nil {
+		s.slotDrainedFn()
 	}
+}
+
+// setSlotDrainedCallback installs the slot-drained callback. Called
+// once at construction time by SessionPoolImpl.createSession (before
+// Session.Start), so no concurrent readers of the field exist. Tests
+// that bypass the pool may install a counter here too. nil clears the
+// callback (subsequent notifySlotDrained fires become no-ops).
+func (s *Session) setSlotDrainedCallback(fn func()) {
+	s.slotDrainedFn = fn
 }
 
 // transitionTo sets the session state to `to` iff ok(currentState) returns
