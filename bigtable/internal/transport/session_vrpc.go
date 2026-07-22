@@ -141,7 +141,7 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 		// (see SESSION_POOL_SPEC #6, I5) drops the re-enqueue if
 		// OnSessionClosing already dropped this handle in the teardown
 		// that the Send failure typically kicks off.
-		s.notifySlotDrained()
+		s.hooks.onSlotDrained()
 		if State(s.state.Load()) == StateClosing {
 			s.signalQuiescent()
 		}
@@ -303,9 +303,9 @@ func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 
 // routeVRPCFrame is the shared skeleton for handleVRPCResponse /
 // handleVRPCErrorResponse. All Java-parity gating (state check, active-
-// vRPC nil guard, id-match, drain-vs-cancel branching, notifySlotDrained
-// on every drain, quiescence signalling in Closing) lives here so the
-// two call sites can't drift.
+// vRPC nil guard, id-match, drain-vs-cancel branching, OnSlotDrained
+// hook on every drain, quiescence signalling in Closing) lives here
+// so the two call sites can't drift.
 //
 // A vRPC frame is only expected while the session is Ready or Closing
 // (drain window). Any other state means either a bug in state tracking
@@ -352,7 +352,7 @@ func (s *Session) routeVRPCFrame(rpcID int64, frameName, nilTag string, counter 
 	// re-enqueues the session in its AFE idle queue and wakes one
 	// parked Checkout waiter. Invoke's return path in the pool no
 	// longer performs the re-enqueue or the wake.
-	s.notifySlotDrained()
+	s.hooks.onSlotDrained()
 	if State(s.state.Load()) == StateClosing {
 		s.signalQuiescent()
 	}

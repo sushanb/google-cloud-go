@@ -535,8 +535,8 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 	// Track invokeErr / backendDur / latency across the defer so the
 	// per-AFE PeakEwma update sees the actual outcome. Under Java-parity
 	// slot lifecycle (v3), drainSlot success is the sole "session free"
-	// signal — the session's response handler fires notifySlotDrained →
-	// onSlotDrained (installed at OnActive) which does the AFE-queue
+	// signal — the session's response handler fires the OnSlotDrained
+	// hook (installed at createSession) which does the AFE-queue
 	// re-enqueue AND the Checkout waiter wake. So this defer no longer
 	// touches sl.ReleaseToPool or signalFree; it stays only for the
 	// per-caller in-flight counter and the outcome-known EWMA update.

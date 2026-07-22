@@ -274,19 +274,19 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 	// down; the closures don't fire until Session.Start runs.
 	sh := &SessionHandle{}
 	hooks := SessionHooks{
-		OnStart:   p.OnStart,
-		OnActive:  func(_ *Session) { p.onActive(sh) },
+		OnStart:  p.OnStart,
+		OnActive: func(_ *Session) { p.onActive(sh) },
+		// Fires from every successful drainSlot; captures sh so it
+		// doesn't need to walk back through Session.
+		OnSlotDrained: func() {
+			p.sl.ReleaseToPool(sh)
+			p.signalFree()
+		},
 		OnClosing: func(_ *Session) { p.onClosing(sh) },
 		OnClose:   func(_ *Session, err error) { p.onClose(sh, err) },
 	}
 	s := NewSession(sessionName, stream, hooks, p.sessionType,
 		WithSessionPoolName(p.poolName), WithSessionLogger(log.Default()))
-	// Slot-drained callback fires from every successful drainSlot;
-	// captures sh so it doesn't need to walk back through Session.
-	s.setSlotDrainedCallback(func() {
-		p.sl.ReleaseToPool(sh)
-		p.signalFree()
-	})
 	if hint := int(pickedChannel.Load()); hint >= 0 {
 		s.SetChannelIndex(hint)
 	}

@@ -29,7 +29,7 @@ The pool does NOT route to individual sessions directly. Every `CheckoutSession`
 2. `afe, decision := picker.PickAfe(ready)` — pick an AFE via one of three strategies.
 3. `sh := sl.Checkout(afe)` — dequeue one session from that AFE's idle list.
 
-The old flat `LeastInFlightPicker` over all sessions is gone. `SessionHandle` no longer holds per-session `ewma`/`freeSignal` — those live per-AFE on `afeHandle`, and wake-ups fire centrally from `Session.notifySlotDrained` (the drain-driven closure `Session.slotDrainedFn`, installed by `SessionPoolImpl.createSession` via `setSlotDrainedCallback`; see `SESSION_SPEC.md #2`). The pool's `Invoke` return path does NOT re-enqueue or wake — under Java-parity slot lifecycle, drain and "caller returned" can be far apart (ctx.Done leaves the slot held until the server response drains it), so folding both actions into the drain site is the only way to keep the queue honest without a busy-skip loop at `Checkout`.
+The old flat `LeastInFlightPicker` over all sessions is gone. `SessionHandle` no longer holds per-session `ewma`/`freeSignal` — those live per-AFE on `afeHandle`, and wake-ups fire centrally from `s.hooks.onSlotDrained()` (the drain-driven `SessionHooks.OnSlotDrained` closure installed by `SessionPoolImpl.createSession` in the `SessionHooks{...}` literal handed to `NewSession`; see `SESSION_SPEC.md #2`). The pool's `Invoke` return path does NOT re-enqueue or wake — under Java-parity slot lifecycle, drain and "caller returned" can be far apart (ctx.Done leaves the slot held until the server response drains it), so folding both actions into the drain site is the only way to keep the queue honest without a busy-skip loop at `Checkout`.
 
 **Three picker impls, chosen by server config `Session.SessionPool.LoadBalancing.Strategy`** (`SESSION_CLIENT_SPEC.md #3`):
 
@@ -144,7 +144,7 @@ Transitions:
 |---|---|---|---|
 | NotRegistered | Idle | `OnSessionStarted` | `SessionPoolImpl.onActive` (fired via the per-session `hooks.OnActive` closure wired in `createSession`) |
 | Idle | InFlight | `Checkout` | `CheckoutSession` after `picker.PickAfe` |
-| InFlight | Idle | `ReleaseToPool` (only if `inExpectedCount`) | `Session.notifySlotDrained` → `Session.slotDrainedFn` — the drain-driven closure installed by `SessionPoolImpl.createSession` (via `setSlotDrainedCallback`), **not** the pool's Invoke return path (Java-parity slot lifecycle: drain and "caller returned" can be far apart; see `SESSION_SPEC.md #2`) |
+| InFlight | Idle | `ReleaseToPool` (only if `inExpectedCount`) | `s.hooks.onSlotDrained()` → `SessionHooks.OnSlotDrained` — the drain-driven closure installed by `SessionPoolImpl.createSession` in the `SessionHooks{...}` literal handed to `NewSession`, **not** the pool's Invoke return path (Java-parity slot lifecycle: drain and "caller returned" can be far apart; see `SESSION_SPEC.md #2`) |
 | {Idle, InFlight} | Closing | `OnSessionClosing` | Session's `notifyClosing` hook |
 | {Idle, InFlight, Closing} | Closed | `OnSessionClosed` | Session's `notifyClosed` hook |
 
