@@ -90,7 +90,16 @@ func (s *PoolSizer) UpdateConfig(config *spb.SessionClientConfiguration_SessionP
 
 	s.minSessions = int(config.MinSessionCount)
 	s.maxSessions = int(config.MaxSessionCount)
-	s.headroomPct = float64(config.Headroom)
+	// Mirror the constructor guard: a zero or negative headroom from
+	// the server would render as HeadroomPct=0 on the loadz trace and
+	// collapse IdleHeadroom to the MinIdleSessions floor — the pool
+	// still works but operators would see a confusing decision trace.
+	// Fall back to the same default the constructor uses.
+	if hp := float64(config.Headroom); hp > 0 {
+		s.headroomPct = hp
+	} else {
+		s.headroomPct = 0.10
+	}
 	if nsql := int(config.GetNewSessionQueueLength()); nsql > 0 {
 		s.newSessionQLen = nsql
 	}
