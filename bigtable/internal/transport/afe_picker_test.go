@@ -23,7 +23,7 @@ import (
 // snapshots from sessionList.ReadyAfes.
 func makeSnapshot(id afeID, inflight int, e2eCost float64) afeSnapshot {
 	return afeSnapshot{
-		Handle:         &afeHandle{id: id},
+		ID:             id,
 		IdleCount:      1,
 		NumOutstanding: inflight,
 		E2eCost:        e2eCost,
@@ -31,9 +31,9 @@ func makeSnapshot(id afeID, inflight int, e2eCost float64) afeSnapshot {
 }
 
 func TestSimpleAfePicker_EmptyReturnsNil(t *testing.T) {
-	got, dec := NewSimpleAfePicker().PickAfe(nil)
-	if got != nil {
-		t.Errorf("PickAfe(nil) handle = %v, want nil", got)
+	_, picked, dec := NewSimpleAfePicker().PickAfe(nil)
+	if picked {
+		t.Error("PickAfe(nil) picked = true, want false")
 	}
 	if dec.Reason != "no-candidates" {
 		t.Errorf("PickAfe(nil) reason = %q, want no-candidates", dec.Reason)
@@ -50,22 +50,22 @@ func TestSimpleAfePicker_DistributesRoughly(t *testing.T) {
 	p := NewSimpleAfePicker()
 	const N = 3000
 	for i := 0; i < N; i++ {
-		h, _ := p.PickAfe(snaps)
-		counts[h.ID()]++
+		id, _, _ := p.PickAfe(snaps)
+		counts[id]++
 	}
 	for _, s := range snaps {
-		got := counts[s.Handle.ID()]
+		got := counts[s.ID]
 		// 3-way uniform expected value = 1000; allow ±25% (~750..1250).
 		if got < 750 || got > 1250 {
-			t.Errorf("AFE %d picked %d/%d times, want ~1000 ±25%%", s.Handle.ID(), got, N)
+			t.Errorf("AFE %d picked %d/%d times, want ~1000 ±25%%", s.ID, got, N)
 		}
 	}
 }
 
 func TestLeastInFlightAfePicker_EmptyReturnsNil(t *testing.T) {
-	got, _ := NewLeastInFlightAfePicker(0).PickAfe(nil)
-	if got != nil {
-		t.Errorf("PickAfe(nil) = %v, want nil", got)
+	_, picked, _ := NewLeastInFlightAfePicker(0).PickAfe(nil)
+	if picked {
+		t.Error("PickAfe(nil) picked = true, want false")
 	}
 }
 
@@ -79,9 +79,9 @@ func TestLeastInFlightAfePicker_PicksMinWhenSubsetCoversAll(t *testing.T) {
 	}
 	p := NewLeastInFlightAfePicker(len(snaps))
 	for i := 0; i < 100; i++ {
-		h, _ := p.PickAfe(snaps)
-		if got := h.ID(); got != 2 {
-			t.Fatalf("iter %d: picked AFE %d, want 2", i, got)
+		id, _, _ := p.PickAfe(snaps)
+		if id != 2 {
+			t.Fatalf("iter %d: picked AFE %d, want 2", i, id)
 		}
 	}
 }
@@ -99,8 +99,8 @@ func TestLeastInFlightAfePicker_KChoicePrefersLowInflight(t *testing.T) {
 	counts := map[afeID]int{}
 	const N = 4000
 	for i := 0; i < N; i++ {
-		h, _ := p.PickAfe(snaps)
-		counts[h.ID()]++
+		id, _, _ := p.PickAfe(snaps)
+		counts[id]++
 	}
 	// K=2 draws hit AFE 3 with prob 1 - (3/4)*(2/3) = 1/2; when drawn
 	// it always wins. So expected share ≈ 50% ± sampling noise (±5%).
@@ -118,17 +118,17 @@ func TestLeastLatencyAfePicker_PicksMinCost(t *testing.T) {
 	}
 	p := NewLeastLatencyAfePicker(len(snaps))
 	for i := 0; i < 100; i++ {
-		h, _ := p.PickAfe(snaps)
-		if got := h.ID(); got != 2 {
-			t.Fatalf("iter %d: picked AFE %d, want 2 (min E2eCost)", i, got)
+		id, _, _ := p.PickAfe(snaps)
+		if id != 2 {
+			t.Fatalf("iter %d: picked AFE %d, want 2 (min E2eCost)", i, id)
 		}
 	}
 }
 
 func TestLeastLatencyAfePicker_EmptyReturnsNil(t *testing.T) {
-	got, _ := NewLeastLatencyAfePicker(0).PickAfe(nil)
-	if got != nil {
-		t.Errorf("PickAfe(nil) = %v, want nil", got)
+	_, picked, _ := NewLeastLatencyAfePicker(0).PickAfe(nil)
+	if picked {
+		t.Error("PickAfe(nil) picked = true, want false")
 	}
 }
 
@@ -152,7 +152,7 @@ func TestKChoiceMinCost_MutatesInputInPlace(t *testing.T) {
 
 	seen := map[afeID]bool{}
 	for _, s := range snaps {
-		seen[s.Handle.ID()] = true
+		seen[s.ID] = true
 	}
 	for _, want := range []afeID{1, 2, 3} {
 		if !seen[want] {
@@ -170,7 +170,7 @@ func TestPickDecision_RecordsCandidatesAndReason(t *testing.T) {
 		makeSnapshot(2, 1, 0),
 		makeSnapshot(3, 3, 0),
 	}
-	_, dec := NewLeastInFlightAfePicker(2).PickAfe(snaps)
+	_, _, dec := NewLeastInFlightAfePicker(2).PickAfe(snaps)
 	if len(dec.Candidates) != 2 {
 		t.Fatalf("Candidates len = %d, want 2 (K-choice-2)", len(dec.Candidates))
 	}
@@ -182,7 +182,7 @@ func TestPickDecision_RecordsCandidatesAndReason(t *testing.T) {
 	}
 
 	// LeastLatency uses e2e cost.
-	_, dec2 := NewLeastLatencyAfePicker(len(snaps)).PickAfe(snaps)
+	_, _, dec2 := NewLeastLatencyAfePicker(len(snaps)).PickAfe(snaps)
 	if dec2.Reason != "min-latency" {
 		t.Errorf("LeastLatency reason = %q, want min-latency", dec2.Reason)
 	}

@@ -51,14 +51,15 @@ type PickDecision struct {
 }
 
 // AfePicker picks one AFE from a snapshot of ready buckets AND returns
-// the decision metadata for loadz. Callers use the *afeHandle; the
+// the decision metadata for loadz. The winner travels back into
+// sessionList.Checkout by id — no *afeHandle ever leaves sl.mu. The
 // PickDecision is passed to SessionPoolImpl.recordPickDecision.
 //
-// Returning nil handle means "no AFE eligible" — the pool treats that
-// the same as len(ready) == 0 (park the caller on freeSignal, kick
+// picked == false means "no AFE eligible" — the pool treats that the
+// same as len(ready) == 0 (park the caller on freeSignal, kick
 // scale-up).
 type AfePicker interface {
-	PickAfe(ready []afeSnapshot) (*afeHandle, PickDecision)
+	PickAfe(ready []afeSnapshot) (winner afeID, picked bool, decision PickDecision)
 	Name() string
 }
 
@@ -73,14 +74,14 @@ func NewSimpleAfePicker() *SimpleAfePicker { return &SimpleAfePicker{} }
 func (SimpleAfePicker) Name() string { return "simple" }
 
 // PickAfe uniformly-at-random picks one bucket from ready.
-func (SimpleAfePicker) PickAfe(ready []afeSnapshot) (*afeHandle, PickDecision) {
+func (SimpleAfePicker) PickAfe(ready []afeSnapshot) (afeID, bool, PickDecision) {
 	if len(ready) == 0 {
-		return nil, PickDecision{Reason: "no-candidates"}
+		return 0, false, PickDecision{Reason: "no-candidates"}
 	}
 	winner := ready[rand.IntN(len(ready))]
-	return winner.Handle, PickDecision{
-		Candidates: []PickCandidate{{AfeID: winner.Handle.ID(), Cost: 0}},
-		Winner:     winner.Handle.ID(),
+	return winner.ID, true, PickDecision{
+		Candidates: []PickCandidate{{AfeID: winner.ID, Cost: 0}},
+		Winner:     winner.ID,
 		Reason:     "uniform-random",
 	}
 }
@@ -108,11 +109,11 @@ func (LeastInFlightAfePicker) Name() string { return "least-inflight" }
 
 // PickAfe returns the AFE with the fewest NumOutstanding among K
 // randomly-drawn ready candidates.
-func (p LeastInFlightAfePicker) PickAfe(ready []afeSnapshot) (*afeHandle, PickDecision) {
-	winner, cands := kChoiceMinCost(ready, p.RandomSubsetSize, func(s afeSnapshot) float64 {
+func (p LeastInFlightAfePicker) PickAfe(ready []afeSnapshot) (afeID, bool, PickDecision) {
+	winner, picked, cands := kChoiceMinCost(ready, p.RandomSubsetSize, func(s afeSnapshot) float64 {
 		return float64(s.NumOutstanding)
 	})
-	return decisionFor(winner, cands, "min-inflight")
+	return decisionFor(winner, picked, cands, "min-inflight")
 }
 
 // LeastLatencyAfePicker picks the AFE with the lowest per-AFE e2e
@@ -133,21 +134,21 @@ func (LeastLatencyAfePicker) Name() string { return "least-latency" }
 
 // PickAfe returns the AFE with the smallest E2eCost among K randomly-
 // drawn ready candidates.
-func (p LeastLatencyAfePicker) PickAfe(ready []afeSnapshot) (*afeHandle, PickDecision) {
-	winner, cands := kChoiceMinCost(ready, p.RandomSubsetSize, func(s afeSnapshot) float64 {
+func (p LeastLatencyAfePicker) PickAfe(ready []afeSnapshot) (afeID, bool, PickDecision) {
+	winner, picked, cands := kChoiceMinCost(ready, p.RandomSubsetSize, func(s afeSnapshot) float64 {
 		return s.E2eCost
 	})
-	return decisionFor(winner, cands, "min-latency")
+	return decisionFor(winner, picked, cands, "min-latency")
 }
 
 // decisionFor packages kChoiceMinCost's return into a PickDecision.
-func decisionFor(winner *afeHandle, cands []PickCandidate, reason string) (*afeHandle, PickDecision) {
-	if winner == nil {
-		return nil, PickDecision{Reason: "no-candidates"}
+func decisionFor(winner afeID, picked bool, cands []PickCandidate, reason string) (afeID, bool, PickDecision) {
+	if !picked {
+		return 0, false, PickDecision{Reason: "no-candidates"}
 	}
-	return winner, PickDecision{
+	return winner, true, PickDecision{
 		Candidates: cands,
-		Winner:     winner.ID(),
+		Winner:     winner,
 		Reason:     reason,
 	}
 }
@@ -168,10 +169,10 @@ func decisionFor(winner *afeHandle, cands []PickCandidate, reason string) (*afeH
 // call; profiling showed it costing ~4µs at the workload's steady-state
 // QPS since the picker runs on every CheckoutSession. Removed because
 // the caller doesn't need ready preserved.
-func kChoiceMinCost(ready []afeSnapshot, k int, cost func(afeSnapshot) float64) (*afeHandle, []PickCandidate) {
+func kChoiceMinCost(ready []afeSnapshot, k int, cost func(afeSnapshot) float64) (afeID, bool, []PickCandidate) {
 	n := len(ready)
 	if n == 0 {
-		return nil, nil
+		return 0, false, nil
 	}
 	if k <= 0 {
 		k = defaultAfeRandomSubsetSize
@@ -181,18 +182,20 @@ func kChoiceMinCost(ready []afeSnapshot, k int, cost func(afeSnapshot) float64) 
 	}
 
 	sampled := make([]PickCandidate, 0, k)
-	var best *afeHandle
+	var best afeID
+	haveBest := false
 	bestCost := -1.0
 	for i := 0; i < k; i++ {
 		j := i + rand.IntN(n-i)
-		picked := ready[j]
-		c := cost(picked)
-		sampled = append(sampled, PickCandidate{AfeID: picked.Handle.ID(), Cost: c})
-		if bestCost < 0 || c < bestCost {
+		s := ready[j]
+		c := cost(s)
+		sampled = append(sampled, PickCandidate{AfeID: s.ID, Cost: c})
+		if !haveBest || c < bestCost {
 			bestCost = c
-			best = picked.Handle
+			best = s.ID
+			haveBest = true
 		}
 		ready[i], ready[j] = ready[j], ready[i]
 	}
-	return best, sampled
+	return best, haveBest, sampled
 }

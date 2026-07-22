@@ -34,16 +34,15 @@ var (
 	sessionUptime        metric.Float64Histogram
 	// transportLatencies is per-vRPC (not per-session-lifecycle), but shares
 	// the same meter + registration path so all session-adjacent metrics
-	// initialize together — matches java-bigtable's MetricRegistry layout.
+	// initialize together.
 	transportLatencies metric.Float64Histogram
 
 	sessionMetricsOnce sync.Once
 	sessionMetricsErr  error
 )
 
-// FineGrainLatencyBounds matches java-bigtable's
-// AGGREGATION_WITH_MILLIS_HISTOGRAM: fine sub-ms + coarse tail. Shared
-// by transport_latencies and attempt_latencies2.
+// FineGrainLatencyBounds is the fine sub-ms + coarse tail bucket layout
+// shared by transport_latencies and attempt_latencies2.
 var FineGrainLatencyBounds = []float64{
 	// Linear 0 → 3ms by 0.1ms (31 boundaries): fine-grained sub-ms.
 	0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
@@ -113,18 +112,9 @@ func InitializeSessionMetrics(meterProvider metric.MeterProvider) error {
 	return sessionMetricsErr
 }
 
-// sessionTracer tracks and records metrics for a Session's lifecycle and
-// individual operations. poolName is a pool-scoped identifier stamped on
-// the session_name metric label — matches java-bigtable's SessionPoolInfo
-// name semantics (bounded cardinality, one per pool per process), NOT the
-// per-session logName (which lives on Session and is unbounded).
-//
-// startTime is the single wall-clock anchor for every emitted metric —
-// mirrors java-bigtable's SessionTracerImpl.uptime stopwatch, which is
-// started once in onStart() and drives session.open_latencies (start →
-// open), session.durations (start → close), and session.uptime (start →
-// sample). `opened` is the boolean "did the session ever reach Ready"
-// flag, filling the same role as Java's State enum for the ready label.
+// sessionTracer records lifecycle + per-vRPC metrics for one Session.
+// poolName (not the per-session logName) is stamped as `session_name`
+// so label cardinality stays bounded.
 type sessionTracer struct {
 	mu          sync.Mutex
 	startTime   time.Time
@@ -215,15 +205,14 @@ func (t *sessionTracer) recordOpen(ctx context.Context, err error) {
 	))
 }
 
-// recordClose records the session's total elapsed time on close.
+// recordClose records the session's total elapsed time (startTime→now)
+// on close.
 //   - closingReason: the terminal Session.CloseReason(), or "" if none.
 //   - streamErr: the terminal stream error; nil means clean close ("OK").
 //   - hadOk / hadErr: whether the session served any OK / error vRPCs.
 //
-// Duration is always startTime→now — matches java-bigtable
-// SessionTracerImpl.onClose (`uptime.elapsed()`, where uptime is anchored
-// at onStart). The `ready` label distinguishes sessions that reached Ready
-// from those that died pre-open.
+// The `ready` label distinguishes sessions that reached Ready from those
+// that died pre-open.
 func (t *sessionTracer) recordClose(ctx context.Context, closingReason string, streamErr error, hadOk, hadErr bool) {
 	if sessionDurations == nil {
 		return
@@ -252,9 +241,8 @@ func (t *sessionTracer) recordClose(ctx context.Context, closingReason string, s
 	))
 }
 
-// vrpcCloseState mirrors java-bigtable's SessionCloseVRpcState.find —
-// (hadOk, hadErr) → {none, all_ok, all_error, some_ok}. The labels match
-// Java exactly so cross-language dashboards work.
+// vrpcCloseState maps (hadOk, hadErr) → {none, all_ok, all_error, some_ok}
+// for the `vrpcs` label on session.durations.
 func vrpcCloseState(hadOk, hadErr bool) string {
 	switch {
 	case hadOk && hadErr:
@@ -272,8 +260,7 @@ func vrpcCloseState(hadOk, hadErr bool) string {
 // still-active session into sessionUptime, with a `ready` label sourced
 // from the tracer's `opened` flag. Called periodically from the pool
 // heartbeat so the histogram represents the distribution of ages across
-// currently-active sessions. Java parity: SessionTracerImpl.recordAsyncMetrics
-// records uptime.elapsed() with `state == Ready` as the label.
+// currently-active sessions.
 func (t *sessionTracer) sampleUptime(ctx context.Context) {
 	if sessionUptime == nil {
 		return
@@ -295,12 +282,11 @@ func msSince(t time.Time) float64 {
 	return float64(time.Since(t)) / float64(time.Millisecond)
 }
 
-// recordTransportOverhead emits a per-vRPC (stream − backend) sample into
-// the transport_latencies histogram. Java's ClientTransportLatency defines
-// this metric as "e2e latencies minus node latencies" — the wire + AFE
-// overhead outside server processing. Caller has already validated the
-// delta is positive; this is a no-op if the metric isn't registered.
-// Method is the vRPC method name (e.g. "ExecuteVRpc/Read").
+// recordTransportOverhead emits a per-vRPC (e2e − backend) sample into
+// the transport_latencies histogram — the wire + AFE overhead outside
+// server processing. Caller has already validated the delta is positive;
+// this is a no-op if the metric isn't registered. Method is the vRPC
+// method name (e.g. "ExecuteVRpc/Read").
 func (t *sessionTracer) recordTransportOverhead(ctx context.Context, method string, overhead time.Duration) {
 	if transportLatencies == nil || overhead <= 0 {
 		return

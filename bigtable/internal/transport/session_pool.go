@@ -289,10 +289,10 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		// we've released p.mu.
 		ready := p.sl.ReadyAfes()
 		pickerName := picker.Name()
-		afe, decision := picker.PickAfe(ready)
+		afeID, picked, decision := picker.PickAfe(ready)
 		p.recordPickDecision(decision, pickerName)
-		if afe != nil {
-			if idle := p.sl.Checkout(afe); idle != nil {
+		if picked {
+			if idle := p.sl.Checkout(afeID); idle != nil {
 				idle.IncOutstanding()
 				atomic.AddInt64(&idle.picks, 1)
 				return idle, nil

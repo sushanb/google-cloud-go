@@ -15,6 +15,7 @@
 package internal
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -36,9 +37,12 @@ const (
 	afeTransportEwmaSeed = 500 * time.Microsecond
 	afeE2eEwmaSeed       = 1 * time.Millisecond
 
-	// afePruneMaxIdle is the age at which an AfeHandle with refCount==0
-	// becomes eligible for GC by sessionList.Prune. Java uses 10 min in
-	// SessionList.prune (its "recently used" retention window).
+	// afePruneMaxIdle is how long an empty AfeHandle (refCount==0) is
+	// retained before Prune is allowed to GC it. Measured from the AFE's
+	// lastConnected — the "last touched" timestamp updated on every
+	// OnSessionStarted and every ReleaseToPool (Java parity,
+	// SessionList.java:167 + :209). NOT "empty since": an AFE whose
+	// last activity was 30s ago is kept even if refCount just hit 0.
 	afePruneMaxIdle = 10 * time.Minute
 )
 
@@ -79,25 +83,36 @@ const (
 //
 // All fields are guarded by the enclosing sessionList's mu.
 type afeHandle struct {
-	id            afeID
-	sessions      []*SessionHandle // idle queue, FIFO
-	refCount      int              // idle + inFlight + closing (I4/I6)
-	lastConnected time.Time        // stamped on OnSessionStarted; drives Prune
-	transportEwma *PeakEwma        // updated on OK vRPCs only (Java parity)
-	e2eEwma       *PeakEwma        // updated on OK vRPCs only (Java parity)
+	id       afeID
+	sessions []*SessionHandle // idle queue, FIFO
+	refCount int              // idle + inFlight + closing (I4/I6)
+	// lastConnected is the "AFE was touched" timestamp — stamped on
+	// OnSessionStarted (new session opens) AND on ReleaseToPool
+	// (session returned to the idle queue after a vRPC). Drives Prune;
+	// also surfaced by Snapshot. Java parity: SessionList.java:167 +
+	// :209 update the same field from the same two sites.
+	lastConnected time.Time
+	transportEwma *PeakEwma // updated on OK vRPCs only (Java parity)
+	e2eEwma       *PeakEwma // updated on OK vRPCs only (Java parity)
 }
-
-// ID returns the AFE identifier for this bucket.
-func (a *afeHandle) ID() afeID { return a.id }
 
 // afeSnapshot is an immutable view of an afeHandle sufficient for a picker
 // to score / pick without needing to hold sessionList.mu on the hot path.
+//
+// Pickers receive value-typed snapshots (no *afeHandle) — the roundtrip
+// back into Checkout is by afeID, re-resolved under sl.mu. This keeps
+// every afeHandle field guarded by the documented lock without relying
+// on the picker to remember not to dereference.
+//
+// Cost fields (TransportCost / E2eCost) are PeakEwma nanoseconds as
+// float64. Snapshot() converts the same numbers to time.Duration for the
+// debug UI; picker cost functions consume the raw float64.
 type afeSnapshot struct {
-	Handle         *afeHandle
+	ID             afeID
 	IdleCount      int
 	NumOutstanding int     // refCount − IdleCount, ≥ 0
-	TransportCost  float64 // 0 if never updated (no OK vRPCs yet)
-	E2eCost        float64 // 0 if never updated
+	TransportCost  float64 // PeakEwma nanoseconds; 0 if never updated
+	E2eCost        float64 // PeakEwma nanoseconds; 0 if never updated
 }
 
 // sessionList groups sessions by the AFE they landed on. Mirrors Java's
@@ -166,22 +181,25 @@ func (sl *sessionList) OnSessionStarted(sh *SessionHandle) {
 	sl.readyCount++ // I2
 }
 
-// Checkout dequeues one idle session from afe (Idle → InFlight). Returns
-// nil when afe is nil or its queue is empty — a legitimate race with a
-// concurrent Checkout or an OnSessionClosing that just drained the last
-// idle handle. Callers should have picked from ReadyAfes() first.
+// Checkout dequeues one idle session from the AFE bucket with id
+// (Idle → InFlight). The bucket is re-resolved under sl.mu so no
+// *afeHandle pointer ever leaves the lock. Returns nil when the id has
+// no bucket or its queue is empty — legitimate races with a concurrent
+// Checkout or an OnSessionClosing that just drained the last idle
+// handle. Callers should have picked from ReadyAfes() first.
 //
 // Under Java-parity slot lifecycle (slotMu + drain-driven queue re-add),
 // the AFE queue only contains sessions with empty in-flight slots by
 // construction — Invoke's return path no longer re-enqueues, only
 // drainSlot's success does. A dequeued session is guaranteed idle-slot
 // so claimSlot at the caller cannot lose except via a pool-bypass bug.
-func (sl *sessionList) Checkout(afe *afeHandle) *SessionHandle {
+func (sl *sessionList) Checkout(id afeID) *SessionHandle {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	afe := sl.afeHandles[id]
 	if afe == nil {
 		return nil
 	}
-	sl.mu.Lock()
-	defer sl.mu.Unlock()
 	sh, nowEmpty := afe.dequeueLocked()
 	if sh == nil {
 		return nil
@@ -218,6 +236,10 @@ func (sl *sessionList) ReleaseToPool(sh *SessionHandle) {
 	if afe.enqueueLocked(sh) { // wasEmpty → afe re-enters the ready set (I3)
 		sl.afesWithReady = append(sl.afesWithReady, afe)
 	}
+	// Java parity: SessionList.java:209 stamps lastConnected on every
+	// return-to-pool so Prune's retention window measures true idleness,
+	// not just "time since last new session opened."
+	afe.lastConnected = time.Now()
 }
 
 // OnSessionClosing transitions {Idle, InFlight} → Closing. Drops the
@@ -259,9 +281,15 @@ func (sl *sessionList) OnSessionClosed(sh *SessionHandle) {
 		return
 	}
 	delete(sl.handleToAfe, sh)
-	if afe.refCount > 0 {
-		afe.refCount-- // I4/I6
-	}
+	// refCount underflow would mean an OnSessionClosed fired without a
+	// matching OnSessionStarted (the map delete above prevents a plain
+	// double-close from reaching this line). Either scenario violates
+	// I4/I6 — surface loudly via the debug-tag counter so silent drift
+	// is impossible, but don't panic (transport-layer panics kill the
+	// whole client).
+	assertDebugTagf(afe.refCount > 0, tagSessionListRefcountUnderflow,
+		"OnSessionClosed on afe=%d with refCount=%d", afe.id, afe.refCount)
+	afe.refCount-- // I4/I6
 	if removed, nowEmpty := afe.removeIfPresentLocked(sh); removed && nowEmpty {
 		sl.removeFromReadyLocked(afe) // I3
 	}
@@ -272,6 +300,14 @@ func (sl *sessionList) OnSessionClosed(sh *SessionHandle) {
 // Java parity, SessionList.java:181-187 — so a fast-failing AFE never
 // looks fastest to LeastLatencyPicker. transportEwma tracks e2e −
 // backend; e2eEwma tracks e2e directly.
+//
+// This method deliberately drops sl.mu between the map read and the
+// PeakEwma.Update calls — the only place in this file that does. Two
+// reasons: PeakEwma has its own mutex (thread-safe), and Update runs
+// on every completed vRPC (hot path). A concurrent OnSessionClosed +
+// Prune could detach the bucket between the read and the Update; the
+// update then lands on a detached PeakEwma and is harmlessly
+// discarded on the next Prune-triggered GC.
 func (sl *sessionList) RecordVRpcOutcome(sh *SessionHandle, e2e, backend time.Duration, ok bool) {
 	if !ok || sh == nil {
 		return
@@ -309,7 +345,7 @@ func (sl *sessionList) ReadyAfes() []afeSnapshot {
 			inflight = 0
 		}
 		out = append(out, afeSnapshot{
-			Handle:         afe,
+			ID:             afe.id,
 			IdleCount:      idle,
 			NumOutstanding: inflight,
 			TransportCost:  afe.transportEwma.Value(),
@@ -367,14 +403,16 @@ func (sl *sessionList) Snapshot() []AfeSnapshotRow {
 			LastConnected: afe.lastConnected,
 		})
 	}
-	sortAfeRowsByID(rows)
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
 	return rows
 }
 
-// Prune deletes AfeHandles that have been empty (refCount == 0) since
-// before `now.Sub(afePruneMaxIdle)`. AFEs with any live session (idle
-// or in-flight) are never pruned. Java parity: SessionList.prune runs
-// on a 10 min cadence.
+// Prune deletes AfeHandles that (a) have refCount == 0 AND (b) haven't
+// been touched (OnSessionStarted or ReleaseToPool) since
+// `now.Sub(afePruneMaxIdle)`. AFEs with any live session (idle,
+// in-flight, or closing) are never pruned — refCount includes all
+// three per I4/I6. Java parity: SessionList.prune runs on a 10 min
+// cadence and reads the same "last touched" timestamp.
 func (sl *sessionList) Prune(now time.Time) {
 	sl.mu.Lock()
 	defer sl.mu.Unlock()
@@ -408,10 +446,15 @@ func (sl *sessionList) dropMembershipLocked(sh *SessionHandle) {
 
 // removeFromReadyLocked removes afe from sl.afesWithReady in O(N).
 // Safe to call when afe is not present (no-op). Caller must hold sl.mu.
+// Nils the vacated tail slot so the backing array doesn't retain a
+// pointer to a bucket that's just been GC-eligible.
 func (sl *sessionList) removeFromReadyLocked(afe *afeHandle) {
 	for i, a := range sl.afesWithReady {
 		if a == afe {
-			sl.afesWithReady = append(sl.afesWithReady[:i], sl.afesWithReady[i+1:]...)
+			last := len(sl.afesWithReady) - 1
+			copy(sl.afesWithReady[i:], sl.afesWithReady[i+1:])
+			sl.afesWithReady[last] = nil
+			sl.afesWithReady = sl.afesWithReady[:last]
 			return
 		}
 	}
@@ -435,6 +478,10 @@ func (a *afeHandle) dequeueLocked() (sh *SessionHandle, nowEmpty bool) {
 		return nil, false
 	}
 	sh = a.sessions[0]
+	// Nil the vacated slot before shrinking the header so the backing
+	// array doesn't retain a reference to the dequeued SessionHandle
+	// (which transitively pins *Session, stream, ctx).
+	a.sessions[0] = nil
 	a.sessions = a.sessions[1:]
 	nowEmpty = len(a.sessions) == 0
 	return
@@ -447,20 +494,13 @@ func (a *afeHandle) dequeueLocked() (sh *SessionHandle, nowEmpty bool) {
 func (a *afeHandle) removeIfPresentLocked(sh *SessionHandle) (removed, nowEmpty bool) {
 	for i, h := range a.sessions {
 		if h == sh {
-			a.sessions = append(a.sessions[:i], a.sessions[i+1:]...)
+			last := len(a.sessions) - 1
+			copy(a.sessions[i:], a.sessions[i+1:])
+			a.sessions[last] = nil // GC: drop the retained tail slot
+			a.sessions = a.sessions[:last]
 			return true, len(a.sessions) == 0
 		}
 	}
 	return false, false
 }
 
-// sortAfeRowsByID sorts an AFE snapshot slice by ID ascending. Used to
-// keep the sessionz / afez rendering deterministic across snapshots
-// (map iteration order is randomised in Go).
-func sortAfeRowsByID(rows []AfeSnapshotRow) {
-	for i := 1; i < len(rows); i++ {
-		for j := i; j > 0 && rows[j-1].ID > rows[j].ID; j-- {
-			rows[j-1], rows[j] = rows[j], rows[j-1]
-		}
-	}
-}

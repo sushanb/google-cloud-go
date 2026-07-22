@@ -15,6 +15,9 @@
 package internal
 
 import (
+	"fmt"
+	"math/rand/v2"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,6 +33,102 @@ func makeHandleWithAfe(t *testing.T, id afeID) *SessionHandle {
 	return NewSessionHandle(s, time.Time{})
 }
 
+// verifyInvariantsLocked re-derives sessionList's bookkeeping from
+// scratch and returns a description of the first invariant violation
+// found (empty string == all invariants hold). Test-only. Caller must
+// hold sl.mu.
+//
+// Checks state invariants I1–I5 documented in session_list.go:65-72.
+// I6 is temporal (refCount decrements only in OnSessionClosed) and
+// cannot be verified from a snapshot alone — indirectly guarded via
+// the sequence of assertions in individual tests.
+func (sl *sessionList) verifyInvariantsLocked() string {
+	// I2 + implicit I1: readyCount equals count of registered handles
+	// with inExpectedCount==true. Any sh with inExpectedCount==true not
+	// present in handleToAfe would corrupt this walk — but we're
+	// iterating handleToAfe, so the "sh missing from map" case is
+	// covered by the count mismatch.
+	derived := 0
+	for sh := range sl.handleToAfe {
+		if sh.inExpectedCount {
+			derived++
+		}
+	}
+	if derived != sl.readyCount {
+		return fmt.Sprintf("I2: readyCount=%d, want %d (from handleToAfe walk)",
+			sl.readyCount, derived)
+	}
+
+	// I4: refCount per AFE matches the number of handleToAfe entries
+	// pointing at it.
+	pointerCounts := map[*afeHandle]int{}
+	for _, afe := range sl.handleToAfe {
+		pointerCounts[afe]++
+	}
+	for id, afe := range sl.afeHandles {
+		if pointerCounts[afe] != afe.refCount {
+			return fmt.Sprintf("I4: afe=%d refCount=%d, want %d (derived)",
+				id, afe.refCount, pointerCounts[afe])
+		}
+	}
+	// Also: no orphaned handleToAfe entry pointing at an AFE not in
+	// sl.afeHandles.
+	for sh, afe := range sl.handleToAfe {
+		if sl.afeHandles[afe.id] != afe {
+			return fmt.Sprintf("I4: sh=%p points at orphan afe=%d", sh, afe.id)
+		}
+	}
+
+	// I5: every sh in afe.sessions maps back to that afe with
+	// inExpectedCount==true.
+	for id, afe := range sl.afeHandles {
+		for i, sh := range afe.sessions {
+			if got := sl.handleToAfe[sh]; got != afe {
+				return fmt.Sprintf("I5: afe=%d sessions[%d] maps to afe=%v, want %v",
+					id, i, got, afe)
+			}
+			if !sh.inExpectedCount {
+				return fmt.Sprintf("I5: afe=%d sessions[%d] has inExpectedCount=false",
+					id, i)
+			}
+		}
+	}
+
+	// I3: afesWithReady == { afe : len(sessions) > 0 } as a set (no dupes).
+	seen := map[*afeHandle]bool{}
+	for _, afe := range sl.afesWithReady {
+		if seen[afe] {
+			return fmt.Sprintf("I3: afe=%d appears twice in afesWithReady", afe.id)
+		}
+		seen[afe] = true
+	}
+	for id, afe := range sl.afeHandles {
+		hasSessions := len(afe.sessions) > 0
+		if hasSessions && !seen[afe] {
+			return fmt.Sprintf("I3: afe=%d has %d sessions but missing from afesWithReady",
+				id, len(afe.sessions))
+		}
+		if !hasSessions && seen[afe] {
+			return fmt.Sprintf("I3: afe=%d has 0 sessions but present in afesWithReady", id)
+		}
+	}
+
+	return ""
+}
+
+// checkInvariants runs verifyInvariantsLocked under sl.mu and fails
+// the test on violation. Call at the end of every mutating test so
+// bookkeeping drift is caught even when the test's explicit assertions
+// wouldn't notice.
+func checkInvariants(t *testing.T, sl *sessionList) {
+	t.Helper()
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	if msg := sl.verifyInvariantsLocked(); msg != "" {
+		t.Errorf("sessionList invariant violation: %s", msg)
+	}
+}
+
 func TestSessionList_OnSessionStarted_BucketsByAfe(t *testing.T) {
 	sl := newSessionList()
 
@@ -41,21 +140,24 @@ func TestSessionList_OnSessionStarted_BucketsByAfe(t *testing.T) {
 	sl.OnSessionStarted(h1b)
 	sl.OnSessionStarted(h2)
 
-	if got := len(sl.afeHandles); got != 2 {
-		t.Errorf("len(afeHandles) = %d, want 2", got)
+	if got, want := sl.ReadyCount(), 3; got != want {
+		t.Errorf("ReadyCount() = %d, want %d", got, want)
 	}
-	if got := len(sl.afesWithReady); got != 2 {
-		t.Errorf("len(afesWithReady) = %d, want 2", got)
+	snaps := sl.ReadyAfes()
+	if got, want := len(snaps), 2; got != want {
+		t.Errorf("len(ReadyAfes()) = %d, want %d", got, want)
 	}
-	if got := sl.afeHandles[1].refCount; got != 2 {
-		t.Errorf("afe(1).refCount = %d, want 2", got)
+	byID := map[afeID]afeSnapshot{}
+	for _, s := range snaps {
+		byID[s.ID] = s
 	}
-	if got := len(sl.afeHandles[1].sessions); got != 2 {
-		t.Errorf("afe(1).sessions len = %d, want 2", got)
+	if got := byID[1]; got.IdleCount != 2 {
+		t.Errorf("AFE 1 IdleCount = %d, want 2", got.IdleCount)
 	}
-	if got := sl.afeHandles[2].refCount; got != 1 {
-		t.Errorf("afe(2).refCount = %d, want 1", got)
+	if got := byID[2]; got.IdleCount != 1 {
+		t.Errorf("AFE 2 IdleCount = %d, want 1", got.IdleCount)
 	}
+	checkInvariants(t, sl)
 }
 
 func TestSessionList_OnSessionStarted_Idempotent(t *testing.T) {
@@ -65,9 +167,10 @@ func TestSessionList_OnSessionStarted_Idempotent(t *testing.T) {
 	sl.OnSessionStarted(h)
 	sl.OnSessionStarted(h) // duplicate
 
-	if got := sl.afeHandles[7].refCount; got != 1 {
-		t.Errorf("refCount = %d, want 1 (dup register must be a no-op)", got)
+	if got, want := sl.ReadyCount(), 1; got != want {
+		t.Errorf("ReadyCount() = %d, want %d (dup register must be a no-op)", got, want)
 	}
+	checkInvariants(t, sl)
 }
 
 func TestSessionList_Checkout_DrainsAndRefills(t *testing.T) {
@@ -77,24 +180,22 @@ func TestSessionList_Checkout_DrainsAndRefills(t *testing.T) {
 	sl.OnSessionStarted(h1)
 	sl.OnSessionStarted(h2)
 
-	afe := sl.afeHandles[1]
-
 	// First checkout: queue still has one → AFE stays in ready list.
-	got1 := sl.Checkout(afe)
+	got1 := sl.Checkout(afeID(1))
 	if got1 == nil {
 		t.Fatal("Checkout returned nil")
 	}
-	if len(sl.afesWithReady) != 1 {
-		t.Errorf("afesWithReady len = %d, want 1 after first checkout", len(sl.afesWithReady))
+	if got, want := len(sl.ReadyAfes()), 1; got != want {
+		t.Errorf("len(ReadyAfes()) = %d, want %d after first checkout", got, want)
 	}
 
 	// Second checkout: queue emptied → AFE drops from ready list.
-	got2 := sl.Checkout(afe)
+	got2 := sl.Checkout(afeID(1))
 	if got2 == nil {
 		t.Fatal("second Checkout returned nil")
 	}
-	if len(sl.afesWithReady) != 0 {
-		t.Errorf("afesWithReady len = %d, want 0 after drain", len(sl.afesWithReady))
+	if got, want := len(sl.ReadyAfes()), 0; got != want {
+		t.Errorf("len(ReadyAfes()) = %d, want %d after drain", got, want)
 	}
 	if got1 == got2 {
 		t.Error("Checkout returned the same handle twice")
@@ -102,23 +203,29 @@ func TestSessionList_Checkout_DrainsAndRefills(t *testing.T) {
 
 	// Release the first: AFE re-enters ready list.
 	sl.ReleaseToPool(got1)
-	if len(sl.afesWithReady) != 1 {
-		t.Errorf("afesWithReady len = %d, want 1 after release", len(sl.afesWithReady))
+	if got, want := len(sl.ReadyAfes()), 1; got != want {
+		t.Errorf("len(ReadyAfes()) = %d, want %d after release", got, want)
 	}
-	if len(afe.sessions) != 1 {
-		t.Errorf("afe.sessions len = %d, want 1 after release", len(afe.sessions))
-	}
+	checkInvariants(t, sl)
 }
 
 func TestSessionList_Checkout_EmptyAfeReturnsNil(t *testing.T) {
 	sl := newSessionList()
 	h := makeHandleWithAfe(t, 1)
 	sl.OnSessionStarted(h)
-	afe := sl.afeHandles[1]
-	sl.Checkout(afe)
-	if got := sl.Checkout(afe); got != nil {
+	sl.Checkout(afeID(1))
+	if got := sl.Checkout(afeID(1)); got != nil {
 		t.Errorf("Checkout on empty AFE = %v, want nil", got)
 	}
+	checkInvariants(t, sl)
+}
+
+func TestSessionList_Checkout_UnknownAfeReturnsNil(t *testing.T) {
+	sl := newSessionList()
+	if got := sl.Checkout(afeID(999)); got != nil {
+		t.Errorf("Checkout on unknown AFE = %v, want nil", got)
+	}
+	checkInvariants(t, sl)
 }
 
 func TestSessionList_OnSessionClosing_RemovesIdleFromQueue(t *testing.T) {
@@ -130,13 +237,20 @@ func TestSessionList_OnSessionClosing_RemovesIdleFromQueue(t *testing.T) {
 
 	sl.OnSessionClosing(h1)
 
-	afe := sl.afeHandles[1]
-	if len(afe.sessions) != 1 {
-		t.Errorf("afe.sessions len = %d, want 1 after closing h1", len(afe.sessions))
+	// I6: refCount is NOT decremented on Closing — slot stays warm.
+	if got, want := sl.afeHandles[1].refCount, 2; got != want {
+		t.Errorf("refCount = %d, want %d (Closing does not decrement, I6)", got, want)
 	}
-	if afe.refCount != 2 {
-		t.Errorf("refCount = %d, want 2 (Closing does not decrement)", afe.refCount)
+	// I2: readyCount drops (h1 out of expected set).
+	if got, want := sl.ReadyCount(), 1; got != want {
+		t.Errorf("ReadyCount() = %d, want %d", got, want)
 	}
+	// I5: h1 removed from idle queue (only h2 pickable).
+	snaps := sl.ReadyAfes()
+	if len(snaps) != 1 || snaps[0].IdleCount != 1 {
+		t.Errorf("ReadyAfes() = %+v, want single AFE with IdleCount=1", snaps)
+	}
+	checkInvariants(t, sl)
 }
 
 func TestSessionList_OnSessionClosed_DecrementsRefcount(t *testing.T) {
@@ -149,13 +263,13 @@ func TestSessionList_OnSessionClosed_DecrementsRefcount(t *testing.T) {
 	sl.OnSessionClosing(h1)
 	sl.OnSessionClosed(h1)
 
-	afe := sl.afeHandles[1]
-	if afe.refCount != 1 {
-		t.Errorf("refCount = %d, want 1 after closing h1", afe.refCount)
+	if got, want := sl.afeHandles[1].refCount, 1; got != want {
+		t.Errorf("refCount = %d, want %d after Closing+Closed h1", got, want)
 	}
-	if _, present := sl.handleToAfe[h1]; present {
-		t.Error("handleToAfe still references closed handle h1")
+	if got, want := sl.ReadyCount(), 1; got != want {
+		t.Errorf("ReadyCount() = %d, want %d", got, want)
 	}
+	checkInvariants(t, sl)
 }
 
 func TestSessionList_OnSessionClosed_LastSessionDropsFromReady(t *testing.T) {
@@ -166,13 +280,15 @@ func TestSessionList_OnSessionClosed_LastSessionDropsFromReady(t *testing.T) {
 	// Skip Closing → straight to Closed (force-close path).
 	sl.OnSessionClosed(h)
 
-	if len(sl.afesWithReady) != 0 {
-		t.Errorf("afesWithReady len = %d, want 0 (last session on AFE closed)", len(sl.afesWithReady))
+	if got, want := len(sl.ReadyAfes()), 0; got != want {
+		t.Errorf("len(ReadyAfes()) = %d, want %d (last session closed)", got, want)
 	}
-	// Bucket stays until Prune GCs it.
-	if _, ok := sl.afeHandles[5]; !ok {
-		t.Error("afeHandles missing bucket 5 (should stay until Prune)")
+	// Bucket stays until Prune GCs it — verified via Snapshot (public).
+	rows := sl.Snapshot()
+	if len(rows) != 1 || rows[0].ID != 5 {
+		t.Errorf("Snapshot() = %+v, want single row for AFE 5", rows)
 	}
+	checkInvariants(t, sl)
 }
 
 func TestSessionList_RecordVRpcOutcome_SkipsNonOK(t *testing.T) {
@@ -185,19 +301,21 @@ func TestSessionList_RecordVRpcOutcome_SkipsNonOK(t *testing.T) {
 	// afeHandle constructs its e2eEwma via NewPeakEwmaSeeded(afeE2eEwmaSeed),
 	// so the untouched value is afeE2eEwmaSeed (1ms), not zero.
 	sl.RecordVRpcOutcome(h, 1*time.Nanosecond, 0, false)
-	if got, want := sl.afeHandles[1].e2eEwma.Value(), float64(afeE2eEwmaSeed); got != want {
-		t.Errorf("e2eEwma = %g, want %g (seed unchanged) after non-OK record", got, want)
+	snap := sl.Snapshot()[0]
+	if got, want := snap.E2eEwma, time.Duration(afeE2eEwmaSeed); got != want {
+		t.Errorf("E2eEwma = %v, want %v (seed unchanged) after non-OK record", got, want)
 	}
 
-	// OK response updates.
+	// OK response updates both cost trackers.
 	sl.RecordVRpcOutcome(h, 5*time.Millisecond, 1*time.Millisecond, true)
-	afe := sl.afeHandles[1]
-	if afe.e2eEwma.Value() <= 0 {
-		t.Errorf("e2eEwma = %g, want > 0 after OK record", afe.e2eEwma.Value())
+	snap = sl.Snapshot()[0]
+	if snap.E2eEwma <= 0 {
+		t.Errorf("E2eEwma = %v, want > 0 after OK record", snap.E2eEwma)
 	}
-	if afe.transportEwma.Value() <= 0 {
-		t.Errorf("transportEwma = %g, want > 0 after OK record", afe.transportEwma.Value())
+	if snap.TransportEwma <= 0 {
+		t.Errorf("TransportEwma = %v, want > 0 after OK record", snap.TransportEwma)
 	}
+	checkInvariants(t, sl)
 }
 
 func TestSessionList_ReadyAfes_Snapshot(t *testing.T) {
@@ -210,16 +328,15 @@ func TestSessionList_ReadyAfes_Snapshot(t *testing.T) {
 	sl.OnSessionStarted(h2)
 
 	// Simulate one in-flight on AFE 1.
-	sl.Checkout(sl.afeHandles[1])
+	sl.Checkout(afeID(1))
 
 	snaps := sl.ReadyAfes()
 	if len(snaps) != 2 {
 		t.Fatalf("snaps len = %d, want 2", len(snaps))
 	}
-
 	byID := map[afeID]afeSnapshot{}
 	for _, s := range snaps {
-		byID[s.Handle.ID()] = s
+		byID[s.ID] = s
 	}
 	if got := byID[1]; got.IdleCount != 1 || got.NumOutstanding != 1 {
 		t.Errorf("AFE 1: idle=%d inflight=%d, want 1/1", got.IdleCount, got.NumOutstanding)
@@ -227,6 +344,7 @@ func TestSessionList_ReadyAfes_Snapshot(t *testing.T) {
 	if got := byID[2]; got.IdleCount != 1 || got.NumOutstanding != 0 {
 		t.Errorf("AFE 2: idle=%d inflight=%d, want 1/0", got.IdleCount, got.NumOutstanding)
 	}
+	checkInvariants(t, sl)
 }
 
 func TestSessionList_Prune(t *testing.T) {
@@ -238,17 +356,43 @@ func TestSessionList_Prune(t *testing.T) {
 	sl.OnSessionStarted(h2)
 	sl.OnSessionClosed(h1)
 
-	// Force AFE 1's lastConnected into the past.
+	// Force AFE 1's lastConnected into the past. This is the ONE
+	// unavoidable white-box touch — Prune's input is time-based and
+	// there's no public knob to move an AFE's clock backward.
+	sl.mu.Lock()
 	sl.afeHandles[1].lastConnected = time.Now().Add(-2 * afePruneMaxIdle)
+	sl.mu.Unlock()
 
 	sl.Prune(time.Now())
 
-	if _, ok := sl.afeHandles[1]; ok {
+	rows := sl.Snapshot()
+	ids := map[int64]bool{}
+	for _, r := range rows {
+		ids[r.ID] = true
+	}
+	if ids[1] {
 		t.Error("AFE 1 should have been pruned (refCount=0, aged)")
 	}
-	if _, ok := sl.afeHandles[2]; !ok {
+	if !ids[2] {
 		t.Error("AFE 2 should not be pruned (still live)")
 	}
+	checkInvariants(t, sl)
+}
+
+func TestSessionList_Prune_KeepsRecentlyActiveEmpty(t *testing.T) {
+	sl := newSessionList()
+	h := makeHandleWithAfe(t, 1)
+	sl.OnSessionStarted(h)
+	sl.OnSessionClosed(h)
+	// Do NOT age lastConnected — it should still be within the window.
+
+	sl.Prune(time.Now())
+
+	rows := sl.Snapshot()
+	if len(rows) != 1 || rows[0].ID != 1 {
+		t.Errorf("Snapshot() = %+v, want single row for AFE 1 (empty but within age window)", rows)
+	}
+	checkInvariants(t, sl)
 }
 
 func TestSessionList_Snapshot(t *testing.T) {
@@ -262,7 +406,7 @@ func TestSessionList_Snapshot(t *testing.T) {
 	sl.OnSessionStarted(h1b)
 
 	// Mark one AFE-1 session as in-flight (idle=1, refCount=2).
-	sl.Checkout(sl.afeHandles[1])
+	sl.Checkout(afeID(1))
 
 	rows := sl.Snapshot()
 	if len(rows) != 2 {
@@ -278,18 +422,242 @@ func TestSessionList_Snapshot(t *testing.T) {
 	if rows[0].LastConnected.IsZero() {
 		t.Error("LastConnected should be populated after OnSessionStarted")
 	}
+	checkInvariants(t, sl)
 }
 
-func TestSessionList_Prune_KeepsRecentlyActiveEmpty(t *testing.T) {
+// TestSessionList_ReleaseToPool_AfterClosing_NoOp pins the guard that
+// prevents the WaitServerClose retry-storm documented in the
+// project_bigtable_release_to_pool_bug memory: a session drained by
+// OnSessionClosing must not re-enter the idle queue when a late
+// ReleaseToPool arrives, or the next Checkout will hand back a dying
+// session and every retry will hit "session is not active."
+//
+// Load-bearing: removing the `!sh.inExpectedCount` guard on
+// session_list.go:211 must make this test fail. If it doesn't, the
+// guard's contract is under-covered.
+func TestSessionList_ReleaseToPool_AfterClosing_NoOp(t *testing.T) {
 	sl := newSessionList()
 	h := makeHandleWithAfe(t, 1)
 	sl.OnSessionStarted(h)
-	sl.OnSessionClosed(h)
-	// Do NOT age lastConnected — it should still be within the window.
 
-	sl.Prune(time.Now())
+	// InFlight → Closing (mid-flight OnSessionClosing race).
+	sl.Checkout(afeID(1))
+	sl.OnSessionClosing(h)
 
-	if _, ok := sl.afeHandles[1]; !ok {
-		t.Error("AFE 1 should be kept (empty but within age window)")
+	// Late ReleaseToPool arriving after Closing must be a no-op.
+	sl.ReleaseToPool(h)
+
+	// AFE must not appear in the ready set: the only session on it is
+	// draining and its idle queue must stay empty.
+	if got := sl.ReadyAfes(); len(got) != 0 {
+		t.Errorf("ReadyAfes() = %+v, want empty (drained session must not re-enqueue)", got)
 	}
+	// Also: a follow-up Checkout must return nil, not hand out the
+	// drained handle.
+	if got := sl.Checkout(afeID(1)); got != nil {
+		t.Errorf("Checkout after Closing+ReleaseToPool = %v, want nil", got)
+	}
+	checkInvariants(t, sl)
+}
+
+// TestSessionList_AfeIDZero_Fallback verifies that sessions whose
+// AfeID is 0 (server didn't populate the peer-info header) all land
+// in the same bucket, count toward ReadyCount, and appear in
+// Snapshot — documented behavior at session_list.go:133-136.
+func TestSessionList_AfeIDZero_Fallback(t *testing.T) {
+	sl := newSessionList()
+
+	h1 := makeHandleWithAfe(t, 0)
+	h2 := makeHandleWithAfe(t, 0)
+	sl.OnSessionStarted(h1)
+	sl.OnSessionStarted(h2)
+
+	if got, want := sl.ReadyCount(), 2; got != want {
+		t.Errorf("ReadyCount() = %d, want %d", got, want)
+	}
+	snaps := sl.ReadyAfes()
+	if len(snaps) != 1 || snaps[0].ID != 0 || snaps[0].IdleCount != 2 {
+		t.Errorf("ReadyAfes() = %+v, want single ID=0 bucket with IdleCount=2", snaps)
+	}
+	rows := sl.Snapshot()
+	if len(rows) != 1 || rows[0].ID != 0 {
+		t.Errorf("Snapshot() = %+v, want single row for AFE 0", rows)
+	}
+	checkInvariants(t, sl)
+}
+
+// TestSessionList_OnSessionClosing_Idempotent covers the guarantee
+// that dropMembershipLocked is safe to call multiple times — pool
+// teardown (session_pool_lifecycle.go) relies on it. Two consecutive
+// OnSessionClosing calls must land readyCount in the same place as
+// one.
+func TestSessionList_OnSessionClosing_Idempotent(t *testing.T) {
+	sl := newSessionList()
+	h := makeHandleWithAfe(t, 1)
+	sl.OnSessionStarted(h)
+
+	sl.OnSessionClosing(h)
+	sl.OnSessionClosing(h) // duplicate
+
+	if got, want := sl.ReadyCount(), 0; got != want {
+		t.Errorf("ReadyCount() = %d, want %d after double-Closing", got, want)
+	}
+	if got, want := sl.afeHandles[1].refCount, 1; got != want {
+		t.Errorf("refCount = %d, want %d (Closing does not decrement, I6)", got, want)
+	}
+	checkInvariants(t, sl)
+}
+
+// TestSessionList_OnSessionClosed_Idempotent covers the double-Closed
+// case. handleToAfe delete on the first call means the second finds
+// afe==nil and short-circuits — must not double-decrement refCount or
+// trip the refcount-underflow assertion.
+func TestSessionList_OnSessionClosed_Idempotent(t *testing.T) {
+	sl := newSessionList()
+	h1 := makeHandleWithAfe(t, 1)
+	h2 := makeHandleWithAfe(t, 1)
+	sl.OnSessionStarted(h1)
+	sl.OnSessionStarted(h2)
+
+	sl.OnSessionClosed(h1)
+	sl.OnSessionClosed(h1) // duplicate
+
+	if got, want := sl.afeHandles[1].refCount, 1; got != want {
+		t.Errorf("refCount = %d, want %d after double-Closed h1", got, want)
+	}
+	checkInvariants(t, sl)
+}
+
+// TestSessionList_OnSessionClosing_ThenClosed_HappyPath and
+// TestSessionList_OnSessionClosed_SkipsClosing are already covered
+// above. This one covers the reversed order — Closed fires first (a
+// force-close path) and Closing arrives late; the late Closing must
+// be a no-op because handleToAfe no longer references the handle.
+func TestSessionList_OnSessionClosed_ThenClosing_LateClosingNoOp(t *testing.T) {
+	sl := newSessionList()
+	h1 := makeHandleWithAfe(t, 1)
+	h2 := makeHandleWithAfe(t, 1)
+	sl.OnSessionStarted(h1)
+	sl.OnSessionStarted(h2)
+
+	sl.OnSessionClosed(h1)  // force-close path
+	sl.OnSessionClosing(h1) // late Closing arriving after Closed
+
+	if got, want := sl.afeHandles[1].refCount, 1; got != want {
+		t.Errorf("refCount = %d, want %d after Closed-then-late-Closing", got, want)
+	}
+	if got, want := sl.ReadyCount(), 1; got != want {
+		t.Errorf("ReadyCount() = %d, want %d", got, want)
+	}
+	checkInvariants(t, sl)
+}
+
+// TestSessionList_ConcurrentOps_MaintainsInvariants stress-tests the
+// mutex discipline. N goroutines drive random OnSessionStarted /
+// Checkout / ReleaseToPool / OnSessionClosing / OnSessionClosed on a
+// shared handle pool; at quiesce the invariant walker must return
+// clean. -race amplifies the coverage. Short-mode-friendly (100 ops
+// per worker, ~10ms wall clock on modern hardware).
+func TestSessionList_ConcurrentOps_MaintainsInvariants(t *testing.T) {
+	const (
+		workers  = 8
+		opsEach  = 200
+		numAfes  = 4
+		poolSize = 32
+	)
+
+	sl := newSessionList()
+
+	// Pre-build the handle pool so goroutines don't race on
+	// makeHandleWithAfe (which is not thread-safe).
+	handles := make([]*SessionHandle, poolSize)
+	for i := range handles {
+		handles[i] = makeHandleWithAfe(t, afeID(1+i%numAfes))
+	}
+
+	// Track per-handle state (unregistered / registered / closed) with
+	// a small stateMu so workers don't double-register the same handle
+	// (which would be a legitimate no-op but skews the invariant walk).
+	type handleState int
+	const (
+		unregistered handleState = iota
+		registered
+		closed
+	)
+	states := make([]handleState, poolSize)
+	var stateMu sync.Mutex
+
+	// Deterministic seed so failures reproduce.
+	rng := rand.New(rand.NewPCG(0x5e551011115700ff, 0xdeadbeefcafebabe))
+	var rngMu sync.Mutex
+	randOp := func() int {
+		rngMu.Lock()
+		defer rngMu.Unlock()
+		return rng.IntN(5)
+	}
+	randHandle := func() int {
+		rngMu.Lock()
+		defer rngMu.Unlock()
+		return rng.IntN(poolSize)
+	}
+	randAfe := func() afeID {
+		rngMu.Lock()
+		defer rngMu.Unlock()
+		return afeID(1 + rng.IntN(numAfes))
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < opsEach; i++ {
+				switch randOp() {
+				case 0: // OnSessionStarted (once per handle)
+					idx := randHandle()
+					stateMu.Lock()
+					if states[idx] == unregistered {
+						states[idx] = registered
+						stateMu.Unlock()
+						sl.OnSessionStarted(handles[idx])
+					} else {
+						stateMu.Unlock()
+					}
+				case 1: // Checkout (may return nil legitimately)
+					sl.Checkout(randAfe())
+				case 2: // ReleaseToPool (only safe on registered handles)
+					idx := randHandle()
+					stateMu.Lock()
+					if states[idx] == registered {
+						stateMu.Unlock()
+						sl.ReleaseToPool(handles[idx])
+					} else {
+						stateMu.Unlock()
+					}
+				case 3: // OnSessionClosing
+					idx := randHandle()
+					stateMu.Lock()
+					if states[idx] == registered {
+						stateMu.Unlock()
+						sl.OnSessionClosing(handles[idx])
+					} else {
+						stateMu.Unlock()
+					}
+				case 4: // OnSessionClosed (transition registered→closed)
+					idx := randHandle()
+					stateMu.Lock()
+					if states[idx] == registered {
+						states[idx] = closed
+						stateMu.Unlock()
+						sl.OnSessionClosed(handles[idx])
+					} else {
+						stateMu.Unlock()
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	checkInvariants(t, sl)
 }

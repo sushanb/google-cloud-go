@@ -169,6 +169,17 @@ const (
 	tagSessionPoolPickLostRace               = "session_pool_pick_lost_race"
 	tagSessionPoolConsecutiveFailuresTripped = "session_pool_consecutive_failures_tripped"
 
+	// sessionList bookkeeping violations.
+	//
+	// tagSessionListRefcountUnderflow fires when OnSessionClosed would
+	// decrement an afeHandle's refCount below zero. Under I4/I6 this is
+	// unreachable — every decrement is preceded by an OnSessionStarted
+	// increment and the handleToAfe map delete guards against a
+	// double-close reaching the decrement. A non-zero count here means
+	// bookkeeping drifted (missed OnSessionStarted, mis-paired hook
+	// ordering, or a force-close bypass) and should be investigated.
+	tagSessionListRefcountUnderflow = "session_list_refcount_underflow"
+
 	// Client configuration polling.
 	tagClientConfigPollFailed     = "client_config_poll_failed"
 	tagClientConfigPollCtxExpired = "client_config_poll_ctx_expired"

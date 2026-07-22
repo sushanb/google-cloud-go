@@ -62,11 +62,10 @@ func BenchmarkRecordPickDecision_WarmRing(b *testing.B) {
 // The []PickCandidate result is retained by PickDecision (goes into
 // pickHistory), so 1 alloc/op is the expected floor.
 func BenchmarkKChoiceMinCost(b *testing.B) {
-	// 8 ready AFEs with valid handles (kChoiceMinCost calls .ID() on the
-	// winner).
+	// 8 ready AFEs — kChoiceMinCost samples snap.ID; no *afeHandle needed.
 	template := make([]afeSnapshot, 8)
 	for i := range template {
-		template[i] = afeSnapshot{Handle: &afeHandle{id: afeID(i + 1)}}
+		template[i] = afeSnapshot{ID: afeID(i + 1)}
 	}
 	ready := make([]afeSnapshot, 8)
 	cost := func(s afeSnapshot) float64 { return float64(s.NumOutstanding) }
@@ -77,7 +76,7 @@ func BenchmarkKChoiceMinCost(b *testing.B) {
 		// Callers pass a throwaway slice per pick; also required because
 		// kChoiceMinCost mutates ready in place via swap-to-front.
 		copy(ready, template)
-		_, _ = kChoiceMinCost(ready, defaultAfeRandomSubsetSize, cost)
+		_, _, _ = kChoiceMinCost(ready, defaultAfeRandomSubsetSize, cost)
 	}
 }
 
