@@ -128,25 +128,35 @@ type Stream interface {
 //
 // Lifecycle ordering guarantees:
 //
-//	OnStart   → fires once when Session.Start is invoked.
-//	OnActive  → fires once at Starting → Ready transition (after PeerInfo
-//	             is populated).
-//	OnClosing → fires once when the session is FIRST known to be dying —
-//	             on the first successful transition out of Ready (any
-//	             non-Ready terminal-bound state). Java parity:
-//	             SessionImpl.onSessionClosing. Consumers use it to
-//	             remove the session from pool routing structures BEFORE
-//	             the actual close (potentially up to
-//	             waitServerCloseGrace seconds) completes.
-//	OnClose   → fires once at the end of teardown, after the stream has
-//	             actually closed. Always fires AFTER OnClosing (the
-//	             session guarantees the ordering via closingOnce +
-//	             closeOnce).
+//	OnStart        → fires once when Session.Start is invoked.
+//	OnActive       → fires once at Starting → Ready transition (after
+//	                  PeerInfo is populated).
+//	OnSlotDrained  → fires on every successful drainSlot on the wire
+//	                  (normal deliver, cancelled-drain, Send-failure
+//	                  Invoke branch). Under Java-parity slot lifecycle
+//	                  this is the sole "session became free" signal —
+//	                  consumers use it to re-enqueue the session in its
+//	                  AFE idle queue and wake one parked Checkout waiter.
+//	                  cancelActiveRPCs (session teardown) intentionally
+//	                  does NOT fire it — OnClosing/OnClose handle removal
+//	                  from routing structures on that path.
+//	OnClosing      → fires once when the session is FIRST known to be
+//	                  dying — on the first successful transition out of
+//	                  Ready (any non-Ready terminal-bound state). Java
+//	                  parity: SessionImpl.onSessionClosing. Consumers use
+//	                  it to remove the session from pool routing
+//	                  structures BEFORE the actual close (potentially up
+//	                  to waitServerCloseGrace seconds) completes.
+//	OnClose        → fires once at the end of teardown, after the stream
+//	                  has actually closed. Always fires AFTER OnClosing
+//	                  (the session guarantees the ordering via closingOnce
+//	                  + closeOnce).
 type SessionHooks struct {
-	OnStart   func(ctx context.Context)
-	OnActive  func(s *Session)
-	OnClosing func(s *Session)
-	OnClose   func(s *Session, err error)
+	OnStart       func(ctx context.Context)
+	OnActive      func(s *Session)
+	OnSlotDrained func()
+	OnClosing     func(s *Session)
+	OnClose       func(s *Session, err error)
 }
 
 func (h SessionHooks) onStart(ctx context.Context) {
@@ -158,6 +168,12 @@ func (h SessionHooks) onStart(ctx context.Context) {
 func (h SessionHooks) onActive(s *Session) {
 	if h.OnActive != nil {
 		h.OnActive(s)
+	}
+}
+
+func (h SessionHooks) onSlotDrained() {
+	if h.OnSlotDrained != nil {
+		h.OnSlotDrained()
 	}
 }
 
@@ -269,14 +285,6 @@ type Session struct {
 	slotMu        sync.Mutex
 	activeRPC     *vrpcImpl
 	currentCancel *vrpcResult
-
-	// slotDrainedFn fires from notifySlotDrained on every successful
-	// drainSlot. Set once at construction (via setSlotDrainedCallback,
-	// called from SessionPoolImpl.createSession); nil for sessions built
-	// by tests that bypass the pool. Replaces the prior back-ref through
-	// SessionHandle.onSlotDrained, so the hot path skips one atomic load
-	// and a pointer chase.
-	slotDrainedFn func()
 
 	// heartbeatIntervalNano is the server-negotiated keep-alive interval
 	// (ns). handleSessionParameters mutates it from readLoop while the
@@ -446,34 +454,6 @@ func (s *Session) setSlotForTest(rpc *vrpcImpl) {
 	s.slotMu.Lock()
 	s.activeRPC = rpc
 	s.slotMu.Unlock()
-}
-
-// notifySlotDrained tells the pool the slot just drained on the wire.
-// Under v3 (Java-parity slot lifecycle + drain-as-sole-free-signal),
-// this is the ONLY path that re-enqueues the session in its AFE idle
-// queue and wakes one parked Checkout waiter — the pool's Invoke
-// return path no longer does either. Fires from every drainSlot
-// success: normal deliver, cancelled-drain (ctx.Done caller already
-// returned), and the Send-failure Invoke branch. The callback is
-// installed once at construction by SessionPoolImpl.createSession via
-// setSlotDrainedCallback; nil-safe for sessions built by tests that
-// bypass the pool. cancelActiveRPCs (session teardown) intentionally
-// does NOT call this — the session is on its way out;
-// OnSessionClosing/OnSessionClosed handle its removal from the routing
-// structures.
-func (s *Session) notifySlotDrained() {
-	if s.slotDrainedFn != nil {
-		s.slotDrainedFn()
-	}
-}
-
-// setSlotDrainedCallback installs the slot-drained callback. Called
-// once at construction time by SessionPoolImpl.createSession (before
-// Session.Start), so no concurrent readers of the field exist. Tests
-// that bypass the pool may install a counter here too. nil clears the
-// callback (subsequent notifySlotDrained fires become no-ops).
-func (s *Session) setSlotDrainedCallback(fn func()) {
-	s.slotDrainedFn = fn
 }
 
 // transitionTo sets the session state to `to` iff ok(currentState) returns
