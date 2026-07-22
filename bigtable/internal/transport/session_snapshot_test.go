@@ -137,7 +137,6 @@ func TestPoolSnapshot_AggregatesSessions(t *testing.T) {
 		s := NewSession("s", stream, SessionHooks{}, SessionTypeTable)
 		s.state.Store(int32(StateReady))
 		sh := NewSessionHandle(s, time.Time{})
-		s.poolHandle.Store(sh)
 		pool.sl.OnSessionStarted(sh)
 		handles = append(handles, sh)
 	}

@@ -103,9 +103,9 @@ func TestOnActive_DuplicateSessionSkipped(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	sh := injectActiveSession(t, p, "s1", time.Now())
 	before := p.sl.ReadyCount()
-	// Firing OnActive for a session already registered must not
-	// double-register (poolHandle dup-check catches it).
-	p.OnActive(sh.session)
+	// Firing onActive on a handle already activated must not
+	// double-register (sh.activated CAS gate catches it).
+	p.onActive(sh)
 	if got := p.sl.ReadyCount(); got != before {
 		t.Errorf("sl.ReadyCount = %d, want %d (duplicate register)", got, before)
 	}
@@ -113,45 +113,52 @@ func TestOnActive_DuplicateSessionSkipped(t *testing.T) {
 
 func TestOnActive_SignalsFree(t *testing.T) {
 	p := newTestPool(t, 1, 10)
-	// Park a waiter directly on the queue. OnActive should wake it.
+	// Park a waiter directly on the queue. onActive should wake it.
 	w := &waiter{ready: make(chan struct{})}
 	p.waitersMu.Lock()
 	w.elem = p.waiters.PushBack(w)
 	p.waitersMu.Unlock()
 
-	// Craft a fresh session and fire OnActive — must wake the parked waiter.
+	// Craft a fresh session + handle and fire onActive — must wake the
+	// parked waiter.
+	sh := NewSessionHandle(nil, time.Now())
 	stream := newFakeStream()
 	s := NewSession("s-fresh", stream, SessionHooks{
 		OnStart:  p.OnStart,
-		OnActive: p.OnActive,
-		OnClose:  p.OnClose,
+		OnActive: func(_ *Session) { p.onActive(sh) },
+		OnClose:  func(_ *Session, err error) { p.onClose(sh, err) },
 	}, SessionTypeTable)
 	s.state.Store(int32(StateReady))
-	p.OnActive(s)
+	sh.session = s
+	p.onActive(sh)
 	select {
 	case <-w.ready:
 		// expected
 	case <-time.After(100 * time.Millisecond):
-		t.Error("OnActive did not wake the parked waiter within 100ms")
+		t.Error("onActive did not wake the parked waiter within 100ms")
 	}
 }
 
 func TestOnClose_StartingSessionBumpsFailedToStart(t *testing.T) {
 	p := newTestPool(t, 1, 10)
-	// Session in startingSessions but never promoted (no poolHandle).
+	// Handle in startingSessions but never activated.
 	stream := newFakeStream()
-	s := NewSession("s-starting", stream, SessionHooks{OnClose: p.OnClose}, SessionTypeTable)
+	sh := NewSessionHandle(nil, time.Time{})
+	s := NewSession("s-starting", stream, SessionHooks{
+		OnClose: func(_ *Session, err error) { p.onClose(sh, err) },
+	}, SessionTypeTable)
+	sh.session = s
 	p.mu.Lock()
-	p.startingSessions[s] = true
+	p.startingSessions[sh] = struct{}{}
 	p.mu.Unlock()
 
-	p.OnClose(s, nil)
+	p.onClose(sh, nil)
 
 	p.mu.Lock()
-	_, stillThere := p.startingSessions[s]
+	_, stillThere := p.startingSessions[sh]
 	p.mu.Unlock()
 	if stillThere {
-		t.Error("session still in startingSessions after OnClose")
+		t.Error("handle still in startingSessions after onClose")
 	}
 	if got := p.snapshotCloseReasons()["FailedToStart"]; got != 1 {
 		t.Errorf("FailedToStart count = %d, want 1", got)
@@ -164,18 +171,13 @@ func TestOnClosing_DropsFromReadyCountAndRecordsLifetime(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	sh := injectActiveSession(t, p, "s1", time.Now().Add(-time.Second))
 	if p.sl.ReadyCount() != 1 {
-		t.Fatalf("ReadyCount before OnClosing = %d, want 1", p.sl.ReadyCount())
+		t.Fatalf("ReadyCount before onClosing = %d, want 1", p.sl.ReadyCount())
 	}
 
-	p.OnClosing(sh.session)
+	p.onClosing(sh)
 
 	if got := p.sl.ReadyCount(); got != 0 {
-		t.Errorf("ReadyCount after OnClosing = %d, want 0 (dying sessions must free the budget)", got)
-	}
-	// poolHandle survives OnClosing — OnClose reads it to hand off to
-	// sl.OnSessionClosed.
-	if got := sh.session.poolHandle.Load(); got != sh {
-		t.Errorf("session.poolHandle = %p, want %p (OnClose needs it for sl teardown)", got, sh)
+		t.Errorf("ReadyCount after onClosing = %d, want 0 (dying sessions must free the budget)", got)
 	}
 	if got := len(p.snapshotLifetimes()); got != 1 {
 		t.Errorf("lifetimes len = %d, want 1 (createdAt was set → recordLifetime should fire)", got)
@@ -185,26 +187,30 @@ func TestOnClosing_DropsFromReadyCountAndRecordsLifetime(t *testing.T) {
 func TestOnClosing_StartingSessionIsNoOp(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	stream := newFakeStream()
-	s := NewSession("s-starting", stream, SessionHooks{OnClosing: p.OnClosing}, SessionTypeTable)
+	sh := NewSessionHandle(nil, time.Time{})
+	s := NewSession("s-starting", stream, SessionHooks{
+		OnClosing: func(_ *Session) { p.onClosing(sh) },
+	}, SessionTypeTable)
+	sh.session = s
 	p.mu.Lock()
-	p.startingSessions[s] = true
+	p.startingSessions[sh] = struct{}{}
 	p.mu.Unlock()
 
-	p.OnClosing(s)
+	p.onClosing(sh)
 
-	// A starting-only session was never promoted via OnActive, so
-	// poolHandle should still be nil.
-	if got := s.poolHandle.Load(); got != nil {
-		t.Errorf("session.poolHandle = %p, want nil for starting-only session", got)
+	// Starting-branch short-circuits — closingRecorded stays unset so a
+	// later onClosing (once promoted) could still run.
+	if sh.closingRecorded.Load() {
+		t.Error("sh.closingRecorded set for starting-only handle; starting-branch must not consume the flag")
 	}
 }
 
-func TestOnClosing_ThenOnClose_UsesPoolHandle(t *testing.T) {
+func TestOnClosing_ThenOnClose_UsesHandleDirectly(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	sh := injectActiveSession(t, p, "s1", time.Now().Add(-time.Second))
 
-	p.OnClosing(sh.session)
-	p.OnClose(sh.session, nil)
+	p.onClosing(sh)
+	p.onClose(sh, nil)
 
 	if got := p.m.sessionsClosed.Load(); got != 1 {
 		t.Errorf("sessionsClosed = %d, want 1", got)
@@ -214,10 +220,10 @@ func TestOnClosing_ThenOnClose_UsesPoolHandle(t *testing.T) {
 func TestPoolClose_RecordsLifetimeOncePerSession(t *testing.T) {
 	// Regression: Phase-1 of Pool.Close records lifetime up-front for every
 	// snapshotted handle. Phase-2 then fires s.Close per session, which
-	// drives notifyClosing → p.OnClosing → recordLifetime again unless
-	// Phase-1 has cleared s.poolHandle to trip OnClosing's nil-guard.
-	// Without the clear, the lifetimes ring double-counts every session
-	// torn down during pool teardown.
+	// drives notifyClosing → p.onClosing → recordLifetime again unless
+	// Phase-1 has tripped sh.closingRecorded. Without the flag, the
+	// lifetimes ring double-counts every session torn down during pool
+	// teardown.
 	p := newTestPool(t, 1, 10)
 	const n = 3
 	for i := 0; i < n; i++ {
@@ -229,7 +235,7 @@ func TestPoolClose_RecordsLifetimeOncePerSession(t *testing.T) {
 	}
 
 	// Pool.Close waits on wg for all Phase-2 s.Close goroutines, and s.Close
-	// fires notifyClosing synchronously → OnClosing has run by return.
+	// fires notifyClosing synchronously → onClosing has run by return.
 	if got := len(p.snapshotLifetimes()); got != n {
 		t.Errorf("lifetimes len = %d, want %d (one per session, not double-counted)", got, n)
 	}
@@ -264,14 +270,16 @@ func TestOnClosing_FiresBeforeOnClose_ViaSessionClose(t *testing.T) {
 
 func TestOnClose_IdxNotFoundStillRecords(t *testing.T) {
 	p := newTestPool(t, 1, 10)
-	// A session neither in sl nor startingSessions — the "already
-	// proactively removed" path (OnClosing already ran, or a bare-metal
-	// caller invoked OnClose directly). recordSessionClose still fires so
-	// the ledger reflects reality.
+	// A handle neither in sl nor startingSessions — the "already
+	// proactively removed" path (onClosing already ran, or a bare-metal
+	// caller invoked onClose directly). recordSessionClose still fires
+	// so the ledger reflects reality.
 	stream := newFakeStream()
+	sh := NewSessionHandle(nil, time.Time{})
 	s := NewSession("s-ghost", stream, SessionHooks{}, SessionTypeTable)
+	sh.session = s
 
-	p.OnClose(s, nil)
+	p.onClose(sh, nil)
 	if got := p.m.sessionsClosed.Load(); got != 1 {
 		t.Errorf("sessionsClosed = %d, want 1", got)
 	}

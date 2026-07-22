@@ -97,12 +97,14 @@ type SessionPoolImpl struct {
 	// consecutive-failure counter on OK.
 	sl     *sessionList
 	budget SessionThrottler
-	// startingSessions holds sessions dialed via createSession that have
-	// not yet reached OnActive. Cleared in OnActive (promotion) or in
-	// OnClose (failed start → bumpStartingClose). Registered active
+	// startingSessions holds handles dialed via createSession that have
+	// not yet reached onActive. Cleared in onActive (promotion) or in
+	// onClose (failed start → bumpStartingClose). Registered active
 	// sessions live in sl (sessionList) — the pool no longer carries a
-	// separate flat slice.
-	startingSessions   map[*Session]bool
+	// separate flat slice. Keyed by *SessionHandle rather than *Session
+	// because the hook closures capture sh; the pool never needs a
+	// *Session-only lookup path.
+	startingSessions   map[*SessionHandle]struct{}
 	closed             bool
 	scalingInProgress  bool
 	minSessions        int
@@ -213,7 +215,7 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 		streamFactory:      streamFactory,
 		openSessionRequest: openSessionRequest,
 		metadata:           md,
-		startingSessions:   make(map[*Session]bool),
+		startingSessions:   make(map[*SessionHandle]struct{}),
 		sessionType:        sessionType,
 		waiters:            list.New(),
 		poolCtx:            poolCtx,

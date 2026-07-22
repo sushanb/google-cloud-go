@@ -33,7 +33,7 @@ func stampCloseReason(s *Session, reason string) {
 }
 
 // abnormalOnCloseFor injects a fresh Session into the pool, stamps a
-// close reason, then invokes p.OnClose(s, nil) so the abnormal-close
+// close reason, then invokes p.onClose(sh, nil) so the abnormal-close
 // counter path runs. abnormal picks a reason isAbnormalCloseReason
 // classifies as abnormal ("StreamEnd:Unavailable"); a false argument
 // picks a clean reason ("StreamEnd:EOF").
@@ -45,7 +45,7 @@ func abnormalOnCloseFor(t testing.TB, p *SessionPoolImpl, abnormal bool) {
 		reason = "StreamEnd:Unavailable"
 	}
 	stampCloseReason(sh.session, reason)
-	p.OnClose(sh.session, nil)
+	p.onClose(sh, nil)
 }
 
 func TestConsecutiveFailures_AbnormalOnCloseIncrements(t *testing.T) {

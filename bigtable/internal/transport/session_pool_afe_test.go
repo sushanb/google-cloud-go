@@ -28,18 +28,18 @@ import (
 func injectActiveOnAfe(t *testing.T, p *SessionPoolImpl, name string, afe afeID) *SessionHandle {
 	t.Helper()
 	stream := newFakeStream()
+	sh := NewSessionHandle(nil, time.Now())
 	s := NewSession(name, stream, SessionHooks{
 		OnStart:  p.OnStart,
-		OnActive: p.OnActive,
-		OnClose:  p.OnClose,
+		OnActive: func(_ *Session) { p.onActive(sh) },
+		OnClose:  func(_ *Session, err error) { p.onClose(sh, err) },
 	}, SessionTypeTable)
 	s.state.Store(int32(StateReady))
 	// Stamp PeerInfo BEFORE registering — sessionList reads AfeID() at
 	// OnSessionStarted, matching production's sync-PeerInfo invariant.
 	s.peerInfo.Store(&spb.PeerInfo{ApplicationFrontendId: int64(afe)})
+	sh.session = s
 
-	sh := NewSessionHandle(s, time.Now())
-	s.poolHandle.Store(sh)
 	p.sl.OnSessionStarted(sh)
 	return sh
 }

@@ -127,8 +127,8 @@ func (p *SessionPoolImpl) recordSessionClose(s *Session, fallbackReason string) 
 
 // bumpStartingClose is the recordSessionClose variant for sessions that
 // died before reaching active state — they're held in startingSessions
-// and never got a poolHandle stamp, so OnClose's starting-branch is the
-// only signal we get. Wraps the same once-flag for consistency.
+// and never fired onActive, so onClose's starting-branch is the only
+// signal we get. Wraps the same once-flag for consistency.
 func (p *SessionPoolImpl) bumpStartingClose(s *Session) {
 	p.recordSessionClose(s, "FailedToStart")
 }
@@ -171,19 +171,22 @@ func (p *SessionPoolImpl) Close() error {
 	// the handles from the AFE-aware sessionList so a concurrent picker
 	// racing with teardown never returns a retired session.
 	//
-	// Clear s.poolHandle after recording so the callback chain fired by the
-	// Phase-2 s.Close (notifyClosing → p.OnClosing, closeOnce → p.OnClose)
-	// short-circuits on its poolHandle.Load()==nil guard. Without this,
-	// OnClosing would re-run recordLifetime for every session and OnClose
-	// would call sl.OnSessionClosed a second time — sessionList tolerates it
-	// (idempotent), but the lifetimes ring gets 2× the correct entries.
+	// Flip closingRecorded / closeRecorded on each handle after recording
+	// so the callback chain fired by Phase-2 s.Close (notifyClosing →
+	// p.onClosing, closeOnce → p.onClose) short-circuits on the CAS
+	// guard. Without this, onClosing would re-run recordLifetime for every
+	// session and onClose would call sl.OnSessionClosed a second time —
+	// sessionList tolerates it (idempotent), but the lifetimes ring gets
+	// 2× the correct entries. Replaces the prior poolHandle.Store(nil)
+	// trick, expressing the dedup as an actual dedup flag.
 	for _, sh := range snapshot {
 		if sh != nil && sh.session != nil {
 			if !sh.createdAt.IsZero() {
 				p.recordLifetime(time.Since(sh.createdAt))
 			}
 			p.recordSessionClose(sh.session, "PoolClose")
-			sh.session.poolHandle.Store(nil)
+			sh.closingRecorded.Store(true)
+			sh.closeRecorded.Store(true)
 		}
 		p.sl.OnSessionClosed(sh)
 	}
@@ -232,51 +235,43 @@ func (p *SessionPoolImpl) Close() error {
 // OnStart is a no-op callback for session start.
 func (p *SessionPoolImpl) OnStart(ctx context.Context) {}
 
-// OnActive is triggered when a background session finishes its open session req and becomes active.
-// The session is wrapped inside a SessionHandle and registered into the ready sessions list!
-func (p *SessionPoolImpl) OnActive(s *Session) {
-	// Callers hold this method's body under p.mu for the full duration.
-	// Keep new work here allocation-only / atomic-only — anything that
-	// blocks would deadlock the read loop and heartbeat scheduler that
-	// contend for p.mu. See SessionHooks doc: "hooks must not block."
+// onActive is triggered when a background session finishes its open
+// session req and becomes active. The SessionHandle was already minted
+// by createSession — this method just publishes it into sl and clears
+// the starting-set entry.
+//
+// The activated CAS makes this safe to invoke twice on the same handle;
+// tests exercise the guard (production wires each closure exactly once
+// per Session lifetime).
+func (p *SessionPoolImpl) onActive(sh *SessionHandle) {
+	if !sh.activated.CompareAndSwap(false, true) {
+		return
+	}
+	// Callers hold this method's body under p.mu for the full duration
+	// of the map/registration work. Keep new work here allocation-only
+	// / atomic-only — anything that blocks would deadlock the read
+	// loop and heartbeat scheduler that contend for p.mu. See
+	// SessionHooks doc: "hooks must not block."
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	delete(p.startingSessions, s)
+	delete(p.startingSessions, sh)
 
 	if p.closed {
 		// Dispatch to a goroutine so this method returns and releases
-		// p.mu before the OnClose callback chain fires. ForceClose →
-		// notifyClosed → hooks.onClose == p.OnClose, and p.OnClose
+		// p.mu before the onClose callback chain fires. ForceClose →
+		// notifyClosed → hooks.onClose fires p.onClose, and p.onClose
 		// re-acquires p.mu — synchronous would deadlock on the
 		// non-reentrant mutex. Race window: Close() sets p.closed=true
 		// then releases p.mu; a session already in flight through
 		// OpenSession can land here up to ~30s later.
-		go s.ForceClose(&spb.CloseSessionRequest{
+		go sh.session.ForceClose(&spb.CloseSessionRequest{
 			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR,
 			Description: "pool closed before session became active",
 		})
 		return
 	}
 
-	// Dup-check via the once-set poolHandle. If OnActive already ran for
-	// this session, poolHandle is non-nil and we exit idempotently.
-	if s.poolHandle.Load() != nil {
-		return
-	}
-
-	sh := NewSessionHandle(s, time.Now())
-	// Drain is the sole "session became free" signal under Java-parity
-	// slot lifecycle (v3): re-enqueue in the AFE idle queue AND wake
-	// one parked Checkout waiter. Invoke's return path no longer does
-	// either — the pre-refactor releaseSlot-in-defer semantics conflated
-	// "slot empty" with "session available"; drain-driven signaling
-	// separates them. Callback captures p and sh once at OnActive.
-	sh.onSlotDrained = func() {
-		p.sl.ReleaseToPool(sh)
-		p.signalFree()
-	}
-	s.poolHandle.Store(sh)
 	p.m.sessionsOpened.Add(1)
 
 	// Register the newly-Active session in its AFE bucket. PeerInfo is
@@ -289,7 +284,7 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 	p.signalFree()
 }
 
-// OnClosing is fired by the Session at the FIRST transition out of Ready
+// onClosing is fired by the Session at the FIRST transition out of Ready
 // (handleGoAway, Close, ForceClose, handleClose — whichever wins). Java
 // parity: onSessionClosing. Removes the session from the pool's
 // operational structures immediately so:
@@ -301,68 +296,71 @@ func (p *SessionPoolImpl) OnActive(s *Session) {
 // complete. This is what lets CheckoutSession skip the per-miss dead-
 // sweep — dying sessions leave the pool's accounting the instant they
 // start dying, not at end-of-teardown.
-func (p *SessionPoolImpl) OnClosing(s *Session) {
-	// Still-starting sessions leave the pool via OnClose's
+func (p *SessionPoolImpl) onClosing(sh *SessionHandle) {
+	// Still-starting sessions leave the pool via onClose's
 	// bumpStartingClose path — they were never promoted to Active, so
-	// s.poolHandle was never stored.
+	// there's nothing to remove from sl.
 	p.mu.Lock()
-	_, starting := p.startingSessions[s]
+	_, starting := p.startingSessions[sh]
 	p.mu.Unlock()
 	if starting {
 		return
 	}
-	removed := s.poolHandle.Load()
-	if removed == nil {
-		return
+	if !sh.closingRecorded.CompareAndSwap(false, true) {
+		return // Pool.Close Phase-1 already recorded.
 	}
-	if !removed.createdAt.IsZero() {
-		p.recordLifetime(time.Since(removed.createdAt))
+	if !sh.createdAt.IsZero() {
+		p.recordLifetime(time.Since(sh.createdAt))
 	}
 
 	// Remove from the AFE idle queue too. sessionList keeps refCount
 	// alive (in-flight vRPCs still complete via the session) until
-	// OnClose fires and drops the handle entirely. This also decrements
+	// onClose fires and drops the handle entirely. This also decrements
 	// sl.readyCount, freeing a slot in the scale-up budget.
-	p.sl.OnSessionClosing(removed)
+	p.sl.OnSessionClosing(sh)
 
 	if p.sl.ReadyCount() < p.maxSessions {
 		go p.PerformScaling(p.poolCtx)
 	}
 }
 
-// OnClose fires at the end of teardown — the stream has actually
-// closed. By this point OnClosing has already dropped the session
+// onClose fires at the end of teardown — the stream has actually
+// closed. By this point onClosing has already dropped the session
 // from sl.readyCount and the picker's idle queue. This callback
 // finalizes: drop the AFE handle from sl (refCount → 0, out of
-// handleToAfe) and record the close in the reason ledger. The
-// *Session → *SessionHandle back-ref is Session.poolHandle, set
-// in OnActive and cleared by Pool.Close's Phase-1 teardown loop
-// (so callbacks fired from a pool-driven s.Close short-circuit).
-func (p *SessionPoolImpl) OnClose(s *Session, err error) {
+// handleToAfe) and record the close in the reason ledger. Pool.Close's
+// Phase-1 flips sh.closeRecorded before Phase-2's s.Close runs, so a
+// pool-driven close short-circuits here instead of double-firing
+// sl.OnSessionClosed.
+func (p *SessionPoolImpl) onClose(sh *SessionHandle, err error) {
 	p.mu.Lock()
-	if _, starting := p.startingSessions[s]; starting {
-		delete(p.startingSessions, s)
+	if _, starting := p.startingSessions[sh]; starting {
+		delete(p.startingSessions, sh)
 		p.mu.Unlock()
 		// A session that was never promoted to active still counts toward
 		// the close ledger — bumpStartingClose is the once-flag path.
-		p.bumpStartingClose(s)
+		p.bumpStartingClose(sh.session)
 		// A start that never reached Active but failed abnormally still
 		// contributes to the consecutive-failure signal. createSession
 		// already routes the OpenSession error through budget.Release
 		// (which applies the creation penalty); this counter is the
 		// separate "did any session make progress" signal Java tracks.
-		p.noteAbnormalCloseIfAny(s)
+		p.noteAbnormalCloseIfAny(sh.session)
 		return
 	}
 	p.mu.Unlock()
 
-	if handle := s.poolHandle.Load(); handle != nil {
-		p.sl.OnSessionClosed(handle)
+	if !sh.closeRecorded.CompareAndSwap(false, true) {
+		// Pool.Close Phase-1 already recorded. bumpAbnormalClose still
+		// runs on the s.poolCloseRecorded once-flag path.
+		p.noteAbnormalCloseIfAny(sh.session)
+		return
 	}
+	p.sl.OnSessionClosed(sh)
 	// recordSessionClose is once-guarded via s.poolCloseRecorded — safe
-	// to call even when OnClosing already invoked it.
-	p.recordSessionClose(s, "")
-	p.noteAbnormalCloseIfAny(s)
+	// to call even when onClosing already invoked it.
+	p.recordSessionClose(sh.session, "")
+	p.noteAbnormalCloseIfAny(sh.session)
 }
 
 // noteAbnormalCloseIfAny bumps the consecutive-failure counter when
