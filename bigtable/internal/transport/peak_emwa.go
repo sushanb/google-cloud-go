@@ -38,10 +38,9 @@ func NewPeakEwma(tau time.Duration) *PeakEwma {
 // NewPeakEwmaSeeded returns a PeakEwma pre-seeded with the given cost so
 // Value() returns non-zero before the first Update lands. The seed is
 // authoritative only until the first Update, which resets value to the
-// real sample (see Update's lastUpdate.IsZero branch). Java parity —
-// SessionList.java seeds transport at 500µs and e2e at 1ms so a
-// brand-new AFE doesn't win the least-latency picker by looking
-// free-cost.
+// real sample (see Update's lastUpdate.IsZero branch). sessionList
+// seeds transport at 500µs and e2e at 1ms so a brand-new AFE doesn't
+// win the least-latency picker by looking free-cost.
 func NewPeakEwmaSeeded(tau, seed time.Duration) *PeakEwma {
 	return &PeakEwma{
 		tau:   tau,
