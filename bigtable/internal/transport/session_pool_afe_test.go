@@ -138,7 +138,7 @@ func TestPool_LeastLatency_PrefersLowCostAFE(t *testing.T) {
 
 // TestPool_LeastLatency_IgnoresFailingAFELatency verifies the OK-gate
 // on per-AFE PeakEwma updates: a fast-failing AFE cannot pretend to be
-// the fastest by feeding synthetic 1ns non-OK samples. Java parity
+// the fastest by feeding synthetic 1ns non-OK samples. Per the
 // (SessionList.java:181-187).
 func TestPool_LeastLatency_IgnoresFailingAFELatency(t *testing.T) {
 	p := newTestPool(t, 1, 20)

@@ -511,7 +511,7 @@ func TestPeerInfoExtracter_ParsesValidHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proto.Marshal: %v", err)
 	}
-	// Server uses URL-safe base64. Java's Base64.getUrlEncoder() emits padded
+	// Server uses URL-safe base64. URL-safe base64 encoders emit padded
 	// output; RawURLEncoding emits unpadded. Extracter must accept both.
 	cases := []struct {
 		name    string

@@ -20,8 +20,8 @@ import (
 
 // defaultAfeRandomSubsetSize is the default K for K-choice random draws
 // in LeastInFlightAfePicker / LeastLatencyAfePicker when the caller
-// doesn't specify one. Matches Java's typical LoadBalancingOptions
-// randomSubsetSize=2 for K-choice-two picking.
+// doesn't specify one. Two candidates ("power of two choices") is the
+// standard K-choice draw size.
 const defaultAfeRandomSubsetSize = 2
 
 // PickCandidate is one AFE the picker considered during a K-choice draw,
@@ -64,7 +64,6 @@ type AfePicker interface {
 }
 
 // SimpleAfePicker chooses an AFE uniformly at random from the ready set.
-// Java parity: SimplePicker.
 type SimpleAfePicker struct{}
 
 // NewSimpleAfePicker constructs a SimpleAfePicker.
@@ -89,13 +88,12 @@ func (SimpleAfePicker) PickAfe(ready []afeSnapshot) (afeID, bool, PickDecision) 
 // LeastInFlightAfePicker picks the AFE with the smallest in-flight count.
 // Draws K distinct candidates via partial Fisher-Yates over the ready
 // snapshot and returns the min-cost one. RandomSubsetSize caps K; when
-// it's <=0 or >= len(ready) every candidate is considered. Java parity:
-// LeastInFlightPicker (partial Fisher-Yates capped by randomSubsetSize,
-// tie-break on first-seen order).
+// it's <=0 or >= len(ready) every candidate is considered. Ties break
+// on first-seen order.
 type LeastInFlightAfePicker struct {
 	// RandomSubsetSize caps the K-choice draw. 0 or negative means
-	// "consider all candidates" (Java parity when
-	// LoadBalancingOptions.randomSubsetSize == 0).
+	// "consider all candidates" (matches LoadBalancingOptions
+	// randomSubsetSize == 0).
 	RandomSubsetSize int
 }
 
@@ -118,8 +116,8 @@ func (p LeastInFlightAfePicker) PickAfe(ready []afeSnapshot) (afeID, bool, PickD
 
 // LeastLatencyAfePicker picks the AFE with the lowest per-AFE e2e
 // PeakEwma cost. Same K-choice partial Fisher-Yates as
-// LeastInFlightAfePicker. Java parity: LeastLatencyPicker (uses
-// AfeHandle.getE2eCost()).
+// LeastInFlightAfePicker. Reads the per-AFE e2eEwma cost — this is
+// what users experience end-to-end.
 type LeastLatencyAfePicker struct {
 	RandomSubsetSize int
 }
@@ -153,7 +151,7 @@ func decisionFor(winner afeID, picked bool, cands []PickCandidate, reason string
 	}
 }
 
-// kChoiceMinCost implements Java's partial-Fisher-Yates + min-cost
+// kChoiceMinCost implements partial-Fisher-Yates + min-cost
 // selection over a snapshot slice. K is clamped to len(ready); K<=0 is
 // treated as the default (defaultAfeRandomSubsetSize) when len(ready)
 // >= default, else scan everything.

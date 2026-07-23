@@ -15,9 +15,7 @@
 // debug_tracer.go — cheap counter for "this branch shouldn't reach"
 // sites in the session pool, session, and configuration manager. Every
 // emission is one atomic add plus one OTel Int64Counter increment; safe
-// to sprinkle freely on cold paths. Metric name matches java-bigtable's
-// ClientDebugTagCount so cross-language dashboards can join on the tag
-// column.
+// to sprinkle freely on cold paths.
 //
 // # How to use
 //
@@ -87,9 +85,7 @@ import (
 )
 
 // debugLevel gates whether a debug tag emission is admitted. Only two
-// levels today — no site needs finer granularity. Values chosen to
-// match Java's TelemetryConfiguration.Level so future wire-config
-// plumbing is a straight cast.
+// levels today — no site needs finer granularity.
 type debugLevel int32
 
 // lvl exposes the debug levels as a small namespace so call sites read
@@ -113,9 +109,7 @@ var lvl = struct {
 // using the fully-qualified name here would double-prefix (and
 // normalize dots to slashes in the second half), producing e.g.
 // `bigtable.googleapis.com/internal/client/bigtable/googleapis/com/internal/client/debug_tags`
-// which Cloud Monitoring rejects as an unknown type. The exported
-// name matches java-bigtable's ClientDebugTagCount so cross-language
-// dashboards can join.
+// which Cloud Monitoring rejects as an unknown type.
 const debugTagCounterName = "debug_tags"
 
 // debugTagAttrKey is the single OTel attribute under which the tag
@@ -126,10 +120,9 @@ const debugTagAttrKey = "tag"
 // Debug-tag catalog. Every recordDebugTag / assertDebugTag call site in
 // the transport package passes one of these constants — never an inline
 // literal. Adding a tag = adding a const here. Names use snake_case on
-// the wire (matches java-bigtable's tag namespace) and camelCase in
-// code. Grep for a tag on either the const name or the string literal
-// and you find the definition + the sole emission site (usually one, at
-// most a few).
+// the wire and camelCase in code. Grep for a tag on either the const
+// name or the string literal and you find the definition + the sole
+// emission site (usually one, at most a few).
 const (
 	// Session-lifecycle observations.
 	tagSessionUnknownResponse       = "session_unknown_response"
@@ -144,12 +137,11 @@ const (
 	// vRPC dispatch observations.
 	//
 	// tagSessionVRPCNil / tagSessionVRPCErrorNil / tagSessionVRPCIDMismatch
-	// are all unreachable in production under the slotMu Java-parity
-	// slot lifecycle (SessionImpl.java:420-614 parity) — the slot is
-	// only cleared by response handlers or session teardown, both of
-	// which serialize via drainSlot. They survive as canary counters
-	// for wire corruption / bookkeeping bugs and as pins for tests
-	// that inject responses out-of-band.
+	// are all unreachable in production under the slotMu slot lifecycle —
+	// the slot is only cleared by response handlers or session teardown,
+	// both of which serialize via drainSlot. They survive as canary
+	// counters for wire corruption / bookkeeping bugs and as pins for
+	// tests that inject responses out-of-band.
 	tagSessionVRPCNil                = "session_vrpc_nil"
 	tagSessionVRPCErrorNil           = "session_vrpc_error_nil"
 	tagSessionVRPCIDMismatch         = "session_vrpc_id_mismatch"
@@ -241,7 +233,7 @@ func init() {
 func registerDebugTagCounter(meter metric.Meter) error {
 	c, err := meter.Int64Counter(
 		debugTagCounterName,
-		metric.WithDescription("Count of unexpected events tagged by call site — the Go client's parity with java-bigtable's ClientDebugTagCount."),
+		metric.WithDescription("Count of unexpected events tagged by call site."),
 	)
 	if err != nil {
 		return fmt.Errorf("create debug_tags counter: %w", err)

@@ -90,7 +90,7 @@ type Handler func(ctx context.Context, req interface{}) (interface{}, error)
 type Interceptor func(ctx context.Context, req interface{}, handler Handler) (interface{}, error)
 
 // VRpcTracer receives per-attempt lifecycle notifications from
-// RetryingVRpc. Matches Java's VRpcTracer role and the tracing/OTel
+// RetryingVRpc. Fills the VRpcTracer role and the tracing/OTel
 // vocabulary — this is a passive observer, not an event subscription
 // (nothing is buffered or delivered asynchronously).
 type VRpcTracer interface {

@@ -172,9 +172,8 @@ func TestThrottler_UpdateConfigShrinkHonoredOnNextAcquire(t *testing.T) {
 		}
 	}
 	// Shrink below current in-use. Existing holders keep their slots
-	// (matches Java's sanityCheck comment: "This could happen if the
-	// budget is updated"), but no new Acquire succeeds until Releases
-	// bring the counter under the new cap.
+	// (the budget may be updated below current in-use), but no new
+	// Acquire succeeds until Releases bring the counter under the new cap.
 	tr.UpdateConfig(1, time.Minute)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)

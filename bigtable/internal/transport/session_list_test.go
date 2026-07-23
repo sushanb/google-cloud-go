@@ -297,7 +297,7 @@ func TestSessionList_RecordVRpcOutcome_SkipsNonOK(t *testing.T) {
 	sl.OnSessionStarted(h)
 
 	// Non-OK response with a very fast (fake) latency must NOT update
-	// EWMA — Java parity, so a fast-failing AFE can't look fastest.
+	// EWMA — OK-gated, so a fast-failing AFE can't look fastest.
 	// afeHandle constructs its e2eEwma via NewPeakEwmaSeeded(afeE2eEwmaSeed),
 	// so the untouched value is afeE2eEwmaSeed (1ms), not zero.
 	sl.RecordVRpcOutcome(h, 1*time.Nanosecond, 0, false)

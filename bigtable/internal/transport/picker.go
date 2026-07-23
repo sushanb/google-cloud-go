@@ -40,8 +40,7 @@ type SessionHandle struct {
 	// sessionList.readyCount (the scale-up budget). Set true in
 	// sl.OnSessionStarted, cleared by whichever of sl.OnSessionClosing /
 	// sl.OnSessionClosed fires first. Guarded by owning sessionList.mu;
-	// do not touch outside sl methods. Java-parity: SessionList.java's
-	// inExpectedCount field.
+	// do not touch outside sl methods.
 	inExpectedCount bool
 	// activated / closingRecorded / closeRecorded are one-shot dedup
 	// flags for the pool's per-session hook chain. They replace the

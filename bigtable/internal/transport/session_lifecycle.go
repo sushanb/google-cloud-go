@@ -274,7 +274,7 @@ func (s *Session) handleSessionResponse(resp *spb.SessionResponse) {
 // the header is already buffered and stream.Header() returns without
 // blocking. Ordering: extract first, then fire onActive, so every observer
 // sees a session whose PeerInfo (and therefore AfeID) is populated. This
-// matches Java's onHeaders synchrony.
+// header is buffered before any bidi message is sent.
 func (s *Session) handleOpenSession(_ *spb.OpenSessionResponse) {
 	if prev, ok := s.transitionTo(StateReady, isState(StateStarting)); !ok {
 		// Server confirmed OpenSession while we were in a state that
@@ -333,11 +333,11 @@ func (s *Session) handleSessionRefreshConfig(cfg *spb.SessionRefreshConfig) {
 
 // handleGoAway processes a server-initiated GoAway:
 //  1. Transitions to StateClosing so pool.CheckoutSession stops handing
-//     this session out for new work (matches Java's onSessionGoAway
+//     this session out for new work (the onSessionGoAway
 //     which marks the session as no longer eligible for new picks).
 //  2. Stamps "GoAway" as the close reason so it survives the eventual
 //     handleClose stamp.
-//  3. Does NOT cancel the in-flight RPC. Java parity: SessionImpl's
+//  3. Does NOT cancel the in-flight RPC:
 //     handleGoAwayResponse just transitions state and leaves currentRpc
 //     alone — if the server sends the response before dropping the
 //     stream, the RPC completes successfully. Only when the stream
@@ -589,7 +589,7 @@ func (s *Session) heartBeatLoop(ctx context.Context) {
 
 // peerInfoExtracter parses the base64-encoded peer info header and caches
 // the decoded PeerInfo on the session. Server emits URL-safe base64
-// (matches java-bigtable's Base64.getUrlDecoder()); trailing '=' padding
+// (URL-safe base64 decoder); trailing '=' padding
 // is stripped so a single RawURLEncoding decoder handles both shapes.
 func (s *Session) peerInfoExtracter(peerInfoData []string) {
 	if len(peerInfoData) == 0 {

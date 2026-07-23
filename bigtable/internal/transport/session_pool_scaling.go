@@ -19,7 +19,7 @@
 //
 // Scale-up is the only actioned branch: the sizer's negative deltas are
 // advisory, and the pool shrinks passively via OnClose's replace-on-
-// death gate (see java-bigtable's PoolSizer for the same asymmetric
+// death gate (the same asymmetric
 // design).
 
 package internal
@@ -113,7 +113,7 @@ func (p *SessionPoolImpl) Maintain(ctx context.Context) {
 	// OnClose fires and the pool retires them.
 	p.sweepStuckSessions()
 	// AFE prune runs on its own timer (see StartAfePrune) at
-	// afePruneMaxIdle cadence for java-parity — kept OFF the 1-sec
+	// afePruneMaxIdle cadence — kept OFF the 1-sec
 	// heartbeat so the sl.mu it holds during map-walk can't contend with
 	// serving-path Checkouts even under pathological AFE-count growth.
 
@@ -144,7 +144,7 @@ func (p *SessionPoolImpl) Maintain(ctx context.Context) {
 
 	// Only scale-up is actioned. Scale-down deltas are advisory — the
 	// pool shrinks passively via OnClose's replace-on-death gate (see
-	// java-bigtable's PoolSizer for the same asymmetric design). This
+	// same asymmetric PoolSizer design). This
 	// removes the periodic prune that produced the burst-then-lull
 	// oscillation on wave-shaped workloads.
 	if delta <= 0 {
@@ -268,7 +268,7 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 
 	// Mint the SessionHandle BEFORE NewSession so the per-session hook
 	// closures can capture it directly — no Session→SessionHandle
-	// back-ref needed. Java parity: SessionPoolImpl.java:424-448 wires
+	// back-ref needed. Design:
 	// per-session listeners at construction time with the handle in
 	// scope. sh.session and sh.createdAt are backfilled two statements
 	// down; the closures don't fire until Session.Start runs.

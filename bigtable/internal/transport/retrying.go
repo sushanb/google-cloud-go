@@ -25,8 +25,7 @@ import (
 // RetryingOptions configures the retry behavior of RetryingVRpc.
 type RetryingOptions struct {
 	// MaxAttempts caps the total number of tries per Invoke (initial +
-	// retries). Defaults to 3 for Java parity — RetryingVRpc.java
-	// hardcodes a 3-attempt cap. Read once at RetryingVRpc construction
+	// retries). Defaults to 3. Read once at RetryingVRpc construction
 	// and captured in the closure; the server-driven client config has
 	// no channel to swap this today (no matching proto field), so
 	// mutating it after RetryingVRpc(...) returns has no effect on
@@ -44,7 +43,7 @@ type RetryingOptions struct {
 	Idempotent bool
 	// ShouldRetry, if non-nil, overrides the default state-based check.
 	// Callers with unusual retry policies use it; the default (nil)
-	// applies Java-parity classification via AttemptState + Idempotent.
+	// applies the strict classification via AttemptState + Idempotent.
 	//
 	// Server-attached RetryInfo is checked BEFORE ShouldRetry and always
 	// wins — a server-directed retry is honored even if ShouldRetry
@@ -110,10 +109,10 @@ func RetryingVRpc(opts RetryingOptions) Interceptor {
 
 			lastErr = err
 
-			// SESSION_SPEC #9 "last-observed err preserved": Java's
-			// RetryingVRpc returns the last attempt's typed error, not
-			// raw context.Canceled/DeadlineExceeded. lastErr carries the
-			// gRPC code + AttemptState tag callers need.
+			// SESSION_SPEC #9 "last-observed err preserved": return the
+			// last attempt's typed error, not raw context.Canceled /
+			// DeadlineExceeded. lastErr carries the gRPC code +
+			// AttemptState tag callers need.
 			if ctx.Err() != nil {
 				return nil, lastErr
 			}
@@ -167,8 +166,7 @@ func RetryingVRpc(opts RetryingOptions) Interceptor {
 
 			// SESSION_SPEC #9 "deadline-fit check": if the delay would
 			// exhaust the caller's remaining deadline, skip the retry
-			// entirely and surface lastErr — Java parity
-			// (RetryingVRpc.java:290-298). Waiting past the deadline
+			// entirely and surface lastErr. Waiting past the deadline
 			// only to have the next attempt immediately fail with
 			// DeadlineExceeded loses the typed error and burns budget.
 			// Applied to any delay (server RetryInfo or client
@@ -195,8 +193,8 @@ func RetryingVRpc(opts RetryingOptions) Interceptor {
 	}
 }
 
-// shouldRetryDefault applies strict Java-parity retry classification for
-// the default retry path (no caller-supplied ShouldRetry, no server
+// shouldRetryDefault applies the strict retry classification for the
+// default retry path (no caller-supplied ShouldRetry, no server
 // RetryInfo). Server RetryInfo is handled by the caller before this fn
 // is consulted — its short-circuit lives at the interceptor level so the
 // custom-ShouldRetry path honors it uniformly (SESSION_SPEC #9).
@@ -207,10 +205,10 @@ func RetryingVRpc(opts RetryingOptions) Interceptor {
 //   - ServerResult → NEVER retry from this path. A bare server-explicit
 //     error — even Unavailable / Aborted / DeadlineExceeded — is NOT
 //     retried without an explicit server go-ahead (RetryInfo handled
-//     upstream). This matches Java's RetryingVRpc: the server said
-//     something specific; the client doesn't second-guess it.
+//     upstream): the server said something specific; the client doesn't
+//     second-guess it.
 //
-// Callers that need the pre-parity permissive behavior (retry on
+// Callers that need the permissive behavior (retry on
 // {Aborted, Internal, ResourceExhausted, Unavailable} without RetryInfo)
 // set RetryingOptions.ShouldRetry.
 func shouldRetryDefault(err error, idempotent bool) bool {

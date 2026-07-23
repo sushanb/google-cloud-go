@@ -411,8 +411,8 @@ func TestInvoke_SendFailureCleansUpMap(t *testing.T) {
 }
 
 // TestInvoke_ConcurrentSecondFailsWithSlotBusy: SESSION_SPEC #2 —
-// single-in-flight-vRPC invariant guarded by claimSlot under slotMu (Java
-// SessionImpl.startRpc L423 parity). A caller entering Invoke while the slot
+// single-in-flight-vRPC invariant guarded by claimSlot under slotMu.
+// A caller entering Invoke while the slot
 // is still claimed MUST get ErrSessionNotActive tagged StateUncommitted with
 // a "busy" diagnostic so the retry oracle steers to another session.
 func TestInvoke_ConcurrentSecondFailsWithSlotBusy(t *testing.T) {

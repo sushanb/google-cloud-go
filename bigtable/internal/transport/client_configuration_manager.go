@@ -367,7 +367,8 @@ func (m *ClientConfigurationManager) addListener(listener configListener) func()
 // when the server didn't set one) and short-circuits when that slice is
 // unchanged from the previous delivery (proto-equality), so unrelated changes
 // — e.g., a new PollingInterval — won't redundantly fire a SessionPool
-// resize. Mirrors the per-listener diff in Java's ListenerEntry.maybeNotify.
+// resize. Per-listener diff avoids re-notifying subscribers whose section
+// of the config is unchanged.
 //
 // Since currentConfig is now a live proto, the extractor forwards the
 // server's full SessionPoolConfiguration verbatim — every field (Headroom,

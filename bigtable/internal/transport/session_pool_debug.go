@@ -95,7 +95,7 @@ type SlowVRpcEvent struct {
 	// BackendLatency is the server-reported processing time
 	// (SessionRequestStats.BackendLatency); zero if not present.
 	BackendLatency time.Duration
-	// TransportLatency on SlowVRpcEvent is the java-parity delta:
+	// TransportLatency on SlowVRpcEvent is the delta:
 	// (stream Send→Recv) − BackendLatency. Isolates wire + AFE +
 	// client-decode overhead outside server processing. Zero when
 	// BackendLatency isn't populated (server didn't return Stats) or

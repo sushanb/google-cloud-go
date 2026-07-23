@@ -322,7 +322,7 @@ func TestInvoke_RetryInfoPackedIntoStatus(t *testing.T) {
 }
 
 // TestHandleVRPCResponse_LateResponseAfterCtxDone_FlagsCancelledDrained
-// pins Java-parity slot-lifecycle: the caller's ctx expires before the
+// pins the slot-lifecycle: the caller's ctx expires before the
 // server response lands, but the slot stays claimed (markCancelled
 // records the cancel; drainSlot does NOT run in Invoke's return path).
 // The eventual server response drains the slot as a bookkeeping-only
@@ -331,7 +331,7 @@ func TestInvoke_RetryInfoPackedIntoStatus(t *testing.T) {
 //  1. Invoke's claimSlot fills activeRPC and Send goes out.
 //  2. ctx deadline fires; awaitInvokeResult returns via <-ctx.Done()
 //     after markCancelled records the cancel result.
-//  3. activeVRPC() is STILL non-nil — Java parity, unlike the pre-
+//  3. activeVRPC() is STILL non-nil — unlike the pre-
 //     slotMu behavior where a defer releaseSlot cleared it.
 //  4. The server's response for that rpc_id lands moments later —
 //     handleVRPCResponse calls drainSlot, sees currentCancel != nil,
@@ -377,12 +377,12 @@ func TestHandleVRPCResponse_LateResponseAfterCtxDone_FlagsCancelledDrained(t *te
 		t.Fatal("Invoke did not return within outer bound")
 	}
 
-	// Java-parity precondition: slot STAYS claimed even after Invoke
+	// Precondition: slot STAYS claimed even after Invoke
 	// returned via ctx.Done. This is the observable divergence from
 	// the pre-slotMu behavior — any future PR that reverts to
 	// client-side release must fail this assertion.
 	if got := s.activeVRPC(); got == nil {
-		t.Fatal("activeVRPC = nil after Invoke returned via ctx.Done; want the slot to stay claimed (Java-parity: only drainSlot releases it)")
+		t.Fatal("activeVRPC = nil after Invoke returned via ctx.Done; want the slot to stay claimed (only drainSlot releases it)")
 	}
 
 	// Snapshot the counter just before the late-response injection so we
@@ -420,7 +420,7 @@ func TestHandleVRPCResponse_LateResponseAfterCtxDone_FlagsCancelledDrained(t *te
 }
 
 // TestInvoke_SecondInvokeAfterCtxDoneRejectedUncommitted pins the
-// Java-parity claim rejection (SessionImpl.startRpc L423 —
+// Claim rejection when the slot is held (
 // currentRpc != null → INTERNAL "RPC multiplexing not supported").
 // Sequence exercised:
 //
@@ -431,7 +431,7 @@ func TestHandleVRPCResponse_LateResponseAfterCtxDone_FlagsCancelledDrained(t *te
 //  4. Server response for rpc_A drains the slot.
 //  5. A fresh Invoke #3 can now claim and proceed normally.
 //
-// This is the Java-parity replacement for the pre-slotMu
+// This is the replacement for the pre-slotMu
 // TestHandleVRPCResponse_LateResponseAfterCtxDoneAndNewInvoke_FlagsIDMismatch
 // (which pinned the client-only slot-release divergence). Any future PR
 // that reverts to client-side release must break this test — the second
@@ -467,7 +467,7 @@ func TestInvoke_SecondInvokeAfterCtxDoneRejectedUncommitted(t *testing.T) {
 		t.Fatal("Invoke #1 did not return within outer bound")
 	}
 
-	// Slot still claimed — Java parity.
+	// Slot still claimed.
 	if got := s.activeVRPC(); got == nil {
 		t.Fatal("activeVRPC = nil after Invoke #1 returned via ctx.Done; want slot held")
 	}
@@ -479,7 +479,7 @@ func TestInvoke_SecondInvokeAfterCtxDoneRejectedUncommitted(t *testing.T) {
 		t.Fatal("Invoke #2 succeeded with slot busy; want Uncommitted error")
 	}
 	if outcome := ClassifyErr(err); outcome.State != StateUncommitted {
-		t.Errorf("Invoke #2 err classified as %v, want StateUncommitted (Java parity: retryer must be free to pick another session)", outcome.State)
+		t.Errorf("Invoke #2 err classified as %v, want StateUncommitted (retryer must be free to pick another session)", outcome.State)
 	}
 	if got := len(stream.snapshotSent()); got != sentBefore {
 		t.Errorf("Invoke #2 sent %d frames beyond Invoke #1; want 0 (Send must not fire on a losing claim, or rpc_id burn / wire noise ensues)", got-sentBefore)

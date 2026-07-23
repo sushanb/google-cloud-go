@@ -18,7 +18,7 @@ import "errors"
 
 // AttemptState classifies how far a single vRPC attempt progressed before
 // terminating. RetryingVRpc consumes this instead of raw gRPC codes so
-// retry decisions match Java's VRpc.VRpcResult.State semantics:
+// retry decisions reflect where the attempt died:
 //
 //   - Uncommitted: safe to retry unconditionally (server saw nothing).
 //   - TransportFailure: safe only for idempotent ops (server may have applied).
@@ -29,8 +29,8 @@ type AttemptState int
 const (
 	// StateServerResult is the zero value: any bare error from a code
 	// path that hasn't yet adopted tagErr (or an error introduced by a
-	// non-vRPC layer) classifies here. Under the strict Java-parity
-	// default (see shouldRetryDefault in retrying.go) StateServerResult
+	// non-vRPC layer) classifies here. Under the strict default
+	// (see shouldRetryDefault in retrying.go) StateServerResult
 	// does NOT retry unless the server explicitly attached RetryInfo or
 	// the caller set RetryingOptions.ShouldRetry to override the whole
 	// classifier. Callers that need a permissive fallback must opt in.

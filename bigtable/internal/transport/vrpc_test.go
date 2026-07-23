@@ -185,7 +185,7 @@ func TestRetryingVRpc_HonorServerRetryDelay(t *testing.T) {
 		attempts++
 		if attempts == 1 {
 			// Server-returned error carrying RetryInfo — permits retry
-			// regardless of state (Java parity: server explicitly said
+			// regardless of state (server explicitly said
 			// "try again in Nms"). Tag as ServerResult to match the real
 			// production path (handleVRPCErrorResponse).
 			st := status.New(codes.Unavailable, "overloaded")
@@ -443,9 +443,9 @@ func TestRetryingVRpc_TransportFailureNonIdempotentNoRetry(t *testing.T) {
 }
 
 // TestRetryingVRpc_ServerResultNotRetriedByDefault verifies strict
-// Java parity for the ServerResult path: a server-explicit error is NOT
+// For the ServerResult path: a server-explicit error is NOT
 // retried without server-attached RetryInfo, regardless of gRPC code.
-// The permissive pre-parity behavior (retry on Unavailable / Aborted /
+// The permissive behavior (retry on Unavailable / Aborted /
 // Internal / ResourceExhausted / DeadlineExceeded) is gone; callers who
 // need it must set RetryingOptions.ShouldRetry.
 func TestRetryingVRpc_ServerResultNotRetriedByDefault(t *testing.T) {
@@ -484,8 +484,8 @@ func TestRetryingVRpc_ServerResultNotRetriedByDefault(t *testing.T) {
 	}
 }
 
-// TestRetryingVRpc_ServerDeadlineExceededNoRetryByDefault verifies Java
-// parity: a server-returned DEADLINE_EXCEEDED is NOT retried by default.
+// TestRetryingVRpc_ServerDeadlineExceededNoRetryByDefault verifies that
+// a server-returned DEADLINE_EXCEEDED is NOT retried by default.
 // The server said "I gave up"; blindly retrying burns budget on ops the
 // server already discarded.
 func TestRetryingVRpc_ServerDeadlineExceededNoRetryByDefault(t *testing.T) {

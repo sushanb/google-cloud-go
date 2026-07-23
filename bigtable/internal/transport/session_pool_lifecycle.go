@@ -285,8 +285,8 @@ func (p *SessionPoolImpl) onActive(sh *SessionHandle) {
 }
 
 // onClosing is fired by the Session at the FIRST transition out of Ready
-// (handleGoAway, Close, ForceClose, handleClose — whichever wins). Java
-// parity: onSessionClosing. Removes the session from the pool's
+// (handleGoAway, Close, ForceClose, handleClose — whichever wins).
+// Removes the session from the pool's
 // operational structures immediately so:
 //   - the picker's AFE idle queue no longer sees it,
 //   - it no longer counts toward the scale-up gate,
@@ -344,7 +344,7 @@ func (p *SessionPoolImpl) onClose(sh *SessionHandle, err error) {
 		// contributes to the consecutive-failure signal. createSession
 		// already routes the OpenSession error through budget.Release
 		// (which applies the creation penalty); this counter is the
-		// separate "did any session make progress" signal Java tracks.
+		// separate "did any session make progress" signal.
 		p.noteAbnormalCloseIfAny(sh.session)
 		return
 	}
@@ -367,7 +367,7 @@ func (p *SessionPoolImpl) onClose(sh *SessionHandle, err error) {
 // the session's final close reason classifies as abnormal (same gate
 // the debug tracer uses for tagSessionAbnormalClose). When the counter
 // crosses consecutiveFailureThreshold, every parked waiter is woken
-// with ErrConsecutiveFailures and the counter is reset. Java parity:
+// with ErrConsecutiveFailures and the counter is reset. Design note:
 // SessionPoolImpl.handleSessionClose lines 572-586.
 func (p *SessionPoolImpl) noteAbnormalCloseIfAny(s *Session) {
 	if !isAbnormalCloseReason(s.CloseReason()) {
@@ -411,7 +411,7 @@ func (p *SessionPoolImpl) StartMaintenance(ctx context.Context, interval time.Du
 }
 
 // StartAfePrune begins the background AFE-handle GC loop. Runs on its
-// own afePruneMaxIdle cadence (java-parity: SessionPoolImpl in Java uses
+// own afePruneMaxIdle cadence (SessionPoolImpl uses
 // the same SESSION_LIST_PRUNE_INTERVAL for both the horizon and the
 // scheduling tick) — deliberately OFF the 1-sec heartbeat so the sl.mu
 // held during the map walk can't contend with serving-path Checkouts

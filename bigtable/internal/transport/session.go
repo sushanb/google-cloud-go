@@ -58,7 +58,7 @@ var (
 	// ErrUnavailableGoAway indicates the server sent GOAWAY. The session
 	// transitions to Closing (pool stops handing it out) but any in-flight
 	// vRPC keeps running — if the server sends the response before dropping
-	// the stream, the RPC completes cleanly (Java parity). Only if the
+	// the stream, the RPC completes cleanly. Only if the
 	// stream actually terminates without a response does the RPC get failed
 	// via handleClose → cancelActiveRPCs (tagged StateTransportFailure).
 	ErrUnavailableGoAway = errors.New("bigtable: session unavailable: server sent GOAWAY")
@@ -135,20 +135,19 @@ type Stream interface {
 //	                  PeerInfo is populated).
 //	OnSlotDrained  → fires on every successful drainSlot on the wire
 //	                  (normal deliver, cancelled-drain, Send-failure
-//	                  Invoke branch). Under Java-parity slot lifecycle
-//	                  this is the sole "session became free" signal —
-//	                  consumers use it to re-enqueue the session in its
-//	                  AFE idle queue and wake one parked Checkout waiter.
-//	                  cancelActiveRPCs (session teardown) intentionally
-//	                  does NOT fire it — OnClosing/OnClose handle removal
-//	                  from routing structures on that path.
+//	                  Invoke branch). This is the sole "session became
+//	                  free" signal — consumers use it to re-enqueue the
+//	                  session in its AFE idle queue and wake one parked
+//	                  Checkout waiter. cancelActiveRPCs (session teardown)
+//	                  intentionally does NOT fire it — OnClosing/OnClose
+//	                  handle removal from routing structures on that path.
 //	OnClosing      → fires once when the session is FIRST known to be
 //	                  dying — on the first successful transition out of
-//	                  Ready (any non-Ready terminal-bound state). Java
-//	                  parity: SessionImpl.onSessionClosing. Consumers use
-//	                  it to remove the session from pool routing
-//	                  structures BEFORE the actual close (potentially up
-//	                  to waitServerCloseGrace seconds) completes.
+//	                  Ready (any non-Ready terminal-bound state).
+//	                  Consumers use it to remove the session from pool
+//	                  routing structures BEFORE the actual close
+//	                  (potentially up to waitServerCloseGrace seconds)
+//	                  completes.
 //	OnClose        → fires once at the end of teardown, after the stream
 //	                  has actually closed. Always fires AFTER OnClosing
 //	                  (the session guarantees the ordering via closingOnce
@@ -258,28 +257,27 @@ type Session struct {
 
 	// closingOnce serializes hooks.OnClosing so it fires exactly once
 	// across the four transition sites that can drive a session out of
-	// Ready (Close, ForceClose, handleGoAway, handleClose). Java parity
-	// with onSessionClosing.
+	// Ready (Close, ForceClose, handleGoAway, handleClose).
 	closingOnce sync.Once
 	// closeOnce serializes hooks.OnClose and tracer.recordClose so they
 	// fire exactly once even if multiple paths race to close the session.
 	closeOnce sync.Once
 
-	// slotMu serializes the (activeRPC, currentCancel) pair — the Go
-	// analog of Java's sessionSyncContext for the one-in-flight slot.
-	// Held only across pointer assignments; no I/O, no chan ops, no
-	// nested locks. Innermost in the session-subsystem lock order.
+	// slotMu serializes the (activeRPC, currentCancel) pair for the
+	// one-in-flight slot. Held only across pointer assignments; no
+	// I/O, no chan ops, no nested locks. Innermost in the session-
+	// subsystem lock order.
 	//
 	// activeRPC holds the single in-flight vRPC (multiPlexingLimit=1).
 	// Claimed by Invoke via claimSlot; released only by
 	// handleVRPCResponse / handleVRPCErrorResponse (successful drain)
 	// or cancelActiveRPCs (session teardown). Caller ctx.Done marks
-	// currentCancel via markCancelled and leaves activeRPC set — Java
-	// SessionImpl.cancelRpc parity (SessionImpl.java:448-457).
+	// currentCancel via markCancelled and leaves activeRPC set — the
+	// slot stays claimed until the server response arrives to drain it.
 	//
-	// currentCancel is the Java-parity companion: first-cancel-wins,
-	// consulted by the drain to decide "was this response caller-
-	// abandoned before it arrived?"
+	// currentCancel is the first-cancel-wins companion, consulted by
+	// the drain to decide "was this response caller-abandoned before
+	// it arrived?"
 	//
 	// Read snapshots via activeVRPC(); all mutations go through
 	// claimSlot / markCancelled / drainSlot. Tests seed the slot via
@@ -371,9 +369,8 @@ func (s *Session) PeerInfo() *spb.PeerInfo {
 // afeID identifies the AFE (Application Front End) a session is pinned to,
 // derived from PeerInfo.ApplicationFrontendId. The zero value is the
 // sentinel for "unknown" — used before PeerInfo is populated or when the
-// server did not send the bigtable-peer-info header. Java-parity: mirrors
-// the AutoValue AfeId in SessionList.java, which wraps the same signed
-// 64-bit long.
+// server did not send the bigtable-peer-info header. Signed int64 to
+// match the proto field type (PeerInfo.ApplicationFrontendId).
 type afeID int64
 
 // AfeID returns the AFE identifier for this session, or 0 if PeerInfo is
@@ -395,7 +392,7 @@ func (s *Session) RefreshConfig() *spb.SessionRefreshConfig {
 
 // activeVRPC returns the currently in-flight vRPC, or nil if the slot is
 // empty. Snapshot read under slotMu — see the field's docstring for the
-// multiplex=1 invariant and the slot's Java-parity lifecycle.
+// multiplex=1 invariant and the slot's lifecycle.
 func (s *Session) activeVRPC() *vrpcImpl {
 	s.slotMu.Lock()
 	rpc := s.activeRPC
@@ -404,8 +401,8 @@ func (s *Session) activeVRPC() *vrpcImpl {
 }
 
 // claimSlot assigns rpc to the empty slot. Returns false if the slot
-// still holds a prior vRPC (Java SessionImpl.startRpc L423 parity —
-// concurrent claims are rejected as UNCOMMITTED at the call site).
+// still holds a prior vRPC — concurrent claims are rejected as
+// UNCOMMITTED at the call site.
 func (s *Session) claimSlot(rpc *vrpcImpl) bool {
 	s.slotMu.Lock()
 	defer s.slotMu.Unlock()
@@ -418,9 +415,8 @@ func (s *Session) claimSlot(rpc *vrpcImpl) bool {
 
 // markCancelled records ctx.Done cancellation of rpc without freeing
 // the slot — the caller returns, but activeRPC stays until the server
-// response arrives to drain it. Java SessionImpl.cancelRpc L448-457
-// parity (first-cancel-wins; a racing drain that clears activeRPC
-// makes this a no-op).
+// response arrives to drain it. First-cancel-wins; a racing drain that
+// clears activeRPC makes this a no-op.
 func (s *Session) markCancelled(rpc *vrpcImpl, res vrpcResult) {
 	s.slotMu.Lock()
 	defer s.slotMu.Unlock()
@@ -433,8 +429,7 @@ func (s *Session) markCancelled(rpc *vrpcImpl, res vrpcResult) {
 }
 
 // drainSlot atomically clears the (activeRPC, currentCancel) pair iff
-// activeRPC == expect, returning what was there. Java
-// SessionImpl.handleVRpcResponse L599-602 parity. Used by response
+// activeRPC == expect, returning what was there. Used by response
 // handlers (after id-match) and by cancelActiveRPCs (session teardown);
 // ok=false means a racing drain got here first.
 func (s *Session) drainSlot(expect *vrpcImpl) (rpc *vrpcImpl, cancel *vrpcResult, ok bool) {

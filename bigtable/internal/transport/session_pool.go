@@ -44,15 +44,15 @@ import (
 // errors.Is(err, ErrNoSessionsAvailable) both hold — callers can
 // distinguish "pool exhaustion timed us out" from "user's ctx fired
 // mid-RPC" via the sentinel while retry code continues to key on the
-// ctx cause. Java parity: SessionPoolImpl.java:836 emits
+// ctx cause. The pool emits
 // Status.DEADLINE_EXCEEDED with description "Deadline exceeded
 // waiting for session".
 var ErrNoSessionsAvailable = errors.New("bigtable: no sessions available")
 
 // ErrConsecutiveFailures is returned by CheckoutSession when the pool
-// has tripped its consecutive-session-failure circuit breaker (Java
-// parity: SessionPoolImpl.popClosableRpcs, fired when consecutive
-// abnormal session closes reach ConsecutiveSessionFailureThreshold).
+// has tripped its consecutive-session-failure circuit breaker (fired
+// when consecutive abnormal session closes reach
+// ConsecutiveSessionFailureThreshold).
 // All parked waiters at trip time are woken with this sentinel so
 // callers surface the failure to the user instead of continuing to
 // block on a pool whose backend is repeatedly rejecting OpenSession.
@@ -128,7 +128,7 @@ type SessionPoolImpl struct {
 
 	// waitersCount is the live count of callers parked inside
 	// CheckoutSession waiting for an idle session at the pool boundary.
-	// This is the "pending vRPCs" signal the sizer needs — Java tracks
+	// This is the "pending vRPCs" signal the sizer needs — same as
 	// it via a dedicated Sized input. Before this field, Stats() was
 	// (mis)reporting sum(outstanding) as PendingCount, which equaled
 	// InUseCount and made the sizer oscillate.
@@ -140,7 +140,7 @@ type SessionPoolImpl struct {
 	// When it crosses consecutiveFailureThreshold the pool trips: every
 	// parked waiter is woken with ErrConsecutiveFailures and the
 	// counter is reset so the next round of traffic gets a fresh
-	// window. Java parity: SessionPoolImpl.consecutiveFailures /
+	// window. Analogous to SessionPoolImpl.consecutiveFailures /
 	// getMaxConsecutiveFailures / popClosableRpcs.
 	consecutiveFailures        atomic.Int32
 	consecutiveFailureThreshold atomic.Int32
@@ -154,7 +154,7 @@ type SessionPoolImpl struct {
 	m poolMetrics
 
 	// waiters is a FIFO queue of CheckoutSession callers parked because
-	// no idle session was available at pick time. Java-parity design
+	// no idle session was available at pick time. Design
 	// (see PendingVRpc/ArrayDeque in SessionPoolImpl.java) — each free-
 	// session event wakes exactly one waiter, in insertion order. Fair
 	// under contention (no random-select unfairness like a shared chan
@@ -189,7 +189,7 @@ func (p *SessionPoolImpl) SetPoolIdentity(id uint64, shortName string) {
 }
 
 // noteVRpcOutcome forwards the vRPC outcome to the AFE's PeakEwma
-// trackers (Java parity: OK-gated) AND, on OK, resets the pool's
+// trackers (OK-gated) AND, on OK, resets the pool's
 // consecutive-failure counter — SessionPoolImpl.java:488 does the
 // equivalent on any successful session-close path; we key on vRPC
 // success instead because that's the strongest "backend is healthy"
@@ -225,7 +225,7 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 		return pool.Stats()
 	}
 	pool.sizer = NewPoolSizer(fetcher, min, max, 0.10)
-	// Bootstrap picker with the "no config yet" fallback (Java-parity
+	// Bootstrap picker with the "no config yet" fallback (matches the
 	// LeastInFlight, K=defaultAfeRandomSubsetSize). Every real caller
 	// wires the pool through ClientConfigurationManager.AddSessionPoolListener,
 	// which fires UpdateConfig synchronously on registration — so the
@@ -238,7 +238,7 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 	// with the server-driven ceiling (default 50) and penalty
 	// (default 60s) before the pool serves real traffic.
 	pool.budget = NewAdaptiveSessionThrottler(10, 10*time.Second)
-	// Bootstrap consecutive-failure threshold. Java default is 10.
+	// Bootstrap consecutive-failure threshold. Default is 10.
 	// UpdateConfig overwrites this with the server-driven value on
 	// the same registration path.
 	pool.consecutiveFailureThreshold.Store(10)
@@ -304,7 +304,7 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 			recordDebugTag(tagSessionPoolPickLostRace)
 		}
 
-		// Slow path: picker returned nil. Java-parity — no dead-sweep
+		// Slow path: picker returned nil. No dead-sweep
 		// needed. Dying sessions leave sl.readyCount the instant they
 		// transition out of Ready via OnClosing (fired from Session's
 		// notifyClosing at handleGoAway / Close / ForceClose /
@@ -377,7 +377,7 @@ func (p *SessionPoolImpl) signalFree() {
 }
 
 // drainWaitersWithErr wakes every parked CheckoutSession caller with
-// the given error. Java parity: SessionPoolImpl.popClosableRpcs, which
+// the given error. Same as SessionPoolImpl.popClosableRpcs, which
 // drains the pool-level pendingRpcs deque and fails each with a
 // consecutive-failures status. Returns the number of waiters woken so
 // the caller can log / meter the blast radius. Safe to call with the
@@ -422,7 +422,7 @@ func (p *SessionPoolImpl) Stats() *PoolStats {
 		StartingCount: len(p.startingSessions),
 		// PendingCount is the true pool-boundary queue depth —
 		// callers parked inside CheckoutSession waiting on
-		// freeSignal. Matches Java's pendingRpcs.getSize() input
+		// freeSignal. The pending-rpc count is the input
 		// to the sizer.
 		PendingCount: int(p.waitersCount.Load()),
 	}
@@ -447,14 +447,14 @@ func (p *SessionPoolImpl) UpdateConfig(config *spb.SessionClientConfiguration_Se
 	// NewSessionPoolImpl. Every real caller registers with
 	// ClientConfigurationManager which fires UpdateConfig synchronously,
 	// so this is where the server-driven ceiling + penalty actually
-	// take effect. Java parity: SessionCreationBudget.updateConfig
+	// take effect. Similar to SessionCreationBudget.updateConfig
 	// (SessionCreationBudget.java:129).
 	if budget := int(config.GetNewSessionCreationBudget()); budget > 0 {
 		penalty := config.GetNewSessionCreationPenalty().AsDuration()
 		p.budget.UpdateConfig(budget, penalty)
 	}
 
-	// Consecutive-failure threshold: Java parity
+	// Consecutive-failure threshold:
 	// SessionPoolImpl.getMaxConsecutiveFailures. Server-driven cap on
 	// how many back-to-back abnormal session closes the pool tolerates
 	// before failing all parked waiters. Zero/negative means "no
@@ -465,7 +465,7 @@ func (p *SessionPoolImpl) UpdateConfig(config *spb.SessionClientConfiguration_Se
 }
 
 // pickerFromLoadBalancing builds an AfePicker from server-driven
-// LoadBalancingOptions. A nil lbo returns Java's default
+// LoadBalancingOptions. A nil lbo returns the default
 // (LeastInFlight with K=defaultAfeRandomSubsetSize) so bootstrap
 // paths (NewSessionPoolImpl before UpdateConfig fires, unit tests
 // that skip the config wiring) get a working picker.
@@ -484,7 +484,7 @@ func pickerFromLoadBalancing(lbo *spb.LoadBalancingOptions) AfePicker {
 	}
 	switch opt := lbo.LoadBalancingStrategy.(type) {
 	case *spb.LoadBalancingOptions_Random_:
-		// Java's SimplePicker: uniform random over ready AFEs, then
+		// SimplePicker: uniform random over ready AFEs, then
 		// dequeue any idle session in that AFE. No K knob.
 		return NewSimpleAfePicker()
 	case *spb.LoadBalancingOptions_LeastInFlight_:
@@ -494,7 +494,7 @@ func pickerFromLoadBalancing(lbo *spb.LoadBalancingOptions) AfePicker {
 		}
 		return NewLeastInFlightAfePicker(k)
 	case *spb.LoadBalancingOptions_PeakEwma_:
-		// PeakEwma maps to Java's LeastLatencyPicker.
+		// PeakEwma maps to the LeastLatencyPicker.
 		k := defaultAfeRandomSubsetSize
 		if opt.PeakEwma != nil && opt.PeakEwma.RandomSubsetSize > 0 {
 			k = int(opt.PeakEwma.RandomSubsetSize)
@@ -530,7 +530,7 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 	// wait from the slow-vRPC log.
 	start := checkoutStart
 	// Track invokeErr / backendDur / latency across the defer so the
-	// per-AFE PeakEwma update sees the actual outcome. Under Java-parity
+	// per-AFE PeakEwma update sees the actual outcome. Under the
 	// slot lifecycle (v3), drainSlot success is the sole "session free"
 	// signal — the session's response handler fires the OnSlotDrained
 	// hook (installed at createSession) which does the AFE-queue
@@ -570,7 +570,7 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 		backendDur = result.Stats.BackendLatency.AsDuration()
 		p.m.backendLatencyHist.record(backendDur)
 	}
-	// Java-parity ClientTransportLatency: (stream Send→Recv) − backend =
+	// ClientTransportLatency: (stream Send→Recv) − backend =
 	// wire + AFE + client-decode overhead outside server processing.
 	// Skip samples missing either half (pre-Recv error, no server Stats)
 	// or with a non-positive delta (clock skew, backend > stream) so

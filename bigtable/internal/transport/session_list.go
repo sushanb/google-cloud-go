@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-// AFE-grouping constants — chosen to match Java's SessionList / AfeHandle.
+// AFE-grouping constants for the per-AFE SessionList / afeHandle.
 const (
 	// afePeakEwmaTau is the PeakEwma decay time constant used for both the
 	// per-AFE transport and e2e latency trackers. Same tau (10s) already
@@ -32,17 +32,16 @@ const (
 	// afeTransportEwmaSeed and afeE2eEwmaSeed seed the per-AFE latency
 	// trackers so a brand-new AFE has non-zero cost immediately (avoids
 	// LeastLatencyPicker pinning traffic to the newest AFE for the first
-	// few samples). Java's SessionList.java uses 500µs / 1ms for the
-	// same reason.
+	// few samples). The 500µs / 1ms values are chosen so a fresh AFE does
+	// not look free-cost relative to warmed ones.
 	afeTransportEwmaSeed = 500 * time.Microsecond
 	afeE2eEwmaSeed       = 1 * time.Millisecond
 
 	// afePruneMaxIdle is how long an empty AfeHandle (refCount==0) is
 	// retained before Prune is allowed to GC it. Measured from the AFE's
 	// lastConnected — the "last touched" timestamp updated on every
-	// OnSessionStarted and every ReleaseToPool (Java parity,
-	// SessionList.java:167 + :209). NOT "empty since": an AFE whose
-	// last activity was 30s ago is kept even if refCount just hit 0.
+	// OnSessionStarted and every ReleaseToPool. NOT "empty since": an AFE
+	// whose last activity was 30s ago is kept even if refCount just hit 0.
 	afePruneMaxIdle = 10 * time.Minute
 )
 
@@ -89,11 +88,10 @@ type afeHandle struct {
 	// lastConnected is the "AFE was touched" timestamp — stamped on
 	// OnSessionStarted (new session opens) AND on ReleaseToPool
 	// (session returned to the idle queue after a vRPC). Drives Prune;
-	// also surfaced by Snapshot. Java parity: SessionList.java:167 +
-	// :209 update the same field from the same two sites.
+	// also surfaced by Snapshot.
 	lastConnected time.Time
-	transportEwma *PeakEwma // updated on OK vRPCs only (Java parity)
-	e2eEwma       *PeakEwma // updated on OK vRPCs only (Java parity)
+	transportEwma *PeakEwma // updated on OK vRPCs only (OK-gated)
+	e2eEwma       *PeakEwma // updated on OK vRPCs only (OK-gated)
 }
 
 // afeSnapshot is an immutable view of an afeHandle sufficient for a picker
@@ -115,8 +113,7 @@ type afeSnapshot struct {
 	E2eCost        float64 // PeakEwma nanoseconds; 0 if never updated
 }
 
-// sessionList groups sessions by the AFE they landed on. Mirrors Java's
-// SessionList (java-bigtable/.../session/SessionList.java) but with a
+// sessionList groups sessions by the AFE they landed on. Uses a
 // dedicated mutex rather than piggy-backing on the pool's monitor.
 //
 // See the "State model" block above for the handle state machine and
@@ -188,8 +185,8 @@ func (sl *sessionList) OnSessionStarted(sh *SessionHandle) {
 // Checkout or an OnSessionClosing that just drained the last idle
 // handle. Callers should have picked from ReadyAfes() first.
 //
-// Under Java-parity slot lifecycle (slotMu + drain-driven queue re-add),
-// the AFE queue only contains sessions with empty in-flight slots by
+// Under the slotMu slot lifecycle (drain-driven queue re-add), the AFE
+// queue only contains sessions with empty in-flight slots by
 // construction — Invoke's return path no longer re-enqueues, only
 // drainSlot's success does. A dequeued session is guaranteed idle-slot
 // so claimSlot at the caller cannot lose except via a pool-bypass bug.
@@ -236,9 +233,9 @@ func (sl *sessionList) ReleaseToPool(sh *SessionHandle) {
 	if afe.enqueueLocked(sh) { // wasEmpty → afe re-enters the ready set (I3)
 		sl.afesWithReady = append(sl.afesWithReady, afe)
 	}
-	// Java parity: SessionList.java:209 stamps lastConnected on every
-	// return-to-pool so Prune's retention window measures true idleness,
-	// not just "time since last new session opened."
+	// Stamp lastConnected on every return-to-pool so Prune's retention
+	// window measures true idleness, not just "time since last new
+	// session opened."
 	afe.lastConnected = time.Now()
 }
 
@@ -297,7 +294,7 @@ func (sl *sessionList) OnSessionClosed(sh *SessionHandle) {
 
 // RecordVRpcOutcome updates the AFE's PeakEwma trackers with an OK
 // response's e2e and backend latencies. Non-OK results are dropped —
-// Java parity, SessionList.java:181-187 — so a fast-failing AFE never
+// OK-gated — so a fast-failing AFE never
 // looks fastest to LeastLatencyPicker. transportEwma tracks e2e −
 // backend; e2eEwma tracks e2e directly.
 //
@@ -411,7 +408,7 @@ func (sl *sessionList) Snapshot() []AfeSnapshotRow {
 // been touched (OnSessionStarted or ReleaseToPool) since
 // `now.Sub(afePruneMaxIdle)`. AFEs with any live session (idle,
 // in-flight, or closing) are never pruned — refCount includes all
-// three per I4/I6. Java parity: SessionList.prune runs on a 10 min
+// three per I4/I6. Prune runs on a 10 min
 // cadence and reads the same "last touched" timestamp.
 func (sl *sessionList) Prune(now time.Time) {
 	sl.mu.Lock()

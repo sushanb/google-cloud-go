@@ -196,7 +196,7 @@ type PoolSnapshot struct {
 	TotalLatencyP95 time.Duration
 	TotalLatencyP99 time.Duration
 	TotalLatencyN   int
-	// TransportLatencyP50/95/99/N: java-parity ClientTransportLatency
+	// TransportLatencyP50/95/99/N: ClientTransportLatency
 	// = (stream Send→Recv) − server-reported BackendLatency. Isolates
 	// wire + AFE + client-decode overhead outside server processing.
 	// Samples are excluded when either half is missing (pre-Recv
@@ -247,7 +247,7 @@ type AfeSnapshotRow struct {
 	// IdleCount.
 	IdleCount int
 	// TransportEwma is the current PeakEwma of (e2e − backend) per-AFE.
-	// Only OK responses feed this — Java parity.
+	// Only OK responses feed this (OK-gated).
 	TransportEwma time.Duration
 	// E2eEwma is the current PeakEwma of e2e latency per-AFE — the
 	// signal LeastLatencyAfePicker uses to steer.

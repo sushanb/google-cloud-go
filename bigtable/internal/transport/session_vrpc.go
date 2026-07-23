@@ -79,8 +79,8 @@ type InvokeResult struct {
 // of the call — the pool guarantees this via CheckoutSession's per-session
 // idle-slot gate. The single-in-flight invariant is enforced by claimSlot
 // under slotMu; a losing claim returns StateUncommitted so the retry
-// oracle can steer to another session (Java SessionImpl.startRpc
-// L420-444 parity). The slot is released only by handleVRPCResponse /
+// oracle can steer to another session. The slot is released only by
+// handleVRPCResponse /
 // handleVRPCErrorResponse (successful drain), cancelActiveRPCs (session
 // teardown), or the Send-failure path below — caller ctx.Done leaves
 // the slot claimed and marks it via markCancelled.
@@ -105,10 +105,9 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 		resultChan: make(chan vrpcResult, 1),
 	}
 
-	// Claim the single in-flight slot. Java SessionImpl.startRpc L423
-	// parity: a losing claim means a prior vRPC on this session has
-	// not drained on the wire yet — return Uncommitted so the retryer
-	// picks another session.
+	// Claim the single in-flight slot. A losing claim means a prior
+	// vRPC on this session has not drained on the wire yet — return
+	// Uncommitted so the retryer picks another session.
 	if !s.claimSlot(rpc) {
 		return result, tagErr(StateUncommitted,
 			unavailable(ErrSessionNotActive,
@@ -131,7 +130,7 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 	result.SentAt = time.Now()
 	if sendErr := s.Send(sessionReq); sendErr != nil {
 		// Synchronous Send failed: no server response is ever coming,
-		// so this call must free the slot itself. Java doesn't need
+		// so this call must free the slot itself. Other paths don't need
 		// this branch — sendMessage there is async and failures come
 		// back through the response observer — but Go's Send is
 		// synchronous, so an early drain is on the Invoke path.
@@ -213,7 +212,7 @@ func buildInvokeRequest(rpcID int64, reqBytes []byte, attempt int64, startTime t
 //
 // ctx.Done branch: check resultChan non-blockingly first so a server
 // response that landed in the same tick as the ctx cancellation isn't
-// dropped. Otherwise mark the slot as cancelled — Java parity leaves
+// dropped. Otherwise mark the slot as cancelled — leaves
 // activeRPC set so a concurrent Invoke fails claimSlot with Uncommitted
 // rather than racing to id-mismatch the abandoned response.
 func (s *Session) awaitInvokeResult(ctx context.Context, rpc *vrpcImpl, desc VRpcDescriptor, result *InvokeResult) error {
@@ -284,16 +283,15 @@ func (s *Session) recordCtxDone(ctx context.Context, rpc *vrpcImpl, method strin
 
 // handleVRPCResponse delivers a server VirtualRpcResponse to the waiting
 // Invoke caller, or drains a cancelled slot if the caller already
-// abandoned the RPC via ctx.Done (Java SessionImpl.handleVRpcResponse
-// L567-614 parity — the cancel branch there discards the response
-// tracer-side; here we just count it).
+// abandoned the RPC via ctx.Done — the cancel branch discards the
+// response tracer-side; here we just count it.
 func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
 	s.routeVRPCFrame(resp.RpcId, "VirtualRpcResponse", tagSessionVRPCNil,
 		&s.okRpcs, vrpcResult{resp: resp})
 }
 
 // handleVRPCErrorResponse routes per-vRPC errors to the waiting caller.
-// Mirrors handleVRPCResponse's Java-parity drain path — a cancelled slot
+// Mirrors handleVRPCResponse's drain path — a cancelled slot
 // drains without deliver.
 func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 	s.routeVRPCFrame(errResp.RpcId, "ErrorResponse", tagSessionVRPCErrorNil,
@@ -301,7 +299,7 @@ func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 }
 
 // routeVRPCFrame is the shared skeleton for handleVRPCResponse /
-// handleVRPCErrorResponse. All Java-parity gating (state check, active-
+// handleVRPCErrorResponse. All gating (state check, active-
 // vRPC nil guard, id-match, drain-vs-cancel branching, OnSlotDrained
 // hook on every drain, quiescence signalling in Closing) lives here
 // so the two call sites can't drift.
@@ -392,7 +390,7 @@ func (s *Session) deliver(rpc *vrpcImpl, res vrpcResult) {
 // error. With multiPlexingLimit=1 there is at most one such vRPC.
 // Called from session teardown paths (Close, ForceClose, handleGoAway,
 // handleClose, heartbeat miss) — the "server will never respond" cases
-// where the slot must be freed even under Java-parity claim-until-drain.
+// where the slot must be freed even under claim-until-drain.
 // If the caller already abandoned via ctx.Done, the drain returns a
 // cancel handle and we skip the deliver (no reader on resultChan).
 func (s *Session) cancelActiveRPCs(err error) {

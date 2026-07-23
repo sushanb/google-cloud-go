@@ -455,7 +455,7 @@ func TestSignalFree_NoWaitersIsNoOp(t *testing.T) {
 
 // TestSignalFree_WakesHeadWaiter parks two waiters directly on the
 // queue and verifies the first signalFree wakes exactly the first one
-// (FIFO), and a second signalFree wakes the second. Java-parity
+// (FIFO), and a second signalFree wakes the second. Expected
 // pendingRpcs.removeFirst semantic.
 func TestSignalFree_WakesHeadWaiter(t *testing.T) {
 	p := newTestPool(t, 1, 10)
@@ -654,7 +654,7 @@ func TestUpdateConfig_HonorsRandomSubsetSize(t *testing.T) {
 }
 
 // TestPickerFromLoadBalancing_NilFallback verifies the constructor's
-// bootstrap path — a nil LoadBalancingOptions gives Java's default
+// bootstrap path — a nil LoadBalancingOptions gives the default
 // (LeastInFlight with K=defaultAfeRandomSubsetSize).
 func TestPickerFromLoadBalancing_NilFallback(t *testing.T) {
 	picker := pickerFromLoadBalancing(nil)
