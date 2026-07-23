@@ -57,7 +57,7 @@ type SessionPool interface {
 
 	// Background loops kicked from sessionClient's BackgroundCtx.
 	StartAfePrune(ctx context.Context)
-	StartHeartbeat(ctx context.Context, interval time.Duration)
+	StartBackgroundScaling(ctx context.Context, interval time.Duration)
 
 	// Server-driven configuration.
 	PerformScaling(ctx context.Context)

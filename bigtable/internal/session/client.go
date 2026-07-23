@@ -104,7 +104,7 @@ type Config struct {
 	SessionLoadListener func(load float64)
 
 	// BackgroundCtx is the parent context passed to per-pool
-	// StartHeartbeat / StartAfePrune / PerformScaling loops. Cancelled
+	// StartBackgroundScaling / StartAfePrune / PerformScaling loops. Cancelled
 	// by Client teardown so all background loops unwind.
 	BackgroundCtx context.Context
 }
@@ -583,7 +583,7 @@ func (sc *sessionClient) getOrCreatePool(
 		}
 	}
 
-	pool.StartHeartbeat(backgroundCtx, 1*time.Second)
+	pool.StartBackgroundScaling(backgroundCtx, 1*time.Second)
 	pool.StartAfePrune(backgroundCtx)
 	pool.PerformScaling(backgroundCtx)
 	return pool

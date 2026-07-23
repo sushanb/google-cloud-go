@@ -392,8 +392,9 @@ func (p *SessionPoolImpl) noteAbnormalCloseIfAny(s *Session) {
 	}
 }
 
-// StartHeartbeat begins the background scaling watchdog evaluation loop.
-func (p *SessionPoolImpl) StartHeartbeat(ctx context.Context, interval time.Duration) {
+// StartBackgroundScaling begins the periodic PerformScaling watchdog. Runs
+// every interval until ctx cancels.
+func (p *SessionPoolImpl) StartBackgroundScaling(ctx context.Context, interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
