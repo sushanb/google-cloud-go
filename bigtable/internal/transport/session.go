@@ -33,11 +33,13 @@ import (
 const multiPlexingLimit = 1
 
 // Default heartbeat tunables. The interval is replaced once the server sends a
-// SessionParametersResponse; the initial deadline is generous enough to span
-// the first handshake.
+// SessionParametersResponse; the initial deadline is kept in lock-step so a
+// session that never receives SessionParameters trips within one interval.
+// Watchdog is idle-gated (only fires while a vRPC is in flight), so a short
+// grace during the handshake window is safe — no VRPC can be racing it.
 const (
-	defaultHeartbeatInterval = 10 * time.Second
-	initialHeartbeatGrace    = 30 * time.Minute
+	defaultHeartbeatInterval = 100 * time.Millisecond
+	initialHeartbeatGrace    = 100 * time.Millisecond
 )
 
 // Sentinel session-level error codes. They are wrapped in a gRPC Unavailable
