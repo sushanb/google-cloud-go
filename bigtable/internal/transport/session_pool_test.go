@@ -398,23 +398,30 @@ func TestRecordPickDecision_RingWrap(t *testing.T) {
 
 // --- core pool setters + hot-path helpers (session_pool.go) ----------------
 
-func TestSetPoolID(t *testing.T) {
+func TestSetPoolIdentity(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	if p.poolID != 0 {
 		t.Errorf("initial poolID = %d, want 0", p.poolID)
 	}
-	p.SetPoolID(42)
-	if p.poolID != 42 {
-		t.Errorf("after SetPoolID(42), poolID = %d, want 42", p.poolID)
-	}
-}
 
-func TestSetPoolShortName_FlattensSlashes(t *testing.T) {
-	p := newTestPool(t, 1, 10)
-	p.SetPoolShortName("projects/p/instances/i/tables/t")
+	// Both fields set in one call.
+	p.SetPoolIdentity(42, "sushanb")
+	if p.poolID != 42 {
+		t.Errorf("after SetPoolIdentity(42, ...), poolID = %d, want 42", p.poolID)
+	}
+	if p.poolShortName != "sushanb" {
+		t.Errorf("after SetPoolIdentity, poolShortName = %q, want %q", p.poolShortName, "sushanb")
+	}
+
+	// Slashes in shortName must flatten to underscores so the name stays
+	// URL-safe for the channelz→sessionz anchor link.
+	p.SetPoolIdentity(99, "projects/p/instances/i/tables/t")
 	want := "projects_p_instances_i_tables_t"
 	if p.poolShortName != want {
 		t.Errorf("poolShortName = %q, want %q (slashes must flatten to underscores)", p.poolShortName, want)
+	}
+	if p.poolID != 99 {
+		t.Errorf("poolID = %d, want 99", p.poolID)
 	}
 }
 

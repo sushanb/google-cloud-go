@@ -176,19 +176,16 @@ type SessionPoolImpl struct {
 	poolCancel context.CancelFunc
 }
 
-// SetPoolID stamps the pool with a SessionManager-assigned unique ID.
-// Used when minting session log names ("OpenTable3-read-5") so names
-// stay unique across pools. Call before any session is created.
-func (p *SessionPoolImpl) SetPoolID(id uint64) {
+// SetPoolIdentity stamps the pool with a SessionManager-assigned unique
+// id and the resource short name (e.g. "sushanb"), both used when
+// minting session log names ("OpenTable3-sushanb-read-5") so names stay
+// unique across pools AND identify what each pool opens. Slashes in
+// shortName are flattened to underscores so the name stays URL-safe
+// for the channelz→sessionz anchor link. Call before any session is
+// created.
+func (p *SessionPoolImpl) SetPoolIdentity(id uint64, shortName string) {
 	p.poolID = id
-}
-
-// SetPoolShortName stamps the pool with a resource short name (e.g.
-// "sushanb") so session log names identify what they're opening
-// ("OpenTable3-sushanb-read-5"). Slashes are flattened to underscores
-// so the name stays URL-safe for the channelz→sessionz anchor link.
-func (p *SessionPoolImpl) SetPoolShortName(name string) {
-	p.poolShortName = strings.ReplaceAll(name, "/", "_")
+	p.poolShortName = strings.ReplaceAll(shortName, "/", "_")
 }
 
 // noteVRpcOutcome forwards the vRPC outcome to the AFE's PeakEwma

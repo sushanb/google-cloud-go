@@ -112,7 +112,7 @@ type Config struct {
 // managedPool bundles a pool with its config-listener unregister
 // thunk so the listener can be detached before pool teardown.
 type managedPool struct {
-	pool       *btransport.SessionPoolImpl
+	pool       SessionPool
 	unregister func()
 }
 
@@ -490,7 +490,7 @@ func (sc *sessionClient) createPoolForPayload(
 	streamFactory func(ctx context.Context) (btransport.Stream, error),
 	payload proto.Message,
 	key poolKey,
-) (*btransport.SessionPoolImpl, error) {
+) (SessionPool, error) {
 	if payload == nil {
 		return nil, nil
 	}
@@ -547,7 +547,7 @@ func (sc *sessionClient) getOrCreatePool(
 	md metadata.MD,
 	sessionType btransport.SessionType,
 	shortName string,
-) *btransport.SessionPoolImpl {
+) SessionPool {
 	sc.poolsMu.Lock()
 	if mp, ok := sc.pools[key]; ok {
 		sc.poolsMu.Unlock()
@@ -562,8 +562,7 @@ func (sc *sessionClient) getOrCreatePool(
 		poolName += " [" + label + "]"
 	}
 	pool := btransport.NewSessionPoolImpl(poolName, min, max, streamFactory, openSessionRequest, md, sessionType)
-	pool.SetPoolID(id)
-	pool.SetPoolShortName(shortName)
+	pool.SetPoolIdentity(id, shortName)
 	mp := &managedPool{pool: pool}
 	sc.pools[key] = mp
 	configManager := sc.configManager
@@ -675,7 +674,7 @@ func (sc *sessionClient) LoadBalancingSnapshots() []btransport.LoadBalancingSnap
 // so they can sort by poolKey without duplicating the collection loop.
 type poolEntry struct {
 	key  poolKey
-	pool *btransport.SessionPoolImpl
+	pool SessionPool
 }
 
 // orderedPoolEntries snapshots the pools map under lock and returns
