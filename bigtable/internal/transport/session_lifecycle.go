@@ -48,7 +48,12 @@ func (s *Session) Start(ctx context.Context, req *spb.OpenSessionRequest) error 
 			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR,
 			Description: "failed to send open session request",
 		})
-		return fmt.Errorf("send open session request: %w", err)
+		// Wrap as codes.Unavailable so retry plumbing (status.Code +
+		// RetryingVRpc's idempotency-independent retry for pre-wire
+		// failures) treats a failed OpenSession send the same as any
+		// other transport-side loss. errors.Is still resolves the
+		// underlying send error via sessionErr.Unwrap.
+		return unavailable(err, "session OpenSession request failed: %v", err)
 	}
 
 	// Fire onStart BEFORE spawning readLoop/heartBeatLoop so hook
