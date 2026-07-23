@@ -293,9 +293,8 @@ func (s *Session) handleVRPCResponse(resp *spb.VirtualRpcResponse) {
 }
 
 // handleVRPCErrorResponse routes per-vRPC errors to the waiting caller.
-// Session-level errors (rpc_id == 0) are handled in handleSessionResponse.
-// Mirrors handleVRPCResponse's Java-parity drain path — a cancelled
-// slot drains without deliver.
+// Mirrors handleVRPCResponse's Java-parity drain path — a cancelled slot
+// drains without deliver.
 func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 	s.routeVRPCFrame(errResp.RpcId, "ErrorResponse", tagSessionVRPCErrorNil,
 		&s.errorRpcs, vrpcResult{errResp: errResp})

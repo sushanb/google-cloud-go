@@ -25,7 +25,6 @@ import (
 	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
-	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -137,36 +136,7 @@ func TestHandleOpenSession_MissingHeaderStillFiresOnActive(t *testing.T) {
 	}
 }
 
-// --- handleErrorResponse / handleGoAway --------------------------------------
-
-func TestHandleErrorResponse_SessionFatalForcesClose(t *testing.T) {
-	listener := &hookCounts{}
-	s, _ := makeActive(t, listener.hooks())
-
-	// Pre-existing in-flight RPC; should be cancelled by ForceClose.
-	rpc := &vrpcImpl{id: 11, method: "ReadRow", resultChan: make(chan vrpcResult, 1)}
-	s.setSlotForTest(rpc)
-
-	s.handleErrorResponse(&spb.ErrorResponse{
-		RpcId:  0,
-		Status: &rpcstatus.Status{Code: int32(codes.Internal), Message: "fatal"},
-	})
-
-	if got := s.State(); got != StateClosed {
-		t.Errorf("state = %v, want StateClosed", got)
-	}
-	select {
-	case res := <-rpc.resultChan:
-		if !errors.Is(res.err, ErrUnavailableSessionError) {
-			t.Errorf("cancelled cause = %v, want ErrUnavailableSessionError", res.err)
-		}
-	default:
-		t.Fatal("in-flight RPC not cancelled by session-fatal error")
-	}
-	if _, _, closed := listener.counts(); closed != 1 {
-		t.Errorf("OnClose called %d times, want 1", closed)
-	}
-}
+// --- handleGoAway ------------------------------------------------------------
 
 // TestHandleGoAway_PreservesInFlightRPC: GOAWAY transitions to Closing (pool
 // stops handing this session out) but does NOT cancel the in-flight RPC. If

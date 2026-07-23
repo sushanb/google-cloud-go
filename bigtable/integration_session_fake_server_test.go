@@ -98,16 +98,6 @@ type fakeBigtableServer struct {
 	poolMinCount int32
 	poolMaxCount int32
 
-	// sessionLevelErrs is a queue of session-level (rpc_id=0) errors. Each
-	// incoming VirtualRpcRequest that finds a queued entry pops it and the
-	// fake replies with a SessionResponse_Error whose ErrorResponse.RpcId
-	// is 0 — which the client's handleErrorResponse treats as a session-
-	// level fault and force-closes the session (SESSION_SPEC.md #5,#8:
-	// ForceClose → cancelActiveRPCs, no CloseSessionRequest). The in-flight
-	// vRPC gets ErrUnavailable* tagged StateTransportFailure and the retry
-	// oracle re-picks a fresh session from the pool.
-	sessionLevelErrs []fakeAttemptErr
-
 	// sessionParamsKeepAlive, when > 0, causes the fake to send a
 	// SessionParameters frame carrying this KeepAlive immediately after
 	// the OpenSession handshake. Updates the client's atomic heartbeat
@@ -304,21 +294,6 @@ func (s *fakeBigtableServer) queueVRpcStalls(n int) {
 	s.stallVRpcCount += n
 }
 
-// queueSessionLevelErrs pushes N session-level (rpc_id=0) errors onto
-// the reply queue. The next N VirtualRpcRequests each pop one entry and
-// receive a SessionResponse_Error framed AS A SESSION-LEVEL FAULT
-// (RpcId==0), which the client's handleErrorResponse handles by
-// force-closing the whole session — cancelling the in-flight vRPC with
-// a StateTransportFailure-tagged Unavailable so the retry oracle
-// re-picks a different session. Use this to exercise the "server pulled
-// the rug on this session, retry on a peer" path deterministically,
-// without needing to wait for the heartbeat watchdog's initial grace.
-func (s *fakeBigtableServer) queueSessionLevelErrs(errs ...fakeAttemptErr) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.sessionLevelErrs = append(s.sessionLevelErrs, errs...)
-}
-
 // closeSessionCount returns how many CloseSession frames the server has
 // received across all streams.
 func (s *fakeBigtableServer) closeSessionCount() int {
@@ -475,11 +450,6 @@ func (s *fakeBigtableServer) OpenTable(stream btpb.Bigtable_OpenTableServer) err
 			armed = &s.attemptErrs[0]
 			s.attemptErrs = s.attemptErrs[1:]
 		}
-		var sessionLevelArmed *fakeAttemptErr
-		if len(s.sessionLevelErrs) > 0 {
-			sessionLevelArmed = &s.sessionLevelErrs[0]
-			s.sessionLevelErrs = s.sessionLevelErrs[1:]
-		}
 		stall := s.stallVRpcCount > 0
 		if stall {
 			s.stallVRpcCount--
@@ -492,28 +462,6 @@ func (s *fakeBigtableServer) OpenTable(stream btpb.Bigtable_OpenTableServer) err
 		if stall {
 			<-stream.Context().Done()
 			return stream.Context().Err()
-		}
-
-		// Session-level error path: reply frame carries RpcId=0, which the
-		// client treats as "the whole session is toast" — ForceClose fires,
-		// the in-flight vRPC is cancelled with StateTransportFailure, and
-		// the retry oracle re-picks. After sending, we exit the loop so
-		// the server-side stream closes; the client will notice the stream
-		// end and won't send further frames on this session.
-		if sessionLevelArmed != nil {
-			errResp := &btpb.SessionResponse{
-				Payload: &btpb.SessionResponse_Error{
-					Error: &btpb.ErrorResponse{
-						RpcId:     0,
-						Status:    sessionLevelArmed.Status,
-						RetryInfo: sessionLevelArmed.RetryInfo,
-					},
-				},
-			}
-			if err := stream.Send(errResp); err != nil {
-				return err
-			}
-			return nil
 		}
 
 		if delay > 0 {

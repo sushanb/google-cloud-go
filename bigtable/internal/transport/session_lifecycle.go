@@ -298,23 +298,9 @@ func (s *Session) handleOpenSession(_ *spb.OpenSessionResponse) {
 	s.hooks.onActive(s)
 }
 
-// handleErrorResponse splits per-RPC errors (rpc_id != 0) from session-level
-// errors (rpc_id == 0). Session-level errors force-close the session;
-// ForceClose then cancels all in-flight RPCs with ErrUnavailableSessionError.
+// handleErrorResponse delivers a server ErrorResponse to the in-flight vRPC.
 func (s *Session) handleErrorResponse(errResp *spb.ErrorResponse) {
-	if errResp.GetRpcId() != 0 {
-		s.handleVRPCErrorResponse(errResp)
-		return
-	}
-	desc := "server reported session-level error"
-	if errResp.Status != nil && errResp.Status.Message != "" {
-		desc = fmt.Sprintf("server session error: %s", errResp.Status.Message)
-	}
-	s.debugf("%s", desc)
-	s.ForceClose(&spb.CloseSessionRequest{
-		Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR,
-		Description: desc,
-	})
+	s.handleVRPCErrorResponse(errResp)
 }
 
 // handleSessionParameters updates the heartbeat interval negotiated by the
