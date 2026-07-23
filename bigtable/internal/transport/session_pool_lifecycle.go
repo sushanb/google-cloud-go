@@ -54,7 +54,7 @@ func (p *SessionPoolImpl) sampleActiveUptimes(ctx context.Context) {
 
 // sweepStuckSessions scans the pool for sessions parked in
 // StateWaitServerClose beyond waitServerCloseGrace and force-closes them.
-// Runs from PerformScaling at the heartbeat cadence; takes p.mu only long
+// Runs from Maintain at the heartbeat cadence; takes p.mu only long
 // enough to snapshot the (handle, last-state-change) tuples then issues
 // ForceClose calls outside the lock.
 func (p *SessionPoolImpl) sweepStuckSessions() {
@@ -290,7 +290,7 @@ func (p *SessionPoolImpl) onActive(sh *SessionHandle) {
 // operational structures immediately so:
 //   - the picker's AFE idle queue no longer sees it,
 //   - it no longer counts toward the scale-up gate,
-//   - PerformScaling gets a chance to replace it right away,
+//   - Maintain gets a chance to replace it right away,
 //
 // even though the actual close may take up to waitServerCloseGrace to
 // complete. This is what lets CheckoutSession skip the per-miss dead-
@@ -320,7 +320,7 @@ func (p *SessionPoolImpl) onClosing(sh *SessionHandle) {
 	p.sl.OnSessionClosing(sh)
 
 	if p.sl.ReadyCount() < p.maxSessions {
-		go p.PerformScaling(p.poolCtx)
+		go p.Maintain(p.poolCtx)
 	}
 }
 
@@ -392,9 +392,9 @@ func (p *SessionPoolImpl) noteAbnormalCloseIfAny(s *Session) {
 	}
 }
 
-// StartBackgroundScaling begins the periodic PerformScaling watchdog. Runs
+// StartMaintenance begins the periodic Maintain watchdog. Runs
 // every interval until ctx cancels.
-func (p *SessionPoolImpl) StartBackgroundScaling(ctx context.Context, interval time.Duration) {
+func (p *SessionPoolImpl) StartMaintenance(ctx context.Context, interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -404,7 +404,7 @@ func (p *SessionPoolImpl) StartBackgroundScaling(ctx context.Context, interval t
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				p.PerformScaling(ctx)
+				p.Maintain(ctx)
 			}
 		}
 	}()

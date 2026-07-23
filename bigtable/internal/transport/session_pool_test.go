@@ -27,7 +27,7 @@ import (
 // newStubStreamFactory returns a streamFactory that hands out fresh
 // fakeStreams and a closeAll function that closes every stream the
 // factory produced. Tests that use SessionPoolImpl.CheckoutSession end
-// up triggering PerformScaling → createSession → Session.Start, which
+// up triggering Maintain → createSession → Session.Start, which
 // spawns a readLoop parked on fakeStream.Recv forever unless the recv
 // channel is closed. Wire closeAll into t.Cleanup so those readLoops
 // exit at end of test instead of accumulating across -count=N runs.
@@ -139,16 +139,16 @@ func TestSessionPool_Close_BoundedByTimeout(t *testing.T) {
 	t.Skip("requires a session that ignores Close — see integration tests")
 }
 
-// TestPerformScaling_NoLongerPrunesOverprovisioned verifies the passive-
-// shrink design: PerformScaling with a scale-down delta must be a no-op
+// TestMaintain_NoLongerPrunesOverprovisioned verifies the passive-
+// shrink design: Maintain with a scale-down delta must be a no-op
 // — the pool shrinks only via OnClose's replace-on-death gate, not via a
 // periodic prune. Regression guard against re-introducing the burst-then-
 // lull oscillation that the earlier active-scale-down design produced.
-func TestPerformScaling_NoLongerPrunesOverprovisioned(t *testing.T) {
+func TestMaintain_NoLongerPrunesOverprovisioned(t *testing.T) {
 	p := newTestPool(t, 1, 20)
 	// 10 idle sessions, none in-flight → sizer will compute
 	// desired ≈ minSessions (5-ish) and delta will be negative.
-	// PerformScaling must observe the negative delta and NOT shrink
+	// Maintain must observe the negative delta and NOT shrink
 	// the pool — regression guard for the removed active-scale-down.
 	for i := 0; i < 10; i++ {
 		sh := injectActiveSession(t, p, "idle", time.Now().Add(-time.Hour))
@@ -156,17 +156,17 @@ func TestPerformScaling_NoLongerPrunesOverprovisioned(t *testing.T) {
 	}
 
 	before := p.sl.ReadyCount()
-	p.PerformScaling(context.Background())
+	p.Maintain(context.Background())
 	after := p.sl.ReadyCount()
 
 	if after != before {
-		t.Errorf("PerformScaling pruned sessions: before=%d after=%d — scale-down must be advisory, not proactive", before, after)
+		t.Errorf("Maintain pruned sessions: before=%d after=%d — scale-down must be advisory, not proactive", before, after)
 	}
 }
 
 // TestSizer_ScaleDownIsAdvisory confirms the sizer still RETURNS a
 // negative delta on overprovision (so ScalingHistory / callers can see
-// the intent) but the calling site (PerformScaling) must not act on it.
+// the intent) but the calling site (Maintain) must not act on it.
 // The paired assertion above proves the caller is well-behaved; this one
 // pins the sizer contract.
 func TestSizer_ScaleDownIsAdvisory(t *testing.T) {

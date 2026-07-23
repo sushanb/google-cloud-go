@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Scaling for SessionPoolImpl: the PerformScaling driver, the
+// Scaling for SessionPoolImpl: the Maintain driver, the
 // createSession worker, the scaling-history ring buffer that records
 // their decisions, the human-readable reason helper, and the
 // deadline-stripping context wrapper used for long-lived dials.
@@ -94,11 +94,11 @@ func (p *SessionPoolImpl) snapshotScalingHistory() []ScalingEvent {
 	return out
 }
 
-// PerformScaling is the heartbeat/checkout-triggered driver that samples
+// Maintain is the heartbeat/checkout-triggered driver that samples
 // operational state, prunes stuck sessions, and — if the sizer asks for
 // growth — launches new-session goroutines. Scale-down deltas are logged
 // but not actioned (passive shrink via OnClose).
-func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
+func (p *SessionPoolImpl) Maintain(ctx context.Context) {
 	// Sample a time-series point on every heartbeat so the sparkline ring
 	// buffer fills at the heartbeat cadence regardless of whether scaling
 	// actually fires below.
@@ -177,7 +177,7 @@ func (p *SessionPoolImpl) PerformScaling(ctx context.Context) {
 				// more sessions and got fewer. Every failure is a tag
 				// so the count IS the "scale-ups we lost" gauge.
 				recordDebugTag(tagSessionPoolCreateFailed)
-				btopt.Debugf(nil, "POOL %s PerformScaling createSession failed: %v", p.poolName, err)
+				btopt.Debugf(nil, "POOL %s Maintain createSession failed: %v", p.poolName, err)
 			} else {
 				launched.Add(1)
 			}
