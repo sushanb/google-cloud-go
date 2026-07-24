@@ -2411,3 +2411,45 @@ func newUnaryClientInterceptor(prepReqCount *int, respPtrs *[]prepareQueryResp, 
 		return nil
 	}
 }
+
+// TestMutationsAreRetryable pins the classifier that decides whether an
+// Apply is safe to retry. A single ServerTime SetCell taints the whole
+// batch — silently flipping this back to "always retryable" would let
+// non-idempotent Apply retries create duplicate cells with different
+// server timestamps.
+func TestMutationsAreRetryable(t *testing.T) {
+	setCell := func(ts int64) *btpb.Mutation {
+		return &btpb.Mutation{Mutation: &btpb.Mutation_SetCell_{SetCell: &btpb.Mutation_SetCell{
+			FamilyName:      "cf",
+			ColumnQualifier: []byte("q"),
+			TimestampMicros: ts,
+			Value:           []byte("v"),
+		}}}
+	}
+	deleteRow := &btpb.Mutation{Mutation: &btpb.Mutation_DeleteFromRow_{DeleteFromRow: &btpb.Mutation_DeleteFromRow{}}}
+	deleteFromFamily := &btpb.Mutation{Mutation: &btpb.Mutation_DeleteFromFamily_{DeleteFromFamily: &btpb.Mutation_DeleteFromFamily{FamilyName: "cf"}}}
+	deleteFromColumn := &btpb.Mutation{Mutation: &btpb.Mutation_DeleteFromColumn_{DeleteFromColumn: &btpb.Mutation_DeleteFromColumn{FamilyName: "cf", ColumnQualifier: []byte("q")}}}
+
+	cases := []struct {
+		name string
+		muts []*btpb.Mutation
+		want bool
+	}{
+		{"nil", nil, true},
+		{"empty", []*btpb.Mutation{}, true},
+		{"single_explicit_ts", []*btpb.Mutation{setCell(1_000_000)}, true},
+		{"single_server_time", []*btpb.Mutation{setCell(int64(ServerTime))}, false},
+		{"mixed_explicit_and_server_time", []*btpb.Mutation{setCell(1_000_000), setCell(int64(ServerTime))}, false},
+		{"delete_row_only", []*btpb.Mutation{deleteRow}, true},
+		{"deletes_only", []*btpb.Mutation{deleteRow, deleteFromFamily, deleteFromColumn}, true},
+		{"deletes_and_server_time_setcell", []*btpb.Mutation{deleteFromFamily, setCell(int64(ServerTime))}, false},
+		{"deletes_and_explicit_setcell", []*btpb.Mutation{deleteFromFamily, setCell(1_000_000)}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mutationsAreRetryable(tc.muts); got != tc.want {
+				t.Errorf("mutationsAreRetryable(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}

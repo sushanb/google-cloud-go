@@ -18,6 +18,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"cloud.google.com/go/bigtable/internal/metrics"
@@ -222,6 +223,167 @@ func TestSessionTable_MatView_MutateRowReturnsErrWriteNotSupported(t *testing.T)
 	// Read side must still work — MatView is read-only, not fully disabled.
 	if _, rerr := tbl.ReadRow(context.Background(), &btpb.SessionReadRowRequest{Key: []byte("row1")}); rerr != nil {
 		t.Errorf("ReadRow on MatView table = %v, want nil (read path must remain functional)", rerr)
+	}
+}
+
+// mutationSetCell / mutationServerTime keep the SetCell shape used by
+// the idempotency-plumbing tests below in one place, so a future proto
+// change lands in one edit instead of scattered literals.
+func mutationSetCell(ts int64) *btpb.Mutation {
+	return &btpb.Mutation{Mutation: &btpb.Mutation_SetCell_{SetCell: &btpb.Mutation_SetCell{
+		FamilyName:      "cf",
+		ColumnQualifier: []byte("q"),
+		TimestampMicros: ts,
+		Value:           []byte("v"),
+	}}}
+}
+
+// TestMutationsAreRetryable_SessionHelper pins the session-package copy
+// of the classifier. The classic helper is duplicated here to avoid an
+// import cycle (table.go:274); the two must stay in sync or a
+// non-idempotent MutateRow on the session path would retry when the
+// classic path wouldn't.
+func TestMutationsAreRetryable_SessionHelper(t *testing.T) {
+	const serverTime int64 = -1
+	cases := []struct {
+		name string
+		muts []*btpb.Mutation
+		want bool
+	}{
+		{"nil", nil, true},
+		{"single_explicit_ts", []*btpb.Mutation{mutationSetCell(1_000_000)}, true},
+		{"single_server_time", []*btpb.Mutation{mutationSetCell(serverTime)}, false},
+		{"mixed_explicit_and_server_time", []*btpb.Mutation{mutationSetCell(1_000_000), mutationSetCell(serverTime)}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mutationsAreRetryable(tc.muts); got != tc.want {
+				t.Errorf("mutationsAreRetryable(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSessionTableMutateRow_IdempotencyFlowsToRetry verifies the
+// end-to-end plumbing from mutationsAreRetryable(req.GetMutations()) →
+// RetryingOptions.Idempotent → shouldRetryDefault at table.go:119,176.
+// The retry interceptor is configured with MaxAttempts=10 in dispatch,
+// so an idempotent TransportFailure runs the full budget while a
+// non-idempotent one fails after exactly one attempt. A regression that
+// hard-wired Idempotent: true (or broke mutationsAreRetryable) would
+// silently allow double-apply on non-idempotent Apply.
+func TestSessionTableMutateRow_IdempotencyFlowsToRetry(t *testing.T) {
+	const serverTime int64 = -1
+	transportErr := btransport.TagErr(btransport.StateTransportFailure, status.Error(codes.Unavailable, "wire error"))
+
+	cases := []struct {
+		name           string
+		muts           []*btpb.Mutation
+		wantAttemptCap int // max attempts we expect the interceptor to burn
+	}{
+		{
+			name:           "explicit_timestamp_idempotent_retries_full_budget",
+			muts:           []*btpb.Mutation{mutationSetCell(1_000_000)},
+			wantAttemptCap: 10, // MaxAttempts in session/table.go dispatch
+		},
+		{
+			name:           "server_time_non_idempotent_stops_at_one_attempt",
+			muts:           []*btpb.Mutation{mutationSetCell(serverTime)},
+			wantAttemptCap: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inv := &fakeInvoker{errBefore: 1000, err: transportErr}
+			tbl, _ := newTestTable(t, nil, inv)
+
+			_, err := tbl.MutateRow(context.Background(), &btpb.SessionMutateRowRequest{
+				Key:       []byte("row1"),
+				Mutations: tc.muts,
+			})
+			if err == nil {
+				t.Fatal("MutateRow returned nil; want the TransportFailure to surface")
+			}
+			if got := inv.callCount(); got != tc.wantAttemptCap {
+				t.Errorf("invoker calls = %d, want %d (Idempotent gate must control retry budget)",
+					got, tc.wantAttemptCap)
+			}
+		})
+	}
+}
+
+// blockingInvoker's Invoke waits on release before returning err. Lets a
+// test kick off a call, cancel ctx while it's in flight, then observe
+// what the retry interceptor does with the resulting error.
+type blockingInvoker struct {
+	mu      sync.Mutex
+	calls   int
+	release chan struct{}
+	err     error
+}
+
+func (b *blockingInvoker) Invoke(ctx context.Context, _ btransport.VRpcDescriptor, _ interface{}) (btransport.InvokeResult, error) {
+	b.mu.Lock()
+	b.calls++
+	b.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return btransport.InvokeResult{}, btransport.TagErr(btransport.StateTransportFailure, ctx.Err())
+	case <-b.release:
+		return btransport.InvokeResult{}, b.err
+	}
+}
+
+func (b *blockingInvoker) callCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.calls
+}
+
+// TestSessionTableMutateRow_CtxDoneStopsAtOneAttempt composes the full
+// chain: real dispatch (RetryingVRpc), real ctx.Done, real ServerTime
+// mutation → attempt tagged StateTransportFailure by the invoker → retry
+// interceptor short-circuits (ctx.Err() branch AND non-idempotent gate
+// would each be sufficient; both together document the safety net).
+// A regression that stripped the ctx.Err check or accidentally retried
+// TransportFailure regardless of Idempotent would show up as
+// callCount > 1.
+func TestSessionTableMutateRow_CtxDoneStopsAtOneAttempt(t *testing.T) {
+	const serverTime int64 = -1
+	inv := &blockingInvoker{release: make(chan struct{})}
+	tbl, _ := newTestTable(t, nil, inv)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := tbl.MutateRow(ctx, &btpb.SessionMutateRowRequest{
+			Key:       []byte("row1"),
+			Mutations: []*btpb.Mutation{mutationSetCell(serverTime)},
+		})
+		done <- err
+	}()
+
+	// Wait until the first attempt is in flight, then cancel.
+	waitUntil := time.Now().Add(2 * time.Second)
+	for inv.callCount() == 0 && time.Now().Before(waitUntil) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if inv.callCount() == 0 {
+		t.Fatal("invoker never received the first call within 2s")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("MutateRow returned nil after ctx cancel; want error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("MutateRow did not return after ctx cancel within 2s")
+	}
+	if got := inv.callCount(); got != 1 {
+		t.Errorf("invoker calls = %d, want 1 (ctx.Done on non-idempotent must not retry)", got)
 	}
 }
 

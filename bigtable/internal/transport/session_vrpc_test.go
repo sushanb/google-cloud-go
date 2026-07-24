@@ -18,7 +18,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -800,5 +802,94 @@ func TestInvoke_ForceCloseWhileSending_BoundedReturn(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Invoke did not return within 3s after ForceClose + unblocked Send")
+	}
+}
+
+// TestGoAwayGrace_NonIdempotentComposesWithRetryInterceptor closes the
+// gap between the individual pieces of the "GOAWAY grace window"
+// design (handleGoAway preserves the in-flight RPC + late response
+// completes it OR stream close cancels it as TransportFailure) and the
+// retry interceptor's Idempotent=false gate. Deleting the grace window
+// so GOAWAY cancels synchronously would silently regress non-idempotent
+// Apply from "server had time to respond → success" to "always fails
+// on GOAWAY"; both subtests here would fail loudly.
+func TestGoAwayGrace_NonIdempotentComposesWithRetryInterceptor(t *testing.T) {
+	cases := []struct {
+		name    string
+		deliver func(t *testing.T, s *Session, sent *spb.VirtualRpcRequest)
+		wantErr bool
+	}{
+		{
+			name: "response_arrives_during_grace",
+			deliver: func(t *testing.T, s *Session, sent *spb.VirtualRpcRequest) {
+				s.handleGoAway(&spb.GoAwayResponse{Reason: "graceful drain"})
+				s.handleVRPCResponse(&spb.VirtualRpcResponse{
+					RpcId:   sent.RpcId,
+					Payload: []byte("late-but-real"),
+				})
+			},
+			wantErr: false,
+		},
+		{
+			name: "stream_closes_during_grace",
+			deliver: func(t *testing.T, s *Session, sent *spb.VirtualRpcRequest) {
+				s.handleGoAway(&spb.GoAwayResponse{Reason: "graceful drain"})
+				// handleClose is what readLoop invokes when Recv returns
+				// an error. cancelActiveRPCs tags the delivery as
+				// StateTransportFailure; the retry interceptor's
+				// Idempotent=false gate must keep this at one attempt.
+				s.handleClose(io.EOF)
+			},
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, stream := makeActive(t, SessionHooks{})
+			desc := newRoundTripDesc()
+
+			var attempts int32
+			handler := func(ctx context.Context, _ interface{}) (interface{}, error) {
+				atomic.AddInt32(&attempts, 1)
+				_, err := s.Invoke(ctx, desc, "hello")
+				return nil, err
+			}
+			retry := RetryingVRpc(RetryingOptions{
+				MaxAttempts:    5,
+				InitialBackoff: 1 * time.Millisecond,
+				Idempotent:     false, // non-idempotent MutateRow (ServerTime SetCell)
+			})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			resCh := make(chan error, 1)
+			go func() {
+				_, err := retry(WithVRpcMetadata(ctx, "test.MutateRow", 1), "hello", handler)
+				resCh <- err
+			}()
+
+			waitFor(t, time.Second, func() bool { return len(stream.snapshotSent()) > 0 }, "Send called")
+			sent := stream.snapshotSent()[0].GetVirtualRpc()
+			if sent == nil {
+				t.Fatal("sent frame was not a VirtualRpcRequest")
+			}
+			tc.deliver(t, s, sent)
+
+			select {
+			case err := <-resCh:
+				if tc.wantErr && err == nil {
+					t.Fatal("interceptor returned nil err; want an error for grace-exhausted GOAWAY")
+				}
+				if !tc.wantErr && err != nil {
+					t.Fatalf("interceptor returned err=%v; want success (GOAWAY grace preserved the RPC)", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("interceptor did not return within 3s")
+			}
+			if got := atomic.LoadInt32(&attempts); got != 1 {
+				t.Errorf("attempts = %d, want 1 (non-idempotent must not retry regardless of GOAWAY outcome)", got)
+			}
+		})
 	}
 }
