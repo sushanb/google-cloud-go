@@ -236,7 +236,11 @@ func (m *ClientConfigurationManager) Start(ctx context.Context) {
 		m.poll(pollCtx)
 	}()
 
-	// Start background polling
+	// Start background polling. Tracked in pollsWG so Close's Wait
+	// keeps the counter ≥ 1 while the loop is alive — the loop's own
+	// inner Add(1) before poll() then can't race Wait's counter-hits-0
+	// wake-up.
+	m.pollsWG.Add(1)
 	go m.pollingLoop()
 }
 
@@ -443,7 +447,11 @@ func (m *ClientConfigurationManager) AddSessionLoadListener(listener func(load f
 
 // pollingLoop continuously polls the Bigtable control plane at the configured interval.
 // It enforces a minimum interval (minPollingInterval) to protect the control plane from DDoSes.
+// Registered in pollsWG by Start; the defer keeps the counter alive
+// until the loop returns so the inner per-poll Add(1)/Done() can't
+// race Close's Wait.
 func (m *ClientConfigurationManager) pollingLoop() {
+	defer m.pollsWG.Done()
 	for {
 		m.mu.RLock()
 		cfg := m.currentConfig
