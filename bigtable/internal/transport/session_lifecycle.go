@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
@@ -65,9 +66,21 @@ func (s *Session) Start(ctx context.Context, req *spb.OpenSessionRequest) error 
 	// is safe.
 	s.hooks.onStart(ctx)
 
-	go s.readLoop(ctx)
-	go s.heartBeatLoop(ctx)
+	// Track readLoop + heartBeatLoop so WaitGoroutines can block until
+	// their callback chains (notifyClosed → recordClose, etc.) have
+	// unwound. Owners (SessionPoolImpl.Close) call WaitGoroutines during
+	// teardown so no session-owned goroutine outlives the pool.
+	s.loops.Add(2)
+	go func() { defer s.loops.Done(); s.readLoop(ctx) }()
+	go func() { defer s.loops.Done(); s.heartBeatLoop(ctx) }()
 	return nil
+}
+
+// WaitGoroutines blocks until readLoop and heartBeatLoop have fully
+// returned (including their notifyClosed / recordClose callback
+// chains). No-op if Start was never called.
+func (s *Session) WaitGoroutines() {
+	s.loops.Wait()
 }
 
 // ForceClose immediately transitions the session to StateClosed and cancels
@@ -240,8 +253,16 @@ func (s *Session) readLoop(ctx context.Context) {
 	// Supervisor: if ctx is cancelled, mark the session closed so callers
 	// observe state immediately. Unblocking Recv() requires the underlying
 	// stream's context to be cancelled by the caller.
+	//
+	// readLoop blocks on supDone at exit so the supervisor's callback
+	// chain (ForceClose → notifyClosed → recordClose) has fully
+	// unwound before Session.WaitGoroutines returns. Without this the
+	// supervisor's recordClose can race package-level metric vars.
 	readLoopDone := make(chan struct{})
+	var supDone sync.WaitGroup
+	supDone.Add(1)
 	go func() {
+		defer supDone.Done()
 		select {
 		case <-ctx.Done():
 			s.ForceClose(&spb.CloseSessionRequest{
@@ -251,7 +272,10 @@ func (s *Session) readLoop(ctx context.Context) {
 		case <-readLoopDone:
 		}
 	}()
-	defer close(readLoopDone)
+	defer func() {
+		close(readLoopDone)
+		supDone.Wait()
+	}()
 
 	for {
 		resp, err := s.stream.Recv()

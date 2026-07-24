@@ -104,9 +104,24 @@ type SessionPoolImpl struct {
 	// separate flat slice. Keyed by *SessionHandle rather than *Session
 	// because the hook closures capture sh; the pool never needs a
 	// *Session-only lookup path.
-	startingSessions   map[*SessionHandle]struct{}
-	closed             bool
-	scalingInProgress  bool
+	startingSessions map[*SessionHandle]struct{}
+	// pendingStarts counts fire-and-forget goroutines spawned by Tick
+	// that haven't yet reached streamFactory success (so they aren't in
+	// startingSessions yet). Without this, back-to-back Ticks fired
+	// within the streamFactory window each see StartingCount=0 and
+	// re-request the same delta — a pending=2 waiter would drive 5×5=25
+	// spawns instead of 5. Bumped in Tick before spawning; consumed by
+	// createSession's transfer into startingSessions on success, or by
+	// the goroutine's defer on any failure before transfer.
+	pendingStarts int
+	// spawns tracks every goroutine the pool fires and forgets — today
+	// only Tick's createSession workers. Close waits on it so no
+	// pool-spawned goroutine outlives Close. Session-owned goroutines
+	// (readLoop, heartBeatLoop) are tracked separately on Session via
+	// Session.loops.
+	spawns sync.WaitGroup
+	closed            bool
+	scalingInProgress bool
 	minSessions        int
 	maxSessions        int
 	streamFactory      func(ctx context.Context) (Stream, error)
@@ -319,7 +334,7 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 	closed := p.closed
 	p.mu.Unlock()
 	if !closed && p.sl.ReadyCount() == 0 {
-		go p.tickOnce(p.poolCtx)
+		p.spawnTickOnce(p.poolCtx)
 	}
 
 	for {
@@ -370,7 +385,7 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		// only live-or-starting sessions; a miss just means all live
 		// sessions are busy.
 		if p.sl.ReadyCount() < p.maxSessions {
-			go p.tickOnce(p.poolCtx)
+			p.spawnTickOnce(p.poolCtx)
 		}
 
 		// Park in the FIFO waiter queue. Each free-session event
@@ -475,9 +490,13 @@ func (p *SessionPoolImpl) Stats() *PoolStats {
 	}
 
 	return &PoolStats{
-		ReadyCount:    ready,
-		InUseCount:    inUse,
-		StartingCount: len(p.startingSessions),
+		ReadyCount: ready,
+		InUseCount: inUse,
+		// StartingCount = sessions past streamFactory (in startingSessions)
+		// PLUS goroutines Tick has spawned but that haven't yet reached
+		// the transfer point. Both count as "in-flight scale-up capacity"
+		// so the sizer doesn't request duplicate delta in a burst.
+		StartingCount: len(p.startingSessions) + p.pendingStarts,
 		// PendingCount is the true pool-boundary queue depth —
 		// callers parked inside CheckoutSession waiting on
 		// freeSignal. The pending-rpc count is the input

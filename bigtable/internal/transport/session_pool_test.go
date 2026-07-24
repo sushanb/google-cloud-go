@@ -34,16 +34,25 @@ import (
 func newStubStreamFactory() (factory func(context.Context) (Stream, error), closeAll func()) {
 	var mu sync.Mutex
 	var streams []*fakeStream
+	var closed bool
 	factory = func(_ context.Context) (Stream, error) {
-		s := newFakeStream()
 		mu.Lock()
+		defer mu.Unlock()
+		if closed {
+			// After closeAll ran, refuse new streams so a fire-and-forget
+			// createSession spawned by (e.g.) onClosing → spawnTickOnce
+			// after cleanup can't produce a fresh unblocked fakeStream
+			// that leaks its readLoop past p.Close.
+			return nil, errors.New("newStubStreamFactory: closed")
+		}
+		s := newFakeStream()
 		streams = append(streams, s)
-		mu.Unlock()
 		return s, nil
 	}
 	closeAll = func() {
 		mu.Lock()
 		defer mu.Unlock()
+		closed = true
 		for _, s := range streams {
 			s.Close()
 		}
@@ -575,6 +584,38 @@ func TestStats_CountsReadyInUsePending(t *testing.T) {
 	}
 	if st.StartingCount != 0 {
 		t.Errorf("StartingCount = %d, want 0", st.StartingCount)
+	}
+}
+
+// TestStats_StartingCountIncludesPendingStarts guards the sizer
+// double-count regression introduced by removing wg.Wait() in Tick
+// (commit 203aa07ecf). Tick reserves pendingStarts BEFORE spawning
+// fire-and-forget goroutines; createSession transfers each reservation
+// into startingSessions once streamFactory succeeds. During the
+// streamFactory window Stats().StartingCount MUST see the reservation
+// so a burst of Ticks doesn't re-request the same delta.
+func TestStats_StartingCountIncludesPendingStarts(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+
+	// Simulate Tick's pre-spawn reservation for delta=3.
+	p.mu.Lock()
+	p.pendingStarts = 3
+	p.mu.Unlock()
+
+	if got := p.Stats().StartingCount; got != 3 {
+		t.Errorf("StartingCount with pendingStarts=3, startingSessions=empty: got %d, want 3", got)
+	}
+
+	// Simulate one goroutine reaching the transfer point: reservation
+	// consumed, session added to startingSessions. Sum must be unchanged.
+	sh := NewSessionHandle(nil, time.Now())
+	p.mu.Lock()
+	p.pendingStarts--
+	p.startingSessions[sh] = struct{}{}
+	p.mu.Unlock()
+
+	if got := p.Stats().StartingCount; got != 3 {
+		t.Errorf("StartingCount after transfer (pendingStarts=2, startingSessions=1): got %d, want 3", got)
 	}
 }
 

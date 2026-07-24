@@ -324,6 +324,13 @@ type Session struct {
 
 	// sessionDebug carries the observability state. See session_debug.go.
 	sessionDebug
+
+	// loops tracks readLoop + heartBeatLoop so a supervising owner
+	// (SessionPoolImpl.Close) can wait for them to fully unwind — through
+	// their notifyClosing / notifyClosed callback chains — before it
+	// returns. Prevents readLoop's recordClose from racing package-level
+	// metric var writes across test boundaries.
+	loops sync.WaitGroup
 }
 
 // SessionOption configures a Session at construction time.

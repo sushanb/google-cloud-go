@@ -230,6 +230,26 @@ func (p *SessionPoolImpl) Close() error {
 	if p.poolCancel != nil {
 		p.poolCancel()
 	}
+
+	// Phase 5: wait for every Tick-spawned createSession worker to exit.
+	// Includes error paths that touch package-level metric state
+	// (recordDebugTag) — without this wait those goroutines can outlive
+	// Close and race with a next test's InitializeSessionMetrics.
+	p.spawns.Wait()
+
+	// Phase 6: wait for every registered Session's readLoop +
+	// heartBeatLoop (and their notifyClosed → recordClose callback
+	// chains) to fully unwind. Re-snapshot AFTER spawns.Wait so
+	// sessions that reached sl during the createSession workers'
+	// tail are also caught. Sessions still in startingSessions never
+	// entered sl (Start failed) — those are already accounted for
+	// because Phase 5 waited on the createSession goroutine that
+	// owned them.
+	for _, sh := range p.sl.AllHandles() {
+		if sh != nil && sh.session != nil {
+			sh.session.WaitGoroutines()
+		}
+	}
 	return nil
 }
 
@@ -321,7 +341,7 @@ func (p *SessionPoolImpl) onClosing(sh *SessionHandle) {
 	p.sl.OnSessionClosing(sh)
 
 	if p.sl.ReadyCount() < p.maxSessions {
-		go p.tickOnce(p.poolCtx)
+		p.spawnTickOnce(p.poolCtx)
 	}
 }
 
@@ -411,7 +431,7 @@ const tickInterval = 1 * time.Second
 // signalFree which wakes any parked Checkout waiter.
 func (p *SessionPoolImpl) Start(ctx context.Context) {
 	p.startOnce.Do(func() {
-		go p.tickOnce(ctx) // async pre-start seed
+		p.spawnTickOnce(ctx) // async pre-start seed
 		p.startTickLoop(ctx)
 		p.startAfePruneLoop(ctx)
 	})
@@ -458,6 +478,30 @@ func (p *SessionPoolImpl) tickOnce(ctx context.Context) {
 		}
 	}()
 	p.Tick(ctx)
+}
+
+// spawnTickOnce is the guarded replacement for `go p.tickOnce(ctx)` at
+// every kick site (Start's pre-start seed, CheckoutSession's empty-pool
+// + waiter-park kicks, onClosing's replace-slot kick). It bumps
+// p.spawns under p.mu after re-checking p.closed so Close's Phase 1
+// (which sets p.closed under the same lock) synchronizes-with any
+// concurrent Wait: an Add either lands BEFORE Close's Lock (so
+// happens-before Wait) or is skipped by the closed re-check. Without
+// this, tickOnce goroutines spawned during Close's own Session.Close
+// wave (Phase 2 → notifyClosing → onClosing → this kick) leak past
+// pool.Close and race the next test's InitializeSessionMetrics.
+func (p *SessionPoolImpl) spawnTickOnce(ctx context.Context) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.spawns.Add(1)
+	p.mu.Unlock()
+	go func() {
+		defer p.spawns.Done()
+		p.tickOnce(ctx)
+	}()
 }
 
 // startAfePruneLoop runs sl.Prune on afePruneMaxIdle cadence until ctx

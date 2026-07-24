@@ -165,10 +165,32 @@ func (p *SessionPoolImpl) Tick(ctx context.Context) {
 		Decision:  decision,
 	})
 
+	// Reserve pendingStarts + register spawns BEFORE launching the
+	// fire-and-forget goroutines. Held under p.mu with a re-check of
+	// p.closed so Close's Phase 1 (which sets p.closed under the same
+	// lock) synchronizes-with all subsequent p.spawns.Wait: if Close has
+	// already fired, we skip both the reservation and the spawn — no
+	// new Add can happen concurrent with Close's Wait, avoiding the
+	// classic WaitGroup Add/Wait race.
+	//
+	// pendingStarts guards the sizer double-count (see field doc);
+	// spawns guards teardown so no createSession goroutine outlives
+	// Close, including error paths that touch package-level metric
+	// state (recordDebugTag).
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.pendingStarts += delta
+	p.spawns.Add(delta)
+	p.mu.Unlock()
+
 	// Scale up: fire and forget. Sessions signal readiness via
-	// OnActive → signalFree; no wait-group here.
+	// OnActive → signalFree; no wait-group needed for readiness.
 	for i := 0; i < delta; i++ {
 		go func() {
+			defer p.spawns.Done()
 			if err := p.createSession(ctx); err != nil {
 				// A scale-up attempt failed — the pool wanted `delta`
 				// more sessions and got fewer. Every failure is a tag
@@ -187,14 +209,34 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 	// preserves cancellation so pool teardown propagates through.
 	dialCtx := noDeadlineButCancellableContext{Context: p.poolCtx}
 
+	// This goroutine owns one pendingStarts reservation minted by Tick.
+	// On any failure before the transfer point below it releases the
+	// reservation; on success the transfer point consumes it atomically
+	// with the startingSessions insert (so a concurrent Decide() sees
+	// exactly one "in-flight" credit — never zero, never two).
+	reserved := true
+	defer func() {
+		if reserved {
+			p.mu.Lock()
+			p.pendingStarts--
+			p.mu.Unlock()
+		}
+	}()
+
 	// Acquire a token from the concurrency governor budget before dialing!
 	if err := p.budget.Acquire(dialCtx); err != nil {
 		return fmt.Errorf("failed to acquire session creation budget: %w", err)
 	}
 
 	success := false
+	budgetReleased := false
 	defer func() {
-		p.budget.Release(success) // Release budget registering success/failure penalty token!
+		// Only release here if the success path hasn't already done so —
+		// success path releases early so budget isn't held for the
+		// Session's lifetime.
+		if !budgetReleased {
+			p.budget.Release(success)
+		}
 	}()
 
 	// Inject the pre-computed target metadata headers context-safely E2E!
@@ -283,9 +325,14 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 	sh.session = s
 	sh.createdAt = time.Now()
 
+	// Transfer the pendingStarts reservation into startingSessions
+	// under a single lock so a concurrent Decide() never sees a
+	// gap (both fields drop to 0) or a double (both count us).
 	p.mu.Lock()
+	p.pendingStarts--
 	p.startingSessions[sh] = struct{}{}
 	p.mu.Unlock()
+	reserved = false
 
 	if err := s.Start(dialCtx, p.openSessionRequest); err != nil {
 		p.mu.Lock()
@@ -296,6 +343,24 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 	}
 
 	success = true
+
+	// Free the budget slot NOW so the next scale-up isn't blocked by the
+	// session's lifetime — normally the deferred Release would fire
+	// only after we return, which is after WaitGoroutines below (i.e.
+	// after the session dies).
+	p.budget.Release(true)
+	budgetReleased = true
+
+	// Block until Session's readLoop + heartBeatLoop have fully unwound
+	// (through their notifyClosed → recordClose / recordDebugTag
+	// callback chains). Keeps this createSession goroutine — tracked by
+	// p.spawns — alive for the entire session lifetime so pool.Close's
+	// Phase 5 (p.spawns.Wait) waits for every session goroutine to exit
+	// before returning. Without this, a session that was removed from
+	// sl by its own onClose (fired synchronously from readLoop) is
+	// missed by any sl-based snapshot, and its readLoop leaks past
+	// Close to race the next test's InitializeSessionMetrics.
+	s.WaitGoroutines()
 	return nil
 }
 
