@@ -48,10 +48,10 @@ The originally-specced behavior — treat any vRPC with `rpc_id > LastRpcIdAdmit
 **Session `Close` reason on GOAWAY-driven teardown.** The `CloseSessionRequest` we send server-side stamps `CLOSE_SESSION_REASON_GOAWAY` (Go) / `CLOSE_SESSION_REASON_GOAWAY` with description `"Server sent GO_AWAY_" + reason` (Java, `SessionImpl.java:706-711`). Description prefix differs; enum value matches.
 
 ### 7. Heartbeat is armed only while a vRPC is in flight
-- Enforced **only while `activeRPC != nil`** — server emits heartbeats *during* long-running vRPCs; idle sessions legitimately receive none and must not be torn down (`session_lifecycle.go:522-528`). Java idle path pushes `nextHeartbeat` to `FUTURE_TIME` (30 min) (`SessionImpl.java:440-443`).
-- Deadline = **`3 × heartbeatInterval`** (default 10 s ⇒ 30 s). Rationale: protocol tolerates **two** missed heartbeats before declaring the stream half-dead.
+- Enforced **only while `activeRPC != nil`** — server emits heartbeats *during* long-running vRPCs; idle sessions legitimately receive none and must not be torn down.
+- Deadline = **`1 × heartbeatInterval`** (default 100 ms). A single missed heartbeat trips the watchdog; healthy sessions never reach the ForceClose branch because each inbound/outbound frame's `resetHeartbeatDeadline` fires before the timer wakes.
 - **Any frame in either direction resets the deadline** — request Send, response Recv, heartbeat frame, `SessionRefreshConfig`, error responses. **Unknown frame types explicitly do NOT reset** (`session_lifecycle.go:233-263`) — otherwise a rogue future frame type would mask a broken stream.
-- Reset is 2 atomic loads + 1 atomic store on the hot path; no mutex.
+- Reset is 1 atomic load + 1 atomic store on the hot path; no mutex.
 
 ### 8. Missed-heartbeat sequence is fixed and observable
 On miss, in this exact order (`session_lifecycle.go:558-572`):
