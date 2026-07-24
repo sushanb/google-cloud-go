@@ -64,7 +64,7 @@ func injectActiveSession(t testing.TB, p *SessionPoolImpl, name string, createdA
 	stream := newFakeStream()
 	sh := NewSessionHandle(nil, createdAt)
 	s := NewSession(name, stream, SessionHooks{
-		OnStart:   p.OnStart,
+		OnStart:   p.onStart,
 		OnActive:  func(_ *Session) { p.onActive(sh) },
 		OnClosing: func(_ *Session) { p.onClosing(sh) },
 		OnClose:   func(_ *Session, err error) { p.onClose(sh, err) },
@@ -80,6 +80,7 @@ func newTestPool(t testing.TB, min, max int) *SessionPoolImpl {
 	t.Helper()
 	factory, closeStreams := newStubStreamFactory()
 	p := NewSessionPoolImpl(
+		PoolIdentity{ID: 1, ShortName: "test", Perm: PermissionRead},
 		"test-pool",
 		min,
 		max,
@@ -198,6 +199,7 @@ func TestSessionPool_Invoke_RecordsSlowCheckoutFailure(t *testing.T) {
 		return nil, ctx.Err()
 	}
 	p := NewSessionPoolImpl(
+		PoolIdentity{ID: 1, ShortName: "test", Perm: PermissionRead},
 		"test-pool",
 		0, 1,
 		neverDialing,
@@ -259,6 +261,7 @@ func TestCheckoutSession_ParkedWaiter_DeadlineExceeded(t *testing.T) {
 		return nil, ctx.Err()
 	}
 	p := NewSessionPoolImpl(
+		PoolIdentity{ID: 1, ShortName: "test", Perm: PermissionRead},
 		"test-pool",
 		0, 1,
 		neverDialing,
@@ -398,34 +401,58 @@ func TestRecordPickDecision_RingWrap(t *testing.T) {
 
 // --- core pool setters + hot-path helpers (session_pool.go) ----------------
 
-func TestSetPoolIdentity(t *testing.T) {
-	p := newTestPool(t, 1, 10)
-	if p.poolID != 0 {
-		t.Errorf("initial poolID = %d, want 0", p.poolID)
-	}
+func TestNewSessionPoolImpl_Identity(t *testing.T) {
+	factory, closeStreams := newStubStreamFactory()
+	t.Cleanup(closeStreams)
 
-	// All three fields set in one call.
-	p.SetPoolIdentity(42, "sushanb", PermissionRead)
+	// Standard identity → all three fields land on the pool.
+	p := NewSessionPoolImpl(
+		PoolIdentity{ID: 42, ShortName: "sushanb", Perm: PermissionRead},
+		"test-pool", 1, 10, factory, &spb.OpenSessionRequest{ProtocolVersion: 1}, nil, SessionTypeTable,
+	)
 	if p.poolID != 42 {
-		t.Errorf("after SetPoolIdentity(42, ...), poolID = %d, want 42", p.poolID)
+		t.Errorf("poolID = %d, want 42", p.poolID)
 	}
 	if p.poolShortName != "sushanb" {
-		t.Errorf("after SetPoolIdentity, poolShortName = %q, want %q", p.poolShortName, "sushanb")
+		t.Errorf("poolShortName = %q, want %q", p.poolShortName, "sushanb")
 	}
 	if p.perm != PermissionRead {
-		t.Errorf("after SetPoolIdentity, perm = %v, want PermissionRead", p.perm)
+		t.Errorf("perm = %v, want PermissionRead", p.perm)
 	}
+	p.Close()
+}
 
-	// Slashes in shortName must flatten to underscores so the name stays
+func TestNewSessionPoolImpl_ShortNameFlattensSlashes(t *testing.T) {
+	factory, closeStreams := newStubStreamFactory()
+	t.Cleanup(closeStreams)
+
+	// Slashes in ShortName must flatten to underscores so the name stays
 	// URL-safe for the channelz→sessionz anchor link.
-	p.SetPoolIdentity(99, "projects/p/instances/i/tables/t", PermissionWrite)
+	p := NewSessionPoolImpl(
+		PoolIdentity{ID: 99, ShortName: "projects/p/instances/i/tables/t", Perm: PermissionWrite},
+		"test-pool", 1, 10, factory, &spb.OpenSessionRequest{ProtocolVersion: 1}, nil, SessionTypeTable,
+	)
 	want := "projects_p_instances_i_tables_t"
 	if p.poolShortName != want {
 		t.Errorf("poolShortName = %q, want %q (slashes must flatten to underscores)", p.poolShortName, want)
 	}
-	if p.poolID != 99 {
-		t.Errorf("poolID = %d, want 99", p.poolID)
-	}
+	p.Close()
+}
+
+func TestNewSessionPoolImpl_PanicsOnPermissionUnknown(t *testing.T) {
+	factory, closeStreams := newStubStreamFactory()
+	t.Cleanup(closeStreams)
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic when ctor is called with PermissionUnknown; got no panic")
+		}
+	}()
+	NewSessionPoolImpl(
+		PoolIdentity{ID: 1, ShortName: "test", Perm: PermissionUnknown},
+		"test-pool", 1, 10, factory, &spb.OpenSessionRequest{ProtocolVersion: 1}, nil, SessionTypeTable,
+	)
+	t.Fatal("unreachable — NewSessionPoolImpl should have panicked above")
 }
 
 // TestSignalFree_NoWaitersIsNoOp verifies the queue-based signalFree

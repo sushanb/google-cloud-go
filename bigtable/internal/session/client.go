@@ -576,8 +576,10 @@ func (sc *sessionClient) getOrCreatePool(
 	if label := key.perm.display(); label != "" {
 		poolName += " [" + label + "]"
 	}
-	pool := btransport.NewSessionPoolImpl(poolName, min, max, streamFactory, openSessionRequest, md, sessionType)
-	pool.SetPoolIdentity(id, shortName, key.perm.transportPerm())
+	pool := btransport.NewSessionPoolImpl(
+		btransport.PoolIdentity{ID: id, ShortName: shortName, Perm: key.perm.transportPerm()},
+		poolName, min, max, streamFactory, openSessionRequest, md, sessionType,
+	)
 	mp := &managedPool{pool: pool}
 	sc.pools[key] = mp
 	configManager := sc.configManager

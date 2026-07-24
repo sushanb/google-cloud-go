@@ -124,7 +124,7 @@ func TestOnActive_SignalsFree(t *testing.T) {
 	sh := NewSessionHandle(nil, time.Now())
 	stream := newFakeStream()
 	s := NewSession("s-fresh", stream, SessionHooks{
-		OnStart:  p.OnStart,
+		OnStart:  p.onStart,
 		OnActive: func(_ *Session) { p.onActive(sh) },
 		OnClose:  func(_ *Session, err error) { p.onClose(sh, err) },
 	}, SessionTypeTable)
@@ -325,7 +325,7 @@ func TestOnStart_NoOp(t *testing.T) {
 	// OnStart takes a ctx and does nothing. Just verify it doesn't
 	// panic and doesn't touch any counters.
 	before := p.m.sessionsOpened.Load()
-	p.OnStart(nil)
+	p.onStart(nil)
 	if got := p.m.sessionsOpened.Load(); got != before {
 		t.Errorf("OnStart mutated sessionsOpened: %d → %d", before, got)
 	}

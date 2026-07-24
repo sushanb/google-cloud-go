@@ -115,14 +115,19 @@ type SessionPoolImpl struct {
 	nextSessionID      uint64                  // Monotonically increasing counter for unique session naming
 	sessionType        SessionType
 	poolName           string
-	// perm is the read/write axis, set by SetPoolIdentity at pool
-	// construction. Consumed by session log name minting; typed
-	// rather than parsed back out of poolName's "[READ]"/"[WRITE]"
-	// suffix.
+	// perm is the read/write axis, required at ctor via PoolIdentity.
+	// Consumed by session log name minting; typed rather than parsed
+	// back out of poolName's "[READ]"/"[WRITE]" suffix.
 	perm Permission
 	// startOnce guards Start so a second call is a no-op, not a
 	// duplicate spawn of the tick + prune goroutines.
 	startOnce sync.Once
+	// tickPending debounces tickOnce so a burst of empty-pool kicks
+	// from CheckoutSession (or a periodic-loop tick landing while a
+	// kicked tick is still running) coalesces to at most one active
+	// Tick body at a time. CAS false→true at entry; Store false at
+	// exit via defer.
+	tickPending atomic.Bool
 	// poolID is the SessionManager-assigned unique pool number used as a
 	// disambiguator when minting session log names — without it,
 	// `session-read-5` would collide across pools because each pool
@@ -186,19 +191,21 @@ type SessionPoolImpl struct {
 
 // Permission is the pool's read/write axis, plumbed as typed data so the
 // session-name minter doesn't have to parse it back out of the poolName
-// display string. Set once via SetPoolIdentity at pool construction.
+// display string. Required at construction — the ctor panics on
+// PermissionUnknown to catch mis-wired callers early.
 type Permission uint8
 
 const (
-	// PermissionUnknown is the zero-value; session-name minting falls
-	// back to a generic "session" role label. Test setups that skip
-	// SetPoolIdentity end up here.
+	// PermissionUnknown is the zero-value; the ctor rejects it so a
+	// forgotten identity field can't silently produce misleading log
+	// names in prod.
 	PermissionUnknown Permission = iota
 	PermissionRead
 	PermissionWrite
 )
 
-// role returns the short label embedded in session log names.
+// role returns the short label embedded in session log names. Panics
+// on PermissionUnknown — the ctor guarantees perm is Read or Write.
 func (p Permission) role() string {
 	switch p {
 	case PermissionRead:
@@ -206,21 +213,27 @@ func (p Permission) role() string {
 	case PermissionWrite:
 		return "write"
 	default:
-		return "session"
+		panic(fmt.Sprintf("session pool: Permission.role() called on %d — SessionPoolImpl was constructed with PermissionUnknown", p))
 	}
 }
 
-// SetPoolIdentity stamps the pool with a SessionManager-assigned unique
-// id, the resource short name (e.g. "sushanb"), and the permission
-// axis. All three feed session log name construction
-// ("OpenTable3-sushanb-read-5") so names stay unique across pools AND
-// identify what each pool opens. Slashes in shortName are flattened
-// to underscores so the name stays URL-safe for the channelz→sessionz
-// anchor link. Call before any session is created.
-func (p *SessionPoolImpl) SetPoolIdentity(id uint64, shortName string, perm Permission) {
-	p.poolID = id
-	p.poolShortName = strings.ReplaceAll(shortName, "/", "_")
-	p.perm = perm
+// PoolIdentity bundles the three fields that identify a pool for the
+// session-name minter and the debug UI. Passed to NewSessionPoolImpl
+// as a group so a caller can't half-construct a pool with only one
+// or two of the three set.
+type PoolIdentity struct {
+	// ID is the SessionManager-assigned unique pool number. Zero is
+	// reserved for test setups; production callers assign monotonic
+	// non-zero.
+	ID uint64
+	// ShortName is the resource leaf (e.g. "sushanb" for an
+	// OpenTable pool) baked into the session log name so the name
+	// identifies WHAT the session opens. Slashes are flattened to
+	// underscores at construction to keep the name URL-safe.
+	ShortName string
+	// Perm is the pool's read/write axis. MUST be PermissionRead or
+	// PermissionWrite; PermissionUnknown panics at construction.
+	Perm Permission
 }
 
 // noteVRpcOutcome forwards the vRPC outcome to the AFE's PeakEwma
@@ -237,11 +250,21 @@ func (p *SessionPoolImpl) noteVRpcOutcome(sh *SessionHandle, e2e, backend time.D
 	}
 }
 
-// NewSessionPoolImpl creates a new SessionPoolImpl.
-func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx context.Context) (Stream, error), openSessionRequest *spb.OpenSessionRequest, md metadata.MD, sessionType SessionType) *SessionPoolImpl {
+// NewSessionPoolImpl creates a new SessionPoolImpl. Panics if
+// identity.Perm is PermissionUnknown — every pool must be either
+// read or write, and a forgotten identity field silently producing
+// "…-session-…" log names in prod is worse than a construction-time
+// panic.
+func NewSessionPoolImpl(identity PoolIdentity, poolName string, min, max int, streamFactory func(ctx context.Context) (Stream, error), openSessionRequest *spb.OpenSessionRequest, md metadata.MD, sessionType SessionType) *SessionPoolImpl {
+	if identity.Perm == PermissionUnknown {
+		panic(fmt.Sprintf("NewSessionPoolImpl: identity.Perm must be PermissionRead or PermissionWrite for pool %q", poolName))
+	}
 	poolCtx, poolCancel := context.WithCancel(context.Background())
 	pool := &SessionPoolImpl{
 		poolName:           poolName,
+		poolID:             identity.ID,
+		poolShortName:      strings.ReplaceAll(identity.ShortName, "/", "_"),
+		perm:               identity.Perm,
 		minSessions:        min,
 		maxSessions:        max,
 		streamFactory:      streamFactory,

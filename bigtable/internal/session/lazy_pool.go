@@ -48,13 +48,6 @@ type SessionPool interface {
 	// Lifecycle.
 	Close() error
 
-	// SetPoolIdentity stamps the pool with a SessionManager-assigned unique
-	// id, the owning resource's short name (e.g. "sushanb"), and the
-	// permission axis. All three feed session log name construction
-	// ("OpenTable3-sushanb-read-5") so names stay unique across pools
-	// AND identify what each pool opens.
-	SetPoolIdentity(id uint64, shortName string, perm btransport.Permission)
-
 	// Start brings the pool up: seeds min-sessions synchronously, then
 	// spawns the periodic Tick watchdog + AFE prune loops. Idempotent
 	// per-pool (call once from getOrCreatePool); loops run until the

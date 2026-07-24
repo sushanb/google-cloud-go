@@ -182,7 +182,7 @@ func TestTick_EarlyReturnWhenClosed(t *testing.T) {
 	}
 }
 
-func TestTick_ReentrantGate(t *testing.T) {
+func TestTick_ScalingInProgressGate(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	// Simulate a prior Tick still in progress. The second call
 	// must exit immediately without racing.

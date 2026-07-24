@@ -29,7 +29,6 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -151,38 +150,34 @@ func (p *SessionPoolImpl) Tick(ctx context.Context) {
 	}
 
 	reason := scalingReason(stats, delta)
-	var launched atomic.Int64
-	defer func() {
-		actual := int(launched.Load())
-		p.recordScaling(ScalingEvent{
-			At:        time.Now(),
-			Before:    currentSessions,
-			Requested: delta,
-			Launched:  actual,
-			Reason:    reason,
-			Decision:  decision,
-		})
-	}()
+	// Record the scaling decision immediately — Requested = delta.
+	// The per-session outcomes (dial + handshake success) can't be
+	// waited on here without blocking every Tick caller (including
+	// Start's pre-start seed) on the slowest session's handshake.
+	// Instead: each session that becomes Ready fires OnActive →
+	// p.signalFree(), which wakes any parked CheckoutSession waiter.
+	// Failures bump tagSessionPoolCreateFailed for observability.
+	p.recordScaling(ScalingEvent{
+		At:        time.Now(),
+		Before:    currentSessions,
+		Requested: delta,
+		Reason:    reason,
+		Decision:  decision,
+	})
 
-	// Scale up: provision new sessions asynchronously and wait for
-	// completion to release the gate.
-	var wg sync.WaitGroup
+	// Scale up: fire and forget. Sessions signal readiness via
+	// OnActive → signalFree; no wait-group here.
 	for i := 0; i < delta; i++ {
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
 			if err := p.createSession(ctx); err != nil {
 				// A scale-up attempt failed — the pool wanted `delta`
 				// more sessions and got fewer. Every failure is a tag
 				// so the count IS the "scale-ups we lost" gauge.
 				recordDebugTag(tagSessionPoolCreateFailed)
 				btopt.Debugf(nil, "POOL %s Tick createSession failed: %v", p.poolName, err)
-			} else {
-				launched.Add(1)
 			}
 		}()
 	}
-	wg.Wait()
 }
 
 func (p *SessionPoolImpl) createSession(ctx context.Context) error {
@@ -267,7 +262,7 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 	// down; the closures don't fire until Session.Start runs.
 	sh := &SessionHandle{}
 	hooks := SessionHooks{
-		OnStart:  p.OnStart,
+		OnStart:  p.onStart,
 		OnActive: func(_ *Session) { p.onActive(sh) },
 		// Fires from every successful drainSlot; captures sh so it
 		// doesn't need to walk back through Session.

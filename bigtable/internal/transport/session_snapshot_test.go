@@ -128,7 +128,10 @@ func TestSessionHandle_Snapshot(t *testing.T) {
 }
 
 func TestPoolSnapshot_AggregatesSessions(t *testing.T) {
-	pool := NewSessionPoolImpl("test:read", 1, 5, nil, nil, nil, SessionTypeTable)
+	pool := NewSessionPoolImpl(
+		PoolIdentity{ID: 1, ShortName: "test", Perm: PermissionRead},
+		"test:read", 1, 5, nil, nil, nil, SessionTypeTable,
+	)
 
 	// Two active sessions, one with traffic.
 	handles := make([]*SessionHandle, 0, 2)

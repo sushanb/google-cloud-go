@@ -234,7 +234,7 @@ func (p *SessionPoolImpl) Close() error {
 }
 
 // OnStart is a no-op callback for session start.
-func (p *SessionPoolImpl) OnStart(ctx context.Context) {}
+func (p *SessionPoolImpl) onStart(ctx context.Context) {}
 
 // onActive is triggered when a background session finishes its open
 // session req and becomes active. The SessionHandle was already minted
@@ -400,16 +400,18 @@ func (p *SessionPoolImpl) noteAbnormalCloseIfAny(s *Session) {
 // the two.
 const tickInterval = 1 * time.Second
 
-// Start brings the pool up: an immediate Tick to seed min-sessions
-// before the caller's next Checkout, plus the two background loops
-// (periodic Tick watchdog + AFE prune). Encapsulates what would
-// otherwise be three separate caller lines whose order matters (seed
-// must precede the loop so callers don't wait a full interval on
-// cold-start). Idempotent per pool — startOnce protects against a
-// double-call spawning duplicate background goroutines.
+// Start brings the pool up: kicks off the pre-start Tick to seed
+// min-sessions (fire-and-forget — Tick now spawns createSession
+// goroutines without waiting on their handshake, so caller doesn't
+// block on the slowest session's dial), plus the two background
+// loops (periodic Tick watchdog + AFE prune). Idempotent per pool —
+// startOnce protects against a double-call spawning duplicate
+// background goroutines. Non-blocking: callers can Start(ctx) and
+// immediately Checkout — sessions signal readiness via OnActive →
+// signalFree which wakes any parked Checkout waiter.
 func (p *SessionPoolImpl) Start(ctx context.Context) {
 	p.startOnce.Do(func() {
-		p.tickOnce(ctx)
+		go p.tickOnce(ctx) // async pre-start seed
 		p.startTickLoop(ctx)
 		p.startAfePruneLoop(ctx)
 	})
@@ -434,14 +436,22 @@ func (p *SessionPoolImpl) startTickLoop(ctx context.Context) {
 	}()
 }
 
-// tickOnce runs one Tick with panic recovery. The single entry point
-// for every Tick invocation — the periodic loop, the pre-start seed in
-// Start, and the three empty-pool kick sites (CheckoutSession's
-// one-shot kick, waiter-park kick, onClosing replace-slot kick). A
-// panic on any of those paths would otherwise kill a bare goroutine
-// or unwind up to the caller; recovering here keeps the pool alive
-// and captures the stack for post-mortem.
+// tickOnce runs one Tick with panic recovery + a debounce gate. The
+// single entry point for every Tick invocation — the periodic loop,
+// the pre-start seed in Start, and the three empty-pool kick sites
+// (CheckoutSession's one-shot kick, waiter-park kick, onClosing
+// replace-slot kick). The tickPending CAS coalesces concurrent
+// invocations to at most one active Tick body: a burst of
+// CheckoutSession kicks after an empty-pool observation would
+// otherwise all fire redundant recordTimeSeries / sampleActiveUptimes
+// / sweepStuckSessions before the scalingInProgress gate rejects them.
+// Panic recover keeps the pool alive if Tick panics and captures the
+// stack for post-mortem.
 func (p *SessionPoolImpl) tickOnce(ctx context.Context) {
+	if !p.tickPending.CompareAndSwap(false, true) {
+		return // another Tick is already running
+	}
+	defer p.tickPending.Store(false)
 	defer func() {
 		if r := recover(); r != nil {
 			btopt.Debugf(nil, "POOL %s Tick panic recovered: %v\n%s", p.poolName, r, debug.Stack())
