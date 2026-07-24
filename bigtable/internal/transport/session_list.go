@@ -187,11 +187,17 @@ func (sl *sessionList) OnSessionStarted(sh *SessionHandle) {
 }
 
 // Checkout dequeues one idle session from the AFE bucket with id
-// (Idle → InFlight). The bucket is re-resolved under sl.mu so no
-// *afeHandle pointer ever leaves the lock. Returns nil when the id has
-// no bucket or its queue is empty — legitimate races with a concurrent
-// Checkout or an OnSessionClosing that just drained the last idle
-// handle. Callers should have picked from ReadyAfes() first.
+// (Idle → InFlight). The bucket is re-resolved under sl.mu and the
+// dequeue completes before the lock is released — a picker holding
+// a stale afeID from a prior ReadyAfes() snapshot cannot dereference
+// a detached bucket here. Returns nil when the id has no bucket or its
+// queue is empty — legitimate races with a concurrent Checkout or an
+// OnSessionClosing that just drained the last idle handle. Callers
+// should have picked from ReadyAfes() first.
+//
+// This is NOT a global sessionList invariant: RecordVRpcOutcome
+// deliberately drops sl.mu between the map lookup and the
+// PeakEwma.Update — see its doc for why that's safe.
 //
 // Under the slotMu slot lifecycle (drain-driven queue re-add), the AFE
 // queue only contains sessions with empty in-flight slots by
