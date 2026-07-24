@@ -97,6 +97,7 @@ func (c *getClientConfigDirectAccessChecker) CheckCompatibility(ctx context.Cont
 	}
 
 	if conn.isALTSConn.Load() {
+		btopt.Debugf(c.logger, "bigtable_direct_access: GetClientConfiguration compatibility check succeeded (ALTS conn, ip_preference=%s)", conn.ipProtocol())
 		c.reportSuccess(ctx, conn.ipProtocol())
 		return conn, true
 	}
