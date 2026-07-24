@@ -115,6 +115,9 @@ type SessionPoolImpl struct {
 	nextSessionID      uint64                  // Monotonically increasing counter for unique session naming
 	sessionType        SessionType
 	poolName           string
+	// startOnce guards Start so a second call is a no-op, not a
+	// duplicate spawn of the tick + prune goroutines.
+	startOnce sync.Once
 	// poolID is the SessionManager-assigned unique pool number used as a
 	// disambiguator when minting session log names — without it,
 	// `session-read-5` would collide across pools because each pool
@@ -261,7 +264,7 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 	closed := p.closed
 	p.mu.Unlock()
 	if !closed && p.sl.ReadyCount() == 0 {
-		go p.Tick(p.poolCtx)
+		go p.tickOnce(p.poolCtx)
 	}
 
 	for {
@@ -312,7 +315,7 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		// only live-or-starting sessions; a miss just means all live
 		// sessions are busy.
 		if p.sl.ReadyCount() < p.maxSessions {
-			go p.Tick(p.poolCtx)
+			go p.tickOnce(p.poolCtx)
 		}
 
 		// Park in the FIFO waiter queue. Each free-session event
