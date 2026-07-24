@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Session lifecycle glue for SessionPoolImpl: session-hooks callbacks
-// (OnStart/OnActive/OnClose), Close/teardown, the per-session close-
-// reason ledger, and the background maintenance ticker (heartbeat) that
-// drives uptime sampling and stuck-session sweeping.
+// SessionPoolImpl lifecycle: session hooks (onStart/onActive/onClosing/
+// onClose), Close/teardown, close-reason ledger, and the background
+// maintenance ticker that drives uptime sampling and stuck-session sweeping.
 
 package internal
 
@@ -30,16 +29,14 @@ import (
 	btopt "cloud.google.com/go/bigtable/internal/option"
 )
 
-// waitServerCloseGrace bounds how long a session may sit in
-// StateWaitServerClose before the pool force-closes it. The server should
-// EOF the stream promptly after acknowledging CloseSession; if it doesn't,
-// this gives us a deterministic teardown so OnClose fires and counters move.
+// waitServerCloseGrace bounds StateWaitServerClose before the pool
+// force-closes the session; guarantees deterministic teardown when the
+// server fails to EOF the stream after acknowledging CloseSession.
 const waitServerCloseGrace = 30 * time.Second
 
-// sampleActiveUptimes snapshots the currently-active session list under
-// the pool lock and records each session's current age into the
-// session.uptime histogram. Sampling happens without the pool lock so
-// tracer work never blocks CheckoutSession / OnClose.
+// sampleActiveUptimes records each Ready session's current age into the
+// session.uptime histogram. Runs without the pool lock so tracer work
+// never blocks CheckoutSession / OnClose.
 func (p *SessionPoolImpl) sampleActiveUptimes(ctx context.Context) {
 	handles := p.sl.AllHandles()
 	for _, sh := range handles {
@@ -53,11 +50,9 @@ func (p *SessionPoolImpl) sampleActiveUptimes(ctx context.Context) {
 	}
 }
 
-// sweepStuckSessions scans the pool for sessions parked in
-// StateWaitServerClose beyond waitServerCloseGrace and force-closes them.
-// Runs from Tick at the heartbeat cadence; takes p.mu only long
-// enough to snapshot the (handle, last-state-change) tuples then issues
-// ForceClose calls outside the lock.
+// sweepStuckSessions force-closes sessions parked in StateWaitServerClose
+// beyond waitServerCloseGrace. Runs from Tick; ForceClose calls fire
+// outside the pool lock.
 func (p *SessionPoolImpl) sweepStuckSessions() {
 	type victim struct {
 		sess     *Session
@@ -77,9 +72,8 @@ func (p *SessionPoolImpl) sweepStuckSessions() {
 	}
 
 	for _, v := range victims {
-		// One tag per swept victim — the count IS the "stuck sessions
-		// per minute" gauge. Server that responsibly EOFed the stream
-		// after our CloseSession never triggers this.
+		// One tag per swept victim — the count is the "stuck sessions
+		// per minute" gauge.
 		recordDebugTag(tagSessionPoolStuckSessionSwept)
 		btopt.Debugf(nil, "POOL %s sweepStuckSessions: force-closing %s stuck in WaitServerClose for %v",
 			p.poolName, v.sess.LogName(), v.stuckFor.Round(time.Second))
@@ -101,16 +95,9 @@ func (p *SessionPoolImpl) bumpCloseReason(label string) {
 }
 
 // recordSessionClose marks a session as retired exactly once and bumps
-// sessionsClosed + the close-reason histogram. Called from every removal
-// site (OnClose, CheckoutSession's dead-detect, Pool.Close) so the
-// counter reflects pool-side retirements promptly even when the
-// underlying session's hooks.OnClose hasn't fired yet (e.g. the server
-// hasn't EOFed the stream). The once-flag lives on the Session so it
-// dedupes across paths.
-//
-// fallbackReason is used only when the session itself hasn't recorded a
-// reason yet — e.g. CheckoutSession found a session in StateClosed via
-// a race and needs to attribute the retirement.
+// sessionsClosed + the close-reason histogram. Once-flag lives on
+// Session so it dedupes across every removal site. fallbackReason is
+// used when the session hasn't recorded its own reason yet.
 func (p *SessionPoolImpl) recordSessionClose(s *Session, fallbackReason string) {
 	if s == nil {
 		return
@@ -126,10 +113,9 @@ func (p *SessionPoolImpl) recordSessionClose(s *Session, fallbackReason string) 
 	p.bumpCloseReason(reason)
 }
 
-// bumpStartingClose is the recordSessionClose variant for sessions that
-// died before reaching active state — they're held in startingSessions
-// and never fired onActive, so onClose's starting-branch is the only
-// signal we get. Wraps the same once-flag for consistency.
+// bumpStartingClose records the close for sessions that died before
+// reaching Ready — they never fire onActive, so onClose's starting
+// branch is the only close signal.
 func (p *SessionPoolImpl) bumpStartingClose(s *Session) {
 	p.recordSessionClose(s, "FailedToStart")
 }
@@ -144,15 +130,13 @@ func (p *SessionPoolImpl) snapshotCloseReasons() map[string]int64 {
 	return out
 }
 
-// Close gracefully closes all active sessions in the pool, bounded by a 30s
-// timeout. Sessions are closed concurrently; Close blocks until every
-// per-session graceful Close returns (or the bounded ctx fires). Only after
-// the WaitGroup completes do we cancel poolCtx, which tears down any
-// remaining session goroutines (readLoop/heartBeatLoop) via Session.Start's
-// ctx supervisor.
+// Close gracefully closes all active sessions in the pool, bounded by
+// a 30s timeout. Sessions close concurrently; Close blocks until every
+// per-session graceful Close returns (or the bounded ctx fires). Only
+// after the WaitGroup completes do we cancel poolCtx, which tears down
+// any remaining session goroutines.
 func (p *SessionPoolImpl) Close() error {
-	// Phase 1: take a snapshot under lock and mark the pool closed so no new
-	// sessions are admitted while we drain.
+	// Phase 1: mark closed so no new sessions are admitted.
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -161,25 +145,16 @@ func (p *SessionPoolImpl) Close() error {
 	p.closed = true
 	p.mu.Unlock()
 
-	// Snapshot AFTER marking closed so any OnActive races have either
-	// (a) already added to sl, in which case we see them, or (b) will
-	// see p.closed and route straight to ForceClose without registering.
+	// Snapshot AFTER marking closed so any onActive races either see
+	// p.closed (and ForceClose without registering) or land in sl in
+	// time to be caught here.
 	snapshot := p.sl.AllHandles()
 
-	// Record the closes up-front (with PoolClose as the fallback reason)
-	// so the debug counters reflect retirement immediately, even though the
-	// actual graceful Close on each session is still in flight. Also drop
-	// the handles from the AFE-aware sessionList so a concurrent picker
-	// racing with teardown never returns a retired session.
-	//
-	// Flip closingRecorded / closeRecorded on each handle after recording
-	// so the callback chain fired by Phase-2 s.Close (notifyClosing →
-	// p.onClosing, closeOnce → p.onClose) short-circuits on the CAS
-	// guard. Without this, onClosing would re-run recordLifetime for every
-	// session and onClose would call sl.OnSessionClosed a second time —
-	// sessionList tolerates it (idempotent), but the lifetimes ring gets
-	// 2× the correct entries. Replaces the prior poolHandle.Store(nil)
-	// trick, expressing the dedup as an actual dedup flag.
+	// Record closes up-front so debug counters reflect retirement
+	// immediately, and drop handles from sl so a racing picker can't
+	// return a retired session. Flipping closingRecorded / closeRecorded
+	// short-circuits the callback chain fired by Phase-2 s.Close so
+	// lifetime histograms and sl aren't double-touched.
 	for _, sh := range snapshot {
 		if sh != nil && sh.session != nil {
 			if !sh.createdAt.IsZero() {
@@ -192,9 +167,9 @@ func (p *SessionPoolImpl) Close() error {
 		p.sl.OnSessionClosed(sh)
 	}
 
-	// Phase 2: kick off graceful Close for every session with a bounded ctx
-	// that is independent of poolCtx — so Session.Close can attempt to drain
-	// in-flight RPCs without being immediately killed by poolCancel below.
+	// Phase 2: kick off graceful Close on every session under a bounded
+	// ctx independent of poolCtx, so Session.Close can drain in-flight
+	// RPCs without being killed by poolCancel below.
 	closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -213,38 +188,28 @@ func (p *SessionPoolImpl) Close() error {
 		}(sh.session)
 	}
 
-	// Phase 3: wait for all graceful closes to finish (or for closeCtx to
-	// fire — Session.Close itself selects on its ctx and ForceCloses on
-	// expiry, so the WaitGroup will unblock either way).
+	// Phase 3: wait for graceful closes. Session.Close selects on its
+	// ctx and ForceCloses on expiry, so the WaitGroup unblocks either way.
 	wg.Wait()
 	if closeCtx.Err() != nil {
-		// Wait unblocked because the 30s bound expired — at least one
-		// session's graceful drain didn't complete and got ForceClosed
-		// as a result. Meaningfully different signal from a clean pool
-		// teardown, so it gets its own tag.
 		recordDebugTag(tagSessionPoolDrainTimeout)
 	}
 
-	// Phase 4: cancel poolCtx to bring down any lingering session goroutines
-	// (readLoop/heartBeatLoop supervisors) that were started from this pool.
+	// Phase 4: cancel poolCtx to bring down any lingering session
+	// goroutines (readLoop / heartBeatLoop supervisors).
 	if p.poolCancel != nil {
 		p.poolCancel()
 	}
 
-	// Phase 5: wait for every Tick-spawned createSession worker to exit.
-	// Includes error paths that touch package-level metric state
-	// (recordDebugTag) — without this wait those goroutines can outlive
-	// Close and race with a next test's InitializeSessionMetrics.
+	// Phase 5: wait for every createSession worker (Tick-spawned). Their
+	// error paths touch package-level metric state, so without this wait
+	// they can outlive Close and race the next test's metrics init.
 	p.spawns.Wait()
 
-	// Phase 6: wait for every registered Session's readLoop +
-	// heartBeatLoop (and their notifyClosed → recordClose callback
-	// chains) to fully unwind. Re-snapshot AFTER spawns.Wait so
-	// sessions that reached sl during the createSession workers'
-	// tail are also caught. Sessions still in startingSessions never
-	// entered sl (Start failed) — those are already accounted for
-	// because Phase 5 waited on the createSession goroutine that
-	// owned them.
+	// Phase 6: wait for every Session's goroutines to unwind. Re-snapshot
+	// AFTER spawns.Wait to catch sessions that reached sl during the tail
+	// of Phase 5. Sessions still in startingSessions never entered sl and
+	// are already accounted for via Phase 5.
 	for _, sh := range p.sl.AllHandles() {
 		if sh != nil && sh.session != nil {
 			sh.session.WaitGoroutines()
@@ -253,39 +218,29 @@ func (p *SessionPoolImpl) Close() error {
 	return nil
 }
 
-// OnStart is a no-op callback for session start.
+// onStart is a no-op callback for session start.
 func (p *SessionPoolImpl) onStart(ctx context.Context) {}
 
-// onActive is triggered when a background session finishes its open
-// session req and becomes active. The SessionHandle was already minted
-// by createSession — this method just publishes it into sl and clears
-// the starting-set entry.
-//
-// The activated CAS makes this safe to invoke twice on the same handle;
-// tests exercise the guard (production wires each closure exactly once
-// per Session lifetime).
+// onActive publishes a newly-started SessionHandle into sl and clears
+// its starting-set entry. The activated CAS makes this safe to invoke
+// twice; production wires each closure exactly once per Session.
 func (p *SessionPoolImpl) onActive(sh *SessionHandle) {
 	if !sh.activated.CompareAndSwap(false, true) {
 		return
 	}
-	// Callers hold this method's body under p.mu for the full duration
-	// of the map/registration work. Keep new work here allocation-only
-	// / atomic-only — anything that blocks would deadlock the read
-	// loop and heartbeat scheduler that contend for p.mu. See
-	// SessionHooks doc: "hooks must not block."
+	// Keep work here allocation-only / atomic-only. Anything blocking
+	// would deadlock the read loop and heartbeat scheduler that contend
+	// for p.mu. (SessionHooks: "hooks must not block.")
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	delete(p.startingSessions, sh)
 
 	if p.closed {
-		// Dispatch to a goroutine so this method returns and releases
-		// p.mu before the onClose callback chain fires. ForceClose →
-		// notifyClosed → hooks.onClose fires p.onClose, and p.onClose
-		// re-acquires p.mu — synchronous would deadlock on the
-		// non-reentrant mutex. Race window: Close() sets p.closed=true
-		// then releases p.mu; a session already in flight through
-		// OpenSession can land here up to ~30s later.
+		// Dispatch async so this method releases p.mu before the
+		// onClose callback chain (which re-acquires p.mu). Race window:
+		// a session in flight through OpenSession can land here up to
+		// ~30s after Close set p.closed=true.
 		go sh.session.ForceClose(&spb.CloseSessionRequest{
 			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR,
 			Description: "pool closed before session became active",
@@ -295,32 +250,23 @@ func (p *SessionPoolImpl) onActive(sh *SessionHandle) {
 
 	p.m.sessionsOpened.Add(1)
 
-	// Register the newly-Active session in its AFE bucket. PeerInfo is
-	// guaranteed populated at this point — handleOpenSession parses it
-	// synchronously before firing onActive (see session_lifecycle.go).
+	// PeerInfo is guaranteed populated: handleOpenSession parses it
+	// synchronously before firing onActive.
 	p.sl.OnSessionStarted(sh)
 
-	// New session is immediately idle. Post a wake-up so a waiting
-	// worker can grab it without waiting out the 50ms safety timer.
+	// New session is immediately idle — wake any parked waiter.
 	p.signalFree()
 }
 
-// onClosing is fired by the Session at the FIRST transition out of Ready
-// (handleGoAway, Close, ForceClose, handleClose — whichever wins).
-// Removes the session from the pool's
-// operational structures immediately so:
-//   - the picker's AFE idle queue no longer sees it,
-//   - it no longer counts toward the scale-up gate,
-//   - Tick gets a chance to replace it right away,
-//
-// even though the actual close may take up to waitServerCloseGrace to
-// complete. This is what lets CheckoutSession skip the per-miss dead-
-// sweep — dying sessions leave the pool's accounting the instant they
-// start dying, not at end-of-teardown.
+// onClosing fires at the FIRST transition out of Ready (handleGoAway,
+// Close, ForceClose, handleClose — whichever wins). Removes the session
+// from the picker's AFE idle queue and the scale-up gate immediately,
+// so replacement can start before teardown completes. sessionList
+// keeps the handle refCount alive so in-flight vRPCs still complete;
+// the final drop happens in onClose.
 func (p *SessionPoolImpl) onClosing(sh *SessionHandle) {
-	// Still-starting sessions leave the pool via onClose's
-	// bumpStartingClose path — they were never promoted to Active, so
-	// there's nothing to remove from sl.
+	// Still-starting sessions never reached sl; they exit via onClose's
+	// bumpStartingClose path.
 	p.mu.Lock()
 	_, starting := p.startingSessions[sh]
 	p.mu.Unlock()
@@ -328,16 +274,12 @@ func (p *SessionPoolImpl) onClosing(sh *SessionHandle) {
 		return
 	}
 	if !sh.closingRecorded.CompareAndSwap(false, true) {
-		return // Pool.Close Phase-1 already recorded.
+		return // Pool.Close Phase 1 already recorded.
 	}
 	if !sh.createdAt.IsZero() {
 		p.recordLifetime(time.Since(sh.createdAt))
 	}
 
-	// Remove from the AFE idle queue too. sessionList keeps refCount
-	// alive (in-flight vRPCs still complete via the session) until
-	// onClose fires and drops the handle entirely. This also decrements
-	// sl.readyCount, freeing a slot in the scale-up budget.
 	p.sl.OnSessionClosing(sh)
 
 	if p.sl.ReadyCount() < p.maxSessions {
@@ -345,51 +287,38 @@ func (p *SessionPoolImpl) onClosing(sh *SessionHandle) {
 	}
 }
 
-// onClose fires at the end of teardown — the stream has actually
-// closed. By this point onClosing has already dropped the session
-// from sl.readyCount and the picker's idle queue. This callback
-// finalizes: drop the AFE handle from sl (refCount → 0, out of
-// handleToAfe) and record the close in the reason ledger. Pool.Close's
-// Phase-1 flips sh.closeRecorded before Phase-2's s.Close runs, so a
-// pool-driven close short-circuits here instead of double-firing
-// sl.OnSessionClosed.
+// onClose fires when the stream has actually closed. onClosing has
+// already dropped the session from sl.readyCount and the picker's idle
+// queue; this callback finalizes by dropping the AFE handle and
+// recording the close reason. Pool.Close's Phase 1 pre-flips
+// sh.closeRecorded so pool-driven closes short-circuit here.
 func (p *SessionPoolImpl) onClose(sh *SessionHandle, err error) {
 	p.mu.Lock()
 	if _, starting := p.startingSessions[sh]; starting {
 		delete(p.startingSessions, sh)
 		p.mu.Unlock()
-		// A session that was never promoted to active still counts toward
-		// the close ledger — bumpStartingClose is the once-flag path.
 		p.bumpStartingClose(sh.session)
-		// A start that never reached Active but failed abnormally still
-		// contributes to the consecutive-failure signal. createSession
-		// already routes the OpenSession error through budget.Release
-		// (which applies the creation penalty); this counter is the
-		// separate "did any session make progress" signal.
 		p.noteAbnormalCloseIfAny(sh.session)
 		return
 	}
 	p.mu.Unlock()
 
 	if !sh.closeRecorded.CompareAndSwap(false, true) {
-		// Pool.Close Phase-1 already recorded. bumpAbnormalClose still
-		// runs on the s.poolCloseRecorded once-flag path.
+		// Pool.Close Phase 1 already recorded. Still safe to bump the
+		// consecutive-failure counter — Session.OnClose is once-guarded,
+		// so this method fires at most once per session.
 		p.noteAbnormalCloseIfAny(sh.session)
 		return
 	}
 	p.sl.OnSessionClosed(sh)
-	// recordSessionClose is once-guarded via s.poolCloseRecorded — safe
-	// to call even when onClosing already invoked it.
 	p.recordSessionClose(sh.session, "")
 	p.noteAbnormalCloseIfAny(sh.session)
 }
 
-// noteAbnormalCloseIfAny bumps the consecutive-failure counter when
-// the session's final close reason classifies as abnormal (same gate
-// the debug tracer uses for tagSessionAbnormalClose). When the counter
-// crosses consecutiveFailureThreshold, every parked waiter is woken
-// with ErrConsecutiveFailures and the counter is reset. Design note:
-// SessionPoolImpl.handleSessionClose lines 572-586.
+// noteAbnormalCloseIfAny bumps the consecutive-failure counter when the
+// session's close reason classifies as abnormal. Crossing the threshold
+// drains every parked waiter with ErrConsecutiveFailures and resets.
+// CAS on reset guards against two goroutines double-draining.
 func (p *SessionPoolImpl) noteAbnormalCloseIfAny(s *Session) {
 	if !isAbnormalCloseReason(s.CloseReason()) {
 		return
@@ -399,11 +328,6 @@ func (p *SessionPoolImpl) noteAbnormalCloseIfAny(s *Session) {
 	if threshold <= 0 || n < threshold {
 		return
 	}
-	// Reset before draining so a concurrent OnClose crossing the
-	// threshold again doesn't double-drain the queue. CAS guards
-	// against two goroutines both seeing n == threshold and both
-	// draining. The loser exits after the CAS fails; the winner
-	// drains and logs.
 	if !p.consecutiveFailures.CompareAndSwap(n, 0) {
 		return
 	}
@@ -413,33 +337,22 @@ func (p *SessionPoolImpl) noteAbnormalCloseIfAny(s *Session) {
 	}
 }
 
-// tickInterval is the cadence for the periodic Tick watchdog. Fixed
-// (not configurable) — server-driven scaling changes take effect on
-// the next tick, so a shorter cadence means faster reaction to server
-// config, and a longer one means less CPU/mu contention. 1 s balances
-// the two.
+// tickInterval is the cadence for the periodic Tick watchdog. 1 s
+// balances reaction to server-driven config against CPU/mu contention.
 const tickInterval = 1 * time.Second
 
-// Start brings the pool up: kicks off the pre-start Tick to seed
-// min-sessions (fire-and-forget — Tick now spawns createSession
-// goroutines without waiting on their handshake, so caller doesn't
-// block on the slowest session's dial), plus the two background
-// loops (periodic Tick watchdog + AFE prune). Idempotent per pool —
-// startOnce protects against a double-call spawning duplicate
-// background goroutines. Non-blocking: callers can Start(ctx) and
-// immediately Checkout — sessions signal readiness via OnActive →
-// signalFree which wakes any parked Checkout waiter.
+// Start brings the pool up: fires a pre-start Tick to seed min-sessions,
+// then runs the periodic Tick watchdog and AFE prune loop.
+// Non-blocking; idempotent via startOnce.
 func (p *SessionPoolImpl) Start(ctx context.Context) {
 	p.startOnce.Do(func() {
-		p.spawnTickOnce(ctx) // async pre-start seed
+		p.spawnTickOnce(ctx)
 		p.startTickLoop(ctx)
 		p.startAfePruneLoop(ctx)
 	})
 }
 
-// startTickLoop runs Tick every tickInterval until ctx cancels. Each
-// iteration goes through tickOnce so a panic inside Tick doesn't
-// silently kill the watchdog goroutine.
+// startTickLoop runs Tick every tickInterval until ctx cancels.
 func (p *SessionPoolImpl) startTickLoop(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(tickInterval)
@@ -457,19 +370,13 @@ func (p *SessionPoolImpl) startTickLoop(ctx context.Context) {
 }
 
 // tickOnce runs one Tick with panic recovery + a debounce gate. The
-// single entry point for every Tick invocation — the periodic loop,
-// the pre-start seed in Start, and the three empty-pool kick sites
-// (CheckoutSession's one-shot kick, waiter-park kick, onClosing
-// replace-slot kick). The tickPending CAS coalesces concurrent
-// invocations to at most one active Tick body: a burst of
-// CheckoutSession kicks after an empty-pool observation would
-// otherwise all fire redundant recordTimeSeries / sampleActiveUptimes
-// / sweepStuckSessions before the scalingInProgress gate rejects them.
-// Panic recover keeps the pool alive if Tick panics and captures the
-// stack for post-mortem.
+// tickPending CAS coalesces concurrent invocations to at most one
+// active Tick body — a burst of empty-pool kicks otherwise fires
+// redundant sampleActiveUptimes / sweepStuckSessions before the
+// scalingInProgress gate rejects them.
 func (p *SessionPoolImpl) tickOnce(ctx context.Context) {
 	if !p.tickPending.CompareAndSwap(false, true) {
-		return // another Tick is already running
+		return
 	}
 	defer p.tickPending.Store(false)
 	defer func() {
@@ -481,15 +388,11 @@ func (p *SessionPoolImpl) tickOnce(ctx context.Context) {
 }
 
 // spawnTickOnce is the guarded replacement for `go p.tickOnce(ctx)` at
-// every kick site (Start's pre-start seed, CheckoutSession's empty-pool
-// + waiter-park kicks, onClosing's replace-slot kick). It bumps
-// p.spawns under p.mu after re-checking p.closed so Close's Phase 1
-// (which sets p.closed under the same lock) synchronizes-with any
-// concurrent Wait: an Add either lands BEFORE Close's Lock (so
-// happens-before Wait) or is skipped by the closed re-check. Without
-// this, tickOnce goroutines spawned during Close's own Session.Close
-// wave (Phase 2 → notifyClosing → onClosing → this kick) leak past
-// pool.Close and race the next test's InitializeSessionMetrics.
+// every kick site. Bumps p.spawns under p.mu after re-checking
+// p.closed so Close's Phase 1 (also under p.mu) synchronizes-with any
+// concurrent Wait: an Add either lands before Close's Lock or is
+// skipped. Without this, kicks fired during Close's own graceful-close
+// wave leak past Close and race the next test's metrics init.
 func (p *SessionPoolImpl) spawnTickOnce(ctx context.Context) {
 	p.mu.Lock()
 	if p.closed {
@@ -505,10 +408,8 @@ func (p *SessionPoolImpl) spawnTickOnce(ctx context.Context) {
 }
 
 // startAfePruneLoop runs sl.Prune on afePruneMaxIdle cadence until ctx
-// cancels — deliberately OFF the tickInterval so the sl.mu held during
-// the map walk can't contend with serving-path Checkouts even under
-// pathological AFE-count growth. Wrapped in defer-recover per iteration
-// so a bad prune body can't kill the loop.
+// cancels — deliberately OFF the tickInterval so sl.mu held during the
+// map walk can't contend with serving-path Checkouts.
 func (p *SessionPoolImpl) startAfePruneLoop(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(afePruneMaxIdle)
