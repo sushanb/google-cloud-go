@@ -137,6 +137,21 @@ func (p permission) display() string {
 	return ""
 }
 
+// transportPerm maps the sessionClient-local permission enum to the
+// transport-package Permission value threaded into SessionPoolImpl.
+// Keeps the session→transport dependency direction on typed data and
+// avoids the pool having to reverse-parse "[READ]"/"[WRITE]" out of
+// its display name.
+func (p permission) transportPerm() btransport.Permission {
+	switch p {
+	case permissionRead:
+		return btransport.PermissionRead
+	case permissionWrite:
+		return btransport.PermissionWrite
+	}
+	return btransport.PermissionUnknown
+}
+
 // poolKey identifies one pool inside sessionClient.pools. Resource is
 // the caller-supplied short name ("table:foo", "av:t:v", "mv:v");
 // permission separates the read pool from the write pool for the same
@@ -562,7 +577,7 @@ func (sc *sessionClient) getOrCreatePool(
 		poolName += " [" + label + "]"
 	}
 	pool := btransport.NewSessionPoolImpl(poolName, min, max, streamFactory, openSessionRequest, md, sessionType)
-	pool.SetPoolIdentity(id, shortName)
+	pool.SetPoolIdentity(id, shortName, key.perm.transportPerm())
 	mp := &managedPool{pool: pool}
 	sc.pools[key] = mp
 	configManager := sc.configManager

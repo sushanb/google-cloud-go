@@ -404,18 +404,21 @@ func TestSetPoolIdentity(t *testing.T) {
 		t.Errorf("initial poolID = %d, want 0", p.poolID)
 	}
 
-	// Both fields set in one call.
-	p.SetPoolIdentity(42, "sushanb")
+	// All three fields set in one call.
+	p.SetPoolIdentity(42, "sushanb", PermissionRead)
 	if p.poolID != 42 {
 		t.Errorf("after SetPoolIdentity(42, ...), poolID = %d, want 42", p.poolID)
 	}
 	if p.poolShortName != "sushanb" {
 		t.Errorf("after SetPoolIdentity, poolShortName = %q, want %q", p.poolShortName, "sushanb")
 	}
+	if p.perm != PermissionRead {
+		t.Errorf("after SetPoolIdentity, perm = %v, want PermissionRead", p.perm)
+	}
 
 	// Slashes in shortName must flatten to underscores so the name stays
 	// URL-safe for the channelz→sessionz anchor link.
-	p.SetPoolIdentity(99, "projects/p/instances/i/tables/t")
+	p.SetPoolIdentity(99, "projects/p/instances/i/tables/t", PermissionWrite)
 	want := "projects_p_instances_i_tables_t"
 	if p.poolShortName != want {
 		t.Errorf("poolShortName = %q, want %q (slashes must flatten to underscores)", p.poolShortName, want)

@@ -29,7 +29,6 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -225,16 +224,10 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 		p.mu.Unlock()
 		return fmt.Errorf("session pool limit reached")
 	}
-	// Derive a short role hint for the session log name from whatever
-	// permission marker the pool's name carries (the SessionManager adds
-	// "[READ]" / "[WRITE]" suffixes). Falls back to a generic "s".
-	role := "s"
-	switch {
-	case strings.Contains(p.poolName, "[READ]"):
-		role = "read"
-	case strings.Contains(p.poolName, "[WRITE]"):
-		role = "write"
-	}
+	// Read the pool's permission axis directly — set once at
+	// construction via SetPoolIdentity. "session" is the fallback for
+	// PermissionUnknown (test setups that skip SetPoolIdentity).
+	role := p.perm.role()
 	// Session log names must be globally unique within the client so the
 	// channelz → sessionz reverse link is unambiguous, and self-describing
 	// so the name itself tells you what the session opens. Format:

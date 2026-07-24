@@ -115,6 +115,11 @@ type SessionPoolImpl struct {
 	nextSessionID      uint64                  // Monotonically increasing counter for unique session naming
 	sessionType        SessionType
 	poolName           string
+	// perm is the read/write axis, set by SetPoolIdentity at pool
+	// construction. Consumed by session log name minting; typed
+	// rather than parsed back out of poolName's "[READ]"/"[WRITE]"
+	// suffix.
+	perm Permission
 	// startOnce guards Start so a second call is a no-op, not a
 	// duplicate spawn of the tick + prune goroutines.
 	startOnce sync.Once
@@ -179,16 +184,43 @@ type SessionPoolImpl struct {
 	poolCancel context.CancelFunc
 }
 
+// Permission is the pool's read/write axis, plumbed as typed data so the
+// session-name minter doesn't have to parse it back out of the poolName
+// display string. Set once via SetPoolIdentity at pool construction.
+type Permission uint8
+
+const (
+	// PermissionUnknown is the zero-value; session-name minting falls
+	// back to a generic "session" role label. Test setups that skip
+	// SetPoolIdentity end up here.
+	PermissionUnknown Permission = iota
+	PermissionRead
+	PermissionWrite
+)
+
+// role returns the short label embedded in session log names.
+func (p Permission) role() string {
+	switch p {
+	case PermissionRead:
+		return "read"
+	case PermissionWrite:
+		return "write"
+	default:
+		return "session"
+	}
+}
+
 // SetPoolIdentity stamps the pool with a SessionManager-assigned unique
-// id and the resource short name (e.g. "sushanb"), both used when
-// minting session log names ("OpenTable3-sushanb-read-5") so names stay
-// unique across pools AND identify what each pool opens. Slashes in
-// shortName are flattened to underscores so the name stays URL-safe
-// for the channelz→sessionz anchor link. Call before any session is
-// created.
-func (p *SessionPoolImpl) SetPoolIdentity(id uint64, shortName string) {
+// id, the resource short name (e.g. "sushanb"), and the permission
+// axis. All three feed session log name construction
+// ("OpenTable3-sushanb-read-5") so names stay unique across pools AND
+// identify what each pool opens. Slashes in shortName are flattened
+// to underscores so the name stays URL-safe for the channelz→sessionz
+// anchor link. Call before any session is created.
+func (p *SessionPoolImpl) SetPoolIdentity(id uint64, shortName string, perm Permission) {
 	p.poolID = id
 	p.poolShortName = strings.ReplaceAll(shortName, "/", "_")
+	p.perm = perm
 }
 
 // noteVRpcOutcome forwards the vRPC outcome to the AFE's PeakEwma
