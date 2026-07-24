@@ -587,32 +587,21 @@ func TestSessionList_ConcurrentOps_MaintainsInvariants(t *testing.T) {
 	states := make([]handleState, poolSize)
 	var stateMu sync.Mutex
 
-	// Deterministic seed so failures reproduce.
-	rng := rand.New(rand.NewPCG(0x5e551011115700ff, 0xdeadbeefcafebabe))
-	var rngMu sync.Mutex
-	randOp := func() int {
-		rngMu.Lock()
-		defer rngMu.Unlock()
-		return rng.IntN(5)
-	}
-	randHandle := func() int {
-		rngMu.Lock()
-		defer rngMu.Unlock()
-		return rng.IntN(poolSize)
-	}
-	randAfe := func() afeID {
-		rngMu.Lock()
-		defer rngMu.Unlock()
-		return afeID(1 + rng.IntN(numAfes))
-	}
+	// Deterministic per-worker seed so failures reproduce AND workers
+	// don't serialize on a shared rand mutex — the whole point of a
+	// concurrency stress test is that the workers actually race.
+	const baseSeed = uint64(0x5e551011115700ff)
 
 	var wg sync.WaitGroup
 	wg.Add(workers)
 	for w := 0; w < workers; w++ {
-		go func() {
+		go func(worker int) {
 			defer wg.Done()
+			rng := rand.New(rand.NewPCG(baseSeed+uint64(worker), 0xdeadbeefcafebabe))
+			randHandle := func() int { return rng.IntN(poolSize) }
+			randAfe := func() afeID { return afeID(1 + rng.IntN(numAfes)) }
 			for i := 0; i < opsEach; i++ {
-				switch randOp() {
+				switch rng.IntN(6) {
 				case 0: // OnSessionStarted (once per handle)
 					idx := randHandle()
 					stateMu.Lock()
@@ -653,9 +642,17 @@ func TestSessionList_ConcurrentOps_MaintainsInvariants(t *testing.T) {
 					} else {
 						stateMu.Unlock()
 					}
+				case 5: // RecordVRpcOutcome — safe on any handle (lookup gates it)
+					// and OK-gate mixed to exercise both branches. Racing
+					// with case 4's OnSessionClosed exercises the
+					// documented detach-then-update path.
+					idx := randHandle()
+					e2e := time.Duration(1+rng.IntN(50)) * time.Millisecond
+					backend := time.Duration(1+rng.IntN(20)) * time.Millisecond
+					sl.RecordVRpcOutcome(handles[idx], e2e, backend, rng.IntN(2) == 0)
 				}
 			}
-		}()
+		}(w)
 	}
 	wg.Wait()
 
