@@ -579,10 +579,14 @@ func TestStart_HandshakeAndClose(t *testing.T) {
 	stream.recv <- recvOp{resp: &spb.SessionResponse{
 		Payload: &spb.SessionResponse_OpenSession{OpenSession: &spb.OpenSessionResponse{}},
 	}}
-	waitFor(t, time.Second, func() bool { return s.State() == StateReady }, "StateReady")
-	if _, active, _ := listener.counts(); active != 1 {
-		t.Errorf("OnActive fired %d times, want 1", active)
-	}
+	// Wait for BOTH state=Ready and OnActive to fire — handleOpenSession
+	// transitions state first, then invokes the hook, so a state-only
+	// check races the hook fire (same shape as the StateClosed+OnClose
+	// wait below).
+	waitFor(t, time.Second, func() bool {
+		_, active, _ := listener.counts()
+		return s.State() == StateReady && active == 1
+	}, "StateReady + OnActive")
 
 	stream.recv <- recvOp{err: fmt.Errorf("server EOF")}
 	// Wait for BOTH the state transition and the OnClose hook — sequenced in
