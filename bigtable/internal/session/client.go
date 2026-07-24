@@ -103,9 +103,9 @@ type Config struct {
 	// classic/session traffic split follows the server's directive.
 	SessionLoadListener func(load float64)
 
-	// BackgroundCtx is the parent context passed to per-pool
-	// StartMaintenance / StartAfePrune / Maintain loops. Cancelled
-	// by Client teardown so all background loops unwind.
+	// BackgroundCtx is the parent context passed to each per-pool
+	// Start(ctx) call. Cancelled by Client teardown so every pool's
+	// Tick + AFE prune loops unwind together.
 	BackgroundCtx context.Context
 }
 
@@ -583,9 +583,7 @@ func (sc *sessionClient) getOrCreatePool(
 		}
 	}
 
-	pool.StartMaintenance(backgroundCtx, 1*time.Second)
-	pool.StartAfePrune(backgroundCtx)
-	pool.Maintain(backgroundCtx)
+	pool.Start(backgroundCtx)
 	return pool
 }
 

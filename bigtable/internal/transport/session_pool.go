@@ -254,14 +254,14 @@ func NewSessionPoolImpl(poolName string, min, max int, streamFactory func(ctx co
 // which superseded an earlier per-session semaphore scheme where random
 // picks stacked on busy sessions even when idle ones existed.
 func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, error) {
-	// One-shot kick if the pool is empty. Cheap check; Maintain
+	// One-shot kick if the pool is empty. Cheap check; Tick
 	// gates on its own in-progress flag so a duplicate goroutine here
 	// exits immediately.
 	p.mu.Lock()
 	closed := p.closed
 	p.mu.Unlock()
 	if !closed && p.sl.ReadyCount() == 0 {
-		go p.Maintain(p.poolCtx)
+		go p.Tick(p.poolCtx)
 	}
 
 	for {
@@ -312,7 +312,7 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		// only live-or-starting sessions; a miss just means all live
 		// sessions are busy.
 		if p.sl.ReadyCount() < p.maxSessions {
-			go p.Maintain(p.poolCtx)
+			go p.Tick(p.poolCtx)
 		}
 
 		// Park in the FIFO waiter queue. Each free-session event

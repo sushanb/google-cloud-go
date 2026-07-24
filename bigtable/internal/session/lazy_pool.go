@@ -17,7 +17,6 @@ package session
 import (
 	"context"
 	"sync"
-	"time"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	btransport "cloud.google.com/go/bigtable/internal/transport"
@@ -55,12 +54,13 @@ type SessionPool interface {
 	// names stay unique across pools AND identify what each pool opens.
 	SetPoolIdentity(id uint64, shortName string)
 
-	// Background loops kicked from sessionClient's BackgroundCtx.
-	StartAfePrune(ctx context.Context)
-	StartMaintenance(ctx context.Context, interval time.Duration)
+	// Start brings the pool up: seeds min-sessions synchronously, then
+	// spawns the periodic Tick watchdog + AFE prune loops. Idempotent
+	// per-pool (call once from getOrCreatePool); loops run until the
+	// ctx passed here is cancelled.
+	Start(ctx context.Context)
 
 	// Server-driven configuration.
-	Maintain(ctx context.Context)
 	UpdateConfig(config *btpb.SessionClientConfiguration_SessionPoolConfiguration)
 
 	// Debug surfaces — cheap snapshot reads, safe on the hot path.

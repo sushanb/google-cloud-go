@@ -164,34 +164,34 @@ func TestNoDeadlineButCancellableContext_PreservesValues(t *testing.T) {
 	}
 }
 
-// --- Maintain --------------------------------------------------------
+// --- Tick --------------------------------------------------------
 
-func TestMaintain_EarlyReturnWhenClosed(t *testing.T) {
+func TestTick_EarlyReturnWhenClosed(t *testing.T) {
 	p := newTestPool(t, 1, 10)
-	// Mark closed BEFORE calling Maintain. The function should
+	// Mark closed BEFORE calling Tick. The function should
 	// return without recording a scaling event.
 	p.mu.Lock()
 	p.closed = true
 	p.mu.Unlock()
 
 	before := len(p.snapshotScalingHistory())
-	p.Maintain(context.Background())
+	p.Tick(context.Background())
 	after := len(p.snapshotScalingHistory())
 	if after != before {
 		t.Errorf("scaling history grew despite closed pool: %d → %d", before, after)
 	}
 }
 
-func TestMaintain_ReentrantGate(t *testing.T) {
+func TestTick_ReentrantGate(t *testing.T) {
 	p := newTestPool(t, 1, 10)
-	// Simulate a prior Maintain still in progress. The second call
+	// Simulate a prior Tick still in progress. The second call
 	// must exit immediately without racing.
 	p.mu.Lock()
 	p.scalingInProgress = true
 	p.mu.Unlock()
 
 	before := len(p.snapshotScalingHistory())
-	p.Maintain(context.Background())
+	p.Tick(context.Background())
 	after := len(p.snapshotScalingHistory())
 	if after != before {
 		t.Errorf("scaling event recorded despite scalingInProgress=true: %d → %d", before, after)

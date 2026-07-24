@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Scaling for SessionPoolImpl: the Maintain driver, the
+// Scaling for SessionPoolImpl: the Tick driver, the
 // createSession worker, the scaling-history ring buffer that records
 // their decisions, the human-readable reason helper, and the
 // deadline-stripping context wrapper used for long-lived dials.
@@ -94,11 +94,11 @@ func (p *SessionPoolImpl) snapshotScalingHistory() []ScalingEvent {
 	return out
 }
 
-// Maintain is the heartbeat/checkout-triggered driver that samples
+// Tick is the heartbeat/checkout-triggered driver that samples
 // operational state, prunes stuck sessions, and — if the sizer asks for
 // growth — launches new-session goroutines. Scale-down deltas are logged
 // but not actioned (passive shrink via OnClose).
-func (p *SessionPoolImpl) Maintain(ctx context.Context) {
+func (p *SessionPoolImpl) Tick(ctx context.Context) {
 	// Sample a time-series point on every heartbeat so the sparkline ring
 	// buffer fills at the heartbeat cadence regardless of whether scaling
 	// actually fires below.
@@ -112,7 +112,7 @@ func (p *SessionPoolImpl) Maintain(ctx context.Context) {
 	// followed up with a stream EOF. ForceClose drives them to Closed so
 	// OnClose fires and the pool retires them.
 	p.sweepStuckSessions()
-	// AFE prune runs on its own timer (see StartAfePrune) at
+	// AFE prune runs on its own timer (see startAfePruneLoop) at
 	// afePruneMaxIdle cadence — kept OFF the 1-sec
 	// heartbeat so the sl.mu it holds during map-walk can't contend with
 	// serving-path Checkouts even under pathological AFE-count growth.
@@ -177,7 +177,7 @@ func (p *SessionPoolImpl) Maintain(ctx context.Context) {
 				// more sessions and got fewer. Every failure is a tag
 				// so the count IS the "scale-ups we lost" gauge.
 				recordDebugTag(tagSessionPoolCreateFailed)
-				btopt.Debugf(nil, "POOL %s Maintain createSession failed: %v", p.poolName, err)
+				btopt.Debugf(nil, "POOL %s Tick createSession failed: %v", p.poolName, err)
 			} else {
 				launched.Add(1)
 			}

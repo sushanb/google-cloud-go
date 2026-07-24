@@ -54,7 +54,7 @@ func (p *SessionPoolImpl) sampleActiveUptimes(ctx context.Context) {
 
 // sweepStuckSessions scans the pool for sessions parked in
 // StateWaitServerClose beyond waitServerCloseGrace and force-closes them.
-// Runs from Maintain at the heartbeat cadence; takes p.mu only long
+// Runs from Tick at the heartbeat cadence; takes p.mu only long
 // enough to snapshot the (handle, last-state-change) tuples then issues
 // ForceClose calls outside the lock.
 func (p *SessionPoolImpl) sweepStuckSessions() {
@@ -290,7 +290,7 @@ func (p *SessionPoolImpl) onActive(sh *SessionHandle) {
 // operational structures immediately so:
 //   - the picker's AFE idle queue no longer sees it,
 //   - it no longer counts toward the scale-up gate,
-//   - Maintain gets a chance to replace it right away,
+//   - Tick gets a chance to replace it right away,
 //
 // even though the actual close may take up to waitServerCloseGrace to
 // complete. This is what lets CheckoutSession skip the per-miss dead-
@@ -320,7 +320,7 @@ func (p *SessionPoolImpl) onClosing(sh *SessionHandle) {
 	p.sl.OnSessionClosing(sh)
 
 	if p.sl.ReadyCount() < p.maxSessions {
-		go p.Maintain(p.poolCtx)
+		go p.Tick(p.poolCtx)
 	}
 }
 
@@ -392,9 +392,23 @@ func (p *SessionPoolImpl) noteAbnormalCloseIfAny(s *Session) {
 	}
 }
 
-// StartMaintenance begins the periodic Maintain watchdog. Runs
-// every interval until ctx cancels.
-func (p *SessionPoolImpl) StartMaintenance(ctx context.Context, interval time.Duration) {
+// Start brings the pool up: an immediate Tick to seed min-sessions
+// before the caller's next Checkout, plus the two background loops
+// (periodic Tick watchdog + AFE prune). Encapsulates what would
+// otherwise be three separate caller lines whose order matters (seed
+// must precede the loop so callers don't wait a full interval on
+// cold-start).
+func (p *SessionPoolImpl) Start(ctx context.Context) {
+	p.Tick(ctx)
+	p.startTickLoop(ctx, 1*time.Second)
+	p.startAfePruneLoop(ctx)
+}
+
+// startTickLoop runs Tick every interval until ctx cancels. Wrapped in
+// a defer-recover so a panic inside Tick doesn't silently kill the
+// watchdog goroutine and strand the pool without stuck-session sweeps
+// or scale-up.
+func (p *SessionPoolImpl) startTickLoop(ctx context.Context, interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -404,19 +418,30 @@ func (p *SessionPoolImpl) StartMaintenance(ctx context.Context, interval time.Du
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				p.Maintain(ctx)
+				p.tickOnce(ctx)
 			}
 		}
 	}()
 }
 
-// StartAfePrune begins the background AFE-handle GC loop. Runs on its
-// own afePruneMaxIdle cadence (SessionPoolImpl uses
-// the same SESSION_LIST_PRUNE_INTERVAL for both the horizon and the
-// scheduling tick) — deliberately OFF the 1-sec heartbeat so the sl.mu
-// held during the map walk can't contend with serving-path Checkouts
-// even under pathological AFE-count growth.
-func (p *SessionPoolImpl) StartAfePrune(ctx context.Context) {
+// tickOnce runs one Tick with panic recovery. Separate helper so the
+// deferred recover has its own function scope per iteration; a panic on
+// tick N doesn't propagate to tick N+1.
+func (p *SessionPoolImpl) tickOnce(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			btopt.Debugf(nil, "POOL %s Tick panic recovered: %v", p.poolName, r)
+		}
+	}()
+	p.Tick(ctx)
+}
+
+// startAfePruneLoop runs sl.Prune on afePruneMaxIdle cadence until ctx
+// cancels — deliberately OFF the 1-sec Tick cadence so the sl.mu held
+// during the map walk can't contend with serving-path Checkouts even
+// under pathological AFE-count growth. Wrapped in defer-recover per
+// iteration so a bad prune body can't kill the loop.
+func (p *SessionPoolImpl) startAfePruneLoop(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(afePruneMaxIdle)
 		defer ticker.Stop()
@@ -426,8 +451,18 @@ func (p *SessionPoolImpl) StartAfePrune(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				p.sl.Prune(time.Now())
+				p.pruneOnce()
 			}
 		}
 	}()
+}
+
+// pruneOnce runs one sl.Prune with panic recovery per iteration.
+func (p *SessionPoolImpl) pruneOnce() {
+	defer func() {
+		if r := recover(); r != nil {
+			btopt.Debugf(nil, "POOL %s AFE prune panic recovered: %v", p.poolName, r)
+		}
+	}()
+	p.sl.Prune(time.Now())
 }
