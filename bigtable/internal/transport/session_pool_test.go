@@ -71,7 +71,7 @@ func newStubStreamFactory() (factory func(context.Context) (Stream, error), clos
 func injectActiveSession(t testing.TB, p *SessionPoolImpl, name string, createdAt time.Time) *SessionHandle {
 	t.Helper()
 	stream := newFakeStream()
-	sh := NewSessionHandle(nil, createdAt)
+	sh := newSessionHandle(nil, createdAt)
 	s := NewSession(name, stream, SessionHooks{
 		OnStart:   p.onStart,
 		OnActive:  func(_ *Session) { p.onActive(sh) },
@@ -571,7 +571,7 @@ func TestStats_StartingCountIncludesPendingStarts(t *testing.T) {
 
 	// Simulate one goroutine reaching the transfer point: reservation
 	// consumed, session added to startingSessions. Sum must be unchanged.
-	sh := NewSessionHandle(nil, time.Now())
+	sh := newSessionHandle(nil, time.Now())
 	p.mu.Lock()
 	p.pendingStarts--
 	p.startingSessions[sh] = struct{}{}

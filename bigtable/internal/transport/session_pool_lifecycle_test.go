@@ -121,7 +121,7 @@ func TestOnActive_SignalsFree(t *testing.T) {
 
 	// Craft a fresh session + handle and fire onActive — must wake the
 	// parked waiter.
-	sh := NewSessionHandle(nil, time.Now())
+	sh := newSessionHandle(nil, time.Now())
 	stream := newFakeStream()
 	s := NewSession("s-fresh", stream, SessionHooks{
 		OnStart:  p.onStart,
@@ -143,7 +143,7 @@ func TestOnClose_StartingSessionBumpsFailedToStart(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	// Handle in startingSessions but never activated.
 	stream := newFakeStream()
-	sh := NewSessionHandle(nil, time.Time{})
+	sh := newSessionHandle(nil, time.Time{})
 	s := NewSession("s-starting", stream, SessionHooks{
 		OnClose: func(_ *Session, err error) { p.onClose(sh, err) },
 	}, SessionTypeTable)
@@ -187,7 +187,7 @@ func TestOnClosing_DropsFromReadyCountAndRecordsLifetime(t *testing.T) {
 func TestOnClosing_StartingSessionIsNoOp(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	stream := newFakeStream()
-	sh := NewSessionHandle(nil, time.Time{})
+	sh := newSessionHandle(nil, time.Time{})
 	s := NewSession("s-starting", stream, SessionHooks{
 		OnClosing: func(_ *Session) { p.onClosing(sh) },
 	}, SessionTypeTable)
@@ -275,7 +275,7 @@ func TestOnClose_IdxNotFoundStillRecords(t *testing.T) {
 	// caller invoked onClose directly). recordSessionClose still fires
 	// so the ledger reflects reality.
 	stream := newFakeStream()
-	sh := NewSessionHandle(nil, time.Time{})
+	sh := newSessionHandle(nil, time.Time{})
 	s := NewSession("s-ghost", stream, SessionHooks{}, SessionTypeTable)
 	sh.session = s
 

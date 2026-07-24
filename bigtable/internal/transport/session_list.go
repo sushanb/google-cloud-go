@@ -148,11 +148,12 @@ func (h *SessionHandle) Picks() int64 {
 	return atomic.LoadInt64(&h.picks)
 }
 
-// NewSessionHandle creates a new SessionHandle wrapping a Session. The
+// newSessionHandle creates a new SessionHandle wrapping a Session. The
 // createdAt stamp is used by the pool's lifetime histogram; pass
 // time.Now() from OnActive, or the zero time from tests that don't
-// care about lifetime accounting.
-func NewSessionHandle(session *Session, createdAt time.Time) *SessionHandle {
+// care about lifetime accounting. Package-internal — SessionHandle is
+// only ever minted from createSession or intra-package test helpers.
+func newSessionHandle(session *Session, createdAt time.Time) *SessionHandle {
 	return &SessionHandle{session: session, createdAt: createdAt}
 }
 

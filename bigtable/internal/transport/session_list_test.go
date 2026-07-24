@@ -30,7 +30,7 @@ func makeHandleWithAfe(t *testing.T, id afeID) *SessionHandle {
 	t.Helper()
 	s := newTestSession(t, newFakeStream(), SessionHooks{})
 	s.peerInfo.Store(&spb.PeerInfo{ApplicationFrontendId: int64(id)})
-	return NewSessionHandle(s, time.Time{})
+	return newSessionHandle(s, time.Time{})
 }
 
 // verifyInvariantsLocked re-derives sessionList's bookkeeping from

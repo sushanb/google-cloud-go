@@ -117,7 +117,7 @@ func TestSession_Snapshot_NilPeer(t *testing.T) {
 
 func TestSessionHandle_Snapshot(t *testing.T) {
 	s, _ := makeActive(t, SessionHooks{})
-	h := NewSessionHandle(s, time.Time{})
+	h := newSessionHandle(s, time.Time{})
 	h.IncOutstanding()
 	h.IncOutstanding()
 
@@ -139,7 +139,7 @@ func TestPoolSnapshot_AggregatesSessions(t *testing.T) {
 		stream := newFakeStream()
 		s := NewSession("s", stream, SessionHooks{}, SessionTypeTable)
 		s.state.Store(int32(StateReady))
-		sh := NewSessionHandle(s, time.Time{})
+		sh := newSessionHandle(s, time.Time{})
 		pool.sl.OnSessionStarted(sh)
 		handles = append(handles, sh)
 	}

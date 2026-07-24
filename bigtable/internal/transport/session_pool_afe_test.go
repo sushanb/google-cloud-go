@@ -28,7 +28,7 @@ import (
 func injectActiveOnAfe(t *testing.T, p *SessionPoolImpl, name string, afe afeID) *SessionHandle {
 	t.Helper()
 	stream := newFakeStream()
-	sh := NewSessionHandle(nil, time.Now())
+	sh := newSessionHandle(nil, time.Now())
 	s := NewSession(name, stream, SessionHooks{
 		OnStart:  p.onStart,
 		OnActive: func(_ *Session) { p.onActive(sh) },
