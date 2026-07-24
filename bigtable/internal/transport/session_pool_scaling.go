@@ -287,8 +287,8 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 	}
 	s := NewSession(sessionName, stream, hooks, p.sessionType,
 		WithSessionPoolName(p.poolName), WithSessionLogger(log.Default()))
-	if hint := int(pickedChannel.Load()); hint >= 0 {
-		s.SetChannelIndex(hint)
+	if hint := pickedChannel.Load(); hint >= 0 {
+		s.setChannelIndex(hint)
 	}
 
 	// Backfill the handle now that the Session exists.

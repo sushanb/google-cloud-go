@@ -103,6 +103,13 @@ func (s *Session) ForceClose(req *spb.CloseSessionRequest) {
 // Ready — handleGoAway, Close, ForceClose, handleClose. notifyClosed also
 // invokes it as a safety net so onClosing is guaranteed to precede
 // onClose even if some future path forgets to call it explicitly.
+//
+// Ordering caveat for downstream consumers: onActive is NOT guaranteed to
+// precede onClosing. If the session tears down while still in Starting
+// (Close or ForceClose fires before OpenSession completes), onActive
+// never runs but onClosing/onClose still do. SESSION_SPEC #4 orders the
+// hooks only among those that fire — if a hook doesn't fire, its
+// ordering slot is skipped, not deferred.
 func (s *Session) notifyClosing() {
 	s.closingOnce.Do(func() {
 		s.hooks.onClosing(s)
@@ -172,7 +179,10 @@ func (s *Session) Close(ctx context.Context, req *spb.CloseSessionRequest) error
 		select {
 		case <-s.quiescent:
 		case <-ctx.Done():
-			s.ForceClose(nil)
+			s.ForceClose(&spb.CloseSessionRequest{
+				Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_USER,
+				Description: "close context deadline exceeded during drain",
+			})
 			return ctx.Err()
 		}
 	}
@@ -186,7 +196,10 @@ func (s *Session) Close(ctx context.Context, req *spb.CloseSessionRequest) error
 		Payload: &spb.SessionRequest_CloseSession{CloseSession: req},
 	}
 	if err := s.Send(closeReq); err != nil {
-		s.ForceClose(nil)
+		s.ForceClose(&spb.CloseSessionRequest{
+			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR,
+			Description: "failed to send close session request",
+		})
 		return fmt.Errorf("send close session request: %w", err)
 	}
 	// Advance to WaitServerClose so the pool monitor can see we're waiting
@@ -210,6 +223,20 @@ func (s *Session) Send(req *spb.SessionRequest) error {
 
 // readLoop drives the inbound side of the stream until Recv returns an error.
 func (s *Session) readLoop(ctx context.Context) {
+	// Panic guard: if handleSessionResponse ever panics on a malformed
+	// frame, tear the session down cleanly instead of losing the goroutine
+	// silently. Debug tag makes the cause traceable via sessionz.
+	defer func() {
+		if r := recover(); r != nil {
+			recordDebugTag(tagSessionReadLoopPanic)
+			s.debugf("readLoop panic: %v", r)
+			s.ForceClose(&spb.CloseSessionRequest{
+				Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR,
+				Description: fmt.Sprintf("readLoop panic: %v", r),
+			})
+		}
+	}()
+
 	// Supervisor: if ctx is cancelled, mark the session closed so callers
 	// observe state immediately. Unblocking Recv() requires the underlying
 	// stream's context to be cancelled by the caller.
@@ -275,6 +302,11 @@ func (s *Session) handleSessionResponse(resp *spb.SessionResponse) {
 // blocking. Ordering: extract first, then fire onActive, so every observer
 // sees a session whose PeerInfo (and therefore AfeID) is populated. This
 // header is buffered before any bidi message is sent.
+//
+// The response body itself is intentionally not consumed. Everything the
+// client needs (PeerInfo) comes from the stream Header; the reply payload
+// has no actionable fields today. If a future server-side change starts
+// populating OpenSessionResponse fields, plumb them here.
 func (s *Session) handleOpenSession(_ *spb.OpenSessionResponse) {
 	if prev, ok := s.transitionTo(StateReady, isState(StateStarting)); !ok {
 		// Server confirmed OpenSession while we were in a state that
@@ -286,7 +318,7 @@ func (s *Session) handleOpenSession(_ *spb.OpenSessionResponse) {
 		return
 	}
 	if md, err := s.stream.Header(); err == nil {
-		s.peerInfoExtracter(md.Get(peerInfoHeaderKey))
+		s.extractPeerInfo(md.Get(peerInfoHeaderKey))
 	} else {
 		s.debugf("stream Header() failed: %v", err)
 	}
@@ -384,8 +416,12 @@ func (s *Session) handleGoAway(goAway *spb.GoAwayResponse) {
 	// Drive the lifecycle to completion off the readLoop. s.Close
 	// sends CloseSession, transitions to WaitServerClose, and then the
 	// pool's stuck-session monitor or the server's EOF moves us to Closed.
+	//
+	// Derive the drain ctx from the stream's ctx so a pool teardown that
+	// cancels the stream also unblocks this drain wait cleanly, instead of
+	// hanging up to 30s on a detached background ctx.
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(s.stream.Context(), 30*time.Second)
 		defer cancel()
 		_ = s.Close(ctx, &spb.CloseSessionRequest{
 			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_GOAWAY,
@@ -429,7 +465,7 @@ func (s *Session) handleClose(err error) {
 	age := time.Since(s.StartedAt())
 	lastRPC := s.nextRPCID.Load()
 	peer := s.peerInfoSummary()
-	s.recordEvent("close", "reason=%s age=%v in_flight=%d last_rpc_id=%d %s raw_err=%v",
+	s.recordEvent(SessionEventClose, "reason=%s age=%v in_flight=%d last_rpc_id=%d %s raw_err=%v",
 		reason, age, inFlight, lastRPC, peer, err)
 	s.cancelActiveRPCs(unavailable(err, "session closed: %v", err))
 	s.signalQuiescent()
@@ -564,7 +600,7 @@ func (s *Session) heartBeatLoop(ctx context.Context) {
 			// otherwise every healthy session would spam the UI ring
 			// buffer ~3x/second and drown out close/missed events.
 			if lastFrameAge >= interval {
-				s.recordEvent("hb-alive", "in_flight=%d last_frame_age=%v remaining=%v interval=%v",
+				s.recordEvent(SessionEventHBAlive, "in_flight=%d last_frame_age=%v remaining=%v interval=%v",
 					active, lastFrameAge, remaining, interval)
 			}
 			timer.Reset(remaining)
@@ -577,7 +613,7 @@ func (s *Session) heartBeatLoop(ctx context.Context) {
 		recordDebugTag(tagSessionHeartbeatMissed)
 		s.debugf("heartbeat MISSED — forcing close in_flight=%d last_frame_age=%v interval=%v",
 			active, lastFrameAge, interval)
-		s.recordEvent("hb-missed", "in_flight=%d last_frame_age=%v interval=%v",
+		s.recordEvent(SessionEventHBMissed, "in_flight=%d last_frame_age=%v interval=%v",
 			active, lastFrameAge, interval)
 		s.ForceClose(&spb.CloseSessionRequest{
 			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_MISSED_HEARTBEAT,
@@ -587,11 +623,11 @@ func (s *Session) heartBeatLoop(ctx context.Context) {
 	}
 }
 
-// peerInfoExtracter parses the base64-encoded peer info header and caches
+// extractPeerInfo parses the base64-encoded peer info header and caches
 // the decoded PeerInfo on the session. Server emits URL-safe base64
 // (URL-safe base64 decoder); trailing '=' padding
 // is stripped so a single RawURLEncoding decoder handles both shapes.
-func (s *Session) peerInfoExtracter(peerInfoData []string) {
+func (s *Session) extractPeerInfo(peerInfoData []string) {
 	if len(peerInfoData) == 0 {
 		return
 	}

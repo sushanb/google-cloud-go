@@ -356,7 +356,7 @@ func (s *Session) Snapshot() SessionSnapshot {
 		ActiveRpcs:        activeRpcs,
 		CloseReason:       s.CloseReason(),
 		ClusterCounts:     s.snapshotClusters(),
-		ChannelIndex:      s.ChannelIndex(),
+		ChannelIndex:      int(s.ChannelIndex()),
 		LatencyP50:        percentile(sortedLat, 50),
 		LatencyP95:        percentile(sortedLat, 95),
 		LatencyP99:        percentile(sortedLat, 99),
@@ -555,7 +555,7 @@ func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 		for _, ev := range s.RecentEvents {
 			snap.RecentEvents = append(snap.RecentEvents, PoolSessionEvent{
 				At:      ev.At,
-				Kind:    ev.Kind,
+				Kind:    string(ev.Kind),
 				Session: s.LogName,
 				Message: ev.Message,
 			})

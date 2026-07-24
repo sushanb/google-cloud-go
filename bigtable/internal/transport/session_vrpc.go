@@ -122,7 +122,7 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 	if attempt > 1 {
 		s.noteRetryAttempt(ctx, desc.Method(), attempt)
 	}
-	sessionReq := buildInvokeRequest(rpcID, reqBytes, attempt, startTime, ctx)
+	sessionReq := buildInvokeRequest(ctx, rpcID, reqBytes, attempt, startTime)
 
 	// Capture SentAt immediately before the frame is handed to Send so
 	// downstream metrics can compute client-side blocking latency as
@@ -173,7 +173,7 @@ func (s *Session) noteRetryAttempt(ctx context.Context, method string, attempt i
 	prevCode := status.Code(prev).String()
 	s.debugf("retry attempt=%d method=%s prev_code=%s prev_err=%v",
 		attempt, method, prevCode, prev)
-	s.recordEvent("retry", "attempt=%d method=%s prev_code=%s prev_err=%v",
+	s.recordEvent(SessionEventRetry, "attempt=%d method=%s prev_code=%s prev_err=%v",
 		attempt, method, prevCode, prev)
 }
 
@@ -183,7 +183,7 @@ func (s *Session) noteRetryAttempt(ctx context.Context, method string, attempt i
 // so the server measures from receive time rather than an absolute wall
 // clock. Omitted when ctx has no deadline or the budget is already
 // non-positive (the client-side ctx.Done branch will fire immediately).
-func buildInvokeRequest(rpcID int64, reqBytes []byte, attempt int64, startTime time.Time, ctx context.Context) *spb.SessionRequest {
+func buildInvokeRequest(ctx context.Context, rpcID int64, reqBytes []byte, attempt int64, startTime time.Time) *spb.SessionRequest {
 	virtRpc := &spb.VirtualRpcRequest{
 		RpcId:   rpcID,
 		Payload: reqBytes,
@@ -220,15 +220,15 @@ func (s *Session) awaitInvokeResult(ctx context.Context, rpc *vrpcImpl, desc VRp
 	case <-ctx.Done():
 		select {
 		case res := <-rpc.resultChan:
-			return s.processResult(rpc, desc, result, res)
+			return s.processResult(desc, result, res)
 		default:
 		}
-		s.recordCtxDone(ctx, rpc, desc.Method(), result.SentAt)
 		cancelErr := tagErr(StateTransportFailure, ctx.Err())
-		s.markCancelled(rpc, vrpcResult{err: cancelErr})
+		stillActive := s.markCancelled(rpc, vrpcResult{err: cancelErr})
+		s.recordCtxDone(ctx, rpc, desc.Method(), result.SentAt, stillActive)
 		return cancelErr
 	case res := <-rpc.resultChan:
-		return s.processResult(rpc, desc, result, res)
+		return s.processResult(desc, result, res)
 	}
 }
 
@@ -240,7 +240,7 @@ func (s *Session) awaitInvokeResult(ctx context.Context, rpc *vrpcImpl, desc VRp
 // The res.resp.RpcId == rpc.id check that used to live here is gone:
 // under slotMu, handleVRPCResponse gates the id match BEFORE drainSlot,
 // so deliver can only ever put a matching-id response into resultChan.
-func (s *Session) processResult(rpc *vrpcImpl, desc VRpcDescriptor, result *InvokeResult, res vrpcResult) error {
+func (s *Session) processResult(desc VRpcDescriptor, result *InvokeResult, res vrpcResult) error {
 	result.TransportLatency = time.Since(result.SentAt)
 	ci := res.ClusterInfo()
 	result.ClusterInfo = ci
@@ -262,22 +262,21 @@ func (s *Session) processResult(rpc *vrpcImpl, desc VRpcDescriptor, result *Invo
 	if res.resp.Stats != nil && res.resp.Stats.BackendLatency != nil {
 		s.recordLatency(res.resp.Stats.BackendLatency.AsDuration())
 	}
-	_ = rpc // rpc kept in signature for future per-rpc metrics; no reads today.
 	return nil
 }
 
 // recordCtxDone emits the debug + sessionz event for a ctx cancellation
-// or deadline fire while a vRPC was in flight. Captures whether the RPC
-// was still holding the slot at cancel time — useful for spotting races
-// between our cancel and a late server response.
-func (s *Session) recordCtxDone(ctx context.Context, rpc *vrpcImpl, method string, sentAt time.Time) {
-	stillActive := s.activeVRPC() == rpc
+// or deadline fire while a vRPC was in flight. stillActive comes from
+// markCancelled's return so no second slotMu take is needed here — it
+// reports whether rpc still held the slot at cancel time, useful for
+// spotting races between our cancel and a late server response.
+func (s *Session) recordCtxDone(ctx context.Context, rpc *vrpcImpl, method string, sentAt time.Time, stillActive bool) {
 	sessState := State(s.state.Load())
 	waited := time.Since(sentAt)
 	peer := s.peerInfoSummary()
 	s.debugf("vRPC %s rpc_id=%d ctx.Done waited=%v err=%v session_state=%v still_in_flight=%v %s",
 		method, rpc.id, waited, ctx.Err(), sessState, stillActive, peer)
-	s.recordEvent("ctx-done", "method=%s rpc_id=%d waited=%v err=%v session_state=%v still_in_flight=%v %s",
+	s.recordEvent(SessionEventCtxDone, "method=%s rpc_id=%d waited=%v err=%v session_state=%v still_in_flight=%v %s",
 		method, rpc.id, waited, ctx.Err(), sessState, stillActive, peer)
 }
 
@@ -342,7 +341,9 @@ func (s *Session) routeVRPCFrame(rpcID int64, frameName, nilTag string, counter 
 		// resultChan. Just count the drain for observability.
 		recordDebugTag(tagSessionVRPCCancelledDrained)
 	} else {
-		s.deliver(drained, result)
+		// resultChan is cap-1 and drainSlot serialized this write; the
+		// send never blocks.
+		drained.resultChan <- result
 	}
 	// v3: drainSlot success is the sole "session became free" signal.
 	// Fires on every drain (not just the cancelled branch) so the pool
@@ -375,17 +376,6 @@ func errorResponseToErr(errResp *spb.ErrorResponse) error {
 	return st.Err()
 }
 
-// deliver writes a result onto the RPC's buffered (cap 1) channel.
-// Under slotMu, exactly one caller ever holds a drained rpc (the
-// winning drainSlot inside handleVRPCResponse / handleVRPCErrorResponse
-// / cancelActiveRPCs), so the two-writers race on resultChan is
-// impossible in production. The cap-1 buffer is retained as defense
-// against the awaitInvokeResult ctx.Done-vs-response tick race — the
-// send must not block if the reader stopped listening.
-func (s *Session) deliver(rpc *vrpcImpl, res vrpcResult) {
-	rpc.resultChan <- res
-}
-
 // cancelActiveRPCs cancels the in-flight vRPC (if any) with the given
 // error. With multiPlexingLimit=1 there is at most one such vRPC.
 // Called from session teardown paths (Close, ForceClose, handleGoAway,
@@ -412,5 +402,5 @@ func (s *Session) cancelActiveRPCs(err error) {
 	// / benign shutdown while an RPC was in-flight. Server may or may not
 	// have processed — TransportFailure classification lets idempotent ops
 	// retry and prevents non-idempotent ones from double-applying.
-	s.deliver(drained, vrpcResult{err: tagErr(StateTransportFailure, err)})
+	drained.resultChan <- vrpcResult{err: tagErr(StateTransportFailure, err)}
 }

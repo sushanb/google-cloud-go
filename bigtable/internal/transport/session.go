@@ -312,7 +312,7 @@ type Session struct {
 	quiescent     chan struct{}
 	quiescentOnce sync.Once
 
-	// peerInfo is populated by peerInfoExtracter from the stream header,
+	// peerInfo is populated by extractPeerInfo from the stream header,
 	// synchronously in handleOpenSession before hooks.onActive fires.
 	// atomic.Pointer so the picker / AfeID / snapshot can read it lock-free.
 	peerInfo atomic.Pointer[spb.PeerInfo]
@@ -340,7 +340,7 @@ func NewSession(logName string, stream Stream, hooks SessionHooks, sessionType S
 		sessionType:   sessionType,
 		heartbeatWake: make(chan struct{}, 1),
 	}
-	s.sessionDebug.init(sessionType)
+	s.sessionDebug.init(newSessionTracer(sessionType))
 	s.state.Store(int32(StateNew))
 	s.heartbeatIntervalNano.Store(int64(defaultHeartbeatInterval))
 	s.nextHeartbeatDeadlineNano.Store(time.Now().Add(initialHeartbeatGrace).UnixNano())
@@ -416,16 +416,20 @@ func (s *Session) claimSlot(rpc *vrpcImpl) bool {
 // markCancelled records ctx.Done cancellation of rpc without freeing
 // the slot — the caller returns, but activeRPC stays until the server
 // response arrives to drain it. First-cancel-wins; a racing drain that
-// clears activeRPC makes this a no-op.
-func (s *Session) markCancelled(rpc *vrpcImpl, res vrpcResult) {
+// clears activeRPC makes this a no-op. Returns whether rpc was still
+// the active slot occupant, so callers that also want the "still in
+// flight?" signal don't have to re-acquire slotMu with a separate
+// activeVRPC() call.
+func (s *Session) markCancelled(rpc *vrpcImpl, res vrpcResult) (stillActive bool) {
 	s.slotMu.Lock()
 	defer s.slotMu.Unlock()
 	if s.activeRPC != rpc {
-		return
+		return false
 	}
 	if s.currentCancel == nil {
 		s.currentCancel = &res
 	}
+	return true
 }
 
 // drainSlot atomically clears the (activeRPC, currentCancel) pair iff
