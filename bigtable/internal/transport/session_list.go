@@ -85,6 +85,12 @@ type afeHandle struct {
 	id       afeID
 	sessions []*SessionHandle // idle queue, FIFO
 	refCount int              // idle + inFlight + closing (I4/I6)
+	// readyIdx is the index of this handle in sl.afesWithReady, or -1
+	// when the handle is not currently in the ready set. Maintained by
+	// addToReadyLocked (writes on append) and removeFromReadyLocked
+	// (writes on swap-with-last). Turns removal from O(N) scan+shift
+	// into O(1) — no linear scan of afesWithReady to find this handle.
+	readyIdx int
 	// lastConnected is the "AFE was touched" timestamp — stamped on
 	// OnSessionStarted (new session opens) AND on ReleaseToPool
 	// (session returned to the idle queue after a vRPC). Drives Prune;
@@ -163,12 +169,14 @@ func (sl *sessionList) OnSessionStarted(sh *SessionHandle) {
 	if afe == nil {
 		afe = &afeHandle{
 			id:            id,
+			readyIdx:      -1,
 			transportEwma: NewPeakEwmaSeeded(afePeakEwmaTau, afeTransportEwmaSeed),
 			e2eEwma:       NewPeakEwmaSeeded(afePeakEwmaTau, afeE2eEwmaSeed),
 		}
 		sl.afeHandles[id] = afe
 	}
 	if afe.enqueueLocked(sh) { // wasEmpty → afe enters the ready set (I3)
+		afe.readyIdx = len(sl.afesWithReady)
 		sl.afesWithReady = append(sl.afesWithReady, afe)
 	}
 	afe.refCount++ // I4
@@ -231,6 +239,7 @@ func (sl *sessionList) ReleaseToPool(sh *SessionHandle) {
 		return
 	}
 	if afe.enqueueLocked(sh) { // wasEmpty → afe re-enters the ready set (I3)
+		afe.readyIdx = len(sl.afesWithReady)
 		sl.afesWithReady = append(sl.afesWithReady, afe)
 	}
 	// Stamp lastConnected on every return-to-pool so Prune's retention
@@ -441,20 +450,28 @@ func (sl *sessionList) dropMembershipLocked(sh *SessionHandle) {
 	}
 }
 
-// removeFromReadyLocked removes afe from sl.afesWithReady in O(N).
-// Safe to call when afe is not present (no-op). Caller must hold sl.mu.
-// Nils the vacated tail slot so the backing array doesn't retain a
-// pointer to a bucket that's just been GC-eligible.
+// removeFromReadyLocked removes afe from sl.afesWithReady in O(1)
+// via the readyIdx bookkeeping — no linear scan and no O(N) shift.
+// Safe to call when afe is not present (readyIdx == -1, no-op).
+// Caller must hold sl.mu. Nils the vacated tail slot so the backing
+// array doesn't retain a pointer to a bucket that's just been
+// GC-eligible.
 func (sl *sessionList) removeFromReadyLocked(afe *afeHandle) {
-	for i, a := range sl.afesWithReady {
-		if a == afe {
-			last := len(sl.afesWithReady) - 1
-			copy(sl.afesWithReady[i:], sl.afesWithReady[i+1:])
-			sl.afesWithReady[last] = nil
-			sl.afesWithReady = sl.afesWithReady[:last]
-			return
-		}
+	i := afe.readyIdx
+	if i < 0 {
+		return
 	}
+	last := len(sl.afesWithReady) - 1
+	if i != last {
+		// Swap-with-last: move the tail into i's slot, update the
+		// moved handle's readyIdx to match its new position.
+		moved := sl.afesWithReady[last]
+		sl.afesWithReady[i] = moved
+		moved.readyIdx = i
+	}
+	sl.afesWithReady[last] = nil
+	sl.afesWithReady = sl.afesWithReady[:last]
+	afe.readyIdx = -1
 }
 
 // enqueueLocked appends sh to the idle FIFO. Returns whether the queue
