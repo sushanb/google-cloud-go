@@ -292,9 +292,13 @@ func (sl *sessionList) OnSessionClosed(sh *SessionHandle) {
 	// double-close from reaching this line). Either scenario violates
 	// I4/I6 — surface loudly via the debug-tag counter so silent drift
 	// is impossible, but don't panic (transport-layer panics kill the
-	// whole client).
-	assertDebugTagf(afe.refCount > 0, tagSessionListRefcountUnderflow,
-		"OnSessionClosed on afe=%d with refCount=%d", afe.id, afe.refCount)
+	// whole client). On assertion failure bail before decrementing
+	// so refCount stays at 0 rather than corrupting to -1 and
+	// producing wrong Prune / inFlight-count decisions downstream.
+	if !assertDebugTagf(afe.refCount > 0, tagSessionListRefcountUnderflow,
+		"OnSessionClosed on afe=%d with refCount=%d", afe.id, afe.refCount) {
+		return
+	}
 	afe.refCount-- // I4/I6
 	if removed, nowEmpty := afe.removeIfPresentLocked(sh); removed && nowEmpty {
 		sl.removeFromReadyLocked(afe) // I3
