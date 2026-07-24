@@ -243,7 +243,8 @@ func NewSessionClient(
 	// Direct-access dialer for the compatibility checker only — layers
 	// DirectPath enablement + ALTS hard-bound tokens on top of the
 	// caller's opts. The pool itself still uses the plain `dial` above
-	// (standard path); only the DAC's PingAndWarm probe uses this.
+	// (standard path); only the DAC's GetClientConfiguration probe uses
+	// this.
 	daDialOpts := append(append([]option.ClientOption{}, opts...),
 		internaloption.EnableDirectPath(true),
 		internaloption.EnableDirectPathXds(),
@@ -256,13 +257,18 @@ func NewSessionClient(
 		return btransport.NewBigtableConn(grpcConn), nil
 	}
 
+	// Instance-scoped headers for GetClientConfiguration — shared by the
+	// DirectAccessChecker's compat probe and ClientConfigurationManager's
+	// steady-state polls so both hit the same-shaped RPC.
+	configMD := metadata.Join(metadata.Pairs(
+		resourcePrefixHeader, fullInstance,
+		requestParamsHeader, fmt.Sprintf("name=%s", url.QueryEscape(fullInstance)),
+	), directAccessMD)
+
 	// No ChannelPrimer on the pool — session-based clients warm channels
-	// via their own OpenSession bidi streams (once a session pool opens
-	// on first ReadRow/MutateRow, its sessions do the warming). The
-	// DirectAccessChecker still needs a primer for its startup probe —
-	// inlined so it doesn't get mistaken for a pool-priming primer.
-	// Placeholder until getClientConfigDirectAccessChecker (fed by
-	// GetClientConfiguration) lands.
+	// via their own OpenSession bidi streams. The DirectAccessChecker
+	// uses GetClientConfiguration (the same RPC ConfigurationManager
+	// polls) for its startup probe.
 	pool, err := btransport.NewBigtableChannelPool(
 		ctx,
 		poolSize,
@@ -272,9 +278,11 @@ func NewSessionClient(
 		btransport.WithInstanceName(fullInstance),
 		btransport.WithAppProfile(appProfile),
 		btransport.WithMeterProvider(factory.OtelMeterProvider),
-		btransport.WithDirectAccessChecker(btransport.NewPingAndWarmDirectAccessChecker(
+		btransport.WithDirectAccessChecker(btransport.NewGetClientConfigDirectAccessChecker(
 			daDial,
-			btransport.NewPingAndWarmChannelPrimer(fullInstance, appProfile, directAccessMD),
+			fullInstance,
+			appProfile,
+			configMD,
 			factory.OtelMeterProvider,
 			nil,
 		)),
@@ -284,12 +292,6 @@ func NewSessionClient(
 	}
 
 	stub := btpb.NewBigtableClient(pool)
-
-	// Instance-scoped headers for GetClientConfiguration polls.
-	configMD := metadata.Join(metadata.Pairs(
-		resourcePrefixHeader, fullInstance,
-		requestParamsHeader, fmt.Sprintf("name=%s", url.QueryEscape(fullInstance)),
-	), directAccessMD)
 
 	backgroundCtx, cancel := context.WithCancel(context.Background())
 

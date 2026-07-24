@@ -34,16 +34,19 @@ import (
 type fakeService struct {
 	testpb.UnimplementedBenchmarkServiceServer
 	btpb.UnimplementedBigtableServer
-	mu                      sync.Mutex
-	pingCount               int
-	callCount               int
-	streamSema              chan struct{} // To control stream lifetime
-	delay                   time.Duration // To simulate work
-	serverErr               error         // Error to return from server
-	lastPingAndWarmMetadata metadata.MD   // Stores metadata from the last PingAndWarm call
-	pingErrs                []error       // Errors to return from PingAndWarm
-	streamRecvErr           error         // Error to return from stream.Recv()
-	streamSendErr           error         // Error to return from stream.Send()
+	mu                          sync.Mutex
+	pingCount                   int
+	callCount                   int
+	streamSema                  chan struct{} // To control stream lifetime
+	delay                       time.Duration // To simulate work
+	serverErr                   error         // Error to return from server
+	lastPingAndWarmMetadata     metadata.MD   // Stores metadata from the last PingAndWarm call
+	pingErrs                    []error       // Errors to return from PingAndWarm
+	streamRecvErr               error         // Error to return from stream.Recv()
+	streamSendErr               error         // Error to return from stream.Send()
+	getConfigCount              int
+	getConfigErrs               []error     // Errors to return from GetClientConfiguration (indexed by call)
+	lastGetClientConfigMetadata metadata.MD // Metadata from the last GetClientConfiguration call
 }
 
 func (s *fakeService) setPingErr(errs ...error) {
@@ -120,6 +123,9 @@ func (f *fakeService) reset() {
 	f.pingErrs = nil
 	f.delay = 0
 	f.lastPingAndWarmMetadata = nil
+	f.getConfigCount = 0
+	f.getConfigErrs = nil
+	f.lastGetClientConfigMetadata = nil
 	if f.streamSema != nil {
 		select {
 		case <-f.streamSema: // Drain if not closed
@@ -186,6 +192,50 @@ func (s *fakeService) setPingCount(count int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pingCount = count
+}
+
+func (s *fakeService) setGetConfigErr(errs ...error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.getConfigErrs = errs
+}
+
+func (s *fakeService) getGetConfigCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getConfigCount
+}
+
+func (s *fakeService) getGetConfigMetadata() metadata.MD {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastGetClientConfigMetadata
+}
+
+// GetClientConfiguration returns a canned response by default; per-call errors
+// can be injected via setGetConfigErr. Metadata from the first call is
+// captured so tests can assert configMD wiring.
+func (s *fakeService) GetClientConfiguration(ctx context.Context, req *btpb.GetClientConfigurationRequest) (*btpb.ClientConfiguration, error) {
+	s.mu.Lock()
+	callNum := s.getConfigCount
+	s.getConfigCount++
+
+	var err error
+	if len(s.getConfigErrs) > 0 {
+		if callNum < len(s.getConfigErrs) {
+			err = s.getConfigErrs[callNum]
+		} else {
+			err = s.getConfigErrs[len(s.getConfigErrs)-1]
+		}
+	}
+	if callNum == 0 {
+		s.lastGetClientConfigMetadata, _ = metadata.FromIncomingContext(ctx)
+	}
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return &btpb.ClientConfiguration{}, nil
 }
 
 func setupTestServer(t testing.TB, service *fakeService) string {

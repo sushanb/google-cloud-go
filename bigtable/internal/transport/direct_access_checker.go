@@ -185,18 +185,36 @@ func (c *pingAndWarmDirectAccessChecker) reportFailure(reason string) {
 
 // investigateFailure runs asynchronously after a failed compatibility check
 // to determine why Direct Access was not usable, and reports the specific
-// reason to the metric. It walks the GCE-environment preconditions in order
-// of cheapness — short-circuits as soon as a failing precondition is found.
+// reason to the metric. Delegates to the package-scope investigation walk
+// with pingAndWarm's Prime as the isolated-endpoint probe.
 func (c *pingAndWarmDirectAccessChecker) investigateFailure(originalErr error) {
+	investigateDirectAccessFailure(c.logger, c.reportFailure,
+		func(ctx context.Context, conn *BigtableConn) error { return c.primer.Prime(ctx, conn) },
+		originalErr)
+}
+
+// investigateDirectAccessFailure walks the GCE-environment preconditions in
+// order of cheapness and reports the first-failing category via
+// reportFailure. When every precondition passes, the final step is an
+// isolated ALTS re-probe (via probe) against a specific xDS endpoint to
+// isolate load-balancer vs endpoint failures. Callers inject their own
+// probe closure so both pingAndWarm and session checkers use the same
+// investigation but hit the right RPC.
+func investigateDirectAccessFailure(
+	logger *log.Logger,
+	reportFailure func(reason string),
+	probe func(ctx context.Context, conn *BigtableConn) error,
+	originalErr error,
+) {
 	if err := directaccess.IsRunningOnGCP(); err != nil {
-		btopt.Debugf(c.logger, "bigtable_direct_access: investigation: %v. Original error: %v", err, originalErr)
-		c.reportFailure("not_in_gcp")
+		btopt.Debugf(logger, "bigtable_direct_access: investigation: %v. Original error: %v", err, originalErr)
+		reportFailure("not_in_gcp")
 		return
 	}
 
 	if err := directaccess.CheckMetadataServerReachability(); err != nil {
-		btopt.Debugf(c.logger, "bigtable_direct_access: investigation: Metadata unreachable: %v", err)
-		c.reportFailure("metadata_unreachable")
+		btopt.Debugf(logger, "bigtable_direct_access: investigation: Metadata unreachable: %v", err)
+		reportFailure("metadata_unreachable")
 		return
 	}
 
@@ -204,40 +222,40 @@ func (c *pingAndWarmDirectAccessChecker) investigateFailure(originalErr error) {
 	ipv6, errV6 := directaccess.FetchIPFromMetadataServer("IPv6")
 
 	if errV4 != nil && errV6 != nil {
-		btopt.Debugf(c.logger, "bigtable_direct_access: investigation: Neither IPv4 nor IPv6 assigned. v4Err: %v, v6Err: %v", errV4, errV6)
-		c.reportFailure("no_ip_assigned")
+		btopt.Debugf(logger, "bigtable_direct_access: investigation: Neither IPv4 nor IPv6 assigned. v4Err: %v, v6Err: %v", errV4, errV6)
+		reportFailure("no_ip_assigned")
 		return
 	}
 
 	if err := directaccess.CheckLoopbackInterfaceUp(); err != nil {
-		btopt.Debugf(c.logger, "bigtable_direct_access: investigation: Loopback interface down: %v", err)
-		c.reportFailure("loopback_misconfigured")
+		btopt.Debugf(logger, "bigtable_direct_access: investigation: Loopback interface down: %v", err)
+		reportFailure("loopback_misconfigured")
 		return
 	}
 
 	if ipv4 != nil {
 		if err := directaccess.CheckLocalIPv4LoopbackAddress(); err != nil {
-			btopt.Debugf(c.logger, "bigtable_direct_access: investigation: IPv4 loopback missing: %v", err)
-			c.reportFailure("loopback_misconfigured_ipv4")
+			btopt.Debugf(logger, "bigtable_direct_access: investigation: IPv4 loopback missing: %v", err)
+			reportFailure("loopback_misconfigured_ipv4")
 			return
 		}
 	}
 
 	if ipv6 != nil {
 		if err := directaccess.CheckLocalIPv6LoopbackAddress(); err != nil {
-			btopt.Debugf(c.logger, "bigtable_direct_access: investigation: IPv6 loopback missing: %v", err)
-			c.reportFailure("loopback_misconfigured_ipv6")
+			btopt.Debugf(logger, "bigtable_direct_access: investigation: IPv6 loopback missing: %v", err)
+			reportFailure("loopback_misconfigured_ipv6")
 			return
 		}
 	}
 
-	v4Plumbed, v6Plumbed := checkIPPlumbing(c.logger, ipv4, ipv6)
+	v4Plumbed, v6Plumbed := checkIPPlumbing(logger, ipv4, ipv6)
 
 	// If metadata assigned IPs but the guest OS hasn't plumbed any of them onto
 	// an interface, that's acceptable for GKE pods — fall through to the xDS
 	// check which will rely on kernel default routing.
 	if !v4Plumbed && !v6Plumbed {
-		btopt.Debugf(c.logger, "bigtable_direct_access: investigation: Metadata IPs not plumbed to local interfaces (likely containerized). Relying on kernel default routing.")
+		btopt.Debugf(logger, "bigtable_direct_access: investigation: Metadata IPs not plumbed to local interfaces (likely containerized). Relying on kernel default routing.")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -245,11 +263,11 @@ func (c *pingAndWarmDirectAccessChecker) investigateFailure(originalErr error) {
 
 	zone, zoneErr := gcpmetadata.ZoneWithContext(ctx)
 	instanceID, idErr := gcpmetadata.InstanceIDWithContext(ctx)
-	btopt.Debugf(c.logger, "bigtable_direct_access: investigation: Metadata fetch - Zone: %q (err: %v), InstanceID: %q (err: %v)", zone, zoneErr, instanceID, idErr)
+	btopt.Debugf(logger, "bigtable_direct_access: investigation: Metadata fetch - Zone: %q (err: %v), InstanceID: %q (err: %v)", zone, zoneErr, instanceID, idErr)
 
 	if zoneErr != nil || idErr != nil {
-		btopt.Debugf(c.logger, "bigtable_direct_access: investigation: Skipping xDS checks (failed to fetch zone or instanceID)")
-		c.reportFailure("metadata_missing")
+		btopt.Debugf(logger, "bigtable_direct_access: investigation: Skipping xDS checks (failed to fetch zone or instanceID)")
+		reportFailure("metadata_missing")
 		return
 	}
 
@@ -259,12 +277,12 @@ func (c *pingAndWarmDirectAccessChecker) investigateFailure(originalErr error) {
 	}
 
 	cdsURI := fmt.Sprintf(xdsCdsURITemplate, region)
-	btopt.Debugf(c.logger, "bigtable_direct_access: investigation: Checking xDS reachability for Node %s in region %s using URI: %s", instanceID, region, cdsURI)
+	btopt.Debugf(logger, "bigtable_direct_access: investigation: Checking xDS reachability for Node %s in region %s using URI: %s", instanceID, region, cdsURI)
 
 	endpoints, failReason, err := directaccess.FetchXdsEndpoints(ctx, instanceID, zone, cdsURI)
 	if err != nil {
-		btopt.Debugf(c.logger, "bigtable_direct_access: investigation: xDS check failed: %v", err)
-		c.reportFailure(failReason)
+		btopt.Debugf(logger, "bigtable_direct_access: investigation: xDS check failed: %v", err)
+		reportFailure(failReason)
 		return
 	}
 
@@ -272,32 +290,39 @@ func (c *pingAndWarmDirectAccessChecker) investigateFailure(originalErr error) {
 	endpoint := endpoints[0]
 	host, _, err := net.SplitHostPort(endpoint)
 	if err != nil {
-		btopt.Debugf(c.logger, "bigtable_direct_access: investigation: Failed to split xDS endpoint host/port %q: %v", endpoint, err)
-		c.reportFailure("xds_malformed_endpoint")
+		btopt.Debugf(logger, "bigtable_direct_access: investigation: Failed to split xDS endpoint host/port %q: %v", endpoint, err)
+		reportFailure("xds_malformed_endpoint")
 		return
 	}
 
 	if err := checkKernelRoutes(ipv4, ipv6, v4Plumbed, v6Plumbed, host, endpoint); err != nil {
-		btopt.Debugf(c.logger, "bigtable_direct_access: investigation: Kernel route check failed to %s: %v", endpoint, err)
-		c.reportFailure("route_unreachable")
+		btopt.Debugf(logger, "bigtable_direct_access: investigation: Kernel route check failed to %s: %v", endpoint, err)
+		reportFailure("route_unreachable")
 		return
 	}
 
-	if err := c.probeSingleEndpoint(ctx, endpoint); err != nil {
-		btopt.Debugf(c.logger, "bigtable_direct_access: investigation: End-to-end ALTS probe failed: %v", err)
-		c.reportFailure("alts_handshake_failed")
+	if err := probeSingleEndpoint(ctx, logger, endpoint, probe); err != nil {
+		btopt.Debugf(logger, "bigtable_direct_access: investigation: End-to-end ALTS probe failed: %v", err)
+		reportFailure("alts_handshake_failed")
 		return
 	}
 
-	btopt.Debugf(c.logger, "bigtable_direct_access: investigation: All preconditions passed but Direct Access originally failed. Original error: %v", originalErr)
-	c.reportFailure("unknown")
+	btopt.Debugf(logger, "bigtable_direct_access: investigation: All preconditions passed but Direct Access originally failed. Original error: %v", originalErr)
+	reportFailure("unknown")
 }
 
-// probeSingleEndpoint attempts an ALTS-authenticated Prime() request directly
-// against a specific xDS endpoint, isolating whether the failure was at the
-// load-balancer level vs the endpoint itself.
-func (c *pingAndWarmDirectAccessChecker) probeSingleEndpoint(ctx context.Context, targetEndpoint string) error {
-	btopt.Debugf(c.logger, "bigtable_direct_access: investigation: Creating ALTS channel to %s...", targetEndpoint)
+// probeSingleEndpoint attempts an ALTS-authenticated RPC directly against a
+// specific xDS endpoint, isolating whether the failure was at the
+// load-balancer level vs the endpoint itself. The probe closure runs the
+// actual RPC — pingAndWarm passes Prime; the session checker passes
+// GetClientConfiguration.
+func probeSingleEndpoint(
+	ctx context.Context,
+	logger *log.Logger,
+	targetEndpoint string,
+	probe func(ctx context.Context, conn *BigtableConn) error,
+) error {
+	btopt.Debugf(logger, "bigtable_direct_access: investigation: Creating ALTS channel to %s...", targetEndpoint)
 
 	altsCreds := alts.NewClientCreds(alts.DefaultClientOptions())
 	scopes := []string{
@@ -326,15 +351,15 @@ func (c *pingAndWarmDirectAccessChecker) probeSingleEndpoint(ctx context.Context
 
 	btc := NewBigtableConn(conn)
 
-	primeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	btopt.Debugf(c.logger, "bigtable_direct_access: investigation: Executing Prime() on %s...", targetEndpoint)
-	if err := c.primer.Prime(primeCtx, btc); err != nil {
-		return fmt.Errorf("Prime() failed: %w", err)
+	btopt.Debugf(logger, "bigtable_direct_access: investigation: Executing probe on %s...", targetEndpoint)
+	if err := probe(probeCtx, btc); err != nil {
+		return fmt.Errorf("probe failed: %w", err)
 	}
 
-	btopt.Debugf(c.logger, "bigtable_direct_access: investigation: Prime() SUCCESS on %s!", targetEndpoint)
+	btopt.Debugf(logger, "bigtable_direct_access: investigation: probe SUCCESS on %s!", targetEndpoint)
 	return nil
 }
 
