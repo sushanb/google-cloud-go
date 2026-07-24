@@ -79,37 +79,37 @@ func buildOpenRequestSnapshot(req *spb.OpenSessionRequest, sessionType SessionTy
 // Session's debugging state. All fields are value types so the snapshot can
 // be marshaled (JSON / template) without re-acquiring any session lock.
 type SessionSnapshot struct {
-	LogName           string
-	State             string
-	SessionType       string
-	LastStateChange   time.Time
-	OkRpcs            int64
-	ErrorRpcs         int64
-	Retries           int64
-	MsgsSent          int64
-	MsgsRecv          int64
+	LogName         string
+	State           string
+	SessionType     string
+	LastStateChange time.Time
+	OkRpcs          int64
+	ErrorRpcs       int64
+	Retries         int64
+	MsgsSent        int64
+	MsgsRecv        int64
 	// MsgsSentByType / MsgsRecvByType break the totals above down by the
 	// SessionRequest / SessionResponse oneof payload type. Keys come from the
 	// reqMsgType / respMsgType String() methods (e.g. "VirtualRpc", "Heartbeat").
 	// Buckets with a zero count are omitted to keep the rendered cell short.
-	MsgsSentByType    map[string]int64
-	MsgsRecvByType    map[string]int64
-	ActiveRpcs        int
-	CloseReason       string
+	MsgsSentByType map[string]int64
+	MsgsRecvByType map[string]int64
+	ActiveRpcs     int
+	CloseReason    string
 	// LatencyP50/95/99 are computed from the server-reported BackendLatency
 	// values cached on the session (last 256 samples). Zero when the session
 	// hasn't seen any responses with Stats populated yet.
-	LatencyP50  time.Duration
-	LatencyP95  time.Duration
-	LatencyP99  time.Duration
-	LatencyN    int // number of samples in the window
+	LatencyP50 time.Duration
+	LatencyP95 time.Duration
+	LatencyP99 time.Duration
+	LatencyN   int // number of samples in the window
 	// ClusterCounts is the per-ClusterInformation.ClusterId response tally
 	// (e.g. {"cluster-c1": 412, "cluster-c2": 198}). Empty until the server
 	// has attached ClusterInformation to at least one response.
 	ClusterCounts map[string]int64
 	// ChannelIndex is the BigtableChannelPool connEntry index the session's
 	// bidi stream landed on, or -1 when unknown (non-Bigtable channel pool).
-	ChannelIndex int
+	ChannelIndex      int
 	HeartbeatInterval time.Duration
 	NextHeartbeat     time.Time
 	HasRefreshConfig  bool
@@ -147,18 +147,18 @@ type SessionHandleSnapshot struct {
 // currently in the pool. Sessions are listed in their pool order; callers may
 // re-sort as they wish.
 type PoolSnapshot struct {
-	Name           string
-	SessionType    string
-	MinSessions    int
-	MaxSessions    int
-	PickerType     string
-	ReadyCount     int
-	StartingCount  int
-	InUseCount     int
-	PendingCount   int
-	TotalSessions  int
-	Sessions       []SessionSnapshot
-	CapturedAt     time.Time
+	Name          string
+	SessionType   string
+	MinSessions   int
+	MaxSessions   int
+	PickerType    string
+	ReadyCount    int
+	StartingCount int
+	InUseCount    int
+	PendingCount  int
+	TotalSessions int
+	Sessions      []SessionSnapshot
+	CapturedAt    time.Time
 	// Lifecycle aggregates surfaced via PoolSnapshot.
 	SessionsOpened int64
 	SessionsClosed int64
@@ -206,7 +206,7 @@ type PoolSnapshot struct {
 	TransportLatencyP95 time.Duration
 	TransportLatencyP99 time.Duration
 	TransportLatencyN   int
-	SlowVRpcs       []SlowVRpcEvent
+	SlowVRpcs           []SlowVRpcEvent
 	// RecentEvents is the pool-wide merge of every session's RecentEvents,
 	// sorted newest-first and capped at maxPoolRecentEvents. Lets the
 	// sessionz UI render a single timeline of session-lifecycle anomalies
@@ -480,8 +480,8 @@ func (h *SessionHandle) Snapshot() SessionHandleSnapshot {
 func (p *SessionPoolImpl) PoolSnapshot() PoolSnapshot {
 	p.mu.Lock()
 	name := p.poolName
-	min := p.minSessions
-	max := p.maxSessions
+	min := int(p.minSessions.Load())
+	max := int(p.maxSessions.Load())
 	sessionType := p.sessionType
 	startingCount := len(p.startingSessions)
 	pickerType := "unknown"

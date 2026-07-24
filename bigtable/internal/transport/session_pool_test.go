@@ -602,8 +602,8 @@ func TestUpdateConfig_SwapsPickerAndBounds(t *testing.T) {
 	if got := p.picker.Name(); got != "simple" {
 		t.Errorf("after Random swap, picker = %q, want simple", got)
 	}
-	if p.minSessions != 4 || p.maxSessions != 40 {
-		t.Errorf("min/max = %d/%d, want 4/40", p.minSessions, p.maxSessions)
+	if p.minSessions.Load() != 4 || p.maxSessions.Load() != 40 {
+		t.Errorf("min/max = %d/%d, want 4/40", p.minSessions.Load(), p.maxSessions.Load())
 	}
 
 	// Switch to PeakEwma with an explicit subset size.
@@ -700,4 +700,3 @@ func TestPickerFromLoadBalancing_NilFallback(t *testing.T) {
 		t.Errorf("K = %d, want %d", li.RandomSubsetSize, defaultAfeRandomSubsetSize)
 	}
 }
-

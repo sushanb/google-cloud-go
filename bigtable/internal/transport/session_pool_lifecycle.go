@@ -282,7 +282,7 @@ func (p *SessionPoolImpl) onClosing(sh *SessionHandle) {
 
 	p.sl.OnSessionClosing(sh)
 
-	if p.sl.ReadyCount() < p.maxSessions {
+	if p.sl.ReadyCount() < int(p.maxSessions.Load()) {
 		p.spawnTickOnce(p.poolCtx)
 	}
 }

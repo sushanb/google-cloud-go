@@ -194,7 +194,7 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 		p.mu.Unlock()
 		return fmt.Errorf("session pool is closed")
 	}
-	if p.sl.ReadyCount() >= p.maxSessions {
+	if p.sl.ReadyCount() >= int(p.maxSessions.Load()) {
 		p.mu.Unlock()
 		return fmt.Errorf("session pool limit reached")
 	}

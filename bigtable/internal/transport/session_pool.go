@@ -77,11 +77,18 @@ type SessionPoolImpl struct {
 	// spawns tracks pool-spawned goroutines (today: createSession
 	// workers) so Close can wait them out. Session-owned goroutines
 	// are tracked separately on Session.loops.
-	spawns             sync.WaitGroup
-	closed             bool
-	scalingInProgress  bool
-	minSessions        int
-	maxSessions        int
+	spawns            sync.WaitGroup
+	closed            bool
+	scalingInProgress bool
+	// minSessions / maxSessions are the server-driven pool bounds.
+	// UpdateConfig writes them under p.mu alongside the picker swap;
+	// hot-path readers (CheckoutSession's scale-up gate, onClosing's
+	// replace-slot check) load them without acquiring p.mu, which is
+	// safe because they have no cross-field invariant with picker /
+	// budget / consecutive-failure-threshold. Writes stay under p.mu
+	// so PoolSnapshot (also under p.mu) reads a consistent min/max pair.
+	minSessions        atomic.Int32
+	maxSessions        atomic.Int32
 	streamFactory      func(ctx context.Context) (Stream, error)
 	openSessionRequest *spb.OpenSessionRequest
 	metadata           metadata.MD
@@ -171,8 +178,6 @@ func NewSessionPoolImpl(identity PoolIdentity, poolName string, min, max int, st
 		poolName:           poolName,
 		poolID:             identity.ID,
 		perm:               identity.Perm,
-		minSessions:        min,
-		maxSessions:        max,
 		streamFactory:      streamFactory,
 		openSessionRequest: openSessionRequest,
 		metadata:           md,
@@ -184,6 +189,8 @@ func NewSessionPoolImpl(identity PoolIdentity, poolName string, min, max int, st
 		sl:                 newSessionList(),
 	}
 	pool.m.afePickCounts = make(map[afeID]int64)
+	pool.minSessions.Store(int32(min))
+	pool.maxSessions.Store(int32(max))
 
 	fetcher := func() *PoolStats { return pool.Stats() }
 	pool.sizer = NewPoolSizer(fetcher, min, max, 0.10)
@@ -246,7 +253,7 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		// the instant they transition out of Ready (OnClosing), so the
 		// maxSessions gate reflects only live-or-starting sessions —
 		// a miss just means all live sessions are busy.
-		if p.sl.ReadyCount() < p.maxSessions {
+		if p.sl.ReadyCount() < int(p.maxSessions.Load()) {
 			p.spawnTickOnce(p.poolCtx)
 		}
 
@@ -360,12 +367,16 @@ func (p *SessionPoolImpl) Stats() *PoolStats {
 }
 
 // UpdateConfig dynamically adjusts the pool size constraints and budget governor limits at runtime.
+// Callers are serialized by ClientConfigurationManager, so we don't
+// bracket min/max as an atomic pair here.
 func (p *SessionPoolImpl) UpdateConfig(config *spb.SessionClientConfiguration_SessionPoolConfiguration) {
 	p.m.listenerFires.Add(1)
 	p.mu.Lock()
-	p.minSessions = int(config.MinSessionCount)
-	p.maxSessions = int(config.MaxSessionCount)
-
+	// Stores stay under p.mu so PoolSnapshot (also under p.mu) reads a
+	// consistent min/max pair. Hot-path readers still Load() without
+	// the lock — atomic makes both directions safe.
+	p.minSessions.Store(int32(config.MinSessionCount))
+	p.maxSessions.Store(int32(config.MaxSessionCount))
 	if config.LoadBalancingOptions != nil {
 		p.picker = pickerFromLoadBalancing(config.LoadBalancingOptions)
 	}
