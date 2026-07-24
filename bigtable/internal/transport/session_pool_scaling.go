@@ -149,7 +149,7 @@ func (p *SessionPoolImpl) Tick(ctx context.Context) {
 		return
 	}
 
-	reason := scalingReason(stats, delta)
+	reason := scalingReason(stats, delta, decision.MinSessions)
 	// Record the scaling decision immediately — Requested = delta.
 	// The per-session outcomes (dial + handshake success) can't be
 	// waited on here without blocking every Tick caller (including
@@ -261,35 +261,11 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 		p.mu.Unlock()
 		return fmt.Errorf("session pool limit reached")
 	}
-	// Read the pool's permission axis directly — set once at
-	// construction via SetPoolIdentity. "session" is the fallback for
-	// PermissionUnknown (test setups that skip SetPoolIdentity).
-	role := p.perm.role()
-	// Session log names must be globally unique within the client so the
-	// channelz → sessionz reverse link is unambiguous, and self-describing
-	// so the name itself tells you what the session opens. Format:
-	//
-	//   {ProtoName}{poolID}-{shortName}-{role}-{uniqueHex}
-	//
-	// e.g. OpenTable1-sushanb-read-a3f2e891, OpenTable3-users-write-7c0d54a2.
-	//
-	// The trailing segment is a random 32-bit hex id rather than a
-	// monotonic counter, so a pool that churns sessions for years can't
-	// overflow a uint64. Collision odds with N live sessions in the
-	// 2^32 space are ≈ N² / 2^33; well under 1 in 8k at N = 1000.
-	//
-	// Falls back to ProtoName-role-hex when no SessionManager IDs are
-	// assigned (test setups).
-	hexID := fmt.Sprintf("%08x", rand.Uint32())
-	var sessionName string
-	switch {
-	case p.poolID > 0 && p.poolShortName != "":
-		sessionName = fmt.Sprintf("%s%d-%s-%s-%s", p.sessionType.ProtoName(), p.poolID, p.poolShortName, role, hexID)
-	case p.poolID > 0:
-		sessionName = fmt.Sprintf("%s%d-%s-%s", p.sessionType.ProtoName(), p.poolID, role, hexID)
-	default:
-		sessionName = fmt.Sprintf("%s-%s-%s", p.sessionType.ProtoName(), role, hexID)
-	}
+	// Session log name = {poolID}-{uniqueHex}. Random 32-bit hex tail
+	// (not a monotonic counter) so a pool that churns sessions for
+	// years can't overflow; collision odds at N live sessions ≈ N²/2^33
+	// (~1 in 8k at N = 1000).
+	sessionName := fmt.Sprintf("%d-%08x", p.poolID, rand.Uint32())
 	// nextSessionID is still bumped so any caller that relies on the
 	// monotonic count for stats stays correct; the value just isn't part
 	// of the name any more.
@@ -367,13 +343,19 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 // scalingReason summarizes why the sizer requested a scale delta given the
 // pool's current stats. Pure helper — no side effects — so the snapshot
 // reader gets the same text the operator would derive from the log.
-func scalingReason(stats *PoolStats, delta int) string {
+func scalingReason(stats *PoolStats, delta int, minSessions int) string {
 	if delta > 0 {
 		switch {
 		case stats == nil:
 			return "scale up (no stats)"
 		case stats.PendingCount > 0:
 			return fmt.Sprintf("pending=%d", stats.PendingCount)
+		case stats.ReadyCount+stats.StartingCount < minSessions:
+			// Delta is driven by the MinSessions floor (session churn from
+			// GoAway / close, not real load). Distinguish from load-driven
+			// scale-ups so the operator can spot the churn pattern.
+			return fmt.Sprintf("below min sessions (ready=%d starting=%d < min=%d)",
+				stats.ReadyCount, stats.StartingCount, minSessions)
 		case stats.InUseCount > 0 && stats.ReadyCount-stats.InUseCount <= 0:
 			return fmt.Sprintf("ready=%d in_use=%d (headroom exhausted)", stats.ReadyCount, stats.InUseCount)
 		default:

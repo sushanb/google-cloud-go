@@ -89,7 +89,7 @@ func newTestPool(t testing.TB, min, max int) *SessionPoolImpl {
 	t.Helper()
 	factory, closeStreams := newStubStreamFactory()
 	p := NewSessionPoolImpl(
-		PoolIdentity{ID: 1, ShortName: "test", Perm: PermissionRead},
+		PoolIdentity{ID: 1, Perm: PermissionRead},
 		"test-pool",
 		min,
 		max,
@@ -208,7 +208,7 @@ func TestSessionPool_Invoke_RecordsSlowCheckoutFailure(t *testing.T) {
 		return nil, ctx.Err()
 	}
 	p := NewSessionPoolImpl(
-		PoolIdentity{ID: 1, ShortName: "test", Perm: PermissionRead},
+		PoolIdentity{ID: 1, Perm: PermissionRead},
 		"test-pool",
 		0, 1,
 		neverDialing,
@@ -270,7 +270,7 @@ func TestCheckoutSession_ParkedWaiter_DeadlineExceeded(t *testing.T) {
 		return nil, ctx.Err()
 	}
 	p := NewSessionPoolImpl(
-		PoolIdentity{ID: 1, ShortName: "test", Perm: PermissionRead},
+		PoolIdentity{ID: 1, Perm: PermissionRead},
 		"test-pool",
 		0, 1,
 		neverDialing,
@@ -414,54 +414,17 @@ func TestNewSessionPoolImpl_Identity(t *testing.T) {
 	factory, closeStreams := newStubStreamFactory()
 	t.Cleanup(closeStreams)
 
-	// Standard identity → all three fields land on the pool.
 	p := NewSessionPoolImpl(
-		PoolIdentity{ID: 42, ShortName: "sushanb", Perm: PermissionRead},
+		PoolIdentity{ID: 42, Perm: PermissionRead},
 		"test-pool", 1, 10, factory, &spb.OpenSessionRequest{ProtocolVersion: 1}, nil, SessionTypeTable,
 	)
 	if p.poolID != 42 {
 		t.Errorf("poolID = %d, want 42", p.poolID)
 	}
-	if p.poolShortName != "sushanb" {
-		t.Errorf("poolShortName = %q, want %q", p.poolShortName, "sushanb")
-	}
 	if p.perm != PermissionRead {
 		t.Errorf("perm = %v, want PermissionRead", p.perm)
 	}
 	p.Close()
-}
-
-func TestNewSessionPoolImpl_ShortNameFlattensSlashes(t *testing.T) {
-	factory, closeStreams := newStubStreamFactory()
-	t.Cleanup(closeStreams)
-
-	// Slashes in ShortName must flatten to underscores so the name stays
-	// URL-safe for the channelz→sessionz anchor link.
-	p := NewSessionPoolImpl(
-		PoolIdentity{ID: 99, ShortName: "projects/p/instances/i/tables/t", Perm: PermissionWrite},
-		"test-pool", 1, 10, factory, &spb.OpenSessionRequest{ProtocolVersion: 1}, nil, SessionTypeTable,
-	)
-	want := "projects_p_instances_i_tables_t"
-	if p.poolShortName != want {
-		t.Errorf("poolShortName = %q, want %q (slashes must flatten to underscores)", p.poolShortName, want)
-	}
-	p.Close()
-}
-
-func TestNewSessionPoolImpl_PanicsOnPermissionUnknown(t *testing.T) {
-	factory, closeStreams := newStubStreamFactory()
-	t.Cleanup(closeStreams)
-
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("expected panic when ctor is called with PermissionUnknown; got no panic")
-		}
-	}()
-	NewSessionPoolImpl(
-		PoolIdentity{ID: 1, ShortName: "test", Perm: PermissionUnknown},
-		"test-pool", 1, 10, factory, &spb.OpenSessionRequest{ProtocolVersion: 1}, nil, SessionTypeTable,
-	)
-	t.Fatal("unreachable — NewSessionPoolImpl should have panicked above")
 }
 
 // TestSignalFree_NoWaitersIsNoOp verifies the queue-based signalFree

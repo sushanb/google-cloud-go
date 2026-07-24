@@ -266,9 +266,14 @@ func NewSessionClient(
 	), directAccessMD)
 
 	// No ChannelPrimer on the pool — session-based clients warm channels
-	// via their own OpenSession bidi streams. The DirectAccessChecker
-	// uses GetClientConfiguration (the same RPC ConfigurationManager
-	// polls) for its startup probe.
+	// via their own OpenSession bidi streams. The DAC still needs a
+	// primer for its startup probe.
+	//
+	// TODO(sushanb): switch to NewGetClientConfigDirectAccessChecker
+	// once we've validated it end-to-end in the sandbox. The session
+	// path should probe with GetClientConfiguration (the same RPC
+	// ConfigurationManager polls) rather than PingAndWarm — see
+	// project_bigtable_direct_access_checker memory.
 	pool, err := btransport.NewBigtableChannelPool(
 		ctx,
 		poolSize,
@@ -278,11 +283,9 @@ func NewSessionClient(
 		btransport.WithInstanceName(fullInstance),
 		btransport.WithAppProfile(appProfile),
 		btransport.WithMeterProvider(factory.OtelMeterProvider),
-		btransport.WithDirectAccessChecker(btransport.NewGetClientConfigDirectAccessChecker(
+		btransport.WithDirectAccessChecker(btransport.NewPingAndWarmDirectAccessChecker(
 			daDial,
-			fullInstance,
-			appProfile,
-			configMD,
+			btransport.NewPingAndWarmChannelPrimer(fullInstance, appProfile, directAccessMD),
 			factory.OtelMeterProvider,
 			nil,
 		)),
@@ -546,11 +549,7 @@ func (sc *sessionClient) createPoolForPayload(
 	if max <= 0 {
 		max = defaultMaxSessions
 	}
-	shortName := ""
-	if sessionDesc.ShortNameFn != nil {
-		shortName = sessionDesc.ShortNameFn(payload)
-	}
-	return sc.getOrCreatePool(key, min, max, streamFactory, handshake, md, sessionDesc.Type, shortName), nil
+	return sc.getOrCreatePool(key, min, max, streamFactory, handshake, md, sessionDesc.Type), nil
 }
 
 // getOrCreatePool ports SessionManager.GetOrCreateSessionPool:
@@ -563,7 +562,6 @@ func (sc *sessionClient) getOrCreatePool(
 	openSessionRequest *btpb.OpenSessionRequest,
 	md metadata.MD,
 	sessionType btransport.SessionType,
-	shortName string,
 ) SessionPool {
 	sc.poolsMu.Lock()
 	if mp, ok := sc.pools[key]; ok {
@@ -572,14 +570,11 @@ func (sc *sessionClient) getOrCreatePool(
 	}
 	id := sc.nextPoolID.Add(1)
 	poolName := fmt.Sprintf("%sPool-%d", sessionType.ProtoName(), id)
-	if shortName != "" {
-		poolName += " (" + shortName + ")"
-	}
 	if label := key.perm.display(); label != "" {
 		poolName += " [" + label + "]"
 	}
 	pool := btransport.NewSessionPoolImpl(
-		btransport.PoolIdentity{ID: id, ShortName: shortName, Perm: key.perm.transportPerm()},
+		btransport.PoolIdentity{ID: id, Perm: key.perm.transportPerm()},
 		poolName, min, max, streamFactory, openSessionRequest, md, sessionType,
 	)
 	mp := &managedPool{pool: pool}

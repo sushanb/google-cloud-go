@@ -83,13 +83,6 @@ type SessionDescriptor struct {
 	HeaderKeys []string
 	LogNameFn  func(req proto.Message) string
 	MetadataFn func(req proto.Message) map[string]string // Dynamically populates handshake metadata headers E2E!
-	// ShortNameFn returns a compact, human-readable identifier for the
-	// resource this descriptor opens — e.g. the table leaf "sushanb" from
-	// the full "projects/.../tables/sushanb" path. Used by SessionManager
-	// to bake the resource into the pool name ("OpenTablePool-1 (sushanb)
-	// [READ]") so operators can tell two pools of the same proto type
-	// apart at a glance.
-	ShortNameFn func(req proto.Message) string
 }
 
 var (
@@ -110,10 +103,6 @@ var (
 				"open_session.payload.permission":     r.Permission.String(),
 			}
 		},
-		ShortNameFn: func(req proto.Message) string {
-			r := req.(*spb.OpenTableRequest)
-			return resourceLeaf(r.TableName)
-		},
 	}
 
 	// AUTHORIZED_VIEW_SESSION manages authorized view scoped connection streams.
@@ -133,18 +122,6 @@ var (
 				"open_session.payload.permission":           r.Permission.String(),
 			}
 		},
-		ShortNameFn: func(req proto.Message) string {
-			r := req.(*spb.OpenAuthorizedViewRequest)
-			// Authorized views live under a table — surface both leafs
-			// joined by "/" so the pool name uniquely identifies the
-			// {table, view} pair without exposing the full resource path.
-			parts := strings.Split(r.AuthorizedViewName, "/")
-			n := len(parts)
-			if n >= 3 && parts[n-2] == "authorizedViews" && parts[n-4] == "tables" {
-				return parts[n-3] + "/" + parts[n-1]
-			}
-			return resourceLeaf(r.AuthorizedViewName)
-		},
 	}
 
 	// MATERIALIZED_VIEW_SESSION manages materialized view scoped connection streams (Read-Only).
@@ -163,10 +140,6 @@ var (
 				"open_session.payload.app_profile_id":         r.AppProfileId,
 				"open_session.payload.permission":             r.Permission.String(),
 			}
-		},
-		ShortNameFn: func(req proto.Message) string {
-			r := req.(*spb.OpenMaterializedViewRequest)
-			return resourceLeaf(r.MaterializedViewName)
 		},
 	}
 )

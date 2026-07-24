@@ -26,7 +26,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -143,16 +142,10 @@ type SessionPoolImpl struct {
 	// Tick body at a time. CAS false→true at entry; Store false at
 	// exit via defer.
 	tickPending atomic.Bool
-	// poolID is the SessionManager-assigned unique pool number used as a
-	// disambiguator when minting session log names — without it,
-	// `session-read-5` would collide across pools because each pool
-	// numbers its sessions from 1. 0 means "not assigned" (test setups).
+	// poolID is the SessionManager-assigned unique pool number baked
+	// into every session log name so the channelz → sessionz reverse
+	// link stays unambiguous across pools.
 	poolID uint64
-	// poolShortName is the resource leaf (e.g. "sushanb" for an
-	// OpenTable pool) baked into the session log name so the name
-	// identifies WHAT the session opens, not just which pool. Empty
-	// when no short name was provided.
-	poolShortName string
 
 	// waitersCount is the live count of callers parked inside
 	// CheckoutSession waiting for an idle session at the pool boundary.
@@ -232,22 +225,13 @@ func (p Permission) role() string {
 	}
 }
 
-// PoolIdentity bundles the three fields that identify a pool for the
-// session-name minter and the debug UI. Passed to NewSessionPoolImpl
-// as a group so a caller can't half-construct a pool with only one
-// or two of the three set.
+// PoolIdentity bundles the identifying fields passed to
+// NewSessionPoolImpl.
 type PoolIdentity struct {
-	// ID is the SessionManager-assigned unique pool number. Zero is
-	// reserved for test setups; production callers assign monotonic
-	// non-zero.
+	// ID is the SessionManager-assigned unique pool number. Baked into
+	// the session log name for the channelz → sessionz reverse link.
 	ID uint64
-	// ShortName is the resource leaf (e.g. "sushanb" for an
-	// OpenTable pool) baked into the session log name so the name
-	// identifies WHAT the session opens. Slashes are flattened to
-	// underscores at construction to keep the name URL-safe.
-	ShortName string
-	// Perm is the pool's read/write axis. MUST be PermissionRead or
-	// PermissionWrite; PermissionUnknown panics at construction.
+	// Perm is the pool's read/write axis.
 	Perm Permission
 }
 
@@ -271,14 +255,10 @@ func (p *SessionPoolImpl) noteVRpcOutcome(sh *SessionHandle, e2e, backend time.D
 // "…-session-…" log names in prod is worse than a construction-time
 // panic.
 func NewSessionPoolImpl(identity PoolIdentity, poolName string, min, max int, streamFactory func(ctx context.Context) (Stream, error), openSessionRequest *spb.OpenSessionRequest, md metadata.MD, sessionType SessionType) *SessionPoolImpl {
-	if identity.Perm == PermissionUnknown {
-		panic(fmt.Sprintf("NewSessionPoolImpl: identity.Perm must be PermissionRead or PermissionWrite for pool %q", poolName))
-	}
 	poolCtx, poolCancel := context.WithCancel(context.Background())
 	pool := &SessionPoolImpl{
 		poolName:           poolName,
 		poolID:             identity.ID,
-		poolShortName:      strings.ReplaceAll(identity.ShortName, "/", "_"),
 		perm:               identity.Perm,
 		minSessions:        min,
 		maxSessions:        max,

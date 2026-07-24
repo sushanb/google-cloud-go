@@ -25,10 +25,11 @@ import (
 
 func TestScalingReason(t *testing.T) {
 	cases := []struct {
-		name  string
-		stats *PoolStats
-		delta int
-		want  string // substring the returned message must contain
+		name        string
+		stats       *PoolStats
+		delta       int
+		minSessions int
+		want        string // substring the returned message must contain
 	}{
 		{
 			name:  "scale-up nil stats",
@@ -41,6 +42,13 @@ func TestScalingReason(t *testing.T) {
 			stats: &PoolStats{PendingCount: 5, InUseCount: 2, ReadyCount: 4},
 			delta: 1,
 			want:  "pending=5",
+		},
+		{
+			name:        "scale-up below min sessions",
+			stats:       &PoolStats{PendingCount: 0, InUseCount: 0, ReadyCount: 4, StartingCount: 0},
+			delta:       1,
+			minSessions: 5,
+			want:        "below min sessions",
 		},
 		{
 			name:  "scale-up headroom exhausted",
@@ -69,10 +77,10 @@ func TestScalingReason(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := scalingReason(tc.stats, tc.delta)
+			got := scalingReason(tc.stats, tc.delta, tc.minSessions)
 			if !strings.Contains(got, tc.want) {
-				t.Errorf("scalingReason(%+v, %d) = %q, want substring %q",
-					tc.stats, tc.delta, got, tc.want)
+				t.Errorf("scalingReason(%+v, %d, %d) = %q, want substring %q",
+					tc.stats, tc.delta, tc.minSessions, got, tc.want)
 			}
 		})
 	}
