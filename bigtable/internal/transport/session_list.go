@@ -17,13 +17,14 @@ package internal
 import (
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // AFE-grouping constants for the per-AFE sessionList / afeHandle.
 const (
 	// afePeakEwmaTau: PeakEwma decay for both per-AFE trackers. Kept
-	// aligned with the per-session tau in picker.go so LeastLatencyPicker
+	// aligned with the per-session tau used elsewhere so LeastLatencyPicker
 	// behaves comparably to today's PeakEwmaPicker.
 	afePeakEwmaTau = 10 * time.Second
 
@@ -99,6 +100,82 @@ type afeSnapshot struct {
 	NumOutstanding int     // refCount − IdleCount, ≥ 0
 	TransportCost  float64 // PeakEwma nanoseconds; 0 if never updated
 	E2eCost        float64 // PeakEwma nanoseconds; 0 if never updated
+}
+
+// SessionHandle wraps a Session with the counters the pool needs to
+// account for it. Picking has moved to the two-tier AFE-aware flow
+// (see afe_picker.go + the sessionList methods below); this type no
+// longer tracks per-session PeakEwma or a pool wake-up signal — the
+// pool drives the wake-up centrally from Invoke's defer.
+type SessionHandle struct {
+	session      *Session
+	outstanding  int64
+	lastActivity int64 // UnixNano timestamp of the last completed call
+	picks        int64 // Number of times the picker has picked this handle.
+	// createdAt is the wall-clock time this handle joined the pool
+	// (stamped in createSession after the handle is minted). Read by
+	// recordLifetime and Pool.Close to bucket per-session lifetimes
+	// into the ring buffer. Zero for test-constructed handles that
+	// never went through the pool — code paths that consume this must
+	// handle the zero-time case.
+	createdAt time.Time
+	// inExpectedCount tracks whether this handle currently counts toward
+	// sessionList.readyCount (the scale-up budget). Set true in
+	// sl.OnSessionStarted, cleared by whichever of sl.OnSessionClosing /
+	// sl.OnSessionClosed fires first. Guarded by owning sessionList.mu;
+	// do not touch outside sl methods.
+	inExpectedCount bool
+	// activated / closingRecorded / closeRecorded are one-shot dedup
+	// flags for the pool's per-session hook chain. They replace the
+	// prior Session→SessionHandle back-ref (Session.poolHandle) whose
+	// nil-ness was abused as an "already handled" signal.
+	//
+	// activated fires exactly once across p.onActive calls (defensive
+	// against a hook chain that re-enters onActive).
+	//
+	// closingRecorded and closeRecorded gate the double-fire path Pool.Close
+	// otherwise would trigger: Phase-1 records lifetime + sl.OnSessionClosed
+	// eagerly and flips both flags, so Phase-2's s.Close driving the hook
+	// chain finds them tripped and short-circuits.
+	activated       atomic.Bool
+	closingRecorded atomic.Bool
+	closeRecorded   atomic.Bool
+}
+
+// Picks returns the number of times this handle has been picked by the pool's
+// picker. Bumped exactly once per successful CheckoutSession.
+func (h *SessionHandle) Picks() int64 {
+	return atomic.LoadInt64(&h.picks)
+}
+
+// NewSessionHandle creates a new SessionHandle wrapping a Session. The
+// createdAt stamp is used by the pool's lifetime histogram; pass
+// time.Now() from OnActive, or the zero time from tests that don't
+// care about lifetime accounting.
+func NewSessionHandle(session *Session, createdAt time.Time) *SessionHandle {
+	return &SessionHandle{session: session, createdAt: createdAt}
+}
+
+// IncOutstanding increments outstanding calls.
+func (h *SessionHandle) IncOutstanding() {
+	atomic.AddInt64(&h.outstanding, 1)
+}
+
+// DecOutstanding decrements outstanding calls and stamps lastActivity.
+// The pool wakes waiters and returns the session to its AFE queue from
+// Invoke's defer, so this method no longer signals directly.
+func (h *SessionHandle) DecOutstanding() {
+	atomic.AddInt64(&h.outstanding, -1)
+	atomic.StoreInt64(&h.lastActivity, time.Now().UnixNano())
+}
+
+// GetLastActivity returns the time of the last activity.
+func (h *SessionHandle) GetLastActivity() time.Time {
+	nano := atomic.LoadInt64(&h.lastActivity)
+	if nano == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nano)
 }
 
 // sessionList groups sessions by the AFE they landed on. See the State

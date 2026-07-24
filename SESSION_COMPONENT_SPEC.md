@@ -45,7 +45,7 @@ Snapshot as of 2026-07-10 against `feat/bigtable-sessionz-debug` (Go) and `~/goo
 | Watchdog | `sweepStuckSessions` in `session_pool_lifecycle.go:63-88` | `SessionPoolImpl.Watchdog` — `SessionPoolImpl.java:844` |
 | Per-AFE grouping | `sessionList` — `session_list.go:81` | `SessionList` — `SessionList.java:52` |
 | AFE bucket | `afeHandle` — `session_list.go:50` | `SessionList.AfeHandle` — `SessionList.java:381` |
-| Per-session handle | `SessionHandle` — `picker.go:27` | `SessionList.SessionHandle` — `SessionList.java:143` |
+| Per-session handle | `SessionHandle` — `session_list.go:110` | `SessionList.SessionHandle` — `SessionList.java:143` |
 | PeakEwma tracker | `PeakEwma` — `peak_emwa.go:24` | `SessionList.PeakEwma` — `SessionList.java:415` |
 | Pool sizing math | `PoolSizer` — `pool_sizer.go:56` (formula + `ScaleDecision`) | `PoolSizer` — `PoolSizer.java:25` |
 | Pool sizing action | `session_pool_scaling.go` + `ScalingEvent` — `:52` (consumes `ScaleDecision`, drives `openSession` / passive shrink) | inline in `SessionPoolImpl.java` |
