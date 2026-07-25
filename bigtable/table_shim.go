@@ -156,5 +156,11 @@ func protoRowToRow(pr *btpb.Row) Row {
 			}
 		}
 	}
+	// Match classic Table.ReadRow: a row with no cells is a not-found
+	// signal; callers check `row == nil`. Server should send pr=nil for
+	// not-found, but defensively collapse the empty-but-non-nil case too.
+	if len(rowMap) == 0 {
+		return nil
+	}
 	return rowMap
 }
