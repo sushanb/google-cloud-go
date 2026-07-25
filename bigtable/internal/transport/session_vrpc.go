@@ -114,6 +114,21 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 				"session %q busy: prior vRPC has not drained on the wire", s.logName))
 	}
 
+	// Observation-only trace: handleGoAway can transition Ready →
+	// Closing between the Invoke entry-guard state check above and
+	// here (Encode + rpcID mint + vrpcImpl alloc + claimSlot — the
+	// "encode window"). On hit, the frame still goes on the wire
+	// under the current behavior; the server drains and ignores it,
+	// and the caller's ctx eventually fires as DeadlineExceeded. We
+	// fire the debug tag to confirm the field hypothesis correlating
+	// with the GOAWAY cadence before landing the short-circuit fix
+	// (drainSlot + return Uncommitted on this same branch).
+	if st := State(s.state.Load()); st != StateReady {
+		recordDebugTag(tagSessionInvokeStateChangedAfterClaim)
+		s.debugf("vRPC state changed %v→%v during Invoke encode window (rpc_id=%d method=%s); frame will be sent on a draining session",
+			StateReady, st, rpcID, desc.Method())
+	}
+
 	// Reset the heartbeat deadline whenever we send an outbound frame: the
 	// server's keepalive clock is implicitly reset by our activity.
 	s.resetHeartbeatDeadline()

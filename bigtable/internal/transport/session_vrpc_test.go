@@ -893,3 +893,99 @@ func TestGoAwayGrace_NonIdempotentComposesWithRetryInterceptor(t *testing.T) {
 		})
 	}
 }
+
+// TestInvoke_StateChangeAfterClaimSlotFiresDebugTag pins the
+// observation trace for the encode-window race: between
+// Session.Invoke's line-90 state check and its line-111 claimSlot, a
+// GOAWAY landing on readLoop can transition the session to Closing.
+// The trace (tagSessionInvokeStateChangedAfterClaim + a debugf line)
+// fires when the post-claimSlot re-check catches the transition —
+// the counter in production should correlate with the server's
+// GOAWAY cadence (e.g. 5-min per session in benchmarks) and with the
+// "DeadlineExceeded every N min" incidents.
+//
+// Observation only — the frame still goes on the wire under current
+// behavior. The short-circuit fix (drainSlot + return Uncommitted on
+// this same branch) lands in a follow-up commit once the field data
+// confirms the correlation. When that fix lands, this test will need
+// its Send-count assertion inverted.
+//
+// Deterministic race: fakeDesc.Encode blocks so the test can fire
+// handleGoAway mid-way, guaranteeing the state transition lands
+// during the encode window regardless of scheduling.
+func TestInvoke_StateChangeAfterClaimSlotFiresDebugTag(t *testing.T) {
+	s, stream := makeActive(t, SessionHooks{})
+	// After the test, unblock the in-flight vRPC + let the async Close
+	// spawned by handleGoAway exit early (otherwise it sleeps up to 30s
+	// on its own ctx.Done backstop).
+	t.Cleanup(func() {
+		s.ForceClose(&spb.CloseSessionRequest{
+			Reason: spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR,
+		})
+	})
+
+	before := snapshotDebugTagCounts()[tagSessionInvokeStateChangedAfterClaim]
+
+	inEncode := make(chan struct{})
+	releaseEncode := make(chan struct{})
+	desc := &fakeDesc{
+		method: "TestMethod",
+		enc: func(_ interface{}) ([]byte, error) {
+			close(inEncode)
+			<-releaseEncode
+			return []byte("payload"), nil
+		},
+		dec: func(buf []byte) (interface{}, error) { return string(buf), nil },
+	}
+
+	resCh := make(chan error, 1)
+	go func() {
+		_, err := s.Invoke(context.Background(), desc, "hello")
+		resCh <- err
+	}()
+
+	// Wait until Invoke is inside Encode — past the line-90 state
+	// check, before line-111 claimSlot.
+	select {
+	case <-inEncode:
+	case <-time.After(time.Second):
+		t.Fatal("Invoke never entered Encode within 1s")
+	}
+
+	// Fire GOAWAY. State transitions Ready → Closing synchronously.
+	s.handleGoAway(&spb.GoAwayResponse{Reason: "test"})
+	if got := s.State(); got != StateClosing {
+		t.Fatalf("state after handleGoAway = %v, want StateClosing", got)
+	}
+
+	// Release Encode. Invoke proceeds through claimSlot (which now
+	// re-checks state and fires the debug tag) and then Send.
+	close(releaseEncode)
+
+	// Wait for the debug tag to fire — the post-claimSlot re-check
+	// runs synchronously right before Send.
+	waitFor(t, time.Second,
+		func() bool {
+			return snapshotDebugTagCounts()[tagSessionInvokeStateChangedAfterClaim] > before
+		},
+		"tagSessionInvokeStateChangedAfterClaim to increment")
+
+	// Behavior-unchanged assertion: the vRPC frame still reaches the
+	// wire (that's the bug we're OBSERVING; the fix lands in a
+	// follow-up). Filter on the VirtualRpc payload so this isn't
+	// satisfied by handleGoAway's own CloseSession frame — that would
+	// land in `stream.sent` even if the vRPC never fired. When the
+	// short-circuit fix lands, this predicate flips to "no VirtualRpc
+	// frame present" (CloseSession will still be there — Igor caught
+	// this exact confounding in review).
+	sawVRpcFrame := func() bool {
+		for _, r := range stream.snapshotSent() {
+			if r.GetVirtualRpc() != nil {
+				return true
+			}
+		}
+		return false
+	}
+	waitFor(t, time.Second, sawVRpcFrame,
+		"vRPC frame reached the wire (behavior unchanged pre-fix)")
+}

@@ -159,6 +159,17 @@ const (
 	// more callers onto the ctx.Done branch.
 	tagSessionVRPCCancelledDrained = "session_vrpc_cancelled_drained"
 
+	// tagSessionInvokeStateChangedAfterClaim fires when Session.Invoke
+	// observes state != Ready AFTER a successful claimSlot — meaning
+	// a GOAWAY (or Close / ForceClose / heartbeat-miss) transitioned
+	// the session during the encode window between the initial state
+	// check and claimSlot. Observation-only signal ahead of the
+	// short-circuit fix: a nonzero rate correlating with the server's
+	// GOAWAY cadence (e.g. 5-min per session in benchmarks) confirms
+	// the "DeadlineExceeded every N minutes" symptom is driven by
+	// frames being sent on a draining session.
+	tagSessionInvokeStateChangedAfterClaim = "session_invoke_state_changed_after_claim"
+
 	// Pool-scoped anomalies.
 	tagSessionPoolStuckSessionSwept          = "session_pool_stuck_session_swept"
 	tagSessionPoolDrainTimeout               = "session_pool_drain_timeout"
