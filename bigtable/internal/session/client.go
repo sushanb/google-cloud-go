@@ -19,7 +19,9 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/url"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -345,6 +347,15 @@ func newSessionClientFromParts(channelPool ChannelPool, stub btpb.BigtableClient
 // (rather than exported+imported) to keep the internal/session package
 // free of a back-reference to the bigtable package.
 func buildFeatureFlagsMD(clientSideMetricsEnabled, disableRetryInfo, enableDirectAccess bool) metadata.MD {
+	// CBT_FORCE_SESSION tri-state — see bigtable.createFeatureFlagsMD for
+	// the semantic (kept in sync intentionally; internal/session can't
+	// import bigtable due to the import-cycle boundary).
+	sessionsCompatible, sessionsRequired := true, false
+	if v, ok := os.LookupEnv("CBT_FORCE_SESSION"); ok {
+		if b, err := strconv.ParseBool(v); err == nil {
+			sessionsCompatible, sessionsRequired = b, b
+		}
+	}
 	ff := btpb.FeatureFlags{
 		RoutingCookie:            true,
 		ReverseScans:             true,
@@ -353,7 +364,8 @@ func buildFeatureFlagsMD(clientSideMetricsEnabled, disableRetryInfo, enableDirec
 		RetryInfo:                !disableRetryInfo,
 		TrafficDirectorEnabled:   enableDirectAccess,
 		DirectAccessRequested:    enableDirectAccess,
-		SessionsCompatible:       true,
+		SessionsCompatible:       sessionsCompatible,
+		SessionsRequired:         sessionsRequired,
 		PeerInfo:                 true,
 	}
 	val := ""

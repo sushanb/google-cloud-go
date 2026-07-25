@@ -25,6 +25,7 @@ import (
 	"hash/crc32"
 	"io"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -191,6 +192,17 @@ func mergeOutgoingMetadata(ctx context.Context, mds ...metadata.MD) context.Cont
 // This header is sent on each request and includes all features supported and
 // enabled on the client.
 func createFeatureFlagsMD(clientSideMetricsEnabled, disableRetryInfo, enableDirectAccess bool) metadata.MD {
+	// CBT_FORCE_SESSION tri-states the session-mode flags on the wire:
+	//   unset  → SessionsCompatible=true,  SessionsRequired=false  (default)
+	//   =true  → SessionsCompatible=true,  SessionsRequired=true   (require sessions)
+	//   =false → SessionsCompatible=false, SessionsRequired=false  (opt out entirely)
+	// Parsed via strconv.ParseBool; unparseable values fall back to default.
+	sessionsCompatible, sessionsRequired := true, false
+	if v, ok := os.LookupEnv("CBT_FORCE_SESSION"); ok {
+		if b, err := strconv.ParseBool(v); err == nil {
+			sessionsCompatible, sessionsRequired = b, b
+		}
+	}
 	ff := btpb.FeatureFlags{
 		RoutingCookie:            true,
 		ReverseScans:             true,
@@ -199,7 +211,8 @@ func createFeatureFlagsMD(clientSideMetricsEnabled, disableRetryInfo, enableDire
 		RetryInfo:                !disableRetryInfo,
 		TrafficDirectorEnabled:   enableDirectAccess,
 		DirectAccessRequested:    enableDirectAccess,
-		SessionsCompatible:       true,
+		SessionsCompatible:       sessionsCompatible,
+		SessionsRequired:         sessionsRequired,
 		PeerInfo:                 true,
 	}
 
