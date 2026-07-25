@@ -614,9 +614,18 @@ func (sc *sessionClient) getOrCreatePool(
 }
 
 // featureFlags builds the OpenSessionRequest.Flags proto from
-// sessionClient config — matches SessionManager.GetOrCreateSessionTable's
-// flags construction at session_manager.go:252.
+// sessionClient config. SessionsCompatible / SessionsRequired MUST
+// match the values in bigtable-features metadata header (built by
+// buildFeatureFlagsMD) — the server rejects OpenSession with
+// INVALID_ARGUMENT when the proto and header disagree on session-mode
+// flags. See bigtable.createFeatureFlagsMD for the tri-state semantic.
 func (sc *sessionClient) featureFlags() *btpb.FeatureFlags {
+	sessionsCompatible, sessionsRequired := true, false
+	if v, ok := os.LookupEnv("CBT_FORCE_SESSION"); ok {
+		if b, err := strconv.ParseBool(v); err == nil {
+			sessionsCompatible, sessionsRequired = b, b
+		}
+	}
 	return &btpb.FeatureFlags{
 		RoutingCookie:            true,
 		ReverseScans:             true,
@@ -625,7 +634,8 @@ func (sc *sessionClient) featureFlags() *btpb.FeatureFlags {
 		RetryInfo:                !sc.cfg.DisableRetryInfo,
 		TrafficDirectorEnabled:   true,
 		DirectAccessRequested:    true,
-		SessionsCompatible:       true,
+		SessionsCompatible:       sessionsCompatible,
+		SessionsRequired:         sessionsRequired,
 		PeerInfo:                 true,
 	}
 }
