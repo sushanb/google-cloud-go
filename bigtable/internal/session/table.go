@@ -234,7 +234,18 @@ func (t *sessionTable) ensureTracer(ctx context.Context, method string) (context
 // stampAttempt copies per-attempt fields off the InvokeResult onto the
 // active per-attempt tracer. No-op when metrics are disabled or when
 // the field is empty (nil ClusterInfo, zero SentAt, etc.).
+//
+// Fires observation-only debug tags when ClusterInformation is absent
+// on the result — these tags let us confirm whether the "no
+// cluster_id label on failed session attempts" pathway drives the
+// reported attempt_latencies2 / connectivity_error_count mismatch,
+// before landing a behavior-changing fix.
 func stampAttempt(ctx context.Context, result btransport.InvokeResult) {
+	if result.ClusterInfo == nil {
+		btransport.RecordDebugTag(btransport.TagSessionAttemptNilClusterInfo)
+	} else if result.ClusterInfo.GetClusterId() == "" {
+		btransport.RecordDebugTag(btransport.TagSessionAttemptEmptyClusterID)
+	}
 	att := metrics.FromContext(ctx).CurrAttempt()
 	if att == nil {
 		return
