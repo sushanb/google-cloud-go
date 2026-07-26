@@ -441,6 +441,10 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 		// Record checkout failure so pool-exhaustion incidents show up
 		// in sessionz's slow-vRPC table and latency histograms.
 		p.recordCheckoutFailure(checkoutStart, desc, err)
+		// Diagnostic: this exit path returns nil ClusterInfo without
+		// hitting checkpoint C below. Counter closes the accounting
+		// against session_attempt_nil_cluster_info.
+		recordDebugTag(tagVRpcPoolCheckoutFailedCINil)
 		return InvokeResult{}, err
 	}
 	poolWait := time.Since(checkoutStart)

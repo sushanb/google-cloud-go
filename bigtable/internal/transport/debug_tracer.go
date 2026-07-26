@@ -210,6 +210,16 @@ const (
 	tagVRpcPRResultClusterInfoNilAfterAssign = "session_pr_result_ci_nil_after_assign"
 	tagVRpcPoolPostInvokeResultClusterInfoNil = "session_pool_postinvoke_result_ci_nil"
 
+	// tagVRpcPoolCheckoutFailedCINil fires on SessionPoolImpl.Invoke's
+	// early return at session_pool.go:444 — CheckoutSession returned an
+	// error, we return InvokeResult{} with nil ClusterInfo, and never
+	// reach checkpoint C. Closes the accounting: expected to explain
+	// (session_attempt_nil_cluster_info) − (postinvoke_result_ci_nil).
+	// The three CheckoutSession failure exits (pool closed at :229,
+	// ctx.Done while parked at :275, drainWaitersWithErr poisoned wake
+	// at :282) all funnel through this single site.
+	tagVRpcPoolCheckoutFailedCINil = "session_pool_checkout_failed_ci_nil"
+
 	// TagSessionAttemptEmptyClusterID fires when ClusterInformation is
 	// present on the InvokeResult but ClusterId is empty — a server
 	// contract violation (server should always populate ClusterId on
