@@ -218,10 +218,9 @@ func TestSessionPool_Invoke_RecordsSlowCheckoutFailure(t *testing.T) {
 	)
 	defer p.Close()
 
-	// Threshold well under the 50ms wait below so the record path fires
-	// deterministically even on slow CI.
-	p.m.slowVRpcThreshold = time.Millisecond
-
+	// 50ms ctx budget vs the 10ms defaultSlowThreshold means the checkout
+	// wait will comfortably exceed the slow-vRPC record threshold even on
+	// slow CI, so the record path fires deterministically.
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	_, err := p.Invoke(ctx, newRoundTripDesc(), "hello")

@@ -501,7 +501,7 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 			sh.session.RecordTransportOverhead(ctx, desc.Method(), d)
 		}
 	}
-	if latency > p.slowThreshold() {
+	if latency > defaultSlowThreshold {
 		ev := SlowVRpcEvent{
 			At:               start,
 			Method:           desc.Method(),

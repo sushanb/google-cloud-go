@@ -264,17 +264,6 @@ func TestRecordCheckoutFailure_ClassifiesErr(t *testing.T) {
 	}
 }
 
-func TestSlowThreshold_DefaultAndOverride(t *testing.T) {
-	p := newTestPool(t, 1, 10)
-	if got := p.slowThreshold(); got != defaultSlowThreshold {
-		t.Errorf("default threshold = %v, want %v", got, defaultSlowThreshold)
-	}
-	p.m.slowVRpcThreshold = 500 * time.Microsecond
-	if got := p.slowThreshold(); got != 500*time.Microsecond {
-		t.Errorf("overridden threshold = %v, want 500µs", got)
-	}
-}
-
 // --- pick history / AFE counts ---------------------------------------------
 
 func TestSnapshotAfePickCounts_ReturnsCopy(t *testing.T) {

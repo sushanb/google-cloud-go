@@ -45,9 +45,8 @@ type poolMetrics struct {
 	scalingHistory   []ScalingEvent
 
 	// Slow-vRPC log ring buffer.
-	slowVRpcsMu       sync.Mutex
-	slowVRpcs         []SlowVRpcEvent
-	slowVRpcThreshold time.Duration
+	slowVRpcsMu sync.Mutex
+	slowVRpcs   []SlowVRpcEvent
 
 	// Time-series sparkline ring buffer + rate-computation state.
 	timeSeriesMu    sync.Mutex
@@ -316,7 +315,7 @@ func (p *SessionPoolImpl) recordSlowVRpc(ev SlowVRpcEvent) {
 func (p *SessionPoolImpl) recordCheckoutFailure(checkoutStart time.Time, desc VRpcDescriptor, err error) {
 	poolWait := time.Since(checkoutStart)
 	p.m.totalLatencyHist.record(poolWait)
-	if poolWait <= p.slowThreshold() {
+	if poolWait <= defaultSlowThreshold {
 		return
 	}
 	ev := SlowVRpcEvent{
@@ -344,13 +343,6 @@ func (p *SessionPoolImpl) snapshotSlowVRpcs() []SlowVRpcEvent {
 	out := make([]SlowVRpcEvent, len(p.m.slowVRpcs))
 	copy(out, p.m.slowVRpcs)
 	return out
-}
-
-func (p *SessionPoolImpl) slowThreshold() time.Duration {
-	if p.m.slowVRpcThreshold > 0 {
-		return p.m.slowVRpcThreshold
-	}
-	return defaultSlowThreshold
 }
 
 // maxPickHistory sizes the pick-decision ring for ~1s of decisions at a
