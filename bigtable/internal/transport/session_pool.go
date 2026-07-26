@@ -44,6 +44,13 @@ var ErrNoSessionsAvailable = errors.New("bigtable: no sessions available")
 // at trip time are woken with this sentinel.
 var ErrConsecutiveFailures = errors.New("bigtable: session pool tripped consecutive-failure threshold")
 
+// ErrPoolClosed is returned to any CheckoutSession caller parked on
+// the waiter queue when Close() runs. Distinct from
+// ErrNoSessionsAvailable (ctx-cancel during cold-start) and
+// ErrConsecutiveFailures (circuit trip) so operators can distinguish
+// "pool is going away" from "your ctx expired while waiting."
+var ErrPoolClosed = errors.New("bigtable: session pool is closed")
+
 // waiter is one parked CheckoutSession caller. Close-exactly-once is
 // guarded by waitersMu + w.elem: enqueued while elem != nil; both wake
 // paths hold waitersMu when they nil elem out.

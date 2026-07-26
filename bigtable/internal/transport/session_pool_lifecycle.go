@@ -145,6 +145,16 @@ func (p *SessionPoolImpl) Close() error {
 	p.closed = true
 	p.mu.Unlock()
 
+	// Drain any parked CheckoutSession waiters. Without this, callers
+	// blocked on the FIFO queue only unblock via (a) their own ctx
+	// cancel or (b) an onSlotDrained wave from an in-flight vRPC — a
+	// long-poll caller with context.Background hangs past Close until
+	// Phase-2 forceCloses cascade signalFree, which only fires for the
+	// N in-flight vRPCs (< M parked waiters under pool saturation).
+	// Drain up-front with a pool-closed sentinel so operators get a
+	// specific error, not a hang.
+	p.drainWaitersWithErr(ErrPoolClosed)
+
 	// Snapshot AFTER marking closed so any onActive races either see
 	// p.closed (and ForceClose without registering) or land in sl in
 	// time to be caught here.

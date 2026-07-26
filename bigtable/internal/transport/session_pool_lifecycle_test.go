@@ -15,7 +15,9 @@
 package internal
 
 import (
+	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -214,6 +216,77 @@ func TestOnClosing_ThenOnClose_UsesHandleDirectly(t *testing.T) {
 
 	if got := p.m.sessionsClosed.Load(); got != 1 {
 		t.Errorf("sessionsClosed = %d, want 1", got)
+	}
+}
+
+// TestPoolClose_DrainsParkedWaitersWithSentinel pins Close's contract
+// to unblock every FIFO-parked CheckoutSession caller with
+// ErrPoolClosed. Without the drain in Phase-1, long-poll callers whose
+// ctx is context.Background hang past Close forever — the in-flight
+// vRPC teardown fires signalFree for only the N in-flight calls, not
+// the M > N parked waiters typical under saturation.
+//
+// Enqueue directly on the waiter queue (mirroring
+// TestConsecutiveFailures_TripWakesParkedWaitersWithSentinel) so the
+// test exercises the wake/err contract without racing auto-scaling.
+func TestPoolClose_DrainsParkedWaitersWithSentinel(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+
+	const nWaiters = 3
+	results := make(chan error, nWaiters)
+	var wg sync.WaitGroup
+	for i := 0; i < nWaiters; i++ {
+		w := &waiter{ready: make(chan struct{})}
+		p.waitersMu.Lock()
+		w.elem = p.waiters.PushBack(w)
+		p.waitersMu.Unlock()
+		p.waitersCount.Add(1)
+
+		wg.Add(1)
+		go func(w *waiter) {
+			defer wg.Done()
+			<-w.ready
+			p.waitersCount.Add(-1)
+			results <- w.err
+		}(w)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- p.Close() }()
+
+	// Waiters must wake within a bounded window driven by Phase-1
+	// drainWaitersWithErr — NOT by the in-flight-vRPC signalFree wave
+	// (there are no in-flight vRPCs in this test).
+	waitCh := make(chan struct{})
+	go func() { wg.Wait(); close(waitCh) }()
+	select {
+	case <-waitCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("parked waiters not woken by Close within 5s — Close doesn't drain the FIFO queue")
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Close err = %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Close did not return within 30s")
+	}
+
+	close(results)
+	for err := range results {
+		if !errors.Is(err, ErrPoolClosed) {
+			t.Errorf("waiter err = %v, want ErrPoolClosed", err)
+		}
+	}
+
+	// After the drain, waiter queue must be empty.
+	p.waitersMu.Lock()
+	remaining := p.waiters.Len()
+	p.waitersMu.Unlock()
+	if remaining != 0 {
+		t.Errorf("waiter queue after Close has %d entries, want 0", remaining)
 	}
 }
 
