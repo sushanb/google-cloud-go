@@ -240,7 +240,7 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		if picked {
 			if idle := p.sl.Checkout(afeID); idle != nil {
 				idle.IncOutstanding()
-				atomic.AddInt64(&idle.picks, 1)
+				idle.IncPicks()
 				return idle, nil
 			}
 			// Picker chose this AFE but its ready session was taken

@@ -142,12 +142,6 @@ type SessionHandle struct {
 	closeRecorded   atomic.Bool
 }
 
-// Picks returns the number of times this handle has been picked by the pool's
-// picker. Bumped exactly once per successful CheckoutSession.
-func (h *SessionHandle) Picks() int64 {
-	return atomic.LoadInt64(&h.picks)
-}
-
 // newSessionHandle creates a new SessionHandle wrapping a Session. The
 // createdAt stamp is used by the pool's lifetime histogram; pass
 // time.Now() from OnActive, or the zero time from tests that don't
@@ -160,6 +154,13 @@ func newSessionHandle(session *Session, createdAt time.Time) *SessionHandle {
 // IncOutstanding increments outstanding calls.
 func (h *SessionHandle) IncOutstanding() {
 	atomic.AddInt64(&h.outstanding, 1)
+}
+
+// IncPicks increments the cumulative pick counter. Called from
+// CheckoutSession on every successful pick so pool callers don't reach
+// into the handle's atomic field directly (same shape as IncOutstanding).
+func (h *SessionHandle) IncPicks() {
+	atomic.AddInt64(&h.picks, 1)
 }
 
 // DecOutstanding decrements outstanding calls and stamps lastActivity.
@@ -205,11 +206,12 @@ func newSessionList() *sessionList {
 // handleOpenSession guarantees this synchronously before hooks.onActive
 // fires. A session whose AfeID() is 0 (server sent no peer-info header)
 // lands in the AfeID=0 bucket — still pickable, but not counted in
-// AFE-fanout. Duplicate register is a silent no-op — OnActive fires
-// exactly once per handle by construction, so this branch is unreachable
-// in practice.
+// AFE-fanout. Duplicate register is a silent no-op — defensive guard
+// against a caller wiring the hook twice; the production path fires
+// OnActive exactly once per handle by construction, but tests exercise
+// the dedup branch directly.
 func (sl *sessionList) OnSessionStarted(sh *SessionHandle) {
-	if sh == nil {
+	if sh == nil || sh.session == nil {
 		return
 	}
 	id := sh.session.AfeID()
@@ -369,8 +371,9 @@ func (sl *sessionList) OnSessionClosed(sh *SessionHandle) {
 // updates (the only method in this file that does): PeakEwma is
 // internally locked and this runs on every completed vRPC. If a
 // concurrent OnSessionClosed + Prune detaches the bucket in between,
-// the update lands on a detached PeakEwma and is harmlessly dropped
-// when the next Prune GCs it.
+// the update lands on a live-but-orphan tracker (afeHandles map entry
+// deleted, PeakEwma struct still allocated) and is harmlessly ignored
+// once GC collects the AFE.
 func (sl *sessionList) RecordVRpcOutcome(sh *SessionHandle, e2e, backend time.Duration, ok bool) {
 	if !ok || sh == nil {
 		return
@@ -499,6 +502,8 @@ func (sl *sessionList) dropMembershipLocked(sh *SessionHandle) {
 	if sh.inExpectedCount {
 		sh.inExpectedCount = false
 		sl.readyCount--
+		assertDebugTagf(sl.readyCount >= 0, tagSessionListReadyCountUnderflow,
+			"dropMembershipLocked drove readyCount=%d below zero", sl.readyCount)
 	}
 }
 

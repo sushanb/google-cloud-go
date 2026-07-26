@@ -444,6 +444,16 @@ func TestSessionList_ReleaseToPool_AfterClosing_NoOp(t *testing.T) {
 	sl.Checkout(afeID(1))
 	sl.OnSessionClosing(h)
 
+	// Pin the mechanism directly: OnSessionClosing MUST flip
+	// inExpectedCount, and that flag is what ReleaseToPool consults
+	// to no-op. If a future refactor moves the guard to a different
+	// mechanism that ALSO happens to leave the queue empty, the
+	// outcome-only assertions below would still pass — this pins the
+	// flag so a swap fails loudly here first.
+	if h.inExpectedCount {
+		t.Fatal("OnSessionClosing must clear inExpectedCount — the I5/I2 guard that makes ReleaseToPool a no-op after Closing")
+	}
+
 	// Late ReleaseToPool arriving after Closing must be a no-op.
 	sl.ReleaseToPool(h)
 
@@ -456,6 +466,45 @@ func TestSessionList_ReleaseToPool_AfterClosing_NoOp(t *testing.T) {
 	// drained handle.
 	if got := sl.Checkout(afeID(1)); got != nil {
 		t.Errorf("Checkout after Closing+ReleaseToPool = %v, want nil", got)
+	}
+	checkInvariants(t, sl)
+}
+
+// TestSessionList_RecordVRpcOutcome_AfterClose asserts the documented
+// detach-then-update path at session_list.go RecordVRpcOutcome: a call
+// that races with OnSessionClosed (i.e. the handle is already deregistered
+// by the time the map read runs) must be dropped silently — no panic,
+// no PeakEwma update, no state mutation. The method drops sl.mu between
+// the map read and the PeakEwma updates specifically to allow this race.
+func TestSessionList_RecordVRpcOutcome_AfterClose(t *testing.T) {
+	sl := newSessionList()
+	h := makeHandleWithAfe(t, 1)
+	sl.OnSessionStarted(h)
+
+	// Seed the AFE's PeakEwma with a known value so we can assert the
+	// post-close call did NOT mutate it.
+	sl.RecordVRpcOutcome(h, 5*time.Millisecond, 1*time.Millisecond, true)
+	afe := sl.afeHandles[afeID(1)]
+	seededE2e := afe.e2eEwma.Value()
+	seededTransport := afe.transportEwma.Value()
+
+	// Full teardown: OnSessionClosing → OnSessionClosed detaches the
+	// handle from handleToAfe entirely.
+	sl.OnSessionClosing(h)
+	sl.OnSessionClosed(h)
+
+	// Post-close RecordVRpcOutcome MUST be a silent no-op.
+	sl.RecordVRpcOutcome(h, 500*time.Millisecond, 100*time.Millisecond, true)
+
+	// Bucket may have been pruned already, but if it survives the
+	// EWMAs must be unchanged (the update we just made was dropped).
+	if afe, ok := sl.afeHandles[afeID(1)]; ok {
+		if afe.e2eEwma.Value() != seededE2e {
+			t.Errorf("e2eEwma mutated post-close: got %v, want seeded %v", afe.e2eEwma.Value(), seededE2e)
+		}
+		if afe.transportEwma.Value() != seededTransport {
+			t.Errorf("transportEwma mutated post-close: got %v, want seeded %v", afe.transportEwma.Value(), seededTransport)
+		}
 	}
 	checkInvariants(t, sl)
 }

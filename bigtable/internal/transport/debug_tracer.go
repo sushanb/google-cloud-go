@@ -217,6 +217,16 @@ const (
 	// ordering, or a force-close bypass) and should be investigated.
 	tagSessionListRefcountUnderflow = "session_list_refcount_underflow"
 
+	// tagSessionListReadyCountUnderflow fires when dropMembershipLocked
+	// would drive sl.readyCount below zero. Under I2 this is unreachable —
+	// inExpectedCount flips true exactly once (in OnSessionStarted) and
+	// dropMembershipLocked is idempotent via the inExpectedCount guard.
+	// A non-zero count here means bookkeeping drifted (an inExpectedCount
+	// increment without the paired OnSessionStarted, or a decrement path
+	// bypassing the guard) and should be investigated before it corrupts
+	// scale-up decisions gated on ReadyCount().
+	tagSessionListReadyCountUnderflow = "session_list_ready_count_underflow"
+
 	// Client configuration polling.
 	tagClientConfigPollFailed     = "client_config_poll_failed"
 	tagClientConfigPollCtxExpired = "client_config_poll_ctx_expired"
