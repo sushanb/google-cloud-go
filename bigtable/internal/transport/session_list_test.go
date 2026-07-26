@@ -24,6 +24,21 @@ import (
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 )
 
+// newSessionHandle mints a SessionHandle wrapping session. The createdAt
+// stamp feeds the pool's lifetime histogram; pass time.Now() from
+// OnActive-style paths or the zero time when the test doesn't care.
+//
+// Test-only helper — production code (session_pool_scaling.go's
+// createSession) mints handles directly with a struct literal so the
+// hot path doesn't take a function-call frame. Shared here rather than
+// per-test file because callers span session_list_test.go,
+// session_pool_test.go, session_pool_afe_test.go,
+// session_pool_lifecycle_test.go, and session_snapshot_test.go — all
+// in the same package.
+func newSessionHandle(session *Session, createdAt time.Time) *SessionHandle {
+	return &SessionHandle{session: session, createdAt: createdAt}
+}
+
 // makeHandleWithAfe creates a SessionHandle whose Session reports the given
 // AfeID. Skips the handshake — sets PeerInfo directly.
 func makeHandleWithAfe(t *testing.T, id afeID) *SessionHandle {

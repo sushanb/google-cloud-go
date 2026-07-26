@@ -142,15 +142,6 @@ type SessionHandle struct {
 	closeRecorded   atomic.Bool
 }
 
-// newSessionHandle creates a new SessionHandle wrapping a Session. The
-// createdAt stamp is used by the pool's lifetime histogram; pass
-// time.Now() from OnActive, or the zero time from tests that don't
-// care about lifetime accounting. Package-internal — SessionHandle is
-// only ever minted from createSession or intra-package test helpers.
-func newSessionHandle(session *Session, createdAt time.Time) *SessionHandle {
-	return &SessionHandle{session: session, createdAt: createdAt}
-}
-
 // IncOutstanding increments outstanding calls.
 func (h *SessionHandle) IncOutstanding() {
 	atomic.AddInt64(&h.outstanding, 1)
