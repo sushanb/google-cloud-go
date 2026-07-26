@@ -202,7 +202,11 @@ func newSessionList() *sessionList {
 // OnActive exactly once per handle by construction, but tests exercise
 // the dedup branch directly.
 func (sl *sessionList) OnSessionStarted(sh *SessionHandle) {
-	if sh == nil || sh.session == nil {
+	if sh == nil {
+		return
+	}
+	if !assertDebugTagf(sh.session != nil, tagSessionListStartedNilSession,
+		"OnSessionStarted called with nil Session on handle %p", sh) {
 		return
 	}
 	id := sh.session.AfeID()

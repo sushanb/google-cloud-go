@@ -30,11 +30,8 @@ import (
 //
 // Test-only helper — production code (session_pool_scaling.go's
 // createSession) mints handles directly with a struct literal so the
-// hot path doesn't take a function-call frame. Shared here rather than
-// per-test file because callers span session_list_test.go,
-// session_pool_test.go, session_pool_afe_test.go,
-// session_pool_lifecycle_test.go, and session_snapshot_test.go — all
-// in the same package.
+// hot path doesn't take a function-call frame. Shared across the
+// package's _test.go files rather than duplicated per file.
 func newSessionHandle(session *Session, createdAt time.Time) *SessionHandle {
 	return &SessionHandle{session: session, createdAt: createdAt}
 }
@@ -485,12 +482,18 @@ func TestSessionList_ReleaseToPool_AfterClosing_NoOp(t *testing.T) {
 	checkInvariants(t, sl)
 }
 
-// TestSessionList_RecordVRpcOutcome_AfterClose asserts the documented
-// detach-then-update path at session_list.go RecordVRpcOutcome: a call
-// that races with OnSessionClosed (i.e. the handle is already deregistered
-// by the time the map read runs) must be dropped silently — no panic,
-// no PeakEwma update, no state mutation. The method drops sl.mu between
-// the map read and the PeakEwma updates specifically to allow this race.
+// TestSessionList_RecordVRpcOutcome_AfterClose pins the "post-close call
+// is a silent no-op" behavior of RecordVRpcOutcome: after full teardown
+// (OnSessionClosing → OnSessionClosed) the handle is out of
+// handleToAfe, so the map lookup returns nil, the method bails, and no
+// PeakEwma seed is disturbed.
+//
+// This test does NOT exercise the documented detach-mid-update race
+// (map lookup returns non-nil afe → sl.mu dropped → close+prune fires
+// → the deferred PeakEwma.Update lands on an orphan struct). Reaching
+// that window requires a concurrent driver or an injectable pause
+// between session_list.go's map read and PeakEwma update; a
+// single-goroutine test can't produce it.
 func TestSessionList_RecordVRpcOutcome_AfterClose(t *testing.T) {
 	sl := newSessionList()
 	h := makeHandleWithAfe(t, 1)

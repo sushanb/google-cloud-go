@@ -227,6 +227,15 @@ const (
 	// scale-up decisions gated on ReadyCount().
 	tagSessionListReadyCountUnderflow = "session_list_ready_count_underflow"
 
+	// tagSessionListStartedNilSession fires when OnSessionStarted is
+	// called with a SessionHandle whose session pointer is nil.
+	// Unreachable in production (createSession populates sh.session
+	// synchronously before the hook fires) — the assertion exists so
+	// that a future caller who accidentally wires a nil-session handle
+	// (e.g. a test double promoted to production) shows up in the
+	// debug counter instead of no-op'ing silently.
+	tagSessionListStartedNilSession = "session_list_started_nil_session"
+
 	// Client configuration polling.
 	tagClientConfigPollFailed     = "client_config_poll_failed"
 	tagClientConfigPollCtxExpired = "client_config_poll_ctx_expired"
