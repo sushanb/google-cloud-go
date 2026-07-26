@@ -197,6 +197,15 @@ const (
 	tagSessionPoolPickLostRace               = "session_pool_pick_lost_race"
 	tagSessionPoolConsecutiveFailuresTripped = "session_pool_consecutive_failures_tripped"
 
+	// tagSessionPoolCheckoutFailedCINil fires on SessionPoolImpl.Invoke's
+	// early return when CheckoutSession failed — pool returns
+	// InvokeResult{} with nil ClusterInfo, so stampAttempt downstream
+	// records TagSessionAttemptNilClusterInfo without any session ever
+	// being picked. Empirically dominates the nil-ClusterInfo population
+	// during pool cold-start (waiters ctx.Done before first session
+	// reaches Ready) and pool-close bursts (drainWaitersWithErr).
+	tagSessionPoolCheckoutFailedCINil = "session_pool_checkout_failed_ci_nil"
+
 	// sessionList bookkeeping violations.
 	//
 	// tagSessionListRefcountUnderflow fires when OnSessionClosed would
