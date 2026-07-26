@@ -464,6 +464,15 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 
 	var result InvokeResult
 	result, invokeErr = sh.session.Invoke(ctx, desc, req)
+	// Checkpoint C: is result.ClusterInfo nil at the pool's post-Invoke
+	// site? This is the caller-visible surface. C - (sum of processResult
+	// A-tags) = the count of nils that come from Session.Invoke early
+	// returns (encode fail, claimSlot lost, Send fail, state != Ready,
+	// awaitInvokeResult ctx.Done with no late frame) — paths that never
+	// reach processResult.
+	if result.ClusterInfo == nil {
+		recordDebugTag(tagVRpcPoolPostInvokeResultClusterInfoNil)
+	}
 	// PeerInfo is set once at session-open and never mutated; a shared
 	// read here lets callers stamp per-attempt transport labels without
 	// reaching back through the pool.

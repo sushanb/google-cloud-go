@@ -182,6 +182,34 @@ const (
 	// connectivity_error_count (labeled <unspecified>).
 	TagSessionAttemptNilClusterInfo DebugTag = "session_attempt_nil_cluster_info"
 
+	// Experimental checkpoint tags — decompose the 402-per-minute
+	// nil-ClusterInfo mystery reported on final_configuration. Three
+	// checkpoints along the code path a caller's InvokeResult traverses:
+	//
+	//   A. processResult's `ci := res.ClusterInfo()` — did the delivery
+	//      onto rpc.resultChan carry a non-nil ClusterInfo? Split by
+	//      cause so we can tell "cancelActiveRPCs delivered res.err"
+	//      from "server error frame with nil ClusterInfo" from "server
+	//      success frame with nil ClusterInfo" (the last is a server
+	//      contract violation).
+	//
+	//   B. processResult after `result.ClusterInfo = ci` — sanity check
+	//      that the assignment stuck. Should equal the sum of the three
+	//      A-tags. A divergence means a data race on InvokeResult.
+	//
+	//   C. SessionPoolImpl.Invoke right after `result, invokeErr =
+	//      sh.session.Invoke(...)`. Catches every path that produces a
+	//      caller-visible InvokeResult — INCLUDING Session.Invoke early
+	//      returns (encode fail, claimSlot lost, Send fail, state != Ready)
+	//      that never reach processResult. C > (A_res_err + A_res_errresp
+	//      + A_server_omitted) tells us how many nils come from those
+	//      pre-processResult paths.
+	tagVRpcPRClusterInfoNilResErr           = "session_pr_ci_nil_res_err"
+	tagVRpcPRClusterInfoNilResErrResp       = "session_pr_ci_nil_res_errresp"
+	tagVRpcPRClusterInfoNilServerOmitted    = "session_pr_ci_nil_server_omitted"
+	tagVRpcPRResultClusterInfoNilAfterAssign = "session_pr_result_ci_nil_after_assign"
+	tagVRpcPoolPostInvokeResultClusterInfoNil = "session_pool_postinvoke_result_ci_nil"
+
 	// TagSessionAttemptEmptyClusterID fires when ClusterInformation is
 	// present on the InvokeResult but ClusterId is empty — a server
 	// contract violation (server should always populate ClusterId on

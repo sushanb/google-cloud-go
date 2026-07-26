@@ -258,7 +258,25 @@ func (s *Session) awaitInvokeResult(ctx context.Context, rpc *vrpcImpl, desc VRp
 func (s *Session) processResult(desc VRpcDescriptor, result *InvokeResult, res vrpcResult) error {
 	result.TransportLatency = time.Since(result.SentAt)
 	ci := res.ClusterInfo()
+	// Checkpoint A: split nil-ClusterInfo cause by which of res.{err,
+	// errResp,resp} was populated at delivery time. Exactly one branch
+	// fires per invocation when ci == nil.
+	if ci == nil {
+		switch {
+		case res.err != nil:
+			recordDebugTag(tagVRpcPRClusterInfoNilResErr)
+		case res.errResp != nil:
+			recordDebugTag(tagVRpcPRClusterInfoNilResErrResp)
+		default:
+			recordDebugTag(tagVRpcPRClusterInfoNilServerOmitted)
+		}
+	}
 	result.ClusterInfo = ci
+	// Checkpoint B: post-assign sanity. Should always match checkpoint A.
+	// A discrepancy would mean a data race on the caller-side InvokeResult.
+	if result.ClusterInfo == nil {
+		recordDebugTag(tagVRpcPRResultClusterInfoNilAfterAssign)
+	}
 	if ci != nil {
 		s.recordCluster(ci.GetClusterId())
 	}
