@@ -75,7 +75,7 @@ type SessionClient interface {
 	// OpenSessionTable returns a SessionTableApi for a standard table,
 	// identified by the leaf table name (e.g. "my-table"). Full
 	// resource composition happens inside the implementation.
-	OpenSessionTable(tableName string) SessionTableApi
+	OpenSessionTable(tableID string) SessionTableApi
 
 	// OpenAuthorizedView returns a SessionTableApi for a specific
 	// authorized view under `table`.

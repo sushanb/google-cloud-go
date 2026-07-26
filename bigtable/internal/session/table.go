@@ -42,7 +42,15 @@ var errReadPoolNil = errors.New("bigtable/session: read pool is nil (unreachable
 // fallback — callers that want fallback wrap sessionTable in
 // bigtable.TableShim.
 type sessionTable struct {
-	tableName      string
+	// tableID is the value stamped as the `table` monitored-resource
+	// label on per-attempt metrics. Shape by resource type, matching
+	// classic (bigtable/open.go + bigtable/table.go:77):
+	//   standard table    → leaf table id ("my-table")
+	//   authorized view   → parent table id (Table.table on classic)
+	//   materialized view → "" (classic never sets Table.table for MV)
+	// Must NOT be the fully-qualified resource name; that would break
+	// dashboards that group by short table id across classic + session.
+	tableID        string
 	readPool       *lazyPool
 	writePool      *lazyPool
 	readVRpcDesc   btransport.VRpcDescriptor
@@ -56,7 +64,7 @@ type sessionTable struct {
 // resource-scoped metadata. metricsFactory may be nil to disable
 // per-attempt metrics.
 func newSessionTable(
-	tableName string,
+	tableID string,
 	openRead func() (Invoker, error),
 	openWrite func() (Invoker, error),
 	readVRpcDesc btransport.VRpcDescriptor,
@@ -65,7 +73,7 @@ func newSessionTable(
 	metricsFactory *metrics.Factory,
 ) *sessionTable {
 	return &sessionTable{
-		tableName:      tableName,
+		tableID:        tableID,
 		readPool:       &lazyPool{open: openRead},
 		writePool:      &lazyPool{open: openWrite},
 		readVRpcDesc:   readVRpcDesc,
@@ -225,7 +233,7 @@ func (t *sessionTable) ensureTracer(ctx context.Context, method string) (context
 	if t.metricsFactory == nil {
 		return ctx, metrics.FromContext(ctx), false // disabled Tracer sentinel; no ownership
 	}
-	fresh := t.metricsFactory.CreateTracer(ctx, t.tableName, false)
+	fresh := t.metricsFactory.CreateTracer(ctx, t.tableID, false)
 	fresh.SetMethod(method)
 	ctx = metrics.NewContext(ctx, &fresh)
 	return ctx, &fresh, true

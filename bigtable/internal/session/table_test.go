@@ -23,6 +23,7 @@ import (
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	"cloud.google.com/go/bigtable/internal/metrics"
 	btransport "cloud.google.com/go/bigtable/internal/transport"
+	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/grpc/codes"
@@ -76,7 +77,7 @@ func newTestTable(t *testing.T, readInv, writeInv Invoker) (*sessionTable, *sdkm
 		openWrite = nil
 	}
 	tbl := newSessionTable(
-		"projects/p/instances/i/tables/test-table",
+		"test-table",
 		openRead,
 		openWrite,
 		&btransport.VRpcDescriptorImpl{MethodName: "test.ReadRow"},
@@ -114,6 +115,39 @@ func sumHistogramSamples(t *testing.T, reader *sdkmetric.ManualReader, name stri
 	return 0, false
 }
 
+// sampleAttribute returns the string value of the named attribute on
+// the first data point of the named histogram. Fails the test if the
+// metric is absent, has zero data points, or the attribute is missing.
+// Used to pin the shape of monitored-resource labels (e.g. `table`).
+func sampleAttribute(t *testing.T, reader *sdkmetric.ManualReader, metricName, attrKey string) string {
+	t.Helper()
+	rm := metricdata.ResourceMetrics{}
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("reader.Collect: %v", err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != metricName {
+				continue
+			}
+			hist, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf("metric %q data is %T, want Histogram[float64]", metricName, m.Data)
+			}
+			if len(hist.DataPoints) == 0 {
+				t.Fatalf("metric %q has no data points", metricName)
+			}
+			v, ok := hist.DataPoints[0].Attributes.Value(attribute.Key(attrKey))
+			if !ok {
+				t.Fatalf("metric %q data point missing attribute %q", metricName, attrKey)
+			}
+			return v.AsString()
+		}
+	}
+	t.Fatalf("metric %q not emitted", metricName)
+	return ""
+}
+
 func assertSamples(t *testing.T, reader *sdkmetric.ManualReader, name string, want uint64) {
 	t.Helper()
 	got, ok := sumHistogramSamples(t, reader, name)
@@ -139,6 +173,24 @@ func TestSessionTableReadRow_RecordsAttemptAndOperation(t *testing.T) {
 	assertSamples(t, reader, "attempt_latencies", 1)
 	assertSamples(t, reader, "attempt_latencies2", 1)
 	assertSamples(t, reader, "operation_latencies", 1)
+}
+
+// TestSessionTable_TableAttributeIsShortID pins the `table` monitored-
+// resource label to the short id passed at construction. Regression
+// guard: the session path used to stamp the fully-qualified resource
+// name here, breaking cross-path dashboards that group by table id.
+func TestSessionTable_TableAttributeIsShortID(t *testing.T) {
+	inv := &fakeInvoker{result: btransport.InvokeResult{Response: &btpb.SessionReadRowResponse{}}}
+	tbl, reader := newTestTable(t, inv, nil)
+
+	if _, err := tbl.ReadRow(context.Background(), &btpb.SessionReadRowRequest{Key: []byte("row1")}); err != nil {
+		t.Fatalf("ReadRow: %v", err)
+	}
+	for _, name := range []string{"attempt_latencies", "attempt_latencies2", "operation_latencies"} {
+		if got := sampleAttribute(t, reader, name, "table"); got != "test-table" {
+			t.Errorf("metric %q: table attribute = %q, want %q (short id, not fully-qualified name)", name, got, "test-table")
+		}
+	}
 }
 
 func TestSessionTableMutateRow_RecordsAttemptAndOperation(t *testing.T) {

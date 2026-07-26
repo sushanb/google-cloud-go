@@ -414,17 +414,17 @@ func (sc *sessionClient) MetricsFactory() *metrics.Factory {
 }
 
 // OpenSessionTable returns a SessionTableApi for a standard table.
-func (sc *sessionClient) OpenSessionTable(tableName string) SessionTableApi {
-	fullName := sc.fullTableName(tableName)
+func (sc *sessionClient) OpenSessionTable(tableID string) SessionTableApi {
+	fullName := sc.fullTableName(tableID)
 	streamFactory := func(ctx context.Context) (btransport.Stream, error) { return sc.stub.OpenTable(ctx) }
-	resource := "table:" + tableName
+	resource := "table:" + tableID
 	openRead := sc.buildLazyOpener(fullName, btransport.TABLE_SESSION, streamFactory,
 		&btpb.OpenTableRequest{TableName: fullName, AppProfileId: sc.cfg.AppProfile, Permission: btpb.OpenTableRequest_PERMISSION_READ},
 		poolKey{resource, permissionRead})
 	openWrite := sc.buildLazyOpener(fullName, btransport.TABLE_SESSION, streamFactory,
 		&btpb.OpenTableRequest{TableName: fullName, AppProfileId: sc.cfg.AppProfile, Permission: btpb.OpenTableRequest_PERMISSION_WRITE},
 		poolKey{resource, permissionWrite})
-	return newSessionTable(fullName, openRead, openWrite, btransport.READ_ROW, btransport.MUTATE_ROW, sc.perResourceMetadata(fullName, "table_name", fullName), sc.metricsFactory)
+	return newSessionTable(tableID, openRead, openWrite, btransport.READ_ROW, btransport.MUTATE_ROW, sc.perResourceMetadata(fullName, "table_name", fullName), sc.metricsFactory)
 }
 
 // OpenAuthorizedView returns a SessionTableApi for an authorized view.
@@ -438,7 +438,7 @@ func (sc *sessionClient) OpenAuthorizedView(table, view string) SessionTableApi 
 	openWrite := sc.buildLazyOpener(fullName, btransport.AUTHORIZED_VIEW_SESSION, streamFactory,
 		&btpb.OpenAuthorizedViewRequest{AuthorizedViewName: fullName, AppProfileId: sc.cfg.AppProfile, Permission: btpb.OpenAuthorizedViewRequest_PERMISSION_WRITE},
 		poolKey{resource, permissionWrite})
-	return newSessionTable(fullName, openRead, openWrite, btransport.READ_ROW_AUTH_VIEW, btransport.MUTATE_ROW_AUTH_VIEW, sc.perResourceMetadata(fullName, "authorized_view_name", fullName), sc.metricsFactory)
+	return newSessionTable(table, openRead, openWrite, btransport.READ_ROW_AUTH_VIEW, btransport.MUTATE_ROW_AUTH_VIEW, sc.perResourceMetadata(fullName, "authorized_view_name", fullName), sc.metricsFactory)
 }
 
 // OpenMaterializedView returns a read-only SessionTableApi for a
@@ -450,7 +450,7 @@ func (sc *sessionClient) OpenMaterializedView(view string) SessionTableApi {
 		func(ctx context.Context) (btransport.Stream, error) { return sc.stub.OpenMaterializedView(ctx) },
 		&btpb.OpenMaterializedViewRequest{MaterializedViewName: fullName, AppProfileId: sc.cfg.AppProfile},
 		poolKey{"mv:" + view, permissionRead})
-	return newSessionTable(fullName, openRead, nil, btransport.READ_ROW_MAT_VIEW, nil, sc.perResourceMetadata(fullName, "materialized_view_name", fullName), sc.metricsFactory)
+	return newSessionTable("", openRead, nil, btransport.READ_ROW_MAT_VIEW, nil, sc.perResourceMetadata(fullName, "materialized_view_name", fullName), sc.metricsFactory)
 }
 
 // Close tears down in the 4-phase order that keeps late callbacks from
