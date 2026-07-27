@@ -155,7 +155,7 @@ func (s *Session) notifyClosed(streamErr error) {
 //  4. Transitions to StateWaitServerClose.
 //  5. The server's EOF eventually drives handleClose → StateClosed.
 //
-// A pool-side monitor (see SessionPoolImpl.startStuckSessionMonitor)
+// A pool-side monitor (see SessionPoolImpl.startSweepStuckSessionsLoop)
 // force-closes sessions stuck in StateWaitServerClose past a grace period
 // so an unresponsive server can't leak Closing sessions indefinitely.
 func (s *Session) Close(ctx context.Context, req *spb.CloseSessionRequest) error {

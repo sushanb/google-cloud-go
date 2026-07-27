@@ -30,13 +30,20 @@ import (
 )
 
 // waitServerCloseGrace bounds StateWaitServerClose before the pool
-// force-closes the session; guarantees deterministic teardown when the
-// server fails to EOF the stream after acknowledging CloseSession.
-// Set to 5 min: long enough that a slow-but-alive server draining
-// in-flight state is not force-closed as collateral damage; the
-// sweeper still runs at Tick's 1s cadence so a genuinely dead session
-// is reclaimed on the next tick past the grace.
+// force-closes the session. 5 min is long enough that a slow-but-alive
+// server still draining in-flight state after acknowledging
+// CloseSession is not force-closed as collateral damage (typical
+// server-side drain is bounded by CloseSession's own reply timeout,
+// well under a minute); a session still stuck past 5 min is almost
+// certainly a hung server or lost stream and needs reclamation.
 const waitServerCloseGrace = 5 * time.Minute
+
+// sweepStuckSessionsInterval is the cadence for the WSC-stuck sweeper.
+// Decoupled from waitServerCloseGrace so worst-case detection is
+// grace + interval (~5m30s) instead of 2×grace (10 min) — no reason
+// to make the loop wake up as slowly as the grace itself, since the
+// per-iteration work is just a stateless walk of sl.AllHandles.
+const sweepStuckSessionsInterval = 30 * time.Second
 
 // sampleActiveUptimes records each Ready session's current age into the
 // session.uptime histogram. Runs without the pool lock so tracer work
@@ -406,8 +413,8 @@ func (p *SessionPoolImpl) startTickLoop(ctx context.Context) {
 // tickOnce runs one Tick with panic recovery + a debounce gate. The
 // tickPending CAS coalesces concurrent invocations to at most one
 // active Tick body — a burst of empty-pool kicks otherwise fires
-// redundant sampleActiveUptimes / sweepStuckSessions before the
-// scalingInProgress gate rejects them.
+// redundant sampleActiveUptimes before the scalingInProgress gate
+// rejects them.
 func (p *SessionPoolImpl) tickOnce(ctx context.Context) {
 	if !p.tickPending.CompareAndSwap(false, true) {
 		return
@@ -469,15 +476,14 @@ func (p *SessionPoolImpl) pruneOnce() {
 }
 
 // startSweepStuckSessionsLoop runs sweepStuckSessions on
-// waitServerCloseGrace cadence until ctx cancels. Deliberately OFF the
-// 1s Tick — a stuck WaitServerClose session only becomes actionable
-// after a full grace has elapsed, so checking more often just burns
-// CPU walking sl.AllHandles. Detection worst-case is 2×grace (session
-// enters WSC right after a tick fires, waits ~grace for the next
-// tick, waits another ~grace for the check to trip).
+// sweepStuckSessionsInterval cadence until ctx cancels. Deliberately
+// OFF the 1s Tick — a stuck WaitServerClose session only becomes
+// actionable after waitServerCloseGrace has elapsed, so checking more
+// often just burns CPU walking sl.AllHandles. Worst-case detection is
+// waitServerCloseGrace + sweepStuckSessionsInterval.
 func (p *SessionPoolImpl) startSweepStuckSessionsLoop(ctx context.Context) {
 	go func() {
-		ticker := time.NewTicker(waitServerCloseGrace)
+		ticker := time.NewTicker(sweepStuckSessionsInterval)
 		defer ticker.Stop()
 
 		for {

@@ -74,9 +74,10 @@ func (p *SessionPoolImpl) snapshotScalingHistory() []ScalingEvent {
 	return out
 }
 
-// Tick is the heartbeat/checkout-triggered driver that samples state,
-// prunes stuck sessions, and launches new-session goroutines when the
-// sizer requests growth. Negative deltas are logged, not actioned.
+// Tick is the heartbeat/checkout-triggered driver that samples state
+// and launches new-session goroutines when the sizer requests growth.
+// Negative deltas are logged, not actioned. Stuck-session sweeping is
+// on its own loop (startSweepStuckSessionsLoop) at a coarser cadence.
 func (p *SessionPoolImpl) Tick(ctx context.Context) {
 	p.recordTimeSeries()
 	p.sampleActiveUptimes(ctx)
