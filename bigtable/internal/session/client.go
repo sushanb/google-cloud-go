@@ -433,7 +433,11 @@ func (sc *sessionClient) OpenMaterializedView(view string) SessionTableApi {
 	fullName := sc.fullMaterializedViewName(view)
 	openRead := sc.buildLazyOpener(fullName, btransport.MATERIALIZED_VIEW_SESSION,
 		func(ctx context.Context) (btransport.Stream, error) { return sc.stub.OpenMaterializedView(ctx) },
-		&btpb.OpenMaterializedViewRequest{MaterializedViewName: fullName, AppProfileId: sc.cfg.AppProfile},
+		&btpb.OpenMaterializedViewRequest{
+			MaterializedViewName: fullName,
+			AppProfileId:         sc.cfg.AppProfile,
+			Permission:           btpb.OpenMaterializedViewRequest_PERMISSION_READ,
+		},
 		poolKey{"mv:" + view, permissionRead})
 	return newSessionTable("", openRead, nil, btransport.READ_ROW_MAT_VIEW, nil, sc.perResourceMetadata(fullName, "materialized_view_name", fullName), sc.metricsFactory)
 }
