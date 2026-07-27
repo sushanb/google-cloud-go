@@ -111,8 +111,9 @@ type SessionPoolImpl struct {
 	waitersCount atomic.Int32
 
 	// consecutiveFailures counts abnormal session closes since the last
-	// OK vRPC (reset atomically on OK). Crossing the threshold trips
-	// the pool: parked waiters are woken with ErrConsecutiveFailures.
+	// successful session-open (cleared in onActive). Crossing the
+	// threshold trips the pool: parked waiters are woken with
+	// ErrConsecutiveFailures.
 	consecutiveFailures         atomic.Int32
 	consecutiveFailureThreshold atomic.Int32
 
@@ -135,10 +136,9 @@ type SessionPoolImpl struct {
 
 // noteVRpcOutcome forwards the outcome to the AFE's PeakEwma trackers
 // (OK-gated). The consecutive-failure counter is NOT reset here —
-// matching Java, only a successful session-open (onActive) clears it,
-// so a long-lived healthy session that never triggers a new open still
-// signals "sustained transport health" via the counter growing under
-// close events, not via per-vRPC OKs.
+// only a successful session-open (onActive) clears it. Resetting on
+// per-vRPC OK would let one long-lived healthy session mask a run
+// of failed opens and keep the breaker from tripping.
 func (p *SessionPoolImpl) noteVRpcOutcome(sh *SessionHandle, e2e, backend time.Duration, ok bool) {
 	p.sl.RecordVRpcOutcome(sh, e2e, backend, ok)
 }

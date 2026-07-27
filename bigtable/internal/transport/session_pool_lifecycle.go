@@ -269,9 +269,10 @@ func (p *SessionPoolImpl) onActive(sh *SessionHandle) {
 	p.m.sessionsOpened.Add(1)
 
 	// A successful session-open signals sustained transport health;
-	// clear the consecutive-failure counter (Java parity: reset lives
-	// in onSessionReady, not on per-vRPC OK). Under sustained failures,
-	// no session reaches this point so the counter grows unimpeded.
+	// clear the consecutive-failure counter. Reset lives here (not on
+	// per-vRPC OK) so a long-lived healthy session can't mask a run
+	// of failing opens. Under sustained failures no session reaches
+	// this point, so the counter grows unimpeded toward the trip.
 	p.consecutiveFailures.Store(0)
 
 	// PeerInfo is guaranteed populated: handleOpenSession parses it
@@ -351,6 +352,11 @@ func (p *SessionPoolImpl) noteAbnormalCloseIfAny(s *Session) {
 	if threshold <= 0 || n < threshold {
 		return
 	}
+	// TODO: reconsider the CAS-reset. Alternative semantics: leave the
+	// counter elevated until a fresh session-open (onActive) clears it,
+	// so a burst of abnormal closes that keeps arriving after a trip
+	// re-drains any newly parked waiters instead of building up a
+	// second budget.
 	if !p.consecutiveFailures.CompareAndSwap(n, 0) {
 		return
 	}
