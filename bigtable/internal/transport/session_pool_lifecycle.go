@@ -184,9 +184,11 @@ func (p *SessionPoolImpl) Close() error {
 	}
 
 	// Phase 2: kick off graceful Close on every session under a bounded
-	// ctx independent of poolCtx, so Session.Close can drain in-flight
-	// RPCs without being killed by poolCancel below.
-	closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// ctx derived from p.poolCtx (not context.Background — this pool
+	// scopes its lifetime to poolCtx). Safe because Phase 4's
+	// poolCancel runs AFTER Phase 3's wg.Wait returns, so Phase 2's
+	// session Close goroutines finish before poolCtx is cancelled.
+	closeCtx, cancel := context.WithTimeout(p.poolCtx, 30*time.Second)
 	defer cancel()
 
 	var wg sync.WaitGroup
