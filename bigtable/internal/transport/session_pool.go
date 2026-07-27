@@ -233,7 +233,7 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
-			return nil, errors.New("session pool is closed")
+			return nil, ErrPoolClosed
 		}
 		picker := p.picker
 		p.mu.Unlock()
