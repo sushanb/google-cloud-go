@@ -32,7 +32,11 @@ import (
 // waitServerCloseGrace bounds StateWaitServerClose before the pool
 // force-closes the session; guarantees deterministic teardown when the
 // server fails to EOF the stream after acknowledging CloseSession.
-const waitServerCloseGrace = 30 * time.Second
+// Set to 5 min: long enough that a slow-but-alive server draining
+// in-flight state is not force-closed as collateral damage; the
+// sweeper still runs at Tick's 1s cadence so a genuinely dead session
+// is reclaimed on the next tick past the grace.
+const waitServerCloseGrace = 5 * time.Minute
 
 // sampleActiveUptimes records each Ready session's current age into the
 // session.uptime histogram. Runs without the pool lock so tracer work
@@ -371,13 +375,14 @@ func (p *SessionPoolImpl) noteAbnormalCloseIfAny(s *Session) {
 const tickInterval = 1 * time.Second
 
 // Start brings the pool up: fires a pre-start Tick to seed min-sessions,
-// then runs the periodic Tick watchdog and AFE prune loop.
-// Non-blocking; idempotent via startOnce.
+// then runs the periodic Tick watchdog, AFE prune loop, and
+// WaitServerClose sweep loop. Non-blocking; idempotent via startOnce.
 func (p *SessionPoolImpl) Start(ctx context.Context) {
 	p.startOnce.Do(func() {
 		p.spawnTickOnce(ctx)
 		p.startTickLoop(ctx)
 		p.startAfePruneLoop(ctx)
+		p.startSweepStuckSessionsLoop(ctx)
 	})
 }
 
@@ -461,4 +466,38 @@ func (p *SessionPoolImpl) pruneOnce() {
 		}
 	}()
 	p.sl.Prune(time.Now())
+}
+
+// startSweepStuckSessionsLoop runs sweepStuckSessions on
+// waitServerCloseGrace cadence until ctx cancels. Deliberately OFF the
+// 1s Tick — a stuck WaitServerClose session only becomes actionable
+// after a full grace has elapsed, so checking more often just burns
+// CPU walking sl.AllHandles. Detection worst-case is 2×grace (session
+// enters WSC right after a tick fires, waits ~grace for the next
+// tick, waits another ~grace for the check to trip).
+func (p *SessionPoolImpl) startSweepStuckSessionsLoop(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(waitServerCloseGrace)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				p.sweepStuckSessionsOnce()
+			}
+		}
+	}()
+}
+
+// sweepStuckSessionsOnce runs one sweepStuckSessions with panic
+// recovery per iteration.
+func (p *SessionPoolImpl) sweepStuckSessionsOnce() {
+	defer func() {
+		if r := recover(); r != nil {
+			btopt.Debugf(nil, "POOL %s sweepStuckSessions panic recovered: %v\n%s", p.poolName, r, debug.Stack())
+		}
+	}()
+	p.sweepStuckSessions()
 }

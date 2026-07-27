@@ -80,7 +80,6 @@ func (p *SessionPoolImpl) snapshotScalingHistory() []ScalingEvent {
 func (p *SessionPoolImpl) Tick(ctx context.Context) {
 	p.recordTimeSeries()
 	p.sampleActiveUptimes(ctx)
-	p.sweepStuckSessions()
 
 	p.mu.Lock()
 	if p.closed || p.scalingInProgress {
