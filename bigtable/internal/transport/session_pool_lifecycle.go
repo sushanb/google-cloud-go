@@ -62,8 +62,8 @@ func (p *SessionPoolImpl) sampleActiveUptimes(ctx context.Context) {
 }
 
 // sweepStuckSessions force-closes sessions parked in StateWaitServerClose
-// beyond waitServerCloseGrace. Runs from Tick; ForceClose calls fire
-// outside the pool lock.
+// beyond waitServerCloseGrace. Driven by startSweepStuckSessionsLoop;
+// ForceClose calls fire outside the pool lock.
 func (p *SessionPoolImpl) sweepStuckSessions() {
 	type victim struct {
 		sess     *Session
