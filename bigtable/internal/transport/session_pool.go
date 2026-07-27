@@ -369,7 +369,7 @@ func (p *SessionPoolImpl) Stats() *PoolStats {
 		if sh.session.State() == StateReady {
 			ready++
 		}
-		if atomic.LoadInt64(&sh.outstanding) > 0 {
+		if sh.outstanding.Load() > 0 {
 			inUse++
 		}
 	}

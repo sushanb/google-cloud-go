@@ -17,7 +17,6 @@ package internal
 import (
 	"reflect"
 	"sort"
-	"sync/atomic"
 	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
@@ -467,9 +466,9 @@ func (p *SessionPoolImpl) LoadBalancingSnapshot() LoadBalancingSnapshot {
 // existing atomics — no lock taken.
 func (h *SessionHandle) Snapshot() SessionHandleSnapshot {
 	return SessionHandleSnapshot{
-		Outstanding:  atomic.LoadInt64(&h.outstanding),
+		Outstanding:  h.outstanding.Load(),
 		LastActivity: h.GetLastActivity(),
-		Picks:        atomic.LoadInt64(&h.picks),
+		Picks:        h.picks.Load(),
 	}
 }
 
