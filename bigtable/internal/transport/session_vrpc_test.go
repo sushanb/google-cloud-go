@@ -211,6 +211,87 @@ func TestInvoke_StatsNilWhenServerOmits(t *testing.T) {
 	}
 }
 
+// TestInvoke_E2EAndTransportLatency pins the InvokeResult.E2ELatency /
+// TransportLatency contract:
+//   - E2ELatency is always set on Recv (wire time, Send→Recv).
+//   - TransportLatency = E2ELatency − BackendLatency, guarded > 0.
+//     Zero when Stats.BackendLatency is missing, or when the
+//     subtraction is non-positive (clock skew).
+// Written after the WireLatency→E2ELatency rename (Java-parity term)
+// per igor-reviewer feedback; locks the semantic swap so a future
+// refactor can't silently return the raw wire time.
+func TestInvoke_E2EAndTransportLatency(t *testing.T) {
+	t.Run("nil_stats_leaves_transport_zero", func(t *testing.T) {
+		res, err := runInvoke(context.Background(), t, func(s *Session, sent *spb.VirtualRpcRequest) {
+			s.handleVRPCResponse(&spb.VirtualRpcResponse{
+				RpcId:   sent.RpcId,
+				Payload: []byte("ok"),
+				// Stats intentionally nil.
+			})
+		})
+		if err != nil {
+			t.Fatalf("Invoke: unexpected err %v", err)
+		}
+		if res.E2ELatency <= 0 {
+			t.Errorf("E2ELatency = %v, want > 0 on successful Recv", res.E2ELatency)
+		}
+		if res.TransportLatency != 0 {
+			t.Errorf("TransportLatency = %v, want 0 when Stats is nil (can't isolate transport)", res.TransportLatency)
+		}
+	})
+
+	t.Run("backend_gt_wire_clock_skew_leaves_transport_zero", func(t *testing.T) {
+		// Server-reported BackendLatency larger than any plausible wire
+		// time — the subtraction goes non-positive and we drop the
+		// sample so p50 isn't dragged toward 0.
+		res, err := runInvoke(context.Background(), t, func(s *Session, sent *spb.VirtualRpcRequest) {
+			s.handleVRPCResponse(&spb.VirtualRpcResponse{
+				RpcId:   sent.RpcId,
+				Payload: []byte("ok"),
+				Stats: &spb.SessionRequestStats{
+					BackendLatency: durationpb.New(24 * time.Hour),
+				},
+			})
+		})
+		if err != nil {
+			t.Fatalf("Invoke: unexpected err %v", err)
+		}
+		if res.E2ELatency <= 0 {
+			t.Errorf("E2ELatency = %v, want > 0", res.E2ELatency)
+		}
+		if res.TransportLatency != 0 {
+			t.Errorf("TransportLatency = %v, want 0 when backend > wire (clock-skew guard)", res.TransportLatency)
+		}
+	})
+
+	t.Run("backend_lt_wire_sets_transport_to_delta", func(t *testing.T) {
+		// Any BackendLatency shorter than the observed wire time gives
+		// a positive delta → TransportLatency = E2ELatency − backend.
+		// Pick 1 microsecond so the delta is basically all of E2ELatency
+		// but strictly less.
+		const backend = 1 * time.Microsecond
+		res, err := runInvoke(context.Background(), t, func(s *Session, sent *spb.VirtualRpcRequest) {
+			s.handleVRPCResponse(&spb.VirtualRpcResponse{
+				RpcId:   sent.RpcId,
+				Payload: []byte("ok"),
+				Stats: &spb.SessionRequestStats{
+					BackendLatency: durationpb.New(backend),
+				},
+			})
+		})
+		if err != nil {
+			t.Fatalf("Invoke: unexpected err %v", err)
+		}
+		if res.E2ELatency <= 0 {
+			t.Fatalf("E2ELatency = %v, want > 0", res.E2ELatency)
+		}
+		want := res.E2ELatency - backend
+		if res.TransportLatency != want {
+			t.Errorf("TransportLatency = %v, want E2ELatency−BackendLatency = %v", res.TransportLatency, want)
+		}
+	})
+}
+
 func TestInvoke_SentAtIsNonZero(t *testing.T) {
 	before := time.Now()
 	res, err := runInvoke(context.Background(), t, func(s *Session, sent *spb.VirtualRpcRequest) {

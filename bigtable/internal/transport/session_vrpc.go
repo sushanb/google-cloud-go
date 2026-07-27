@@ -59,12 +59,20 @@ type InvokeResult struct {
 	// (1, 2, 3, …). Distinguishes warm-up vRPCs (small id) from
 	// established-session vRPCs.
 	RpcIDOnSession int64
-	// TransportLatency is the time between the vRPC frame being handed
-	// to the bidi Send and the response (or server-side error) arriving
-	// on the stream. Approximates network RTT + server queue + Backend;
-	// (TransportLatency - BackendLatency) surfaces "everything except
-	// server processing". Zero when Invoke returned before a Recv event
-	// (context cancellation or pre-Send failure).
+	// E2ELatency is the wall-clock time between handing the vRPC
+	// frame to the bidi Send and the response (or server-side error)
+	// arriving on the stream. Approximates network RTT + server queue
+	// + backend processing. Zero when Invoke returned before a Recv
+	// event (context cancellation or pre-Send failure).
+	E2ELatency time.Duration
+	// TransportLatency isolates the wire + AFE + client-decode
+	// overhead by subtracting the server-reported BackendLatency from
+	// E2ELatency (TransportLatency = E2ELatency − BackendLatency).
+	// Zero when BackendLatency is missing (server didn't populate
+	// Stats), when the call errored pre-Recv, or when the subtraction
+	// is non-positive (clock skew / backend > wire — treated as a
+	// stat we can't trust). Callers wanting the raw round-trip should
+	// read E2ELatency instead.
 	TransportLatency time.Duration
 }
 
@@ -256,7 +264,7 @@ func (s *Session) awaitInvokeResult(ctx context.Context, rpc *vrpcImpl, desc VRp
 // under slotMu, handleVRPCResponse gates the id match BEFORE drainSlot,
 // so deliver can only ever put a matching-id response into resultChan.
 func (s *Session) processResult(desc VRpcDescriptor, result *InvokeResult, res vrpcResult) error {
-	result.TransportLatency = time.Since(result.SentAt)
+	result.E2ELatency = time.Since(result.SentAt)
 	ci := res.ClusterInfo()
 	result.ClusterInfo = ci
 	if ci != nil {
@@ -280,7 +288,16 @@ func (s *Session) processResult(desc VRpcDescriptor, result *InvokeResult, res v
 	result.Response = respMsg
 	result.Stats = res.resp.Stats
 	if res.resp.Stats != nil && res.resp.Stats.BackendLatency != nil {
-		s.recordLatency(res.resp.Stats.BackendLatency.AsDuration())
+		backend := res.resp.Stats.BackendLatency.AsDuration()
+		s.recordLatency(backend)
+		// TransportLatency = E2ELatency − BackendLatency isolates
+		// wire + AFE + client-decode overhead from server processing.
+		// Skip when the delta is non-positive (clock skew or
+		// backend > wire) — those samples can't be trusted for the
+		// per-AFE transport-overhead histograms downstream.
+		if d := result.E2ELatency - backend; d > 0 {
+			result.TransportLatency = d
+		}
 	}
 	return nil
 }

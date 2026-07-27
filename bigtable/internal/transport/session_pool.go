@@ -504,17 +504,16 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 		backendDur = result.Stats.BackendLatency.AsDuration()
 		p.m.backendLatencyHist.record(backendDur)
 	}
-	// ClientTransportLatency = (stream Send→Recv) − backend, i.e. wire +
-	// AFE + client-decode overhead. Skip samples missing either half or
-	// with a non-positive delta (clock skew, backend > stream) so the
-	// p50 isn't dragged toward 0.
-	var transportOverhead time.Duration
-	if result.TransportLatency > 0 && backendDur > 0 {
-		if d := result.TransportLatency - backendDur; d > 0 {
-			transportOverhead = d
-			p.m.transportLatencyHist.record(d)
-			sh.session.RecordTransportOverhead(ctx, desc.Method(), d)
-		}
+	// TransportLatency (wire + AFE + client-decode overhead) is now
+	// computed at the source in Session.processResult as
+	// E2ELatency − BackendLatency (guarded > 0). Zero here means the
+	// server didn't populate Stats, the call errored pre-Recv, or the
+	// subtraction was non-positive (clock skew) — all cases we skip
+	// from the per-AFE transport-overhead histograms so p50 isn't
+	// dragged toward 0.
+	if result.TransportLatency > 0 {
+		p.m.transportLatencyHist.record(result.TransportLatency)
+		sh.session.RecordTransportOverhead(ctx, desc.Method(), result.TransportLatency)
 	}
 	if latency > defaultSlowThreshold {
 		ev := SlowVRpcEvent{
@@ -525,7 +524,8 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 			Success:          invokeErr == nil,
 			PoolWait:         poolWait,
 			BackendLatency:   backendDur,
-			TransportLatency: transportOverhead,
+			E2ELatency:       result.E2ELatency,
+			TransportLatency: result.TransportLatency,
 			RpcIDOnSession:   result.RpcIDOnSession,
 		}
 		ev.SessionAge = start.Sub(sh.session.StartedAt())
