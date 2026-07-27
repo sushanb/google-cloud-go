@@ -19,6 +19,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 )
 
 // --- scalingReason ---------------------------------------------------------
@@ -211,5 +213,51 @@ func TestTick_ScalingInProgressGate(t *testing.T) {
 	p.mu.Unlock()
 	if !stillGated {
 		t.Error("scalingInProgress was flipped by an early-return; the defer should only fire for the winning call")
+	}
+}
+
+// TestTick_CreateSessionPanic_PoolSurvives pins the per-goroutine recover
+// on Tick's createSession fanout. Without it, a panic inside
+// streamFactory / NewSession / hook wiring crashes the whole process
+// (tickOnce's recover fires BEFORE the fire-and-forget goroutine runs).
+// After the fix: the panic is caught, spawns.Done() still fires so
+// Close's Phase-5 wait unblocks, and createSession's own defer stack
+// balances pendingStarts even on the panic path.
+func TestTick_CreateSessionPanic_PoolSurvives(t *testing.T) {
+	panicFactory := func(_ context.Context) (Stream, error) {
+		panic("simulated streamFactory panic")
+	}
+	p := NewSessionPoolImpl(
+		uint64(1), "test-panic-pool", 1, 10, panicFactory,
+		&spb.OpenSessionRequest{ProtocolVersion: 1}, nil, SessionTypeTable,
+	)
+	t.Cleanup(func() { _ = p.Close() })
+
+	// Tick spawns a createSession goroutine; the factory panics inside
+	// createSession → the per-goroutine defer recover must catch it.
+	// If recover is missing this call crashes the test process instead
+	// of returning.
+	p.Tick(context.Background())
+
+	// spawns.Wait must unblock — proves the goroutine's `defer
+	// p.spawns.Done()` ran despite the panic (recover ordering: Done
+	// runs LAST because defers are LIFO, so recover fires first and
+	// then Done fires on unwind).
+	waitCh := make(chan struct{})
+	go func() { p.spawns.Wait(); close(waitCh) }()
+	select {
+	case <-waitCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("spawns.Wait did not return within 2s after panic — goroutine leaked past recover")
+	}
+
+	// pendingStarts must have been released by createSession's own
+	// deferred `reserved` guard, even though the goroutine unwound via
+	// panic instead of a normal error return.
+	p.mu.Lock()
+	pending := p.pendingStarts
+	p.mu.Unlock()
+	if pending != 0 {
+		t.Errorf("pendingStarts after panic = %d, want 0 (createSession's reserved-defer must release on panic too)", pending)
 	}
 }

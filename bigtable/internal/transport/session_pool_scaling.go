@@ -137,9 +137,23 @@ func (p *SessionPoolImpl) Tick(ctx context.Context) {
 	p.mu.Unlock()
 
 	// Fire and forget. Readiness signals via OnActive → signalFree.
+	// Per-goroutine recover: the parent tickOnce's recover fires BEFORE
+	// this goroutine runs (Tick returns after spawning), so an
+	// unhandled panic inside NewSession / streamFactory / hook wiring
+	// would crash the process. Recover locally, tag as create-failed,
+	// and let spawns.Done() unwind so Close's Phase-5 wait isn't blocked.
+	// pendingStarts is released inside createSession's own defer stack
+	// via the `reserved` flag, so a panic before that transfer still
+	// balances the counter.
 	for i := 0; i < delta; i++ {
 		go func() {
 			defer p.spawns.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					recordDebugTag(tagSessionPoolCreateFailed)
+					btopt.Debugf(nil, "POOL %s createSession panic recovered: %v", p.poolName, r)
+				}
+			}()
 			if err := p.createSession(ctx); err != nil {
 				recordDebugTag(tagSessionPoolCreateFailed)
 				btopt.Debugf(nil, "POOL %s Tick createSession failed: %v", p.poolName, err)
@@ -202,7 +216,6 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 	// (not a counter) so long-running pools never overflow; collision
 	// odds at N live sessions ≈ N²/2^33 (~1 in 8k at N=1000).
 	sessionName := fmt.Sprintf("%d-%08x", p.poolID, rand.Uint32())
-	atomic.AddUint64(&p.nextSessionID, 1)
 	p.mu.Unlock()
 
 	// Mint the SessionHandle BEFORE NewSession so per-session hook

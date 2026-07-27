@@ -99,7 +99,6 @@ type SessionPoolImpl struct {
 	streamFactory      func(ctx context.Context) (Stream, error)
 	openSessionRequest *spb.OpenSessionRequest
 	metadata           metadata.MD
-	nextSessionID      uint64
 	sessionType        SessionType
 	poolName           string
 	startOnce          sync.Once
