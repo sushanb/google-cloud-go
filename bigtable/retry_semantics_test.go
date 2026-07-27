@@ -35,11 +35,11 @@
 //     TestSessionTableMutateRow_CtxDoneStopsAtOneAttempt
 //
 //   internal/transport/session_lifecycle_test.go
-//     TestHeartBeatLoop_ForceClosesOnMissedHeartbeat
+//     TestHeartbeatLoop_ForceClosesOnMissedHeartbeat
 //
 // The missed-heartbeat critical case sushanb asked about is composed
 // from two of the above:
-//   - HeartBeatLoop → ForceClose is proven at the transport layer.
+//   - HeartbeatLoop → ForceClose is proven at the transport layer.
 //   - ForceClose tags in-flight vRPCs as StateTransportFailure at
 //     session_vrpc.go:420 (cancelActiveRPCs).
 //   - The retry interceptor then treats StateTransportFailure per

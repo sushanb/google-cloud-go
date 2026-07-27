@@ -222,7 +222,7 @@ func TestSessionTracer_MetricsRoundTrip(t *testing.T) {
 // NOTE: TestSessionTracer_NilHistogramsAreNoOps intentionally does NOT
 // exist on this branch. Mutating the package-global histograms under
 // save/restore races leaked heartbeatLoop goroutines from other tests
-// (e.g. TestHeartBeatLoop_ForceClosesOnMissedHeartbeat) that keep
+// (e.g. TestHeartbeatLoop_ForceClosesOnMissedHeartbeat) that keep
 // calling recordClose on the same globals. The recorders' nil-check
 // paths (early-return when the histogram is nil) are exercised on
 // the upstream-facing feat/bigtable-session-tracer PR branch where no
