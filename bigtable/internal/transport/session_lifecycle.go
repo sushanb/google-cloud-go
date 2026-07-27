@@ -475,6 +475,7 @@ func (s *Session) handleClose(err error) {
 	s.notifyClosing()
 	reason := streamEndReason(err)
 	s.setCloseReason(reason)
+	s.setCloseErr(err)
 	// After setCloseReason (CompareAndSwap-once), the *final* reason may
 	// be an earlier stamp (GoAway / MissedHeartbeat / Error) or the
 	// streamEndReason we just computed. Only flag as abnormal when the

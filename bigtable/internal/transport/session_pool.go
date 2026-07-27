@@ -41,8 +41,45 @@ var ErrNoSessionsAvailable = errors.New("bigtable: no sessions available")
 
 // ErrConsecutiveFailures is returned by CheckoutSession when the pool's
 // consecutive-abnormal-close circuit breaker trips. All parked waiters
-// at trip time are woken with this sentinel.
+// at trip time are woken with an error that either equals this sentinel
+// or wraps it via *consecutiveFailureError (which also carries the last
+// abnormal-close cause and its gRPC status code).
 var ErrConsecutiveFailures = errors.New("bigtable: session pool tripped consecutive-failure threshold")
+
+// consecutiveFailureError decorates ErrConsecutiveFailures with the last
+// abnormal-close error captured by the pool. It preserves both:
+//   - errors.Is(err, ErrConsecutiveFailures) — so retry/observability
+//     paths that already match the sentinel keep working.
+//   - status.Code(err) — inherited from the last abnormal-close error
+//     when that error is a gRPC status (e.g. FailedPrecondition when
+//     the server rejected OpenSession because the resource is still
+//     being created). Falls back to codes.Unknown otherwise.
+//
+// Only constructed via SessionPoolImpl.consecutiveFailureErr, which
+// guarantees inner != nil.
+type consecutiveFailureError struct {
+	inner error
+}
+
+func (e *consecutiveFailureError) Error() string {
+	return fmt.Sprintf("%s (last error: %v)", ErrConsecutiveFailures.Error(), e.inner)
+}
+
+func (e *consecutiveFailureError) Is(target error) bool {
+	return target == ErrConsecutiveFailures
+}
+
+func (e *consecutiveFailureError) Unwrap() error { return e.inner }
+
+// GRPCStatus lets status.Code / status.FromError extract the gRPC code
+// from the underlying cause. Without this shim, callers doing
+// status.Code(err) == codes.FailedPrecondition would see Unknown.
+// status.FromError always returns a non-nil *Status (Unknown on ok=false),
+// so no fallback needed.
+func (e *consecutiveFailureError) GRPCStatus() *status.Status {
+	st, _ := status.FromError(e.inner)
+	return st
+}
 
 // ErrPoolClosed is returned to any CheckoutSession caller parked on
 // the waiter queue when Close() runs. Distinct from
@@ -116,6 +153,13 @@ type SessionPoolImpl struct {
 	// ErrConsecutiveFailures.
 	consecutiveFailures         atomic.Int32
 	consecutiveFailureThreshold atomic.Int32
+
+	// lastAbnormalCloseErr holds the most recent abnormal-close raw error,
+	// captured in noteAbnormalCloseIfAny. When the breaker trips we wrap
+	// this into the ErrConsecutiveFailures poison so waiters see WHY
+	// (e.g. FailedPrecondition ... still being created) instead of only
+	// the generic sentinel.
+	lastAbnormalCloseErr atomic.Pointer[error]
 
 	// m holds observability-only state (counters, ring buffers,
 	// histograms) — see poolMetrics in session_pool_debug.go.

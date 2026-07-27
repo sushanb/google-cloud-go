@@ -285,6 +285,7 @@ func (p *SessionPoolImpl) onActive(sh *SessionHandle) {
 	// of failing opens. Under sustained failures no session reaches
 	// this point, so the counter grows unimpeded toward the trip.
 	p.consecutiveFailures.Store(0)
+	p.lastAbnormalCloseErr.Store(nil)
 
 	// PeerInfo is guaranteed populated: handleOpenSession parses it
 	// synchronously before firing onActive.
@@ -358,11 +359,19 @@ func (p *SessionPoolImpl) noteAbnormalCloseIfAny(s *Session) {
 	if !isAbnormalCloseReason(s.CloseReason()) {
 		return
 	}
+	if e := s.closeError(); e != nil {
+		p.lastAbnormalCloseErr.Store(&e)
+	}
 	n := p.consecutiveFailures.Add(1)
 	threshold := p.consecutiveFailureThreshold.Load()
 	if threshold <= 0 || n < threshold {
 		return
 	}
+	// Snapshot the poison BEFORE the CAS-reset so a concurrent abnormal
+	// close arriving in the reset→drain gap can't swap the "last error"
+	// out from under the waiter drain — trip attribution stays pinned
+	// to the close that actually crossed the threshold.
+	tripErr := p.consecutiveFailureErr()
 	// TODO: reconsider the CAS-reset. Alternative semantics: leave the
 	// counter elevated until a fresh session-open (onActive) clears it,
 	// so a burst of abnormal closes that keeps arriving after a trip
@@ -371,10 +380,25 @@ func (p *SessionPoolImpl) noteAbnormalCloseIfAny(s *Session) {
 	if !p.consecutiveFailures.CompareAndSwap(n, 0) {
 		return
 	}
-	woken := p.drainWaitersWithErr(ErrConsecutiveFailures)
+	woken := p.drainWaitersWithErr(tripErr)
 	if woken > 0 {
 		recordDebugTag(tagSessionPoolConsecutiveFailuresTripped)
 	}
+}
+
+// consecutiveFailureErr builds the error handed to parked waiters on a
+// breaker trip. When a last abnormal-close error is captured, returns a
+// *consecutiveFailureError so that (a) errors.Is against
+// ErrConsecutiveFailures still holds and (b) status.Code inherits the
+// underlying cause's gRPC code (e.g. FailedPrecondition when the server
+// rejected OpenSession because the resource is still being created).
+// Falls back to the bare sentinel when no cause is available.
+func (p *SessionPoolImpl) consecutiveFailureErr() error {
+	last := p.lastAbnormalCloseErr.Load()
+	if last == nil {
+		return ErrConsecutiveFailures
+	}
+	return &consecutiveFailureError{inner: *last}
 }
 
 // tickInterval is the cadence for the periodic Tick watchdog. 1 s

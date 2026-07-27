@@ -77,6 +77,11 @@ type sessionDebug struct {
 	// category (Heartbeat / GoAway / Error / User).
 	closeReason atomic.Pointer[string]
 
+	// closeErr preserves the raw Recv error handed to handleClose. The
+	// pool surfaces this on consecutive-failure breaker trips so operators
+	// see the underlying server rejection instead of only the sentinel.
+	closeErr atomic.Pointer[error]
+
 	// poolCloseRecorded is the once-flag SessionPoolImpl consults so its
 	// sessionsClosed / CloseReasons counters bump exactly once per session
 	// regardless of which removal path arrives first (proactive prune,
@@ -309,6 +314,26 @@ func (s *Session) CloseReason() string {
 		return *p
 	}
 	return ""
+}
+
+// setCloseErr records the raw error that ended the stream. First writer
+// wins so a follow-up close path (e.g. cancelActiveRPCs) can't overwrite
+// the original cause. Nil is treated as "no error" and ignored.
+func (s *Session) setCloseErr(err error) {
+	if err == nil {
+		return
+	}
+	s.closeErr.CompareAndSwap(nil, &err)
+}
+
+// closeError returns the raw error that ended the stream, or nil if
+// none was recorded. Consulted by the pool to surface the underlying
+// server rejection on consecutive-failure trips.
+func (s *Session) closeError() error {
+	if p := s.closeErr.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // SampleUptime records the session's current alive time into the

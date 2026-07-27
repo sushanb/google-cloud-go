@@ -17,11 +17,14 @@ package internal
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	spb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
@@ -261,6 +264,70 @@ func TestConsecutiveFailures_TripWakesParkedWaitersWithSentinel(t *testing.T) {
 		t.Fatalf("waiter queue after trip has %d entries, want 0", remaining)
 	}
 	_ = waiters // silence unused when the test is trimmed
+}
+
+// TestConsecutiveFailures_TripCarriesLastCauseAndGRPCStatus pins the
+// error propagation contract added alongside the abnormal-close
+// counter: when the breaker trips, waiters wake with an error that
+// (a) satisfies errors.Is(err, ErrConsecutiveFailures) — retry paths
+// still work; (b) unwraps to the last session's raw Recv error — the
+// operator sees WHY the trip happened; (c) inherits the underlying
+// gRPC status code via GRPCStatus so status.Code(err) returns the
+// server's rejection code (e.g. FailedPrecondition) instead of Unknown.
+// Without this, a still-being-created MV manifests as
+// "session pool tripped consecutive-failure threshold" with code
+// Unknown — masking the actionable server signal.
+func TestConsecutiveFailures_TripCarriesLastCauseAndGRPCStatus(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+	p.consecutiveFailureThreshold.Store(2)
+
+	// The last abnormal close will carry a synthetic FailedPrecondition
+	// mirroring the shape the server emits when MV backfill is running.
+	const wantMsg = "materialized view is still being created"
+	serverErr := status.Error(codes.FailedPrecondition, wantMsg)
+
+	// One waiter is enough to observe the drain-time wrap.
+	w := &waiter{ready: make(chan struct{})}
+	p.waitersMu.Lock()
+	w.elem = p.waiters.PushBack(w)
+	p.waitersMu.Unlock()
+	p.waitersCount.Add(1)
+
+	done := make(chan error, 1)
+	go func() {
+		<-w.ready
+		p.waitersCount.Add(-1)
+		done <- w.err
+	}()
+
+	// First bump: benign cause, doesn't trip.
+	sh1 := injectActiveSession(t, p, "s1", time.Now())
+	stampCloseReason(sh1.session, "StreamEnd:Unavailable")
+	sh1.session.setCloseErr(errors.New("transient"))
+	p.onClose(sh1, nil)
+
+	// Second bump: the cause we want propagated to the waiter.
+	sh2 := injectActiveSession(t, p, "s2", time.Now())
+	stampCloseReason(sh2.session, "StreamEnd:FailedPrecondition")
+	sh2.session.setCloseErr(serverErr)
+	p.onClose(sh2, nil)
+
+	var got error
+	select {
+	case got = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter not woken after trip")
+	}
+
+	if !errors.Is(got, ErrConsecutiveFailures) {
+		t.Fatalf("errors.Is(err, ErrConsecutiveFailures) = false; err = %v", got)
+	}
+	if code := status.Code(got); code != codes.FailedPrecondition {
+		t.Fatalf("status.Code(err) = %v, want FailedPrecondition; err = %v", code, got)
+	}
+	if !strings.Contains(got.Error(), wantMsg) {
+		t.Fatalf("err text %q missing underlying cause %q", got.Error(), wantMsg)
+	}
 }
 
 func TestConsecutiveFailures_CheckoutSessionReturnsSentinelOnTrip(t *testing.T) {
