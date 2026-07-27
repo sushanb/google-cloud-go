@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"runtime/debug"
 	"sync/atomic"
 	"time"
 
@@ -150,8 +151,14 @@ func (p *SessionPoolImpl) Tick(ctx context.Context) {
 			defer p.spawns.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					recordDebugTag(tagSessionPoolCreateFailed)
-					btopt.Debugf(nil, "POOL %s createSession panic recovered: %v", p.poolName, r)
+					// Distinct tag from tagSessionPoolCreateFailed so ops can
+					// grep panics (client-side bug) apart from error returns
+					// (typically transient). Include debug.Stack() to match
+					// the tickOnce / AFE-prune recover sites — panics inside
+					// third-party code (streamFactory / NewSession / hook
+					// wiring) are exactly where you want the stack trace.
+					recordDebugTag(tagSessionPoolCreatePanic)
+					btopt.Debugf(nil, "POOL %s createSession panic recovered: %v\n%s", p.poolName, r, debug.Stack())
 				}
 			}()
 			if err := p.createSession(ctx); err != nil {

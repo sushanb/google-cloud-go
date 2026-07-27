@@ -194,6 +194,13 @@ const (
 	tagSessionPoolStuckSessionSwept          = "session_pool_stuck_session_swept"
 	tagSessionPoolDrainTimeout               = "session_pool_drain_timeout"
 	tagSessionPoolCreateFailed               = "session_pool_create_failed"
+	// tagSessionPoolCreatePanic distinguishes a recovered panic inside
+	// Tick's createSession fanout (streamFactory / NewSession / hook
+	// wiring) from a plain error return (tagSessionPoolCreateFailed).
+	// The two paths have very different root causes — a panic indicates
+	// a client-side bug, an error is typically transient — so ops
+	// should be able to grep them apart in the debug-tag counters.
+	tagSessionPoolCreatePanic                = "session_pool_create_panic"
 	tagSessionPoolPickLostRace               = "session_pool_pick_lost_race"
 	tagSessionPoolConsecutiveFailuresTripped = "session_pool_consecutive_failures_tripped"
 
