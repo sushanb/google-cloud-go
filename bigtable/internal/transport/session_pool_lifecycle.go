@@ -145,14 +145,10 @@ func (p *SessionPoolImpl) Close() error {
 	p.closed = true
 	p.mu.Unlock()
 
-	// Drain any parked CheckoutSession waiters. Without this, callers
-	// blocked on the FIFO queue only unblock via (a) their own ctx
-	// cancel or (b) an onSlotDrained wave from an in-flight vRPC — a
-	// long-poll caller with context.Background hangs past Close until
-	// Phase-2 forceCloses cascade signalFree, which only fires for the
-	// N in-flight vRPCs (< M parked waiters under pool saturation).
-	// Drain up-front with a pool-closed sentinel so operators get a
-	// specific error, not a hang.
+	// Drain parked waiters with ErrPoolClosed. Without this, long-poll
+	// callers with context.Background hang past Close: only ctx-cancel
+	// or an onSlotDrained wake unblocks them, and cancelActiveRPCs
+	// intentionally skips onSlotDrained on teardown paths.
 	p.drainWaitersWithErr(ErrPoolClosed)
 
 	// Snapshot AFTER marking closed so any onActive races either see
@@ -160,16 +156,14 @@ func (p *SessionPoolImpl) Close() error {
 	// time to be caught here.
 	snapshot := p.sl.AllHandles()
 
-	// Record closes up-front so debug counters reflect retirement
-	// immediately, and drop handles from sl so a racing picker can't
-	// return a retired session. Flipping closingRecorded / closeRecorded
-	// short-circuits the callback chain fired by Phase-2 s.Close so
-	// lifetime histograms and sl aren't double-touched. CAS (not Store)
-	// on both flags: a mid-flight onClosing (GOAWAY / heartbeat trip)
-	// that landed AFTER the AllHandles snapshot but BEFORE this loop
-	// already won its CAS at onClosing:286 and recorded lifetime — a
-	// plain Store here would double-count. Same shape for closeRecorded
-	// so a racing onClose doesn't double-bump recordSessionClose.
+	// Pre-flip closingRecorded / closeRecorded via CAS so a mid-flight
+	// onClosing (GOAWAY / heartbeat trip) that landed after AllHandles
+	// but before this loop can't double-count via its own CAS at
+	// onClosing. closingRecorded is load-bearing (recordLifetime has
+	// no inner guard); closeRecorded is symmetric — recordSessionClose
+	// already dedupes internally, but keeping the CAS reads uniform.
+	// Also drops handles from sl so a picker can't hand back a retired
+	// session before Phase-2 tears them down.
 	for _, sh := range snapshot {
 		if sh == nil || sh.session == nil {
 			continue
@@ -236,7 +230,7 @@ func (p *SessionPoolImpl) Close() error {
 	return nil
 }
 
-// onStart is a no-op callback for session start.
+// onStart is a no-op — retained for SessionHooks shape symmetry.
 func (p *SessionPoolImpl) onStart(ctx context.Context) {}
 
 // onActive publishes a newly-started SessionHandle into sl and clears
@@ -255,16 +249,12 @@ func (p *SessionPoolImpl) onActive(sh *SessionHandle) {
 	delete(p.startingSessions, sh)
 
 	if p.closed {
-		// Dispatch async so this method releases p.mu before the
-		// onClose callback chain (which re-acquires p.mu). Race window:
-		// a session in flight through OpenSession can land here up to
-		// ~30s after Close set p.closed=true.
-		//
-		// Track on p.spawns so Close's Phase-5 wait catches this
-		// goroutine — otherwise ForceClose → onClose →
-		// recordSessionClose → noteAbnormalCloseIfAny can touch pool
-		// metric state after Close has returned and the next test's
-		// metrics init has started.
+		// Dispatch async so we release p.mu before the onClose chain
+		// re-acquires it. Race window: onActive can land ~30s after
+		// Close set p.closed=true. Track on p.spawns so Phase-5 catches
+		// this goroutine; safe to Add(1) after p.closed=true because
+		// createSession's own spawns entry for this session is still
+		// pending in WaitGoroutines — the counter stays > 0.
 		p.spawns.Add(1)
 		go func() {
 			defer p.spawns.Done()
@@ -286,12 +276,11 @@ func (p *SessionPoolImpl) onActive(sh *SessionHandle) {
 	p.signalFree()
 }
 
-// onClosing fires at the FIRST transition out of Ready (handleGoAway,
-// Close, ForceClose, handleClose — whichever wins). Removes the session
-// from the picker's AFE idle queue and the scale-up gate immediately,
-// so replacement can start before teardown completes. sessionList
-// keeps the handle refCount alive so in-flight vRPCs still complete;
-// the final drop happens in onClose.
+// onClosing fires on the FIRST transition out of Ready (handleGoAway,
+// Close, ForceClose, or handleClose). Drops the session from the
+// picker's idle queue and the scale-up gate so replacement can start
+// before teardown completes; refCount keeps in-flight vRPCs alive
+// until onClose finalizes.
 func (p *SessionPoolImpl) onClosing(sh *SessionHandle) {
 	// Still-starting sessions never reached sl; they exit via onClose's
 	// bumpStartingClose path.
@@ -415,12 +404,10 @@ func (p *SessionPoolImpl) tickOnce(ctx context.Context) {
 	p.Tick(ctx)
 }
 
-// spawnTickOnce is the guarded replacement for `go p.tickOnce(ctx)` at
-// every kick site. Bumps p.spawns under p.mu after re-checking
-// p.closed so Close's Phase 1 (also under p.mu) synchronizes-with any
-// concurrent Wait: an Add either lands before Close's Lock or is
-// skipped. Without this, kicks fired during Close's own graceful-close
-// wave leak past Close and race the next test's metrics init.
+// spawnTickOnce is the guarded `go p.tickOnce(ctx)` used at every kick
+// site. Re-checks p.closed and bumps p.spawns under p.mu so an Add
+// either lands before Close's Phase-1 Lock or is skipped — kicks
+// spawned during Close can't leak past p.spawns.Wait.
 func (p *SessionPoolImpl) spawnTickOnce(ctx context.Context) {
 	p.mu.Lock()
 	if p.closed {

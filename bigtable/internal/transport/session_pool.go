@@ -88,12 +88,9 @@ type SessionPoolImpl struct {
 	closed            bool
 	scalingInProgress bool
 	// minSessions / maxSessions are the server-driven pool bounds.
-	// UpdateConfig writes them under p.mu alongside the picker swap;
-	// hot-path readers (CheckoutSession's scale-up gate, onClosing's
-	// replace-slot check) load them without acquiring p.mu, which is
-	// safe because they have no cross-field invariant with picker /
-	// budget / consecutive-failure-threshold. Writes stay under p.mu
-	// so PoolSnapshot (also under p.mu) reads a consistent min/max pair.
+	// Writes go under p.mu so PoolSnapshot reads a consistent pair;
+	// hot-path readers Load() without the lock (no cross-field invariant
+	// with picker/budget/threshold).
 	minSessions        atomic.Int32
 	maxSessions        atomic.Int32
 	streamFactory      func(ctx context.Context) (Stream, error)
@@ -309,7 +306,7 @@ func (p *SessionPoolImpl) drainWaitersWithErr(err error) int {
 	}
 }
 
-// Stats returns the current operational statistics of the session pool.
+// Stats snapshots ready/inUse/starting/pending counts.
 func (p *SessionPoolImpl) Stats() *PoolStats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -364,7 +361,6 @@ func (p *SessionPoolImpl) UpdateConfig(config *spb.SessionClientConfiguration_Se
 	}
 	p.mu.Unlock()
 
-	// Dynamically update sizer thresholds E2E!
 	p.sizer.UpdateConfig(config)
 
 	// Budget was bootstrapped with a placeholder; UpdateConfig on
@@ -413,9 +409,8 @@ func pickerFromLoadBalancing(lbo *spb.LoadBalancingOptions) AfePicker {
 	}
 }
 
-// Invoke checks out a session, runs one vRPC, and returns the InvokeResult
-// (response, cluster info, server Stats, SentAt). RetryInfo from server
-// errors is plumbed through the returned error via gRPC status details.
+// Invoke runs one vRPC on a checked-out session. Server RetryInfo
+// travels via gRPC status details on the returned error.
 func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req interface{}) (InvokeResult, error) {
 	checkoutStart := time.Now()
 	sh, err := p.CheckoutSession(ctx)

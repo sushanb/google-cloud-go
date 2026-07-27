@@ -137,26 +137,18 @@ func (p *SessionPoolImpl) Tick(ctx context.Context) {
 	p.spawns.Add(delta)
 	p.mu.Unlock()
 
-	// Fire and forget. Readiness signals via OnActive → signalFree.
-	// Per-goroutine recover: the parent tickOnce's recover fires BEFORE
-	// this goroutine runs (Tick returns after spawning), so an
-	// unhandled panic inside NewSession / streamFactory / hook wiring
-	// would crash the process. Recover locally, tag as create-failed,
-	// and let spawns.Done() unwind so Close's Phase-5 wait isn't blocked.
-	// pendingStarts is released inside createSession's own defer stack
-	// via the `reserved` flag, so a panic before that transfer still
-	// balances the counter.
+	// Fire and forget; readiness signals via OnActive → signalFree.
+	// Per-goroutine recover: tickOnce's recover fires BEFORE this
+	// goroutine runs (Tick spawns and returns), so an unhandled panic
+	// inside third-party code (NewSession / streamFactory / hook wiring)
+	// would crash the process. Distinct tag from create_failed so ops
+	// can grep panics (client bug) apart from err returns (transient).
+	// createSession's `reserved` defer balances pendingStarts on panic.
 	for i := 0; i < delta; i++ {
 		go func() {
 			defer p.spawns.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					// Distinct tag from tagSessionPoolCreateFailed so ops can
-					// grep panics (client-side bug) apart from error returns
-					// (typically transient). Include debug.Stack() to match
-					// the tickOnce / AFE-prune recover sites — panics inside
-					// third-party code (streamFactory / NewSession / hook
-					// wiring) are exactly where you want the stack trace.
 					recordDebugTag(tagSessionPoolCreatePanic)
 					btopt.Debugf(nil, "POOL %s createSession panic recovered: %v\n%s", p.poolName, r, debug.Stack())
 				}
@@ -273,11 +265,10 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 	p.budget.Release(true)
 	budgetReleased = true
 
-	// Keep this createSession goroutine — tracked by p.spawns — alive
-	// for the entire session lifetime so pool.Close's Phase 5
-	// (p.spawns.Wait) waits for every Session goroutine to exit before
-	// returning. Without this, a session removed by its own onClose can
-	// leak its readLoop past Close and race the next test's metrics init.
+	// Block on WaitGoroutines so this createSession goroutine stays on
+	// p.spawns for the session's entire lifetime — Close's Phase-5 then
+	// waits for every Session's readLoop / heartBeatLoop to exit before
+	// returning.
 	s.WaitGoroutines()
 	return nil
 }
