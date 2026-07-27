@@ -219,7 +219,7 @@ func (p *SessionPoolImpl) Close() error {
 	}
 
 	// Phase 4: cancel poolCtx to bring down any lingering session
-	// goroutines (readLoop / heartBeatLoop supervisors).
+	// goroutines (readLoop / heartbeatLoop supervisors).
 	if p.poolCancel != nil {
 		p.poolCancel()
 	}

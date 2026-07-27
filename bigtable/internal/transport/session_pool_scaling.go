@@ -267,7 +267,7 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 
 	// Block on WaitGoroutines so this createSession goroutine stays on
 	// p.spawns for the session's entire lifetime — Close's Phase-5 then
-	// waits for every Session's readLoop / heartBeatLoop to exit before
+	// waits for every Session's readLoop / heartbeatLoop to exit before
 	// returning.
 	s.WaitGoroutines()
 	return nil

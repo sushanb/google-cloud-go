@@ -295,7 +295,7 @@ type Session struct {
 	// inbound frame extends it via resetHeartbeatDeadline.
 	nextHeartbeatDeadlineNano atomic.Int64
 
-	// heartbeatWake nudges heartBeatLoop to re-evaluate its Timer after
+	// heartbeatWake nudges heartbeatLoop to re-evaluate its Timer after
 	// the atomic deadline moves. Cap-1 non-blocking channel: a burst of
 	// resets coalesces to one wake, so hot-path frame handling stays
 	// allocation-free. Without this, the Timer stays armed to whatever
@@ -325,7 +325,7 @@ type Session struct {
 	// sessionDebug carries the observability state. See session_debug.go.
 	sessionDebug
 
-	// loops tracks readLoop + heartBeatLoop so a supervising owner
+	// loops tracks readLoop + heartbeatLoop so a supervising owner
 	// (SessionPoolImpl.Close) can wait for them to fully unwind — through
 	// their notifyClosing / notifyClosed callback chains — before it
 	// returns. Prevents readLoop's recordClose from racing package-level
