@@ -692,9 +692,6 @@ func closeReasonLabel(req *spb.CloseSessionRequest) string {
 	case spb.CloseSessionRequest_CLOSE_SESSION_REASON_USER:
 		return "User"
 	default:
-		// CLOSE_SESSION_REASON_DOWNSIZE folds here — no client code path
-		// produces it anymore after passive-scaling migration (replace-
-		// on-close replaced the periodic pruneSessions).
 		return "Other"
 	}
 }
