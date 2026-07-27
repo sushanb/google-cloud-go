@@ -100,7 +100,13 @@ func TestConsecutiveFailures_UserReasonNotAbnormal(t *testing.T) {
 	}
 }
 
-func TestConsecutiveFailures_ResetOnSuccessfulVRpc(t *testing.T) {
+// TestConsecutiveFailures_ResetOnSessionOpen pins Java-parity reset
+// semantics: a successful session-open (onActive) clears the
+// consecutive-failure counter — NOT a successful vRPC. Under sustained
+// failures no session reaches Ready, so the counter grows toward the
+// trip threshold; a fresh session opening is the only "sustained
+// transport health" signal that clears it.
+func TestConsecutiveFailures_ResetOnSessionOpen(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	abnormalOnCloseFor(t, p, true)
 	abnormalOnCloseFor(t, p, true)
@@ -108,24 +114,46 @@ func TestConsecutiveFailures_ResetOnSuccessfulVRpc(t *testing.T) {
 		t.Fatalf("precondition: counter = %d, want 2", got)
 	}
 
-	// Inject a live handle and record an ok outcome on it.
-	sh := injectActiveSession(t, p, "healthy", time.Now())
-	p.noteVRpcOutcome(sh, time.Millisecond, time.Millisecond, true)
+	// Fire onActive on a fresh handle — mirrors production's
+	// createSession → hooks.onActive → p.onActive(sh) chain.
+	sh := newSessionHandle(nil, time.Now())
+	stream := newFakeStream()
+	s := NewSession("healthy", stream, SessionHooks{
+		OnStart:  p.onStart,
+		OnActive: func(_ *Session) { p.onActive(sh) },
+		OnClose:  func(_ *Session, err error) { p.onClose(sh, err) },
+	}, SessionTypeTable)
+	s.state.Store(int32(StateReady))
+	sh.session = s
+	p.onActive(sh)
 
 	if got := p.consecutiveFailures.Load(); got != 0 {
-		t.Fatalf("after ok vRPC = %d, want 0", got)
+		t.Fatalf("after successful session-open = %d, want 0", got)
 	}
 }
 
-func TestConsecutiveFailures_FailedVRpcDoesNotReset(t *testing.T) {
+// TestConsecutiveFailures_VRpcOutcomeDoesNotReset pins the flip side
+// of ResetOnSessionOpen: neither an OK nor a failed vRPC affects the
+// counter. Only session-open events (onActive) reset it.
+func TestConsecutiveFailures_VRpcOutcomeDoesNotReset(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	abnormalOnCloseFor(t, p, true)
+	abnormalOnCloseFor(t, p, true)
+	if got := p.consecutiveFailures.Load(); got != 2 {
+		t.Fatalf("precondition: counter = %d, want 2", got)
+	}
 
-	sh := injectActiveSession(t, p, "sad", time.Now())
+	sh := injectActiveSession(t, p, "healthy", time.Now())
+	// OK vRPC — must NOT clear the counter.
+	p.noteVRpcOutcome(sh, time.Millisecond, time.Millisecond, true)
+	if got := p.consecutiveFailures.Load(); got != 2 {
+		t.Errorf("counter after OK vRPC = %d, want 2 (only onActive resets)", got)
+	}
+	// Failed vRPC — also must NOT touch the counter (increment happens
+	// via onClose's noteAbnormalCloseIfAny, not via vRPC outcome).
 	p.noteVRpcOutcome(sh, time.Millisecond, time.Millisecond, false)
-
-	if got := p.consecutiveFailures.Load(); got != 1 {
-		t.Fatalf("failed vRPC changed counter to %d, want 1", got)
+	if got := p.consecutiveFailures.Load(); got != 2 {
+		t.Errorf("counter after failed vRPC = %d, want 2 (vRPC outcome must not touch the counter)", got)
 	}
 }
 

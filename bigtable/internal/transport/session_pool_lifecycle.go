@@ -268,6 +268,12 @@ func (p *SessionPoolImpl) onActive(sh *SessionHandle) {
 
 	p.m.sessionsOpened.Add(1)
 
+	// A successful session-open signals sustained transport health;
+	// clear the consecutive-failure counter (Java parity: reset lives
+	// in onSessionReady, not on per-vRPC OK). Under sustained failures,
+	// no session reaches this point so the counter grows unimpeded.
+	p.consecutiveFailures.Store(0)
+
 	// PeerInfo is guaranteed populated: handleOpenSession parses it
 	// synchronously before firing onActive.
 	p.sl.OnSessionStarted(sh)

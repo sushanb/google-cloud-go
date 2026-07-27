@@ -134,12 +134,13 @@ type SessionPoolImpl struct {
 }
 
 // noteVRpcOutcome forwards the outcome to the AFE's PeakEwma trackers
-// (OK-gated) and, on OK, resets the pool's consecutive-failure counter.
+// (OK-gated). The consecutive-failure counter is NOT reset here —
+// matching Java, only a successful session-open (onActive) clears it,
+// so a long-lived healthy session that never triggers a new open still
+// signals "sustained transport health" via the counter growing under
+// close events, not via per-vRPC OKs.
 func (p *SessionPoolImpl) noteVRpcOutcome(sh *SessionHandle, e2e, backend time.Duration, ok bool) {
 	p.sl.RecordVRpcOutcome(sh, e2e, backend, ok)
-	if ok {
-		p.consecutiveFailures.Store(0)
-	}
 }
 
 // NewSessionPoolImpl creates a new SessionPoolImpl. id is baked into
