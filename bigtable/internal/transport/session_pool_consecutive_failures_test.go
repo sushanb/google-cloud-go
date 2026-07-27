@@ -72,6 +72,34 @@ func TestConsecutiveFailures_CleanCloseDoesNotIncrement(t *testing.T) {
 	}
 }
 
+// TestConsecutiveFailures_UserReasonNotAbnormal pins the fix that keeps
+// pool-driven teardown from tripping the consecutive-failure circuit
+// breaker. Pool.Close's Phase-2 fires s.Close with
+// CLOSE_SESSION_REASON_USER on every session; closeReasonLabel maps that
+// to "User". Without the whitelist entry, isAbnormalCloseReason would
+// classify each close as abnormal and a 100-session Pool.Close would trip
+// the breaker AND drain any late-arriving waiters with
+// ErrConsecutiveFailures instead of ErrPoolClosed.
+func TestConsecutiveFailures_UserReasonNotAbnormal(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+
+	// Drop threshold to 2 so a leaked-classification bug would trip on
+	// the second close instead of needing 10.
+	p.consecutiveFailureThreshold.Store(2)
+
+	// Fire "User" close-reason twice — the label Pool.Close's Phase-2
+	// stamps on every session.
+	for i := 0; i < 2; i++ {
+		sh := injectActiveSession(t, p, "user-close", time.Now())
+		stampCloseReason(sh.session, "User")
+		p.onClose(sh, nil)
+	}
+
+	if got := p.consecutiveFailures.Load(); got != 0 {
+		t.Fatalf("consecutiveFailures after 2 User closes = %d, want 0 (User must be whitelisted; Pool.Close would otherwise trip the breaker on every teardown)", got)
+	}
+}
+
 func TestConsecutiveFailures_ResetOnSuccessfulVRpc(t *testing.T) {
 	p := newTestPool(t, 1, 10)
 	abnormalOnCloseFor(t, p, true)

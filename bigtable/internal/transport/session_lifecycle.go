@@ -547,7 +547,13 @@ func streamEndReason(err error) string {
 func isAbnormalCloseReason(reason string) bool {
 	switch reason {
 	case "StreamEnd:EOF", "StreamEnd:Canceled",
-		"GoAway", "MissedHeartbeat", "Error", "":
+		"GoAway", "MissedHeartbeat", "Error", "",
+		// "User" fires from Session.Close(CLOSE_SESSION_REASON_USER),
+		// which is what Pool.Close's Phase-2 sends on every session
+		// during graceful pool teardown. Treating it abnormal would
+		// trip the consecutive-failure circuit breaker every time
+		// Pool.Close runs on a healthy multi-session pool.
+		"User":
 		return false
 	}
 	return strings.HasPrefix(reason, "StreamEnd")

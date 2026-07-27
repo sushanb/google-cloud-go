@@ -164,15 +164,21 @@ func (p *SessionPoolImpl) Close() error {
 	// immediately, and drop handles from sl so a racing picker can't
 	// return a retired session. Flipping closingRecorded / closeRecorded
 	// short-circuits the callback chain fired by Phase-2 s.Close so
-	// lifetime histograms and sl aren't double-touched.
+	// lifetime histograms and sl aren't double-touched. CAS (not Store)
+	// on both flags: a mid-flight onClosing (GOAWAY / heartbeat trip)
+	// that landed AFTER the AllHandles snapshot but BEFORE this loop
+	// already won its CAS at onClosing:286 and recorded lifetime — a
+	// plain Store here would double-count. Same shape for closeRecorded
+	// so a racing onClose doesn't double-bump recordSessionClose.
 	for _, sh := range snapshot {
-		if sh != nil && sh.session != nil {
-			if !sh.createdAt.IsZero() {
-				p.recordLifetime(time.Since(sh.createdAt))
-			}
+		if sh == nil || sh.session == nil {
+			continue
+		}
+		if sh.closingRecorded.CompareAndSwap(false, true) && !sh.createdAt.IsZero() {
+			p.recordLifetime(time.Since(sh.createdAt))
+		}
+		if sh.closeRecorded.CompareAndSwap(false, true) {
 			p.recordSessionClose(sh.session, "PoolClose")
-			sh.closingRecorded.Store(true)
-			sh.closeRecorded.Store(true)
 		}
 		p.sl.OnSessionClosed(sh)
 	}
@@ -251,10 +257,20 @@ func (p *SessionPoolImpl) onActive(sh *SessionHandle) {
 		// onClose callback chain (which re-acquires p.mu). Race window:
 		// a session in flight through OpenSession can land here up to
 		// ~30s after Close set p.closed=true.
-		go sh.session.ForceClose(&spb.CloseSessionRequest{
-			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR,
-			Description: "pool closed before session became active",
-		})
+		//
+		// Track on p.spawns so Close's Phase-5 wait catches this
+		// goroutine — otherwise ForceClose → onClose →
+		// recordSessionClose → noteAbnormalCloseIfAny can touch pool
+		// metric state after Close has returned and the next test's
+		// metrics init has started.
+		p.spawns.Add(1)
+		go func() {
+			defer p.spawns.Done()
+			sh.session.ForceClose(&spb.CloseSessionRequest{
+				Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR,
+				Description: "pool closed before session became active",
+			})
+		}()
 		return
 	}
 

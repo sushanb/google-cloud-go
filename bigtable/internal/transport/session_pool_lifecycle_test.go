@@ -314,6 +314,34 @@ func TestPoolClose_RecordsLifetimeOncePerSession(t *testing.T) {
 	}
 }
 
+// TestPoolClose_OnClosingBeforePhase1_NoDoubleLifetime pins the reverse
+// race ordering to TestPoolClose_RecordsLifetimeOncePerSession: a
+// notifyClosing (GOAWAY / heartbeat trip) that fires BEFORE Pool.Close's
+// Phase-1 loop must still leave exactly one lifetime recorded.
+// Previously Phase-1 did `sh.closingRecorded.Store(true)` unconditionally,
+// so the racing onClosing (which already recorded lifetime under its own
+// CAS) followed by Phase-1's Store meant Phase-1 also called
+// recordLifetime — double-count. Fix uses CompareAndSwap in Phase-1 too.
+func TestPoolClose_OnClosingBeforePhase1_NoDoubleLifetime(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+	sh := injectActiveSession(t, p, "raced", time.Now().Add(-time.Second))
+
+	// Simulate the race: onClosing wins before Pool.Close's Phase-1
+	// snapshot loop reaches this handle.
+	p.onClosing(sh)
+	if got := len(p.snapshotLifetimes()); got != 1 {
+		t.Fatalf("precondition: onClosing should have recorded 1 lifetime, got %d", got)
+	}
+
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close returned err = %v", err)
+	}
+
+	if got := len(p.snapshotLifetimes()); got != 1 {
+		t.Errorf("lifetimes len after Close = %d, want 1 (Phase-1 must CAS-guard recordLifetime; racing onClosing already recorded it)", got)
+	}
+}
+
 func TestOnClosing_FiresBeforeOnClose_ViaSessionClose(t *testing.T) {
 	// End-to-end: driving Session.ForceClose() must fire OnClosing
 	// (dropping the session from sl.ReadyCount) and the eventual
