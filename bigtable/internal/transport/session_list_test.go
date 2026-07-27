@@ -303,6 +303,47 @@ func TestSessionList_OnSessionClosed_LastSessionDropsFromReady(t *testing.T) {
 	checkInvariants(t, sl)
 }
 
+// TestSessionList_AllHandles_ReflectsMembership pins that AllHandles()
+// returns every handle currently in handleToAfe — every state EXCEPT
+// NotRegistered and Closed. Sessionz's per-session UI iterates this
+// slice, so an implementation slip that drops in-flight or Closing
+// handles would silently blank rows in the debug view.
+func TestSessionList_AllHandles_ReflectsMembership(t *testing.T) {
+	sl := newSessionList()
+	h1 := makeHandleWithAfe(t, 1) // will stay Idle
+	h2 := makeHandleWithAfe(t, 2) // will close
+	h3 := makeHandleWithAfe(t, 1) // will move to Closing (not yet Closed)
+	sl.OnSessionStarted(h1)
+	sl.OnSessionStarted(h2)
+	sl.OnSessionStarted(h3)
+
+	// Move h3 into Closing but NOT Closed — AllHandles should still see it.
+	sl.OnSessionClosing(h3)
+
+	// Fully close h2 — AllHandles must drop it.
+	sl.OnSessionClosing(h2)
+	sl.OnSessionClosed(h2)
+
+	got := sl.AllHandles()
+	if len(got) != 2 {
+		t.Fatalf("AllHandles() len = %d, want 2 (h1 Idle + h3 Closing; h2 fully closed)", len(got))
+	}
+	seen := map[*SessionHandle]bool{}
+	for _, sh := range got {
+		seen[sh] = true
+	}
+	if !seen[h1] {
+		t.Error("AllHandles() missing h1 (Idle)")
+	}
+	if !seen[h3] {
+		t.Error("AllHandles() missing h3 (Closing — refCount kept warm per I6)")
+	}
+	if seen[h2] {
+		t.Error("AllHandles() included h2 which is Closed")
+	}
+	checkInvariants(t, sl)
+}
+
 func TestSessionList_RecordVRpcOutcome_SkipsNonOK(t *testing.T) {
 	sl := newSessionList()
 	h := makeHandleWithAfe(t, 1)

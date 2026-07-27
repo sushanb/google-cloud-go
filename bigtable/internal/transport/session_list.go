@@ -70,6 +70,10 @@ const (
 //   I6  refCount is decremented ONLY on OnSessionClosed (Closing keeps the slot warm)
 //
 // Lock order: sl.mu ONLY. Never take pool.mu while holding sl.mu.
+//
+// Every *afeHandle deref in this file happens under sl.mu with one
+// documented exception: RecordVRpcOutcome deliberately drops the lock
+// between the map lookup and the PeakEwma.Update — see its doc.
 
 // afeHandle is the per-AFE bucket in sessionList: FIFO idle queue,
 // refCount (idle + inFlight + closing per I4/I6), and the two PeakEwma
@@ -244,10 +248,6 @@ func (sl *sessionList) OnSessionStarted(sh *SessionHandle) {
 // Returns nil when id has no bucket or its queue is empty — legitimate
 // races with a concurrent Checkout or an OnSessionClosing that drained
 // the last idle handle.
-//
-// Every *afeHandle deref in this file happens under sl.mu with one
-// documented exception: RecordVRpcOutcome deliberately drops the lock
-// between the map lookup and the PeakEwma.Update — see its doc.
 //
 // Under the drain-driven slot lifecycle the AFE queue only holds
 // sessions with an empty in-flight slot (Invoke's return path no longer
@@ -492,14 +492,21 @@ func (sl *sessionList) Prune(now time.Time) {
 // readyCount if the flag was true. Idempotent — a second call is a
 // no-op. Both OnSessionClosing and OnSessionClosed call this so a
 // handle leaves the "member" set exactly once (I2), regardless of which
-// path runs first or whether both run.
+// path runs first or whether both run. Bails BEFORE the decrement if
+// readyCount is already 0 so the underflow debug tag doesn't leave the
+// counter corrupted at -1 (mirrors the OnSessionClosed refCount
+// underflow guard).
 func (sl *sessionList) dropMembershipLocked(sh *SessionHandle) {
-	if sh.inExpectedCount {
-		sh.inExpectedCount = false
-		sl.readyCount--
-		assertDebugTagf(sl.readyCount >= 0, tagSessionListReadyCountUnderflow,
-			"dropMembershipLocked drove readyCount=%d below zero", sl.readyCount)
+	if !sh.inExpectedCount {
+		return
 	}
+	if !assertDebugTagf(sl.readyCount > 0, tagSessionListReadyCountUnderflow,
+		"dropMembershipLocked would drive readyCount below zero (inExpectedCount=true)") {
+		sh.inExpectedCount = false
+		return
+	}
+	sh.inExpectedCount = false
+	sl.readyCount--
 }
 
 // removeFromReadyLocked removes afe from sl.afesWithReady in O(1) via
