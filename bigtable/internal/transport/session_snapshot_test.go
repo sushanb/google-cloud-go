@@ -129,7 +129,7 @@ func TestSessionHandle_Snapshot(t *testing.T) {
 
 func TestPoolSnapshot_AggregatesSessions(t *testing.T) {
 	pool := NewSessionPoolImpl(
-		PoolIdentity{ID: 1, Perm: PermissionRead},
+		uint64(1),
 		"test:read", 1, 5, nil, nil, nil, SessionTypeTable,
 	)
 

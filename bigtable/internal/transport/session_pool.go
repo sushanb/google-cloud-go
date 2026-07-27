@@ -102,9 +102,7 @@ type SessionPoolImpl struct {
 	nextSessionID      uint64
 	sessionType        SessionType
 	poolName           string
-	// perm is the read/write axis, required at ctor via PoolIdentity.
-	perm      Permission
-	startOnce sync.Once
+	startOnce          sync.Once
 	// tickPending debounces tickOnce so a burst of empty-pool kicks
 	// coalesces to at most one active Tick.
 	tickPending atomic.Bool
@@ -139,36 +137,6 @@ type SessionPoolImpl struct {
 	poolCancel context.CancelFunc
 }
 
-// Permission is the pool's read/write axis, typed so the session-name
-// minter doesn't parse it back out of a display string.
-type Permission uint8
-
-const (
-	PermissionUnknown Permission = iota
-	PermissionRead
-	PermissionWrite
-)
-
-// role returns the short label embedded in session log names.
-func (p Permission) role() string {
-	switch p {
-	case PermissionRead:
-		return "read"
-	case PermissionWrite:
-		return "write"
-	default:
-		panic(fmt.Sprintf("session pool: Permission.role() called on %d", p))
-	}
-}
-
-// PoolIdentity bundles the identifying fields passed to NewSessionPoolImpl.
-type PoolIdentity struct {
-	// ID is the unique pool number baked into every session log name.
-	ID uint64
-	// Perm is the pool's read/write axis.
-	Perm Permission
-}
-
 // noteVRpcOutcome forwards the outcome to the AFE's PeakEwma trackers
 // (OK-gated) and, on OK, resets the pool's consecutive-failure counter.
 func (p *SessionPoolImpl) noteVRpcOutcome(sh *SessionHandle, e2e, backend time.Duration, ok bool) {
@@ -178,13 +146,14 @@ func (p *SessionPoolImpl) noteVRpcOutcome(sh *SessionHandle, e2e, backend time.D
 	}
 }
 
-// NewSessionPoolImpl creates a new SessionPoolImpl.
-func NewSessionPoolImpl(identity PoolIdentity, poolName string, min, max int, streamFactory func(ctx context.Context) (Stream, error), openSessionRequest *spb.OpenSessionRequest, md metadata.MD, sessionType SessionType) *SessionPoolImpl {
+// NewSessionPoolImpl creates a new SessionPoolImpl. id is baked into
+// every session log name so channelz/sessionz can reverse-link back to
+// the pool that owns each session.
+func NewSessionPoolImpl(id uint64, poolName string, min, max int, streamFactory func(ctx context.Context) (Stream, error), openSessionRequest *spb.OpenSessionRequest, md metadata.MD, sessionType SessionType) *SessionPoolImpl {
 	poolCtx, poolCancel := context.WithCancel(context.Background())
 	pool := &SessionPoolImpl{
 		poolName:           poolName,
-		poolID:             identity.ID,
-		perm:               identity.Perm,
+		poolID:             id,
 		streamFactory:      streamFactory,
 		openSessionRequest: openSessionRequest,
 		metadata:           md,
@@ -349,6 +318,13 @@ func (p *SessionPoolImpl) Stats() *PoolStats {
 	ready := 0
 	inUse := 0
 	for _, sh := range p.sl.AllHandles() {
+		// Same nil-guard shape as sampleActiveUptimes and sweepStuckSessions
+		// in session_pool_lifecycle.go — sl.AllHandles is a snapshot and
+		// the underlying handle can be torn down mid-iteration by a
+		// concurrent teardown that beat this walk to sl.mu.
+		if sh == nil || sh.session == nil {
+			continue
+		}
 		if sh.session.State() == StateReady {
 			ready++
 		}
@@ -516,7 +492,7 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 		ev.SessionAge = start.Sub(sh.session.StartedAt())
 		// PeerInfo on the row makes cohort patterns (e.g. failures
 		// clustered on one AFE) visible without a per-session cross-ref.
-		ev.Peer = peerInfoToSnapshot(sh.session.peerInfo.Load())
+		ev.Peer = peerInfoToSnapshot(sh.session.PeerInfo())
 		ev.RemoteAddr = sh.session.RemoteAddr()
 		if invokeErr != nil {
 			// stdlib context errors don't implement GRPCStatus, so

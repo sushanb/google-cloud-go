@@ -89,7 +89,7 @@ func newTestPool(t testing.TB, min, max int) *SessionPoolImpl {
 	t.Helper()
 	factory, closeStreams := newStubStreamFactory()
 	p := NewSessionPoolImpl(
-		PoolIdentity{ID: 1, Perm: PermissionRead},
+		uint64(1),
 		"test-pool",
 		min,
 		max,
@@ -208,7 +208,7 @@ func TestSessionPool_Invoke_RecordsSlowCheckoutFailure(t *testing.T) {
 		return nil, ctx.Err()
 	}
 	p := NewSessionPoolImpl(
-		PoolIdentity{ID: 1, Perm: PermissionRead},
+		uint64(1),
 		"test-pool",
 		0, 1,
 		neverDialing,
@@ -269,7 +269,7 @@ func TestCheckoutSession_ParkedWaiter_DeadlineExceeded(t *testing.T) {
 		return nil, ctx.Err()
 	}
 	p := NewSessionPoolImpl(
-		PoolIdentity{ID: 1, Perm: PermissionRead},
+		uint64(1),
 		"test-pool",
 		0, 1,
 		neverDialing,
@@ -414,14 +414,11 @@ func TestNewSessionPoolImpl_Identity(t *testing.T) {
 	t.Cleanup(closeStreams)
 
 	p := NewSessionPoolImpl(
-		PoolIdentity{ID: 42, Perm: PermissionRead},
+		uint64(42),
 		"test-pool", 1, 10, factory, &spb.OpenSessionRequest{ProtocolVersion: 1}, nil, SessionTypeTable,
 	)
 	if p.poolID != 42 {
 		t.Errorf("poolID = %d, want 42", p.poolID)
-	}
-	if p.perm != PermissionRead {
-		t.Errorf("perm = %v, want PermissionRead", p.perm)
 	}
 	p.Close()
 }
