@@ -125,14 +125,14 @@ const debugTagAttrKey = "tag"
 // emission site (usually one, at most a few).
 const (
 	// Session-lifecycle observations.
-	tagSessionUnknownResponse       = "session_unknown_response"
-	tagSessionOpenWrongState        = "session_open_wrong_state"
-	tagSessionGoawayAfterClose      = "session_goaway_after_close"
-	tagSessionGoawayBeforeStart     = "session_goaway_before_start"
-	tagSessionAbnormalClose         = "session_abnormal_close"
-	tagSessionHeartbeatMissed       = "session_heartbeat_missed"
+	tagSessionUnknownResponse        = "session_unknown_response"
+	tagSessionOpenWrongState         = "session_open_wrong_state"
+	tagSessionGoawayAfterClose       = "session_goaway_after_close"
+	tagSessionGoawayBeforeStart      = "session_goaway_before_start"
+	tagSessionAbnormalClose          = "session_abnormal_close"
+	tagSessionHeartbeatMissed        = "session_heartbeat_missed"
 	tagSessionForceCloseNeverStarted = "session_force_close_never_started"
-	tagSessionCloseNoReason         = "session_close_no_reason"
+	tagSessionCloseNoReason          = "session_close_no_reason"
 	// tagSessionReadLoopPanic fires when readLoop's deferred recover
 	// catches a panic from handleSessionResponse (or any downstream
 	// handler). Session is force-closed with REASON_ERROR carrying the
@@ -191,9 +191,9 @@ const (
 	TagSessionAttemptEmptyClusterID DebugTag = "session_attempt_empty_cluster_id"
 
 	// Pool-scoped anomalies.
-	tagSessionPoolStuckSessionSwept          = "session_pool_stuck_session_swept"
-	tagSessionPoolDrainTimeout               = "session_pool_drain_timeout"
-	tagSessionPoolCreateFailed               = "session_pool_create_failed"
+	tagSessionPoolStuckSessionSwept = "session_pool_stuck_session_swept"
+	tagSessionPoolDrainTimeout      = "session_pool_drain_timeout"
+	tagSessionPoolCreateFailed      = "session_pool_create_failed"
 	// tagSessionPoolCreatePanic distinguishes a recovered panic inside
 	// Tick's createSession fanout (streamFactory / NewSession / hook
 	// wiring) from a plain error return (tagSessionPoolCreateFailed).
@@ -203,6 +203,14 @@ const (
 	tagSessionPoolCreatePanic                = "session_pool_create_panic"
 	tagSessionPoolPickLostRace               = "session_pool_pick_lost_race"
 	tagSessionPoolConsecutiveFailuresTripped = "session_pool_consecutive_failures_tripped"
+	// tagSessionPoolNoBudget fires when createSession's budget.Acquire
+	// returns an error — either poolCtx cancel (teardown) or the
+	// throttler's NewSessionCreationPenalty window expired without an
+	// existing reservation being released. The count is the pool's
+	// "opens throttled" signal; sustained emission means the budget
+	// ceiling is too low for the offered load OR opens are hanging past
+	// the penalty window.
+	tagSessionPoolNoBudget = "session_pool_no_budget"
 
 	// tagSessionPoolCheckoutFailedCINil fires on SessionPoolImpl.Invoke's
 	// early return when CheckoutSession failed — pool returns
