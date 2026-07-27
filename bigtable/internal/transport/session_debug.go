@@ -153,6 +153,22 @@ const (
 	// prior attempt's gRPC code + err (if the retry interceptor stashed
 	// one on ctx).
 	SessionEventRetry SessionEventKind = "retry"
+	// SessionEventProtocolError fires when routeVRPCFrame observes a
+	// state/frame combination that violates the client-server contract:
+	// a frame arrived in a state readLoop shouldn't be running in
+	// (New/Starting/Closed) OR the server's rpc_id didn't match our
+	// active vRPC. Escalated to session teardown via cancelActiveRPCs.
+	// Kept separate from SessionEventLateFrame so operators filtering
+	// sessionz for genuine desyncs aren't swamped by benign
+	// late-after-cancel drops.
+	SessionEventProtocolError SessionEventKind = "protocol-error"
+	// SessionEventLateFrame fires when routeVRPCFrame drops a frame
+	// because there's no active vRPC on this session (activeVRPC()==nil).
+	// This is a documented race — the caller ctx.Done'd and cancelled
+	// the slot, but the server's response arrived before the cancel
+	// landed on the wire. Not a protocol violation; the session stays
+	// healthy and the frame is dropped.
+	SessionEventLateFrame SessionEventKind = "late-frame"
 )
 
 // SessionEvent is one entry in a session's per-session debug ring buffer.

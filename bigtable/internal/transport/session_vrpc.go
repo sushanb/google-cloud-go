@@ -270,6 +270,11 @@ func (s *Session) processResult(desc VRpcDescriptor, result *InvokeResult, res v
 	}
 	respMsg, decodeErr := desc.Decode(res.resp.Payload)
 	if decodeErr != nil {
+		// StateServerResult per SESSION_SPEC #9: the server sent a
+		// response, so the request likely COMMITTED even if we can't
+		// parse the reply. Retrying an idempotent-only-under-strict-ID
+		// mutation could double-apply. Callers with a genuine idempotency
+		// token can override at the retry-oracle level.
 		return tagErr(StateServerResult, fmt.Errorf("decode vRPC response: %w", decodeErr))
 	}
 	result.Response = respMsg
@@ -318,9 +323,32 @@ func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 // hook on every drain, quiescence signalling in Closing) lives here
 // so the two call sites can't drift.
 //
-// A vRPC frame is only expected while the session is Ready or Closing
-// (drain window). Any other state means either a bug in state tracking
-// or a server retransmit after teardown — drop.
+// Frame gating (per-scenario handling, per mutianf review on #20213 —
+// silent drops are dangerous; escalate genuine protocol violations to
+// a full session teardown so the pool removes the session from routing
+// and the caller isn't left waiting on a session the server has
+// desynced from):
+//
+//   - State ∈ {Ready, Closing, WaitServerClose}: expected. The drain
+//     window keeps accepting frames until the server's EOF.
+//   - State ∈ {New, Starting, Closed}: unrecoverable state-tracking
+//     inconsistency. Emit SessionEventProtocolError + ForceClose to
+//     get the OnClosing/OnClose hooks to remove the session from the
+//     pool's AFE routing (SESSION_SPEC #2: cancelActiveRPCs alone
+//     leaves a Ready session orphaned from the AFE queue). In practice
+//     this branch is unreachable in production — readLoop only runs
+//     post-Start (state ≥ Ready) and ForceClose no-ops on Closed via
+//     the transitionTo CAS. Kept as belt-and-suspenders: cheap, and
+//     the id-mismatch branch below IS live under wire corruption.
+//   - Nil active vRPC: documented ctx.Done race — the caller cancelled
+//     the slot and the server's response landed after. NOT a protocol
+//     violation. Emit SessionEventLateFrame (separate kind so operators
+//     grep-ing "protocol-error" don't see benign late-frame drops),
+//     drop the frame, keep the session healthy.
+//   - RPC id mismatch: genuine protocol desync (server sent a response
+//     for a different id than our active vRPC). Emit
+//     SessionEventProtocolError + ForceClose so the caller gets a
+//     terminal error AND the session leaves the pool cleanly.
 //
 // The two call sites differ only in:
 //   - frameName / nilTag / counter — labels + which atomic bumps
@@ -331,19 +359,34 @@ func (s *Session) handleVRPCErrorResponse(errResp *spb.ErrorResponse) {
 // deliver already fired the terminal error; nothing to do.
 func (s *Session) routeVRPCFrame(rpcID int64, frameName, nilTag string, counter *atomic.Int64, result vrpcResult) {
 	st := s.State()
-	if !assertDebugTagf(st == StateReady || st == StateClosing, tagSessionVRPCResponseWrongState,
-		"%s for rpc_id=%d arrived in state %s", frameName, rpcID, st) {
+	if st != StateReady && st != StateClosing && st != StateWaitServerClose {
+		recordDebugTagAt(lvl.Error, tagSessionVRPCResponseWrongState)
+		s.recordEvent(SessionEventProtocolError,
+			"%s for rpc_id=%d arrived in state %s — force-closing session",
+			frameName, rpcID, st)
+		s.ForceClose(&spb.CloseSessionRequest{
+			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR,
+			Description: fmt.Sprintf("protocol error: %s for rpc_id=%d in state %s", frameName, rpcID, st),
+		})
 		return
 	}
 	rpc := s.activeVRPC()
 	if rpc == nil {
 		recordDebugTag(nilTag)
-		s.debugf("dropping %s for rpc_id=%d — no in-flight RPC tracked", frameName, rpcID)
+		s.recordEvent(SessionEventLateFrame,
+			"%s for rpc_id=%d dropped — no in-flight RPC tracked (late frame after ctx.Done cancel)",
+			frameName, rpcID)
 		return
 	}
 	if rpc.id != rpcID {
 		recordDebugTag(tagSessionVRPCIDMismatch)
-		s.debugf("dropping %s rpc_id=%d != in-flight rpc_id=%d", frameName, rpcID, rpc.id)
+		s.recordEvent(SessionEventProtocolError,
+			"%s rpc_id=%d != in-flight rpc_id=%d — server desync, force-closing session",
+			frameName, rpcID, rpc.id)
+		s.ForceClose(&spb.CloseSessionRequest{
+			Reason:      spb.CloseSessionRequest_CLOSE_SESSION_REASON_ERROR,
+			Description: fmt.Sprintf("protocol error: %s rpc_id=%d != active rpc_id=%d", frameName, rpcID, rpc.id),
+		})
 		return
 	}
 	drained, cancel, ok := s.drainSlot(rpc)
