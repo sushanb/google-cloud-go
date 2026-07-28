@@ -86,7 +86,7 @@ func (c *Client) getOrCreateSessionTable(table string) session.TableAPI {
 	if st, ok := c.sessionTables[key]; ok {
 		return st
 	}
-	st := c.sessionImpl.OpenSessionTable(table)
+	st := c.sessionImpl.OpenTable(table)
 	c.sessionTables[key] = st
 	return st
 }

@@ -111,15 +111,15 @@ type Config struct {
 	BackgroundCtx context.Context
 }
 
-// managedPool bundles a pool with its config-listener unregister
+// managedSessionPool bundles a pool with its config-listener unregister
 // thunk so the listener can be detached before pool teardown.
-type managedPool struct {
+type managedSessionPool struct {
 	pool       SessionPool
 	unregister func()
 }
 
 // permission is the read/write axis of a pool's identity. Kept as a
-// typed enum (not a string suffix on the map key) so getOrCreatePool
+// typed enum (not a string suffix on the map key) so getOrCreateSessionPool
 // doesn't have to reverse-parse the key to label the pool.
 type permission int
 
@@ -166,10 +166,16 @@ func (k poolKey) less(other poolKey) bool {
 // all three. backgroundCancel unwinds every per-pool goroutine parented
 // on the internally-created background ctx.
 type sessionClient struct {
-	cfg              Config
-	channelPool      ChannelPool
-	stub             btpb.BigtableClient
-	metricsFactory   *metrics.Factory
+	cfg            Config
+	channelPool    ChannelPool
+	stub           btpb.BigtableClient
+	metricsFactory *metrics.Factory
+	// configManager runs the server-driven GetClientConfiguration poll
+	// loop for the lifetime of this Client. Production runtime state
+	// (not debug/test) — its output drives Diverter.SetSessionLoad,
+	// per-pool UpdateConfig reshapes (bounds, picker, load-balancing
+	// strategy), and future eager-scale directives. Also surfaced on
+	// /debug/configz for operator visibility.
 	configManager    *btransport.ClientConfigurationManager
 	backgroundCancel context.CancelFunc // release when Close() runs
 	// dsm + connRecycler are the lifecycle monitors classic clients get
@@ -181,9 +187,9 @@ type sessionClient struct {
 	dsm          *btransport.DynamicScaleMonitor
 	connRecycler *btransport.ConnectionRecycler
 
-	poolsMu    sync.Mutex
-	pools      map[poolKey]*managedPool
-	nextPoolID atomic.Uint64
+	sessionPoolsMu sync.Mutex
+	sessionPools   map[poolKey]*managedSessionPool
+	nextPoolID     atomic.Uint64
 }
 
 // NewSessionClient constructs a standalone SessionClient. It owns the
@@ -349,8 +355,15 @@ func newSessionClientFromParts(channelPool ChannelPool, stub btpb.BigtableClient
 		channelPool:    channelPool,
 		stub:           stub,
 		metricsFactory: metricsFactory,
-		pools:          make(map[poolKey]*managedPool),
+		sessionPools:   make(map[poolKey]*managedSessionPool),
 	}
+	// stub == nil only happens on the test-only newSessionClientFromParts
+	// path (unit tests wiring a fake ChannelPool without a real gRPC stub).
+	// In that mode we do NOT construct a ClientConfigurationManager, do
+	// NOT poll GetClientConfiguration, and do NOT fall back to any
+	// default config — pools open with whatever seed the test supplies,
+	// and SessionLoadListener never fires. Production NewClient always
+	// supplies a stub.
 	if stub != nil {
 		sc.configManager = btransport.NewClientConfigurationManager(
 			stub, sc.fullInstanceName(), cfg.AppProfile, cfg.ConfigMD, nil,
@@ -433,8 +446,8 @@ func (sc *sessionClient) MetricsFactory() *metrics.Factory {
 	return sc.metricsFactory
 }
 
-// OpenSessionTable returns a TableAPI for a standard table.
-func (sc *sessionClient) OpenSessionTable(tableID string) TableAPI {
+// OpenTable returns a TableAPI for a standard table.
+func (sc *sessionClient) OpenTable(tableID string) TableAPI {
 	fullName := sc.fullTableName(tableID)
 	streamFactory := func(ctx context.Context) (btransport.Stream, error) { return sc.stub.OpenTable(ctx) }
 	resource := "table:" + tableID
@@ -490,12 +503,12 @@ func (sc *sessionClient) OpenMaterializedView(view string) TableAPI {
 //  5. Close the underlying channel pool.
 //  6. Shut down the metrics factory (final flush).
 func (sc *sessionClient) Close() error {
-	sc.poolsMu.Lock()
-	defer sc.poolsMu.Unlock()
+	sc.sessionPoolsMu.Lock()
+	defer sc.sessionPoolsMu.Unlock()
 	if sc.configManager != nil {
 		sc.configManager.Close()
 	}
-	for _, mp := range sc.pools {
+	for _, mp := range sc.sessionPools {
 		if mp.unregister != nil {
 			mp.unregister()
 		}
@@ -507,9 +520,9 @@ func (sc *sessionClient) Close() error {
 	// Stop the lifecycle monitors before closing the pool so neither
 	// tries to dial/replace/scale a pool that's mid-teardown. Mirrors
 	// managedChannelPool.Close in bigtable/channel_pool_factory.go.
-	// Safe to call under sc.poolsMu: neither Stop callback reaches back
+	// Safe to call under sc.sessionPoolsMu: neither Stop callback reaches back
 	// into sessionClient. If that changes, hoist Stop calls above the
-	// mutex — otherwise a callback that re-acquires poolsMu deadlocks.
+	// mutex — otherwise a callback that re-acquires sessionPoolsMu deadlocks.
 	if sc.dsm != nil {
 		sc.dsm.Stop()
 	}
@@ -541,7 +554,7 @@ func (sc *sessionClient) buildLazyOpener(
 		return nil
 	}
 	return func() (Invoker, error) {
-		pool, err := sc.createPoolForPayload(resourceName, sessionDesc, streamFactory, payload, key)
+		pool, err := sc.createSessionPoolForPayload(resourceName, sessionDesc, streamFactory, payload, key)
 		if err != nil {
 			return nil, err
 		}
@@ -552,11 +565,11 @@ func (sc *sessionClient) buildLazyOpener(
 	}
 }
 
-// createPoolForPayload marshals the resource-typed OpenXxxRequest
+// createSessionPoolForPayload marshals the resource-typed OpenXxxRequest
 // into the transport-level OpenSessionRequest envelope, builds routing
 // metadata via the descriptor's MetadataFn, and delegates to
-// getOrCreatePool for cache-hit-or-construct.
-func (sc *sessionClient) createPoolForPayload(
+// getOrCreateSessionPool for cache-hit-or-construct.
+func (sc *sessionClient) createSessionPoolForPayload(
 	resourceName string,
 	sessionDesc *btransport.SessionDescriptor,
 	streamFactory func(ctx context.Context) (btransport.Stream, error),
@@ -601,13 +614,13 @@ func (sc *sessionClient) createPoolForPayload(
 	if max <= 0 {
 		max = defaultMaxSessions
 	}
-	return sc.getOrCreatePool(key, min, max, streamFactory, handshake, md, sessionDesc.Type), nil
+	return sc.getOrCreateSessionPool(key, min, max, streamFactory, handshake, md, sessionDesc.Type), nil
 }
 
-// getOrCreatePool ports SessionManager.GetOrCreateSessionPool:
+// getOrCreateSessionPool ports SessionManager.GetOrCreateSessionPool:
 // dedups on key, mints a display name, constructs the pool, wires
 // the config listener + background loops.
-func (sc *sessionClient) getOrCreatePool(
+func (sc *sessionClient) getOrCreateSessionPool(
 	key poolKey,
 	min, max int,
 	streamFactory func(ctx context.Context) (btransport.Stream, error),
@@ -615,9 +628,9 @@ func (sc *sessionClient) getOrCreatePool(
 	md metadata.MD,
 	sessionType btransport.SessionType,
 ) SessionPool {
-	sc.poolsMu.Lock()
-	if mp, ok := sc.pools[key]; ok {
-		sc.poolsMu.Unlock()
+	sc.sessionPoolsMu.Lock()
+	if mp, ok := sc.sessionPools[key]; ok {
+		sc.sessionPoolsMu.Unlock()
 		return mp.pool
 	}
 	id := sc.nextPoolID.Add(1)
@@ -629,22 +642,22 @@ func (sc *sessionClient) getOrCreatePool(
 		id,
 		poolName, min, max, streamFactory, openSessionRequest, md, sessionType,
 	)
-	mp := &managedPool{pool: pool}
-	sc.pools[key] = mp
+	mp := &managedSessionPool{pool: pool}
+	sc.sessionPools[key] = mp
 	configManager := sc.configManager
 	backgroundCtx := sc.cfg.BackgroundCtx
-	sc.poolsMu.Unlock()
+	sc.sessionPoolsMu.Unlock()
 
 	if configManager != nil {
 		unregister := configManager.AddSessionPoolListener(func(config *btpb.SessionClientConfiguration_SessionPoolConfiguration) {
 			pool.UpdateConfig(config)
 		})
-		sc.poolsMu.Lock()
-		if cur, stillThere := sc.pools[key]; stillThere && cur == mp {
+		sc.sessionPoolsMu.Lock()
+		if cur, stillThere := sc.sessionPools[key]; stillThere && cur == mp {
 			mp.unregister = unregister
-			sc.poolsMu.Unlock()
+			sc.sessionPoolsMu.Unlock()
 		} else {
-			sc.poolsMu.Unlock()
+			sc.sessionPoolsMu.Unlock()
 			unregister()
 		}
 	}
@@ -754,15 +767,15 @@ type poolEntry struct {
 // orderedPoolEntries snapshots the pools map under lock and returns
 // its non-nil entries sorted by poolKey.
 func (sc *sessionClient) orderedPoolEntries() []poolEntry {
-	sc.poolsMu.Lock()
-	entries := make([]poolEntry, 0, len(sc.pools))
-	for k, mp := range sc.pools {
+	sc.sessionPoolsMu.Lock()
+	entries := make([]poolEntry, 0, len(sc.sessionPools))
+	for k, mp := range sc.sessionPools {
 		if mp == nil || mp.pool == nil {
 			continue
 		}
 		entries = append(entries, poolEntry{key: k, pool: mp.pool})
 	}
-	sc.poolsMu.Unlock()
+	sc.sessionPoolsMu.Unlock()
 	sort.Slice(entries, func(i, j int) bool { return entries[i].key.less(entries[j].key) })
 	return entries
 }

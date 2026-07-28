@@ -50,7 +50,7 @@ type SessionPool interface {
 
 	// Start brings the pool up: seeds min-sessions synchronously, then
 	// spawns the periodic Tick watchdog + AFE prune loops. Idempotent
-	// per-pool (call once from getOrCreatePool); loops run until the
+	// per-pool (call once from getOrCreateSessionPool); loops run until the
 	// ctx passed here is cancelled.
 	Start(ctx context.Context)
 

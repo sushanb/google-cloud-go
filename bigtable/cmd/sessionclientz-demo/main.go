@@ -92,7 +92,7 @@ func main() {
 	defer sc.Close()
 
 	// Drive some traffic so sessionz / loadz have live data to render.
-	tbl := sc.OpenSessionTable(*table)
+	tbl := sc.OpenTable(*table)
 	defer tbl.Close()
 	go driveTraffic(ctx, tbl)
 
@@ -119,7 +119,7 @@ func main() {
 // sessionz / loadz have live data to render. SessionReadRowRequest
 // carries only the row key + optional filter — table / app-profile
 // identity is baked into the underlying session (established by the
-// OpenTableRequest that session.OpenSessionTable emits behind the
+// OpenTableRequest that session.OpenTable emits behind the
 // scenes). Errors are logged but don't stop the loop — the demo
 // prioritizes the debug view working over any single RPC succeeding.
 func driveTraffic(ctx context.Context, tbl session.TableAPI) {
