@@ -56,6 +56,13 @@ type Client struct {
 	backgroundCtx              context.Context
 	backgroundCancel           context.CancelFunc
 
+	// tcpStats is the per-connection TCP_INFO collector that backs the
+	// /debug/tcpz/ view. Auto-constructed in NewClientWithConfig when
+	// ClientConfig.EnableClientDebug is true; nil otherwise. Exposed
+	// via Client.TCPStats() so callers wiring debugview.Handler don't
+	// have to construct + attach TCPStats separately.
+	tcpStats *TCPStats
+
 	// sessionTables caches per-resource TableAPI instances so
 	// repeat Open* calls return the same handle (and by extension the
 	// same underlying session pools). SessionClient does not cache; the
@@ -172,6 +179,23 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 
 	// Allow non-default service account in DirectPath.
 	o = append(o, internaloption.AllowNonDefaultServiceAccount(true))
+
+	// Auto-construct the /debug/tcpz/ collector when debug is on so
+	// callers don't have to attach TCPStats.ClientOption() themselves.
+	// The dial option is applied to BOTH the classic and session
+	// channel pools (both dial from `o`), so tcpz sees every connection
+	// the Client uses. Stored on the Client below (c.tcpStats) and
+	// surfaced via Client.TCPStats() for debugview.Handler wiring.
+	// Callers who bring their own bigtable.NewTCPStats() and pass its
+	// ClientOption via opts should NOT combine that with
+	// EnableClientDebug=true — grpc.WithContextDialer is last-write-
+	// wins, so the caller-supplied collector would be silently
+	// overridden and register nothing.
+	var tcpStats *TCPStats
+	if config.EnableClientDebug {
+		tcpStats = NewTCPStats()
+		o = append(o, tcpStats.ClientOption())
+	}
 	o = append(o, opts...)
 
 	// TODO(b/372244283): Remove after b/358175516 has been fixed
@@ -226,6 +250,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		config:                  config,
 		diverter:                btransport.NewDiverter(1.0),
 		sessionTables:           make(map[string]session.TableAPI),
+		tcpStats:                tcpStats,
 	}
 	c.backgroundCtx, c.backgroundCancel = context.WithCancel(context.Background())
 
@@ -279,6 +304,18 @@ func (c *Client) Close() error {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// TCPStats returns the per-connection TCP_INFO collector attached to
+// this Client's channel pools. Non-nil when ClientConfig.EnableClientDebug
+// is true (NewClientWithConfig auto-constructs + attaches it); nil
+// otherwise. Wire the returned value into debugview.Handler(client, ...)
+// to expose /debug/tcpz/. Callers who need TCPStats for reasons other
+// than the debug view can still bring their own via
+// bigtable.NewTCPStats() + tcpStats.ClientOption() in opts — but they
+// should NOT combine that with EnableClientDebug=true.
+func (c *Client) TCPStats() *TCPStats {
+	return c.tcpStats
 }
 
 func (c *Client) fullInstanceName() string {
