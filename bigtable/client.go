@@ -56,12 +56,12 @@ type Client struct {
 	backgroundCtx              context.Context
 	backgroundCancel           context.CancelFunc
 
-	// sessionTables caches per-resource SessionTableApi instances so
+	// sessionTables caches per-resource TableAPI instances so
 	// repeat Open* calls return the same handle (and by extension the
 	// same underlying session pools). SessionClient does not cache; the
 	// consumer (this Client) is responsible.
 	sessionTablesMu sync.Mutex
-	sessionTables   map[string]session.SessionTableApi
+	sessionTables   map[string]session.TableAPI
 }
 
 // ClientConfig has configurations for the client.
@@ -208,7 +208,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		featureFlagsMD:          directAccessMD,
 		config:                  config,
 		diverter:                btransport.NewDiverter(1.0),
-		sessionTables:           make(map[string]session.SessionTableApi),
+		sessionTables:           make(map[string]session.TableAPI),
 	}
 	c.backgroundCtx, c.backgroundCancel = context.WithCancel(context.Background())
 

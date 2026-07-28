@@ -160,7 +160,7 @@ func (k poolKey) less(other poolKey) bool {
 
 // sessionClient is the internal implementation of the SessionClient
 // interface. Owns the channel pool + gRPC stub + configuration
-// manager, and vends per-resource SessionTableApi instances.
+// manager, and vends per-resource TableAPI instances.
 //
 // The channel pool + stub + metrics factory are OWNED — Close() closes
 // all three. backgroundCancel unwinds every per-pool goroutine parented
@@ -398,8 +398,8 @@ func (sc *sessionClient) MetricsFactory() *metrics.Factory {
 	return sc.metricsFactory
 }
 
-// OpenSessionTable returns a SessionTableApi for a standard table.
-func (sc *sessionClient) OpenSessionTable(tableID string) SessionTableApi {
+// OpenSessionTable returns a TableAPI for a standard table.
+func (sc *sessionClient) OpenSessionTable(tableID string) TableAPI {
 	fullName := sc.fullTableName(tableID)
 	streamFactory := func(ctx context.Context) (btransport.Stream, error) { return sc.stub.OpenTable(ctx) }
 	resource := "table:" + tableID
@@ -412,8 +412,8 @@ func (sc *sessionClient) OpenSessionTable(tableID string) SessionTableApi {
 	return newSessionTable(tableID, openRead, openWrite, btransport.READ_ROW, btransport.MUTATE_ROW, sc.perResourceMetadata(fullName, "table_name", fullName), sc.metricsFactory)
 }
 
-// OpenAuthorizedView returns a SessionTableApi for an authorized view.
-func (sc *sessionClient) OpenAuthorizedView(table, view string) SessionTableApi {
+// OpenAuthorizedView returns a TableAPI for an authorized view.
+func (sc *sessionClient) OpenAuthorizedView(table, view string) TableAPI {
 	fullName := sc.fullAuthorizedViewName(table, view)
 	streamFactory := func(ctx context.Context) (btransport.Stream, error) { return sc.stub.OpenAuthorizedView(ctx) }
 	resource := fmt.Sprintf("av:%s:%s", table, view)
@@ -426,10 +426,10 @@ func (sc *sessionClient) OpenAuthorizedView(table, view string) SessionTableApi 
 	return newSessionTable(table, openRead, openWrite, btransport.READ_ROW_AUTH_VIEW, btransport.MUTATE_ROW_AUTH_VIEW, sc.perResourceMetadata(fullName, "authorized_view_name", fullName), sc.metricsFactory)
 }
 
-// OpenMaterializedView returns a read-only SessionTableApi for a
+// OpenMaterializedView returns a read-only TableAPI for a
 // materialized view. Only a read pool is opened; MutateRow errors
 // cleanly via the nil openWrite passed to newSessionTable.
-func (sc *sessionClient) OpenMaterializedView(view string) SessionTableApi {
+func (sc *sessionClient) OpenMaterializedView(view string) TableAPI {
 	fullName := sc.fullMaterializedViewName(view)
 	openRead := sc.buildLazyOpener(fullName, btransport.MATERIALIZED_VIEW_SESSION,
 		func(ctx context.Context) (btransport.Stream, error) { return sc.stub.OpenMaterializedView(ctx) },

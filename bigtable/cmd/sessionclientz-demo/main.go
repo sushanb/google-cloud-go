@@ -122,7 +122,7 @@ func main() {
 // OpenTableRequest that session.OpenSessionTable emits behind the
 // scenes). Errors are logged but don't stop the loop — the demo
 // prioritizes the debug view working over any single RPC succeeding.
-func driveTraffic(ctx context.Context, tbl session.SessionTableApi) {
+func driveTraffic(ctx context.Context, tbl session.TableAPI) {
 	tick := time.NewTicker(500 * time.Millisecond)
 	defer tick.Stop()
 	for {

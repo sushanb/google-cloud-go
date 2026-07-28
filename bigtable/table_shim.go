@@ -24,7 +24,7 @@ import (
 
 // TableShim implements TableAPI by routing between a classic gRPC
 // data-plane and a proto-native session data-plane
-// (session.SessionTableApi). Traffic direction is decided per-call by
+// (session.TableAPI). Traffic direction is decided per-call by
 // the Diverter's SessionLoad ratio. TableShim owns the proto ↔
 // bigtable.Row conversion so the session package can stay proto-native.
 //
@@ -34,14 +34,14 @@ import (
 // not support the CheckAndMutateRow shape today.
 type TableShim struct {
 	classic  TableAPI
-	session  session.SessionTableApi
+	session  session.TableAPI
 	diverter *btransport.Diverter
 }
 
 // NewTableShim wraps a classic TableAPI + a proto-native session API
 // with a Diverter-gated router. Any of session or diverter may be nil,
 // in which case the shim behaves like classic-only.
-func NewTableShim(classic TableAPI, sessionAPI session.SessionTableApi, diverter *btransport.Diverter) TableAPI {
+func NewTableShim(classic TableAPI, sessionAPI session.TableAPI, diverter *btransport.Diverter) TableAPI {
 	return &TableShim{
 		classic:  classic,
 		session:  sessionAPI,

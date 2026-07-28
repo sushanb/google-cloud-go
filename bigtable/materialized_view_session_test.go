@@ -143,7 +143,7 @@ func TestMaterializedViewSessionSandbox(t *testing.T) {
 
 	// MV is read-only: any Apply must fail. Session-path Apply returns
 	// session.ErrWriteNotSupported directly (nil openWrite on the
-	// SessionTableApi).
+	// TableAPI).
 	t.Logf("attempting Apply via MV (must fail — MV is read-only)...")
 	mut := NewMutation()
 	mut.Set(sessionSandboxFamily, "colq1", ServerTime, []byte("should-not-write"))

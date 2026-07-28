@@ -77,9 +77,9 @@ func (c *Client) OpenMaterializedView(materializedView string) TableAPI {
 	return NewTableShim(classicAPI, c.getOrCreateSessionMaterializedView(materializedView), c.diverter)
 }
 
-// getOrCreateSessionTable returns the cached SessionTableApi for this
+// getOrCreateSessionTable returns the cached TableAPI for this
 // table, opening a fresh one on cache miss.
-func (c *Client) getOrCreateSessionTable(table string) session.SessionTableApi {
+func (c *Client) getOrCreateSessionTable(table string) session.TableAPI {
 	c.sessionTablesMu.Lock()
 	defer c.sessionTablesMu.Unlock()
 	key := "tbl:" + table
@@ -91,9 +91,9 @@ func (c *Client) getOrCreateSessionTable(table string) session.SessionTableApi {
 	return st
 }
 
-// getOrCreateSessionAuthorizedView is the SessionTableApi cache lookup
+// getOrCreateSessionAuthorizedView is the TableAPI cache lookup
 // for authorized views. Cache key is "av:<table>:<view>".
-func (c *Client) getOrCreateSessionAuthorizedView(table, view string) session.SessionTableApi {
+func (c *Client) getOrCreateSessionAuthorizedView(table, view string) session.TableAPI {
 	c.sessionTablesMu.Lock()
 	defer c.sessionTablesMu.Unlock()
 	key := "av:" + table + ":" + view
@@ -105,9 +105,9 @@ func (c *Client) getOrCreateSessionAuthorizedView(table, view string) session.Se
 	return st
 }
 
-// getOrCreateSessionMaterializedView is the SessionTableApi cache
+// getOrCreateSessionMaterializedView is the TableAPI cache
 // lookup for materialized views. Cache key is "mv:<view>".
-func (c *Client) getOrCreateSessionMaterializedView(view string) session.SessionTableApi {
+func (c *Client) getOrCreateSessionMaterializedView(view string) session.TableAPI {
 	c.sessionTablesMu.Lock()
 	defer c.sessionTablesMu.Unlock()
 	key := "mv:" + view

@@ -37,7 +37,7 @@ var ErrWriteNotSupported = errors.New("bigtable/session: write operations not su
 // instead of silently misclassified as a write-side failure.
 var errReadPoolNil = errors.New("bigtable/session: read pool is nil (unreachable — every resource has a read side)")
 
-// sessionTable implements SessionTableApi. Read and write session
+// sessionTable implements TableAPI. Read and write session
 // pools open lazily on first call (see lazyPool). No classic
 // fallback — callers that want fallback wrap sessionTable in
 // bigtable.TableShim.
