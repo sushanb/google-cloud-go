@@ -109,6 +109,12 @@ type Config struct {
 	// Start(ctx) call. Cancelled by Client teardown so every pool's
 	// Tick + AFE prune loops unwind together.
 	BackgroundCtx context.Context
+
+	// EnableDebug threads bigtable.ClientConfig.EnableClientDebug down
+	// to per-pool debug recorders. Default false. When false, pools
+	// skip every allocating snapshot site and SessionDebug() returns
+	// nil so the debugview handler renders a "not enabled" panel.
+	EnableDebug bool
 }
 
 // managedSessionPool bundles a pool with its config-listener unregister
@@ -187,6 +193,12 @@ type sessionClient struct {
 	dsm          *btransport.DynamicScaleMonitor
 	connRecycler *btransport.ConnectionRecycler
 
+	// enableDebug threads bigtable.ClientConfig.EnableClientDebug down
+	// to every SessionPoolImpl this client mints. When false, pools
+	// short-circuit every allocating debug recorder and SessionDebug()
+	// returns nil so /debug/ renders a "not enabled" panel.
+	enableDebug bool
+
 	sessionPoolsMu sync.Mutex
 	sessionPools   map[poolKey]*managedSessionPool
 	nextPoolID     atomic.Uint64
@@ -214,6 +226,7 @@ func NewSessionClient(
 	ctx context.Context,
 	project, instance, appProfile string,
 	metricsProvider metrics.MetricsProvider,
+	enableDebug bool,
 	opts ...option.ClientOption,
 ) (SessionClient, error) {
 	factory, err := metrics.NewFactory(ctx, project, instance, appProfile, metricsProvider)
@@ -335,6 +348,7 @@ func NewSessionClient(
 		MinSessions:      defaultMinSessions,
 		MaxSessions:      defaultMaxSessions,
 		BackgroundCtx:    backgroundCtx,
+		EnableDebug:      enableDebug,
 	})
 	sc.backgroundCancel = cancel
 	sc.dsm = dsm
@@ -355,6 +369,7 @@ func newSessionClientFromParts(channelPool ChannelPool, stub btpb.BigtableClient
 		channelPool:    channelPool,
 		stub:           stub,
 		metricsFactory: metricsFactory,
+		enableDebug:    cfg.EnableDebug,
 		sessionPools:   make(map[poolKey]*managedSessionPool),
 	}
 	// stub == nil only happens on the test-only newSessionClientFromParts
@@ -641,6 +656,7 @@ func (sc *sessionClient) getOrCreateSessionPool(
 	pool := btransport.NewSessionPoolImpl(
 		id,
 		poolName, min, max, streamFactory, openSessionRequest, md, sessionType,
+		sc.enableDebug,
 	)
 	mp := &managedSessionPool{pool: pool}
 	sc.sessionPools[key] = mp

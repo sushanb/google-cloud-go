@@ -43,12 +43,18 @@ type SessionRef = btransport.SessionRef
 type ConfigDebugProvider = btransport.ConfigDebugProvider
 
 // SessionDebug returns a SessionDebugProvider for this Client. Returns
-// nil when ClientConfig.EnableSessionPool is false — in that case there
-// is no session-based transport to report on.
+// nil when ClientConfig.EnableSessionPool is false OR when
+// ClientConfig.EnableClientDebug is false — in either case there is no
+// session-based snapshot state to report on (session pool disabled or
+// debug recorders skipped entirely for zero hot-path overhead). Callers
+// should treat nil as "no debug data available"; the debugview handler
+// renders a "not enabled" panel in that case.
 //
 // The concrete provider layers the mixed-mode Diverter on top of the
 // SessionClient's own session-only provider. sessionImpl.SessionDebug()
-// already produces the Snapshot + LoadBalancingSnapshots parts.
+// already produces the Snapshot + LoadBalancingSnapshots parts, and
+// itself returns nil when EnableClientDebug is false — that nil
+// propagates through the check on the next few lines.
 func (c *Client) SessionDebug() SessionDebugProvider {
 	if !c.config.EnableSessionPool || c.sessionImpl == nil {
 		return nil

@@ -95,7 +95,10 @@ func Handler(p DebugProviders, s *bigtable.TCPStats) http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		writeHTML(w, indexTpl, indexPageData{Generated: time.Now()})
+		writeHTML(w, indexTpl, indexPageData{
+			Generated:         time.Now(),
+			SessionDebugAvail: sessionProv != nil,
+		})
 	})
 
 	return mux
@@ -142,6 +145,12 @@ func isNilDebugProviders(p DebugProviders) bool {
 
 type indexPageData struct {
 	Generated time.Time
+	// SessionDebugAvail is true when the underlying DebugProviders
+	// returned a non-nil SessionDebugProvider. When false, the index
+	// page renders a banner explaining that the session-scoped views
+	// (sessionz / afez / loadz) will show "not enabled" until the
+	// caller flips bigtable.ClientConfig.EnableClientDebug=true.
+	SessionDebugAvail bool
 }
 
 const indexTplSrc = `<!doctype html>
@@ -157,10 +166,21 @@ li{background:#fff;margin-bottom:.6em;padding:.6em .9em;box-shadow:0 1px 2px rgb
 li a{color:#1a5fb4;text-decoration:none;font-weight:600;font-size:1em}
 li a:hover{text-decoration:underline}
 li .desc{color:#666;font-size:.88em;margin-top:.15em}
+.disabled{background:#fff8dc;border-left:4px solid #d4a017;padding:.8em 1em;margin:0 0 1.2em 0;max-width:38em;font-size:.92em;color:#5a4a10}
+.disabled code{background:#fff2c8;padding:1px 4px;border-radius:2px}
 </style>
 </head><body>
 <h1>Bigtable debug views</h1>
 <h2>generated {{.Generated.Format "15:04:05 MST"}}</h2>
+{{if not .SessionDebugAvail}}
+<div class="disabled">
+<strong>session debug not enabled.</strong> Session pool snapshot state
+(sessionz / afez / loadz) is not being collected. Set
+<code>bigtable.ClientConfig.EnableClientDebug = true</code> and rebuild
+your client to enable per-pool snapshots; leaving it off skips every
+allocating debug recorder for zero hot-path overhead.
+</div>
+{{end}}
 <ul>
 <li><a href="sessionz/">sessionz</a> <div class="desc">per-pool sessions, states, latency histograms, slow-vRPC log, scaling history.</div></li>
 <li><a href="afez/">afez</a> <div class="desc">per-AFE bucketing: refCount, idle, in-use, EWMAs, last-connected.</div></li>

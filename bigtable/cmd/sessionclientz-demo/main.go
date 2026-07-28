@@ -85,7 +85,7 @@ func main() {
 	// internally. Pass nil MetricsProvider for default (enabled) metrics;
 	// bigtable.NoopMetricsProvider{} to disable.
 	// -------------------------------------------------------------------
-	sc, err := session.NewSessionClient(ctx, *project, *instance, *appProf, nil, dialOpts...)
+	sc, err := session.NewSessionClient(ctx, *project, *instance, *appProf, nil, true /* enableDebug: demo binary always exposes /debug/ */, dialOpts...)
 	if err != nil {
 		log.Fatalf("session.NewSessionClient: %v", err)
 	}

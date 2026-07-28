@@ -90,6 +90,23 @@ type ClientConfig struct {
 	// EnableSessionPool enables the dedicated session pool infrastructure for vRPC operations.
 	EnableSessionPool bool
 
+	// EnableClientDebug turns on per-pool snapshot state used by the
+	// debugview handlers (sessionz / afez / flightz / loadz).
+	//
+	// Default false. When false, the session pool skips every
+	// allocating debug recorder — no per-session events ring, no
+	// latency-sample buffers, no per-pick candidate slices, no
+	// pool-wide histogram inserts, no slow-vRPC log entries — so the
+	// hot path is zero-allocation on the recording side.
+	// SessionDebug() also returns nil so the debugview handler
+	// renders a "not enabled" panel instead of empty snapshots.
+	//
+	// Turn this on when you plan to serve /debug/ from
+	// bigtable/debugview or scrape session snapshots programmatically.
+	// The debug surface is otherwise unchanged; flipping the flag on
+	// or off requires rebuilding the client.
+	EnableClientDebug bool
+
 	// SessionPoolMin configures the minimum number of sessions in the pool.
 	SessionPoolMin int
 
@@ -221,7 +238,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 	// itself has no notion of a classic path to divert away from; that's
 	// this Client's concern.
 	if config.EnableSessionPool {
-		sc, sessionErr := session.NewSessionClient(ctx, project, instance, config.AppProfile, config.MetricsProvider, o...)
+		sc, sessionErr := session.NewSessionClient(ctx, project, instance, config.AppProfile, config.MetricsProvider, config.EnableClientDebug, o...)
 		if sessionErr != nil {
 			classicManaged.Close()
 			return nil, fmt.Errorf("failed to create session client: %w", sessionErr)

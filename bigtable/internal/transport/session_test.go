@@ -148,7 +148,10 @@ func (f *fakeDesc) Decode(buf []byte) (interface{}, error) { return f.dec(buf) }
 
 func newTestSession(t *testing.T, stream Stream, hooks SessionHooks) *Session {
 	t.Helper()
-	return NewSession("test-session", stream, hooks, SessionTypeTable)
+	// Tests exercise debug ring-buffer state (events, latencies) so enable
+	// the debug recorder gate. Production callers set this from
+	// bigtable.ClientConfig.EnableClientDebug.
+	return NewSession("test-session", stream, hooks, SessionTypeTable, WithSessionDebugEnabled(true))
 }
 
 // waitFor polls cond every 5ms up to timeout, failing the test if cond never

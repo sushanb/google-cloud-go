@@ -76,7 +76,7 @@ func BenchmarkKChoiceMinCost(b *testing.B) {
 		// Callers pass a throwaway slice per pick; also required because
 		// kChoiceMinCost mutates ready in place via swap-to-front.
 		copy(ready, template)
-		_, _, _ = kChoiceMinCost(ready, defaultAfeRandomSubsetSize, cost)
+		_, _, _ = kChoiceMinCost(ready, defaultAfeRandomSubsetSize, true, cost)
 	}
 }
 

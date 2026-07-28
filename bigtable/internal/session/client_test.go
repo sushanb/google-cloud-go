@@ -411,7 +411,9 @@ func TestSessionClient_OpenTableAndAuthorizedView_ReturnTableAPI(t *testing.T) {
 // PoolSnapshots / LoadBalancingSnapshots return empty (not nil-panic)
 // on a freshly-constructed client that has never opened a pool.
 func TestSessionClient_DebugAccessors(t *testing.T) {
-	sc := newTestClient(t, &fakeChannelPool{}, Config{})
+	// EnableDebug: true — otherwise SessionDebug() returns nil by design.
+	// The "not enabled" nil path is exercised in the disabled-mode test.
+	sc := newTestClient(t, &fakeChannelPool{}, Config{EnableDebug: true})
 	defer sc.Close()
 
 	if p := sc.SessionDebug(); p == nil {
