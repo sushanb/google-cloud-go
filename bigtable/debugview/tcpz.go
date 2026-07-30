@@ -783,7 +783,12 @@ type tcpzHeaderCell struct {
 
 func (s *tcpzServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	all := q.Get("all") == "1"
+	// hide443 was the historical default (dev env had non-Bigtable
+	// noise on :443 that operators wanted out of the way). Every
+	// Bigtable conn is :443, so that default hid the entire fleet.
+	// Now opt-in via ?hide=443; default shows everything. The ?all=1
+	// legacy param still forces show-all so old bookmarks keep working.
+	all := q.Get("all") == "1" || q.Get("hide") != "443"
 	onlyHot := q.Get("only") == "hot"
 	flat := q.Get("flat") == "1"
 	expandAll := q.Get("expand") == "all"
