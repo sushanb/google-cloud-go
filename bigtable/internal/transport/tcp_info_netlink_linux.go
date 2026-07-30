@@ -89,10 +89,10 @@ func queryTCPInfoByAddrs(srcIP net.IP, srcPort uint16, dstIP net.IP, dstPort uin
 			}
 			return TCPInfoSnapshot{}, fmt.Errorf("netlink NLMSG_ERROR errno=%d", -errno)
 		case unix.SOCK_DIAG_BY_FAMILY:
-			// Data: inet_diag_msg (72 bytes) + attributes.
 			info, ok := extractTCPInfoAttr(m.Data)
 			if !ok {
-				return TCPInfoSnapshot{}, errors.New("INET_DIAG_INFO attribute not found")
+				return TCPInfoSnapshot{}, fmt.Errorf("INET_DIAG_INFO attribute not found (payloadLen=%d, attrs=%v, fullHex=%x)",
+					len(m.Data), tcpInfoAttrDebug, m.Data)
 			}
 			return tcpInfoToSnapshot(info), nil
 		}
@@ -128,10 +128,10 @@ func buildInetDiagReq(family uint8, srcIP net.IP, srcPort uint16, dstIP net.IP, 
 
 	// inet_diag_req_v2 lives right after the nlmsghdr.
 	body := buf[unix.NLMSG_HDRLEN:]
-	body[0] = family                // sdiag_family
-	body[1] = unix.IPPROTO_TCP      // sdiag_protocol
-	body[2] = 1 << (inetDiagInfo - 1) // idiag_ext bitmask; bit for INET_DIAG_INFO
-	body[3] = 0                     // pad
+	body[0] = family           // sdiag_family
+	body[1] = unix.IPPROTO_TCP // sdiag_protocol
+	body[2] = 0xFF             // idiag_ext bitmask — request every extension the kernel supports (INET_DIAG_INFO is bit 1)
+	body[3] = 0                // pad
 	binary.LittleEndian.PutUint32(body[4:8], 0xFFFFFFFF) // idiag_states: all states
 
 	// inet_diag_sockid — ports are network-byte-order (big-endian),
@@ -141,8 +141,13 @@ func buildInetDiagReq(family uint8, srcIP net.IP, srcPort uint16, dstIP net.IP, 
 	binary.BigEndian.PutUint16(sockid[2:4], dstPort)
 	writeAddr(sockid[4:20], srcIP)
 	writeAddr(sockid[20:36], dstIP)
-	// idiag_if (4B) + idiag_cookie[2] (8B) already zero via make.
-	// Cookie left at 0 (wildcard).
+	// idiag_if — leave as 0 (no interface constraint).
+	// idiag_cookie[2] — MUST be INET_DIAG_NOCOOKIE (~0U) to skip
+	// cookie matching. Zero-cookie is treated as "match sockets whose
+	// cookie is exactly 0", which no live socket has, so the kernel
+	// returns ENOENT for every query.
+	binary.LittleEndian.PutUint32(sockid[40:44], 0xFFFFFFFF)
+	binary.LittleEndian.PutUint32(sockid[44:48], 0xFFFFFFFF)
 
 	return buf
 }
@@ -160,19 +165,50 @@ func writeAddr(dst []byte, ip net.IP) {
 	}
 }
 
-// extractTCPInfoAttr walks the attribute chain that follows the
-// inet_diag_msg header, returning the TCPInfo bytes cast to
-// *unix.TCPInfo when the INET_DIAG_INFO attribute is present.
+// extractTCPInfoAttr walks the attribute chain past the inet_diag_msg
+// header looking for the INET_DIAG_INFO attribute and returns its
+// TCPInfo payload cast to *unix.TCPInfo. Uses a scan-based approach
+// rather than trusting a fixed inet_diag_msg size — some kernels seem
+// to insert trailing padding / opaque fields between the base msg
+// and the first attribute, and hand-computing that offset per kernel
+// version is a maintenance trap.
+//
+// The scan strategy: start immediately after the fixed 4-byte msg
+// prefix (family/state/timer/retrans) and walk forward looking for
+// the first valid rtattr header (small length, plausible type). Once
+// aligned, walk normally to find INET_DIAG_INFO.
 func extractTCPInfoAttr(payload []byte) (*unix.TCPInfo, bool) {
 	if len(payload) < inetDiagMsgSize {
 		return nil, false
 	}
-	attrs := payload[inetDiagMsgSize:]
+	// Scan for the first plausible attribute header. Attributes are
+	// 4-byte aligned, so probe at 4-byte increments starting from a
+	// safe lower bound (past sockid). Valid attr: nla_len in
+	// [4, len(payload)-offset] and nla_type <= 32 (kernel enum
+	// upper bound with generous room to grow).
+	start := -1
+	var scanDbg []string
+	for off := inetDiagMsgSize - 4; off+4 <= len(payload); off += 4 {
+		aLen := binary.LittleEndian.Uint16(payload[off : off+2])
+		aType := binary.LittleEndian.Uint16(payload[off+2 : off+4])
+		scanDbg = append(scanDbg, fmt.Sprintf("off=%d len=%d type=%d", off, aLen, aType))
+		if aLen >= 4 && int(aLen) <= len(payload)-off && aType > 0 && aType <= 32 {
+			start = off
+			break
+		}
+	}
+	tcpInfoScanDbg = scanDbg
+	if start < 0 {
+		return nil, false
+	}
+	attrs := payload[start:]
+	var seen []uint16
 	for len(attrs) >= unix.SizeofRtAttr {
 		aLen := binary.LittleEndian.Uint16(attrs[0:2])
 		aType := binary.LittleEndian.Uint16(attrs[2:4])
+		seen = append(seen, aType)
 		if int(aLen) > len(attrs) || aLen < unix.SizeofRtAttr {
-			return nil, false
+			break
 		}
 		if aType == inetDiagInfo {
 			data := attrs[unix.SizeofRtAttr:aLen]
@@ -181,12 +217,28 @@ func extractTCPInfoAttr(payload []byte) (*unix.TCPInfo, bool) {
 			}
 			return (*unix.TCPInfo)(unsafe.Pointer(&data[0])), true
 		}
-		// rtattr entries are 4-byte-aligned.
 		aligned := (int(aLen) + 3) &^ 3
 		if aligned > len(attrs) {
-			return nil, false
+			break
 		}
 		attrs = attrs[aligned:]
 	}
+	tcpInfoAttrDebug = seen
 	return nil, false
 }
+
+// tcpInfoAttrDebug captures the attr types from the last extract
+// failure. Test-only diagnostic; safe to read after a failed
+// queryTCPInfoByAddrs to see which attrs the kernel DID return.
+var tcpInfoAttrDebug []uint16
+
+// TCPInfoAttrDebug returns the last set of attribute types the kernel
+// returned in a netlink response where INET_DIAG_INFO wasn't found.
+// Test-only diagnostic.
+func TCPInfoAttrDebug() []uint16 { return tcpInfoAttrDebug }
+
+var tcpInfoScanDbg []string
+
+// TCPInfoScanDebug returns the per-offset scan trace from the last
+// extractTCPInfoAttr call. Test-only.
+func TCPInfoScanDebug() []string { return tcpInfoScanDbg }

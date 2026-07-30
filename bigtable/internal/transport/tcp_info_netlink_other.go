@@ -24,3 +24,9 @@ import "net"
 func queryTCPInfoByAddrs(srcIP net.IP, srcPort uint16, dstIP net.IP, dstPort uint16) (TCPInfoSnapshot, error) {
 	return TCPInfoSnapshot{}, ErrTCPInfoUnsupported
 }
+
+// TCPInfoAttrDebug always empty on non-Linux — no netlink to talk to.
+func TCPInfoAttrDebug() []uint16 { return nil }
+
+// TCPInfoScanDebug always empty on non-Linux.
+func TCPInfoScanDebug() []string { return nil }

@@ -18,19 +18,19 @@
 //
 // Typical wiring is one line:
 //
-//	stats := bigtable.NewTCPStats()
 //	client, _ := bigtable.NewClientWithConfig(ctx, "p", "i",
-//	    bigtable.ClientConfig{EnableSessionPool: true},
-//	    stats.ClientOption())
+//	    bigtable.ClientConfig{EnableClientDebug: true})
 //	http.Handle("/debug/", http.StripPrefix("/debug",
-//	    debugview.Handler(client, stats)))
+//	    debugview.Handler(client)))
 //
 // Handler accepts anything satisfying DebugProviders — *bigtable.Client
 // today, internal/session.SessionClient (via a future public wrapper),
-// and any custom type that exposes the same three methods. Both arguments
-// are nil-safe: client-backed views on a nil DebugProviders render their
-// "not enabled" empty state, and /tcpz/ with nil stats renders
-// "TCP stats collector not attached".
+// and any custom type that exposes the same three methods. Passing
+// nil DebugProviders is legal: client-backed views render their
+// "not enabled" empty state. The TCPStats collector is picked up
+// automatically when the provider implements TCPStats()
+// (*bigtable.Client does; internal session.Client doesn't — avoids
+// an import cycle).
 package debugview
 
 import (
@@ -71,19 +71,33 @@ var _ DebugProviders = (*bigtable.Client)(nil)
 // view falls back to its "not enabled" empty state. Panics on template
 // parse errors would surface at package-init time (see the per-view
 // *TplSrc constants), not here.
-func Handler(p DebugProviders, s *bigtable.TCPStats) http.Handler {
+//
+// The tcpz collector is discovered via an optional interface: if p
+// implements `TCPStats() *bigtable.TCPStats`, the returned collector
+// wires the tcpz page. bigtable.Client implements it; internal
+// session.Client doesn't (would create an import cycle). Passing a
+// provider that doesn't implement it leaves tcpz in its "collector
+// not attached" state.
+func Handler(p DebugProviders) http.Handler {
 	mux := http.NewServeMux()
 
 	sessionProv := sessionProviderFor(p)
 	channelProv := channelProviderFor(p)
 	configProv := configProviderFor(p)
 
+	var stats *bigtable.TCPStats
+	if ts, ok := p.(interface {
+		TCPStats() *bigtable.TCPStats
+	}); ok && !isNilDebugProviders(p) {
+		stats = ts.TCPStats()
+	}
+
 	mux.Handle("/sessionz/", http.StripPrefix("/sessionz", newSessionzHandler(sessionProv)))
 	mux.Handle("/afez/", http.StripPrefix("/afez", newAfezHandler(sessionProv)))
 	mux.Handle("/loadz/", http.StripPrefix("/loadz", newLoadzHandler(sessionProv)))
 	mux.Handle("/channelz/", http.StripPrefix("/channelz", newChannelzHandler(channelProv)))
 	mux.Handle("/configz/", http.StripPrefix("/configz", newConfigzHandler(configProv)))
-	mux.Handle("/tcpz/", http.StripPrefix("/tcpz", newTcpzHandler(s)))
+	mux.Handle("/tcpz/", http.StripPrefix("/tcpz", newTcpzHandler(stats)))
 	// debugtagsz reads a process-global tracer, no per-Client wiring
 	// needed — mounts even when DebugProviders is nil.
 	mux.Handle("/debugtagsz/", http.StripPrefix("/debugtagsz", newDebugtagszHandler()))

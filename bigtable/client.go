@@ -124,7 +124,7 @@ type ClientConfig struct {
 	// Callers wire the debug pages via:
 	//
 	//   mux.Handle("/debug/", http.StripPrefix("/debug",
-	//       debugview.Handler(client, client.TCPStats())))
+	//       debugview.Handler(client)))
 	//
 	// See bigtable/debugview and bigtable/tcp_stats.go.
 	EnableClientDebug bool
@@ -390,7 +390,7 @@ func (c *Client) Close() error {
 //	client, _ := bigtable.NewClientWithConfig(ctx, "p", "i",
 //	    bigtable.ClientConfig{EnableClientDebug: true})
 //	http.Handle("/debug/", http.StripPrefix("/debug",
-//	    debugview.Handler(client, client.TCPStats())))
+//	    debugview.Handler(client)))
 func (c *Client) TCPStats() *TCPStats {
 	if c == nil {
 		return nil
