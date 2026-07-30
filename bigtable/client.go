@@ -199,23 +199,33 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 
 	// Allow non-default service account in DirectPath.
 	o = append(o, internaloption.AllowNonDefaultServiceAccount(true))
-	o = append(o, opts...)
-	o = append(o, internaloption.EnableNewAuthLibrary())
-	o = append(o, internaloption.EnableJwtWithScope())
 
 	// EnableClientDebug wires the TCPStats collector into every managed
 	// gRPC connection so /debug/tcpz/ can render live TCP_INFO snapshots.
-	// grpc.WithContextDialer is last-write-wins across the option list —
-	// a caller that also passed their own TCPStats.ClientOption in opts
-	// gets silently overridden by ours. The built-in collector is the
-	// intended primary path since it's what debugview.Handler(client,
-	// client.TCPStats()) renders; callers who need a bespoke collector
-	// should leave EnableClientDebug off.
+	// Order matters: attach BEFORE opts... and BEFORE the internaloption
+	// blocks below. Two reasons —
+	//
+	//  1. Some internaloption calls (EnableNewAuthLibrary,
+	//     EnableJwtWithScope) resolve/freeze the transport factory as
+	//     they're composed in. A grpc.WithContextDialer placed AFTER
+	//     them ends up dropped for the DirectPath xDS transport (empirically:
+	//     tcpz captured DirectPath conns on the sessionz-debug branch,
+	//     which appends tcpStats BEFORE those internals; moving it AFTER
+	//     lost every DirectPath conn).
+	//  2. Placing it BEFORE opts... means caller-supplied
+	//     TCPStats.ClientOption via opts will now WIN (last-write-wins).
+	//     Callers who want their own collector should leave
+	//     EnableClientDebug off; the built-in TCPStats is the primary
+	//     path that debugview.Handler(client, client.TCPStats()) renders.
 	var tcpStats *TCPStats
 	if config.EnableClientDebug {
 		tcpStats = NewTCPStats()
 		o = append(o, tcpStats.ClientOption())
 	}
+
+	o = append(o, opts...)
+	o = append(o, internaloption.EnableNewAuthLibrary())
+	o = append(o, internaloption.EnableJwtWithScope())
 
 	disableRetryInfo := false
 
