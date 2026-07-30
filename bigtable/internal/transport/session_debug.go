@@ -23,7 +23,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	btmetrics "cloud.google.com/go/bigtable/internal/metrics"
 	btopt "cloud.google.com/go/bigtable/internal/option"
 )
 
@@ -35,9 +34,9 @@ import (
 // The split exists so session.go stays focused on the protocol state
 // machine and vRPC dispatch; new observability hooks land here.
 //
-// Writer sites for the counter/close-reason/remote-addr fields land in
-// the follow-up session_vrpc.go and session_lifecycle.go PRs; today
-// most read-side accessors defined below return zero-values.
+// Observability read accessors live here; the writer sites for the
+// counter/close-reason/remote-addr fields live in session_vrpc.go and
+// session_lifecycle.go.
 type sessionDebug struct {
 	logger *log.Logger
 	tracer *sessionTracer
@@ -77,6 +76,11 @@ type sessionDebug struct {
 	// teardown so SessionPoolImpl.OnClose can attribute the close to a
 	// category (Heartbeat / GoAway / Error / User).
 	closeReason atomic.Pointer[string]
+
+	// closeErr preserves the raw Recv error handed to handleClose. The
+	// pool surfaces this on consecutive-failure breaker trips so operators
+	// see the underlying server rejection instead of only the sentinel.
+	closeErr atomic.Pointer[error]
 
 	// poolCloseRecorded is the once-flag SessionPoolImpl consults so its
 	// sessionsClosed / CloseReasons counters bump exactly once per session
@@ -121,8 +125,7 @@ func (d *sessionDebug) init(tracer *sessionTracer) {
 
 // SessionEventKind is the closed set of debug-event categories emitted
 // into the per-session ring buffer. A typed const (rather than a bare
-// string) keeps writers honest as they land in the follow-up vRPC and
-// lifecycle PRs.
+// string) keeps writers honest across session_vrpc.go / session_lifecycle.go.
 type SessionEventKind string
 
 // Enumerated SessionEventKind values.
@@ -154,11 +157,10 @@ const (
 	// state/frame combination that violates the client-server contract:
 	// a frame arrived in a state readLoop shouldn't be running in
 	// (New/Starting/Closed) OR the server's rpc_id didn't match our
-	// active vRPC. Escalated to session teardown via ForceClose so the
-	// pool's OnClosing/OnClose hooks fire and the session leaves the
-	// AFE routing set. Kept separate from SessionEventLateFrame so
-	// operators filtering sessionz for genuine desyncs aren't swamped
-	// by benign late-after-cancel drops.
+	// active vRPC. Escalated to session teardown via cancelActiveRPCs.
+	// Kept separate from SessionEventLateFrame so operators filtering
+	// sessionz for genuine desyncs aren't swamped by benign
+	// late-after-cancel drops.
 	SessionEventProtocolError SessionEventKind = "protocol-error"
 	// SessionEventLateFrame fires when routeVRPCFrame drops a frame
 	// because there's no active vRPC on this session (activeVRPC()==nil).
@@ -231,7 +233,7 @@ func (s *Session) peerInfoSummary() string {
 		p.GetApplicationFrontendRegion(),
 		p.GetApplicationFrontendSubzone(),
 		p.GetGoogleFrontendId(),
-		btmetrics.TransportTypeName(p.GetTransportType()))
+		TransportTypeName(p.GetTransportType()))
 }
 
 const latencyWindow = 256
@@ -307,7 +309,7 @@ func (s *Session) snapshotClusters() map[string]int64 {
 
 // setChannelIndex records the BigtableChannelPool connEntry index the
 // session's stream landed on. Package-private — the only writer is the
-// pool wiring in the follow-up PRs.
+// pool wiring in session_pool_scaling.go.
 func (s *Session) setChannelIndex(idx int32) {
 	s.channelIndex.Store(idx)
 }
@@ -337,6 +339,26 @@ func (s *Session) CloseReason() string {
 		return *p
 	}
 	return ""
+}
+
+// setCloseErr records the raw error that ended the stream. First writer
+// wins so a follow-up close path (e.g. cancelActiveRPCs) can't overwrite
+// the original cause. Nil is treated as "no error" and ignored.
+func (s *Session) setCloseErr(err error) {
+	if err == nil {
+		return
+	}
+	s.closeErr.CompareAndSwap(nil, &err)
+}
+
+// closeError returns the raw error that ended the stream, or nil if
+// none was recorded. Consulted by the pool to surface the underlying
+// server rejection on consecutive-failure trips.
+func (s *Session) closeError() error {
+	if p := s.closeErr.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // SampleUptime records the session's current alive time into the
@@ -409,28 +431,9 @@ func WithSessionLogger(logger *log.Logger) SessionOption {
 }
 
 // WithSessionPoolName stamps the pool-scoped name used for the
-// session_name label on session lifecycle metrics — cardinality stays
-// bounded by the number of pools per process, not per session.
+// session_name label on session lifecycle metrics. Label carries the
+// per-pool identifier so cardinality stays bounded by the number of
+// pools per process, not per session.
 func WithSessionPoolName(name string) SessionOption {
 	return func(s *Session) { s.tracer.setPoolName(name) }
-}
-
-// setCloseErr records the raw error that ended the stream. First writer
-// wins so a follow-up close path (e.g. cancelActiveRPCs) can't overwrite
-// the original cause. Nil is treated as "no error" and ignored.
-func (s *Session) setCloseErr(err error) {
-	if err == nil {
-		return
-	}
-	s.closeErr.CompareAndSwap(nil, &err)
-}
-
-// closeError returns the raw error that ended the stream, or nil if
-// none was recorded. Consulted by the pool to surface the underlying
-// server rejection on consecutive-failure trips.
-func (s *Session) closeError() error {
-	if p := s.closeErr.Load(); p != nil {
-		return *p
-	}
-	return nil
 }

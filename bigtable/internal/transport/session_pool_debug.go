@@ -85,9 +85,14 @@ type SlowVRpcEvent struct {
 	// BackendLatency is server-reported processing time; zero if the
 	// server didn't populate Stats.
 	BackendLatency time.Duration
-	// TransportLatency = (stream Send→Recv) − BackendLatency — wire +
-	// AFE + client-decode overhead outside server processing. Zero
-	// when BackendLatency is missing or the call errored pre-Recv.
+	// E2ELatency is the raw wall-clock round-trip from vRPC Send to
+	// server response Recv. Preserved on the slow row for post-hoc
+	// forensics — TransportLatency alone loses the raw number.
+	E2ELatency time.Duration
+	// TransportLatency isolates wire + AFE + client-decode overhead:
+	// TransportLatency = E2ELatency − BackendLatency, guarded > 0.
+	// Zero when BackendLatency is missing, the call errored pre-Recv,
+	// or the subtraction is non-positive (clock skew / backend > wire).
 	TransportLatency time.Duration
 	// RPCIDOnSession is the per-session 1-indexed RPC id; small values
 	// indicate a freshly-opened session.

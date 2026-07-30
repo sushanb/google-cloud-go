@@ -74,6 +74,13 @@ type Client struct {
 	// 1 h) via a background sweeper, or immediately when the caller
 	// calls Close() on the returned handle. See session_table_cache.go.
 	sessionTables *sessionTableCache
+	// tcpStats is the auto-attached TCP-INFO collector. Non-nil only
+	// when ClientConfig.EnableClientDebug was true at construction; the
+	// dial option that populates it goes into `o` before both classic
+	// and session pool dials. Callers reach it via Client.TCPStats() and
+	// hand it to debugview.Handler so /debug/tcpz/ can render live
+	// per-conn TCP_INFO snapshots.
+	tcpStats *TCPStats
 }
 
 // ClientConfig has configurations for the client.
@@ -101,6 +108,26 @@ type ClientConfig struct {
 
 	// DisableDirectAccess disables direct access by default.
 	DisableDirectAccess bool
+
+	// EnableClientDebug turns on the debug/observability stack:
+	//
+	//   - Per-pool snapshot recorders (sessionz / afez / loadz / channelz /
+	//     configz) — populated by the session backend so debugview
+	//     handlers can render live state.
+	//   - Auto-attached TCPStats collector — a grpc.WithContextDialer is
+	//     prepended to the dial-option list, so every managed gRPC
+	//     connection routes through a per-conn registry that /debug/tcpz/
+	//     can render via TCP_INFO.
+	//
+	// Default false. When off, the recording hot paths short-circuit
+	// with no allocation, and the TCPStats collector is not constructed.
+	// Callers wire the debug pages via:
+	//
+	//   mux.Handle("/debug/", http.StripPrefix("/debug",
+	//       debugview.Handler(client, client.TCPStats())))
+	//
+	// See bigtable/debugview and bigtable/tcp_stats.go.
+	EnableClientDebug bool
 }
 
 // MetricsProvider is a wrapper for the built-in metrics meter provider.
@@ -176,6 +203,20 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 	o = append(o, internaloption.EnableNewAuthLibrary())
 	o = append(o, internaloption.EnableJwtWithScope())
 
+	// EnableClientDebug wires the TCPStats collector into every managed
+	// gRPC connection so /debug/tcpz/ can render live TCP_INFO snapshots.
+	// grpc.WithContextDialer is last-write-wins across the option list —
+	// a caller that also passed their own TCPStats.ClientOption in opts
+	// gets silently overridden by ours. The built-in collector is the
+	// intended primary path since it's what debugview.Handler(client,
+	// client.TCPStats()) renders; callers who need a bespoke collector
+	// should leave EnableClientDebug off.
+	var tcpStats *TCPStats
+	if config.EnableClientDebug {
+		tcpStats = NewTCPStats()
+		o = append(o, tcpStats.ClientOption())
+	}
+
 	disableRetryInfo := false
 
 	// If DISABLE_RETRY_INFO=1, library does not base retry decision and back off time on server returned RetryInfo value.
@@ -250,6 +291,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		featureFlagsMD:          directAccessMD,
 		mPool:                   mPool,
 		diverter:                btransport.NewDiverter(0.0),
+		tcpStats:                tcpStats,
 	}
 
 	// Session data-plane backend construction has two guardrails so it
@@ -292,7 +334,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		// in (endpoint, scopes, user-agent, interceptors) — passing
 		// bare opts leaves the resolver target empty and the dial
 		// aborts with "passthrough: received empty target in Build()".
-		sc, sessionErr := session.NewClient(ctx, project, instance, config.AppProfile, metricsProvider, o...)
+		sc, sessionErr := session.NewClient(ctx, project, instance, config.AppProfile, metricsProvider, config.EnableClientDebug, o...)
 		if sessionErr != nil {
 			// Best-effort cleanup of the classic pool since we won't
 			// return c to the caller. Go through the ManagedChannelPool
@@ -343,6 +385,25 @@ func (c *Client) Close() error {
 		return err
 	}
 	return sessionErr
+}
+
+// TCPStats returns the auto-attached TCP-INFO collector for this Client,
+// or nil when ClientConfig.EnableClientDebug was false at construction.
+// Callers hand the returned value to debugview.Handler so /debug/tcpz/
+// can render per-conn TCP_INFO. Safe to call on a nil *Client (returns
+// nil) and on a Client whose EnableClientDebug was false (returns nil).
+//
+// Typical wiring:
+//
+//	client, _ := bigtable.NewClientWithConfig(ctx, "p", "i",
+//	    bigtable.ClientConfig{EnableClientDebug: true})
+//	http.Handle("/debug/", http.StripPrefix("/debug",
+//	    debugview.Handler(client, client.TCPStats())))
+func (c *Client) TCPStats() *TCPStats {
+	if c == nil {
+		return nil
+	}
+	return c.tcpStats
 }
 
 func (c *Client) fullInstanceName() string {
