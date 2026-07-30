@@ -199,30 +199,6 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 
 	// Allow non-default service account in DirectPath.
 	o = append(o, internaloption.AllowNonDefaultServiceAccount(true))
-
-	// EnableClientDebug wires the TCPStats collector into every managed
-	// gRPC connection so /debug/tcpz/ can render live TCP_INFO snapshots.
-	// Order matters: attach BEFORE opts... and BEFORE the internaloption
-	// blocks below. Two reasons —
-	//
-	//  1. Some internaloption calls (EnableNewAuthLibrary,
-	//     EnableJwtWithScope) resolve/freeze the transport factory as
-	//     they're composed in. A grpc.WithContextDialer placed AFTER
-	//     them ends up dropped for the DirectPath xDS transport (empirically:
-	//     tcpz captured DirectPath conns on the sessionz-debug branch,
-	//     which appends tcpStats BEFORE those internals; moving it AFTER
-	//     lost every DirectPath conn).
-	//  2. Placing it BEFORE opts... means caller-supplied
-	//     TCPStats.ClientOption via opts will now WIN (last-write-wins).
-	//     Callers who want their own collector should leave
-	//     EnableClientDebug off; the built-in TCPStats is the primary
-	//     path that debugview.Handler(client, client.TCPStats()) renders.
-	var tcpStats *TCPStats
-	if config.EnableClientDebug {
-		tcpStats = NewTCPStats()
-		o = append(o, tcpStats.ClientOption())
-	}
-
 	o = append(o, opts...)
 	o = append(o, internaloption.EnableNewAuthLibrary())
 	o = append(o, internaloption.EnableJwtWithScope())
@@ -301,7 +277,6 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		featureFlagsMD:          directAccessMD,
 		mPool:                   mPool,
 		diverter:                btransport.NewDiverter(0.0),
-		tcpStats:                tcpStats,
 	}
 
 	// Session data-plane backend construction has two guardrails so it
@@ -356,6 +331,13 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		}
 		sc.AddSessionLoadListener(c.diverter.SetSessionLoad)
 		c.sessionImpl = sc
+
+		// Wire the /debug/tcpz/ collector as a thin wrapper over the
+		// sessionClient's IP registry. Registry is non-nil iff
+		// EnableClientDebug is true — newTCPStatsFromRegistry returns
+		// nil for nil input, so Client.TCPStats() honors the same
+		// "off → nil" contract as before.
+		c.tcpStats = newTCPStatsFromRegistry(sc.SessionIPRegistry())
 
 		// Per-resource TableAPI cache with TTL-on-idle eviction. The
 		// cache is opener-agnostic — each getOrCreateSession* helper

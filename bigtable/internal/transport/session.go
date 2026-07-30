@@ -156,6 +156,16 @@ type Session struct {
 	// for the top-of-thread contract.
 	debugEnabled bool
 
+	// ipRegistry captures the (localAddr, remoteAddr) 5-tuple of this
+	// session's bidi stream at handleOpenSession time so /debug/tcpz/
+	// can render TCP_INFO by 4-tuple lookup (netlink INET_DIAG). Nil
+	// when the owning pool wasn't wired with a registry (test fakes,
+	// or EnableClientDebug=false in production). Ownership: shared
+	// across every session in the same Client — the Client's
+	// sessionClient constructs one and forwards it via
+	// WithSessionIPRegistry to every pool → session.
+	ipRegistry *SessionIPRegistry
+
 	// state is the lifecycle position; read via State(), mutate via
 	// transitionTo. lastStateChangeNano is stamped inside transitionTo on
 	// each successful swap; it lives on the embedded sessionDebug (below)
@@ -248,6 +258,14 @@ type SessionOption func(*Session)
 // default for exactly this reason.
 func WithSessionDebugEnabled(enabled bool) SessionOption {
 	return func(s *Session) { s.debugEnabled = enabled }
+}
+
+// WithSessionIPRegistry wires a SessionIPRegistry that handleOpenSession
+// populates with this session's (localAddr, remoteAddr) 5-tuple. Nil
+// registries are legal (Session skips the Add call), so pools that
+// aren't debug-enabled don't need to plumb this option in.
+func WithSessionIPRegistry(reg *SessionIPRegistry) SessionOption {
+	return func(s *Session) { s.ipRegistry = reg }
 }
 
 // NewSession constructs a Session bound to stream. Zero-value SessionHooks is

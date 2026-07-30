@@ -244,7 +244,8 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 	}
 	s := NewSession(sessionName, stream, hooks, p.sessionType,
 		WithSessionPoolName(p.poolName), WithSessionLogger(log.Default()),
-		WithSessionDebugEnabled(p.debugEnabled))
+		WithSessionDebugEnabled(p.debugEnabled),
+		WithSessionIPRegistry(p.ipRegistry))
 	if hint := pickedChannel.Load(); hint >= 0 {
 		s.setChannelIndex(hint)
 	}

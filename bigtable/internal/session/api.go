@@ -109,6 +109,13 @@ type Client interface {
 	ChannelDebug() btransport.ChannelDebugProvider
 	ConfigDebug() btransport.ConfigDebugProvider
 
+	// SessionIPRegistry returns the Client-wide 4-tuple registry
+	// populated at handleOpenSession time so /debug/tcpz/ can look up
+	// TCP_INFO by 4-tuple (netlink). Returns nil when the client was
+	// constructed with EnableDebug=false. bigtable.Client.TCPStats
+	// wraps the returned registry into the public *bigtable.TCPStats.
+	SessionIPRegistry() *btransport.SessionIPRegistry
+
 	// AddSessionLoadListener registers a listener invoked every time
 	// the server-driven ClientConfigurationManager reports a new
 	// session-load ratio (0.0 = classic-only, 1.0 = session-only).

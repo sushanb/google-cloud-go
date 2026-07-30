@@ -246,6 +246,31 @@ type sessionClient struct {
 	sessionPoolsMu sync.Mutex
 	sessionPools   map[poolKey]*managedSessionPool
 	nextPoolID     atomic.Uint64
+
+	// ipRegistry is the Client-wide 4-tuple registry populated by
+	// every session's handleOpenSession. Non-nil iff enableDebug is
+	// true; forwarded to each SessionPoolImpl at construction so the
+	// pool can hand it to each new Session via WithSessionIPRegistry.
+	// Reached by bigtable.Client.TCPStats() via SessionIPRegistry().
+	ipRegistry *btransport.SessionIPRegistry
+}
+
+// SessionIPRegistry returns the Client-wide SessionIPRegistry, or nil
+// when EnableDebug is off. Exposed for bigtable.Client.TCPStats() to
+// wrap; the top-level client is the only intended consumer.
+func (sc *sessionClient) SessionIPRegistry() *btransport.SessionIPRegistry {
+	return sc.ipRegistry
+}
+
+// newIPRegistryIfDebug constructs a SessionIPRegistry only when debug
+// recording is on. Keeps the "no allocation when debug is off"
+// contract: EnableDebug=false leaves ipRegistry nil, and every
+// downstream .Add / .Remove call is a nil-safe no-op.
+func newIPRegistryIfDebug(enableDebug bool) *btransport.SessionIPRegistry {
+	if !enableDebug {
+		return nil
+	}
+	return btransport.NewSessionIPRegistry()
 }
 
 // NewClient constructs a standalone session.Client. It owns the
@@ -384,6 +409,7 @@ func newSessionClientFromParts(channelPool ChannelPool, stub btpb.BigtableClient
 		stub:           stub,
 		metricsFactory: metricsFactory,
 		enableDebug:    cfg.EnableDebug,
+		ipRegistry:     newIPRegistryIfDebug(cfg.EnableDebug),
 		sessionPools:   make(map[poolKey]*managedSessionPool),
 	}
 	// stub == nil only happens on the test-only newSessionClientFromParts
@@ -738,6 +764,11 @@ func (sc *sessionClient) getOrCreateSessionPool(
 		poolName, 0, 0, streamFactory, openSessionRequest, md, sessionType,
 		sc.enableDebug,
 	)
+	// Forward the Client-wide IP registry so each session this pool
+	// spawns can register its (localAddr, remoteAddr) 5-tuple for tcpz.
+	// Nil-safe when EnableDebug is off (registry is nil, pool skips
+	// forwarding, sessions have nil ipRegistry → .Add is a no-op).
+	pool.SetSessionIPRegistry(sc.ipRegistry)
 	mp := &managedSessionPool{pool: pool}
 	sc.sessionPools[key] = mp
 	configManager := sc.configManager

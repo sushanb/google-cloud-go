@@ -155,6 +155,10 @@ func (s *Session) notifyClosed(streamErr error) {
 			s.HasErrorRpcs(),
 		)
 		s.hooks.onClose(s, streamErr)
+		// Drop this session's IP registry entry so tcpz no longer
+		// tries to netlink-query a torn-down 4-tuple (would race the
+		// kernel closing the socket and yield ENOENT). Nil-safe.
+		s.ipRegistry.Remove(s.logName)
 	})
 }
 
@@ -341,6 +345,18 @@ func (s *Session) handleOpenSession(_ *spb.OpenSessionResponse) {
 	if p, ok := peer.FromContext(s.stream.Context()); ok && p.Addr != nil {
 		addr := p.Addr.String()
 		s.remoteAddr.Store(&addr)
+		// Register the (remote, local) 5-tuple in the Client-wide
+		// SessionIPRegistry so /debug/tcpz/ can look up TCP_INFO by
+		// 4-tuple (netlink INET_DIAG) instead of by fd. Works for
+		// DirectPath — we're extracting addrs from the established
+		// stream, not from a dialer that DirectPath's xDS transport
+		// would skip. Nil-safe when the pool wasn't wired with a
+		// registry (EnableClientDebug=false, or unit-test fakes).
+		local := ""
+		if p.LocalAddr != nil {
+			local = p.LocalAddr.String()
+		}
+		s.ipRegistry.Add(s.logName, addr, local, s.peerInfo.Load())
 	}
 	s.tracer.recordOpen(context.Background(), s.peerInfo.Load(), nil)
 	s.hooks.onActive(s)

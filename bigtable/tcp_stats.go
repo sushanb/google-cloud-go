@@ -16,58 +16,90 @@ package bigtable
 
 import (
 	btransport "cloud.google.com/go/bigtable/internal/transport"
-	"google.golang.org/api/option"
-	"google.golang.org/grpc"
 )
 
-// TCPStats is the opt-in collector for per-connection TCP statistics
-// (RTT, retransmits, cwnd, etc.) from every gRPC dial a bigtable client
-// makes. Create one, pass its ClientOption() into NewClient / NewAdminClient,
-// then hand the same TCPStats to tcpz.Handler to expose a live debug page.
+// TCPStats is the opt-in collector for per-session TCP statistics
+// (RTT, retransmits, cwnd, etc.) exposed via /debug/tcpz/.
 //
-// The collector never wraps the returned net.Conn — it just records a
-// reference for later TCP_INFO reads. The RPC hot path traverses zero
-// TCPStats code. Cost is limited to one map insert per gRPC dial and one
-// getsockopt(TCP_INFO) per conn per debug-page render.
+// Populated at session-open time: every session's handleOpenSession
+// captures the (localAddr, remoteAddr) 5-tuple from
+// peer.FromContext(stream.Context()) and registers it. When tcpz
+// renders, we look up TCP_INFO for each live 5-tuple via netlink
+// SOCK_DIAG_BY_FAMILY / INET_DIAG_INFO — no file descriptor needed.
 //
-// Not compatible with DirectPath. When the client runs over DirectPath
-// (xDS-managed connections) the standard dialer is bypassed, so nothing
-// is registered and Snapshot returns empty.
+// Works for DirectPath. Prior implementations wrapped the standard
+// dialer via grpc.WithContextDialer, which DirectPath's xDS transport
+// bypasses; the session-registration approach doesn't care how the
+// underlying dial happened as long as the resulting bidi stream
+// carries a peer address.
 //
-// Linux only. On other platforms Snapshot returns entries with Err
-// populated ("tcp_info not supported on this platform"); dialing and
-// registration still work but the numeric fields stay zero.
+// Scope: session-pool conns ONLY. Classic-pool conns and admin-side
+// dials are not captured — those don't go through handleOpenSession.
+// DirectPath is a session-pool concern in practice, so this matches
+// the operator use case.
+//
+// Linux only for TCP_INFO. On other platforms the registry still
+// populates (so operators see peer addresses on tcpz) but every row's
+// numeric TCP_INFO fields stay zero and Err is set.
+//
+// Construction is not exposed as a public constructor — a *TCPStats is
+// available exclusively via (*Client).TCPStats() after
+// NewClientWithConfig with EnableClientDebug=true. Callers who need a
+// bespoke collector should implement their own stats.Handler; the
+// built-in path is the one debugview.Handler renders.
 type TCPStats struct {
-	reg *btransport.ConnRegistry
+	reg *btransport.SessionIPRegistry
 }
 
-// NewTCPStats constructs an empty collector. Call ClientOption() to wire
-// it into a Client, and pass the same *TCPStats to tcpz.Handler.
+// newTCPStatsFromRegistry wraps a SessionIPRegistry as a TCPStats.
+// Unexported — Client is the only intended constructor. Returns nil
+// when reg is nil so Client can stash the result unconditionally.
+func newTCPStatsFromRegistry(reg *btransport.SessionIPRegistry) *TCPStats {
+	if reg == nil {
+		return nil
+	}
+	return &TCPStats{reg: reg}
+}
+
+// NewTCPStats constructs an empty *TCPStats not wired to any Client.
+// Production callers should reach for (*Client).TCPStats() after
+// NewClientWithConfig with EnableClientDebug=true; this constructor
+// exists so debugview + external tests can build a *TCPStats for
+// handler wiring without spinning up a full Client. Snapshot on a
+// fresh empty TCPStats returns nil.
 func NewTCPStats() *TCPStats {
-	return &TCPStats{reg: btransport.NewConnRegistry()}
+	return &TCPStats{reg: btransport.NewSessionIPRegistry()}
 }
 
-// ClientOption returns an option.ClientOption that installs the TCP-stats
-// dialer. Safe to pass to NewClient, NewClientWithConfig, NewAdminClient,
-// etc. — the underlying grpc.WithContextDialer is additive to whatever
-// gRPC options bigtable already applies.
-func (t *TCPStats) ClientOption() option.ClientOption {
-	return option.WithGRPCDialOption(grpc.WithContextDialer(t.reg.Dial))
-}
-
-// Snapshot returns the current per-connection TCP_INFO for every conn the
-// dialer captured, oldest first. Stale entries (fd closed by gRPC) are
-// pruned during Snapshot so this list stays honest.
+// Snapshot returns one TCPInfoSnapshot per currently-registered
+// session, ordered by session LogName. Address fields (RemoteAddr,
+// LocalAddr, DialedAt) come from the registry; TCP_INFO fields come
+// from a netlink lookup by 4-tuple. Netlink failures for a given
+// entry populate Err on that row and leave numeric fields zero — the
+// row still renders so operators can see the session exists.
 func (t *TCPStats) Snapshot() []btransport.TCPInfoSnapshot {
-	return t.reg.Snapshot()
+	if t == nil || t.reg == nil {
+		return nil
+	}
+	entries := t.reg.Snapshot()
+	out := make([]btransport.TCPInfoSnapshot, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, btransport.QueryTCPInfoForSessionEntry(e))
+	}
+	return out
 }
 
-// Len returns the number of currently-registered conns (including any
-// closed-but-not-yet-pruned ones). Useful for a "conns=N" summary.
-func (t *TCPStats) Len() int { return t.reg.Len() }
+// Len returns the number of currently-registered sessions.
+func (t *TCPStats) Len() int {
+	if t == nil {
+		return 0
+	}
+	return t.reg.Len()
+}
 
-// DeadConns returns the recently-departed conns the registry still
-// remembers, oldest death first. Used by tcpz to plot conn-lifetime
-// distributions that include already-closed conns. Bounded — very old
-// deaths eventually fall off the ring.
-func (t *TCPStats) DeadConns() []btransport.DeadConnInfo { return t.reg.DeadConns() }
+// DeadConns is retained for API compatibility with the earlier
+// dial-intercept implementation, which tracked closed conns in a
+// bounded graveyard ring. The registry-based collector drops entries
+// on session close, so no dead-conn history is available; always
+// returns nil. The tcpz template renders empty on nil input.
+func (t *TCPStats) DeadConns() []btransport.DeadConnInfo { return nil }

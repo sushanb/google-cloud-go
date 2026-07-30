@@ -181,6 +181,22 @@ type SessionPoolImpl struct {
 	// Pure atomic-counter bumps (msgsSent, retries, etc.) are NOT
 	// gated — a branch check costs more than the atomic.
 	debugEnabled bool
+
+	// ipRegistry is the Client-wide SessionIPRegistry used by
+	// /debug/tcpz/. Optional (nil-safe); wired post-construction via
+	// SetSessionIPRegistry so NewSessionPoolImpl's signature stays
+	// stable across every existing caller / test fake. Forwarded to
+	// each session at spawn time.
+	ipRegistry *SessionIPRegistry
+}
+
+// SetSessionIPRegistry wires a SessionIPRegistry onto this pool. The
+// pool forwards it to every session it spawns so
+// Session.handleOpenSession can register (localAddr, remoteAddr) for
+// tcpz. Nil is legal — pools without a registry skip the forwarding.
+// Idempotent; safe to call before Start.
+func (p *SessionPoolImpl) SetSessionIPRegistry(reg *SessionIPRegistry) {
+	p.ipRegistry = reg
 }
 
 // noteVRpcOutcome forwards the outcome to the AFE's PeakEwma trackers
@@ -212,6 +228,11 @@ func NewSessionPoolImpl(id uint64, poolName string, min, max int, streamFactory 
 		debugEnabled:       debugEnabled,
 	}
 	pool.m.afePickCounts = make(map[AfeID]int64)
+	// ipRegistry is nil until SetSessionIPRegistry wires one in — the
+	// Client-wide registry construction happens after this constructor,
+	// so we don't take it as a positional arg (would churn every test
+	// callsite for a strictly-optional dependency). Setter is a no-op
+	// when ipRegistry == nil at the session-spawn site.
 
 	// Bootstrap sizer/picker/budget/threshold from the default
 	// ClientConfiguration proto (default_client_config.go). Fallback
