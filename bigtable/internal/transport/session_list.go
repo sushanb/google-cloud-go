@@ -40,6 +40,22 @@ const (
 	afePruneMaxIdle = 10 * time.Minute
 )
 
+// Outlier-detection tunables. Package vars (not consts) so tests can
+// tighten them to trip within a burst of a few RPCs; production values
+// balance "quarantine a rogue AFE fast" against "don't quarantine on
+// transient blips."
+//
+// Trip rule: N consecutive non-OK RecordVRpcOutcome results (any
+// error class — DeadlineExceeded, TransportFailure, ServerResult)
+// arms the quarantine. A single OK result resets the counter to 0
+// (so a rogue AFE that mostly succeeds and occasionally hangs never
+// trips at threshold=5). Threshold values that fire on the "steady
+// drip" failure mode from the SESSION_POOL_SPEC #2 rationale.
+var (
+	afeOutlierErrThreshold  int32 = 5
+	afeOutlierQuarantineDur       = 30 * time.Second
+)
+
 // State model
 // -----------
 // A registered SessionHandle transitions through:
@@ -109,6 +125,22 @@ type afeHandle struct {
 	lastConnected time.Time // touched on OnSessionStarted + ReleaseToPool; drives Prune
 	transportEwma *PeakEwma // OK-gated
 	e2eEwma       *PeakEwma // OK-gated
+
+	// Outlier-detection state. Both atomic so RecordVRpcOutcome can
+	// update without holding sl.mu across the update (matches the
+	// existing drop-lock pattern for the PeakEwma updates). Written
+	// from RecordVRpcOutcome; read by ReadyAfes.
+	//
+	// consecutiveErrors: incremented on each non-OK outcome, reset to
+	// 0 on any OK. Reaching afeOutlierErrThreshold arms the quarantine.
+	//
+	// quarantinedUntilNano: Unix-nano timestamp when the quarantine
+	// expires; 0 means healthy. ReadyAfes filters out AFEs where
+	// now < quarantinedUntilNano — unless doing so would leave the
+	// ready set empty (guard against starving the client when EVERY
+	// AFE is quarantined).
+	consecutiveErrors    atomic.Int32
+	quarantinedUntilNano atomic.Int64
 }
 
 // SessionHandle wraps a Session with the counters the pool needs to
@@ -375,7 +407,7 @@ func (sl *sessionList) OnSessionClosed(sh *SessionHandle) {
 // deleted, PeakEwma struct still allocated) and is harmlessly ignored
 // once GC collects the AFE.
 func (sl *sessionList) RecordVRpcOutcome(sh *SessionHandle, e2e, backend time.Duration, ok bool) {
-	if !ok || sh == nil {
+	if sh == nil {
 		return
 	}
 	sl.mu.Lock()
@@ -384,6 +416,36 @@ func (sl *sessionList) RecordVRpcOutcome(sh *SessionHandle, e2e, backend time.Du
 	if afe == nil {
 		return
 	}
+	if !ok {
+		// Outlier-detection feed. Non-OK outcomes bump consecutiveErrors
+		// but never touch the PeakEwma trackers — the OK-gating rule
+		// documented at SESSION_POOL_SPEC #2 still holds. A steady drip
+		// of failures against one AFE (the "rogue AFE returning
+		// DeadlineExceeded" case in the operator playbook) will trip
+		// this counter within a handful of calls and remove the AFE
+		// from ReadyAfes for afeOutlierQuarantineDur.
+		//
+		// TODO: an AttemptState-aware version would distinguish
+		// Uncommitted (server never saw it → don't blame the AFE)
+		// from TransportFailure / ServerResult (server did see it or
+		// the transport is hung → do blame the AFE). Requires plumbing
+		// AttemptState through Invoke; deferred.
+		n := afe.consecutiveErrors.Add(1)
+		if n == afeOutlierErrThreshold {
+			expiry := time.Now().Add(afeOutlierQuarantineDur).UnixNano()
+			afe.quarantinedUntilNano.Store(expiry)
+			assertDebugTagf(false, tagAfeOutlierQuarantined,
+				"afe=%d quarantined for %s after %d consecutive non-OK outcomes",
+				afe.id, afeOutlierQuarantineDur, n)
+		}
+		return
+	}
+	// OK path. Reset the consecutive-error counter — a single healthy
+	// response is enough to reopen the trip counter. Do NOT clear
+	// quarantinedUntilNano here: let ReadyAfes clear it on cooldown
+	// expiry via the probe path, so a mid-quarantine lucky success
+	// doesn't reopen the floodgates while the AFE is still mostly bad.
+	afe.consecutiveErrors.Store(0)
 	if e2e > 0 {
 		afe.e2eEwma.Update(e2e)
 	}
@@ -403,8 +465,36 @@ func (sl *sessionList) ReadyAfes() []AfeSnapshot {
 	if len(sl.afesWithReady) == 0 {
 		return nil
 	}
+	// Outlier-detection filter. Two-pass so we can honor the "never
+	// quarantine the last live AFE" guard — if every AFE is quarantined
+	// (or the only ones with idle sessions are), the client would be
+	// starved for no benefit. Better to let one hobble through than to
+	// return an empty ready set.
+	now := time.Now().UnixNano()
+	healthy := 0
+	for _, afe := range sl.afesWithReady {
+		q := afe.quarantinedUntilNano.Load()
+		if q == 0 || now >= q {
+			healthy++
+		}
+	}
 	out := make([]AfeSnapshot, 0, len(sl.afesWithReady))
 	for _, afe := range sl.afesWithReady {
+		q := afe.quarantinedUntilNano.Load()
+		if q > 0 {
+			if now < q && healthy > 0 {
+				continue // quarantined AND we have alternatives
+			}
+			if now >= q {
+				// Cooldown expired — clear the timestamp so the AFE
+				// gets a probe. If the probe returns non-OK,
+				// RecordVRpcOutcome re-arms consecutiveErrors and
+				// this AFE quarantines again on the next threshold.
+				// CAS so a concurrent RecordVRpcOutcome re-quarantine
+				// doesn't get clobbered.
+				afe.quarantinedUntilNano.CompareAndSwap(q, 0)
+			}
+		}
 		idle := len(afe.sessions)
 		inflight := afe.refCount - idle
 		if inflight < 0 {

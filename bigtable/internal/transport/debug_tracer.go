@@ -163,6 +163,15 @@ const (
 	// debug counter instead of no-op'ing silently.
 	tagSessionListStartedNilSession = "session_list_started_nil_session"
 
+	// tagAfeOutlierQuarantined fires when an AFE's consecutive non-OK
+	// RecordVRpcOutcome count crosses afeOutlierErrThreshold and the
+	// AFE is placed into a time-boxed quarantine (removed from
+	// ReadyAfes for afeOutlierQuarantineDur). One emission per trip,
+	// not per skipped ReadyAfes call. Sustained emission against the
+	// same AFE ID indicates a genuinely rogue frontend that the
+	// picker's OK-gated PeakEwma cannot see.
+	tagAfeOutlierQuarantined = "afe_outlier_quarantined"
+
 	// Client configuration polling.
 	tagClientConfigPollFailed     = "client_config_poll_failed"
 	tagClientConfigPollCtxExpired = "client_config_poll_ctx_expired"

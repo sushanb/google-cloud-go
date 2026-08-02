@@ -766,3 +766,138 @@ func TestSessionList_ConcurrentOps_MaintainsInvariants(t *testing.T) {
 
 	checkInvariants(t, sl)
 }
+
+// withOutlierTunables temporarily overrides afeOutlierErrThreshold /
+// afeOutlierQuarantineDur for a single test and restores them via
+// t.Cleanup. Keeps the package vars honest across the test suite.
+func withOutlierTunables(t *testing.T, threshold int32, dur time.Duration) {
+	t.Helper()
+	origThresh, origDur := afeOutlierErrThreshold, afeOutlierQuarantineDur
+	afeOutlierErrThreshold = threshold
+	afeOutlierQuarantineDur = dur
+	t.Cleanup(func() {
+		afeOutlierErrThreshold = origThresh
+		afeOutlierQuarantineDur = origDur
+	})
+}
+
+// TestSessionList_OutlierQuarantine_TripsAtThreshold pins the primary
+// trip rule: N consecutive non-OK outcomes on one AFE moves it to
+// quarantine, and ReadyAfes filters it out for the cooldown window
+// (as long as another AFE is available).
+func TestSessionList_OutlierQuarantine_TripsAtThreshold(t *testing.T) {
+	withOutlierTunables(t, 3, 10*time.Minute)
+	sl := newSessionList()
+	// Two AFEs; we'll trip AFE 1 and expect ReadyAfes to filter it out
+	// while AFE 2 stays reachable.
+	roguesess := makeHandleWithAfe(t, 1)
+	healthysess := makeHandleWithAfe(t, 2)
+	sl.OnSessionStarted(roguesess)
+	sl.OnSessionStarted(healthysess)
+
+	// 2 non-OK is under threshold — both AFEs should still be ready.
+	sl.RecordVRpcOutcome(roguesess, 0, 0, false)
+	sl.RecordVRpcOutcome(roguesess, 0, 0, false)
+	if got := len(sl.ReadyAfes()); got != 2 {
+		t.Errorf("ReadyAfes after 2 non-OK = %d, want 2 (below threshold)", got)
+	}
+
+	// 3rd non-OK hits threshold → quarantine armed → AFE 1 filtered out.
+	sl.RecordVRpcOutcome(roguesess, 0, 0, false)
+	snaps := sl.ReadyAfes()
+	if len(snaps) != 1 {
+		t.Fatalf("ReadyAfes after threshold hit = %d, want 1 (rogue filtered)", len(snaps))
+	}
+	if snaps[0].ID != AfeID(2) {
+		t.Errorf("ReadyAfes survivor = AFE %d, want AFE 2 (healthy one)", snaps[0].ID)
+	}
+	checkInvariants(t, sl)
+}
+
+// TestSessionList_OutlierQuarantine_OKResetsCounter pins that a single
+// OK outcome clears the consecutiveErrors run — a partially-flaky AFE
+// that succeeds most of the time and fails once every few calls
+// (below threshold) never trips.
+func TestSessionList_OutlierQuarantine_OKResetsCounter(t *testing.T) {
+	withOutlierTunables(t, 3, 10*time.Minute)
+	sl := newSessionList()
+	h := makeHandleWithAfe(t, 1)
+	sl.OnSessionStarted(h)
+
+	// Two errors, then an OK — resets the run. Two more errors after
+	// that must NOT trip (run counts from 0 again).
+	sl.RecordVRpcOutcome(h, 0, 0, false)
+	sl.RecordVRpcOutcome(h, 0, 0, false)
+	sl.RecordVRpcOutcome(h, 5*time.Millisecond, 1*time.Millisecond, true)
+	sl.RecordVRpcOutcome(h, 0, 0, false)
+	sl.RecordVRpcOutcome(h, 0, 0, false)
+	if got := len(sl.ReadyAfes()); got != 1 {
+		t.Errorf("ReadyAfes after OK-reset = %d, want 1 (no quarantine)", got)
+	}
+	checkInvariants(t, sl)
+}
+
+// TestSessionList_OutlierQuarantine_NeverStarveClient pins the guard:
+// if every ready AFE is quarantined, ReadyAfes returns the quarantined
+// ones anyway rather than an empty set (the client would park forever
+// otherwise). Better a hobbled request than a hung caller.
+func TestSessionList_OutlierQuarantine_NeverStarveClient(t *testing.T) {
+	withOutlierTunables(t, 1, 10*time.Minute)
+	sl := newSessionList()
+	h1 := makeHandleWithAfe(t, 1)
+	h2 := makeHandleWithAfe(t, 2)
+	sl.OnSessionStarted(h1)
+	sl.OnSessionStarted(h2)
+
+	// Trip both AFEs (threshold=1).
+	sl.RecordVRpcOutcome(h1, 0, 0, false)
+	sl.RecordVRpcOutcome(h2, 0, 0, false)
+
+	// Both quarantined, so the "never starve" guard should return
+	// both anyway (healthy count == 0).
+	snaps := sl.ReadyAfes()
+	if len(snaps) != 2 {
+		t.Errorf("ReadyAfes when all quarantined = %d, want 2 (starvation guard)", len(snaps))
+	}
+	checkInvariants(t, sl)
+}
+
+// TestSessionList_OutlierQuarantine_CooldownProbeClears pins the probe
+// path: after the cooldown expires, ReadyAfes clears the quarantine
+// timestamp and returns the AFE. A subsequent OK outcome then leaves
+// the counter reset; a subsequent non-OK re-arms toward the next
+// threshold trip (but doesn't quarantine on that single call).
+func TestSessionList_OutlierQuarantine_CooldownProbeClears(t *testing.T) {
+	// Very short cooldown so the test doesn't sleep.
+	withOutlierTunables(t, 2, 1*time.Nanosecond)
+	sl := newSessionList()
+	h1 := makeHandleWithAfe(t, 1)
+	h2 := makeHandleWithAfe(t, 2)
+	sl.OnSessionStarted(h1)
+	sl.OnSessionStarted(h2)
+
+	// Trip AFE 1.
+	sl.RecordVRpcOutcome(h1, 0, 0, false)
+	sl.RecordVRpcOutcome(h1, 0, 0, false)
+
+	// Give the cooldown some real slack past the 1ns setting to avoid
+	// any single-nanosecond race with the wall clock.
+	time.Sleep(1 * time.Millisecond)
+
+	snaps := sl.ReadyAfes()
+	if len(snaps) != 2 {
+		t.Errorf("ReadyAfes post-cooldown = %d, want 2 (AFE 1 probe)", len(snaps))
+	}
+	// Timestamp should be cleared by the probe path.
+	afe := sl.afeHandles[AfeID(1)]
+	if q := afe.quarantinedUntilNano.Load(); q != 0 {
+		t.Errorf("quarantinedUntilNano after cooldown probe = %d, want 0", q)
+	}
+	// Counter is NOT reset by the probe path itself — it's only reset
+	// on an OK outcome. So consecutiveErrors is still 2 from before.
+	if got := afe.consecutiveErrors.Load(); got != 2 {
+		t.Errorf("consecutiveErrors after cooldown probe = %d, want 2 (probe doesn't reset)", got)
+	}
+	checkInvariants(t, sl)
+}
+
