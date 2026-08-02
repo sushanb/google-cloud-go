@@ -16,6 +16,8 @@ package internal
 
 import (
 	"math/rand/v2"
+	"sync/atomic"
+	"time"
 )
 
 // defaultAfeRandomSubsetSize is the default K for K-choice random draws
@@ -23,6 +25,52 @@ import (
 // doesn't specify one. Two candidates ("power of two choices") is the
 // standard K-choice draw size.
 const defaultAfeRandomSubsetSize = 2
+
+// EWMA outlier gate on LeastInFlightAfePicker.
+//
+// The default AFE picker (LEAST_IN_FLIGHT server strategy) scores only on
+// NumOutstanding. That gives it no memory of past latency — a rogue AFE
+// that hangs sporadically (e.g. DeadlineExceeded on ~1 in 20 calls) drops
+// its inflight count as soon as the failed request completes and looks
+// identical to a healthy peer on the very next pick. The picker keeps
+// steering fair share to it, and the caller keeps eating timeouts.
+//
+// The gate: candidates whose per-AFE e2e PeakEwma exceeds
+// afeLeastInFlightEwmaGateNanos get an additive penalty that dominates
+// any realistic NumOutstanding count. Healthy candidates still compete
+// on inflight only; a rogue candidate is deprioritized until its EWMA
+// decays back below the gate. If EVERY candidate is above the gate the
+// least-loaded outlier still wins (never-starve).
+//
+// Both knobs are atomic package vars so tests can toggle them without a
+// full config plumbing pass. Production defaults:
+//
+//   - Gate = 10 × afeE2eEwmaSeed = 10ms. Rogue-AFE E2eCost seen in prod
+//     was ~14-25ms; healthy AFEs sit at 1-6ms. 10ms leaves headroom for
+//     load spikes while cleanly separating hang-signature AFEs.
+//   - Penalty = 1e9. Any realistic NumOutstanding (<<1M) can't overcome it.
+var (
+	afeLeastInFlightEwmaGateNanos atomic.Int64
+	afeLeastInFlightEwmaPenalty   atomic.Int64
+)
+
+func init() {
+	afeLeastInFlightEwmaGateNanos.Store(int64(10 * afeE2eEwmaSeed))
+	afeLeastInFlightEwmaPenalty.Store(1_000_000_000)
+}
+
+// setLeastInFlightEwmaGate overrides the gate + penalty at runtime. Test-
+// only. Returns a restore func for t.Cleanup.
+func setLeastInFlightEwmaGate(gate time.Duration, penalty int64) (restore func()) {
+	oldGate := afeLeastInFlightEwmaGateNanos.Load()
+	oldPenalty := afeLeastInFlightEwmaPenalty.Load()
+	afeLeastInFlightEwmaGateNanos.Store(int64(gate))
+	afeLeastInFlightEwmaPenalty.Store(penalty)
+	return func() {
+		afeLeastInFlightEwmaGateNanos.Store(oldGate)
+		afeLeastInFlightEwmaPenalty.Store(oldPenalty)
+	}
+}
 
 // PickCandidate is one AFE the picker considered during a K-choice draw,
 // with the cost value the picker's decision rule used to score it.
@@ -118,10 +166,19 @@ func NewLeastInFlightAfePicker(randomSubsetSize int, recordCandidates bool) *Lea
 func (LeastInFlightAfePicker) Name() string { return "least-inflight" }
 
 // PickAfe returns the AFE with the fewest NumOutstanding among K
-// randomly-drawn ready candidates.
+// randomly-drawn ready candidates. Candidates whose E2eCost exceeds the
+// package-level EWMA gate get an additive penalty (see the gate docstring
+// at the top of this file) that pushes them behind any healthy candidate
+// while still leaving them pickable when every candidate is over the gate.
 func (p LeastInFlightAfePicker) PickAfe(ready []AfeSnapshot) (AfeID, bool, PickDecision) {
+	gate := float64(afeLeastInFlightEwmaGateNanos.Load())
+	penalty := float64(afeLeastInFlightEwmaPenalty.Load())
 	winner, picked, cands := kChoiceMinCost(ready, p.RandomSubsetSize, p.recordCandidates, func(s AfeSnapshot) float64 {
-		return float64(s.NumOutstanding)
+		cost := float64(s.NumOutstanding)
+		if s.E2eCost > gate {
+			cost += penalty
+		}
+		return cost
 	})
 	return decisionFor(winner, picked, cands, "min-inflight")
 }

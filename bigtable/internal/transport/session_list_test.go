@@ -344,19 +344,19 @@ func TestSessionList_AllHandles_ReflectsMembership(t *testing.T) {
 	checkInvariants(t, sl)
 }
 
-func TestSessionList_RecordVRpcOutcome_SkipsNonOK(t *testing.T) {
+func TestSessionList_RecordVRpcOutcome_SkipsFastFail(t *testing.T) {
 	sl := newSessionList()
 	h := makeHandleWithAfe(t, 1)
 	sl.OnSessionStarted(h)
 
-	// Non-OK response with a very fast (fake) latency must NOT update
-	// EWMA — OK-gated, so a fast-failing AFE can't look fastest.
+	// Fast-fail (sub-seed) non-OK response must NOT touch EWMA — else a
+	// fast-erroring AFE looks artificially cheap and games the picker.
 	// afeHandle constructs its e2eEwma via NewPeakEwmaSeeded(afeE2eEwmaSeed),
 	// so the untouched value is afeE2eEwmaSeed (1ms), not zero.
 	sl.RecordVRpcOutcome(h, 1*time.Nanosecond, 0, false)
 	snap := sl.Snapshot()[0]
 	if got, want := snap.E2eEwma, time.Duration(afeE2eEwmaSeed); got != want {
-		t.Errorf("E2eEwma = %v, want %v (seed unchanged) after non-OK record", got, want)
+		t.Errorf("E2eEwma = %v, want %v (seed unchanged) after fast-fail non-OK", got, want)
 	}
 
 	// OK response updates both cost trackers.
@@ -367,6 +367,35 @@ func TestSessionList_RecordVRpcOutcome_SkipsNonOK(t *testing.T) {
 	}
 	if snap.TransportEwma <= 0 {
 		t.Errorf("TransportEwma = %v, want > 0 after OK record", snap.TransportEwma)
+	}
+	checkInvariants(t, sl)
+}
+
+// TestSessionList_RecordVRpcOutcome_SlowFailFeedsE2e pins the new cost-
+// gated behavior: a non-OK response above the fast-fail seed feeds
+// e2eEwma (so the picker sees the true cost of a hang / timeout /
+// stall) but still skips transportEwma (backendDur is 0 on error,
+// which would double-attribute if we let it through).
+func TestSessionList_RecordVRpcOutcome_SlowFailFeedsE2e(t *testing.T) {
+	sl := newSessionList()
+	h := makeHandleWithAfe(t, 1)
+	sl.OnSessionStarted(h)
+
+	beforeTransport := sl.Snapshot()[0].TransportEwma
+
+	// 25ms non-OK — well above afeE2eEwmaSeed (1ms). Represents the
+	// prod DeadlineExceeded signature (BackendLatency=0, TransportLatency=0,
+	// e2e = full caller deadline).
+	sl.RecordVRpcOutcome(h, 25*time.Millisecond, 0, false)
+	snap := sl.Snapshot()[0]
+
+	if got := snap.E2eEwma; got <= time.Duration(afeE2eEwmaSeed) {
+		t.Errorf("E2eEwma = %v, want > seed (%v) after slow-fail non-OK",
+			got, time.Duration(afeE2eEwmaSeed))
+	}
+	if got := snap.TransportEwma; got != beforeTransport {
+		t.Errorf("TransportEwma moved from %v to %v on non-OK; must stay put "+
+			"(backendDur=0 on error double-attributes)", beforeTransport, got)
 	}
 	checkInvariants(t, sl)
 }

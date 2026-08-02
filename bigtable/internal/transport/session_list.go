@@ -108,7 +108,7 @@ type afeHandle struct {
 	readyIdx      int
 	lastConnected time.Time // touched on OnSessionStarted + ReleaseToPool; drives Prune
 	transportEwma *PeakEwma // OK-gated
-	e2eEwma       *PeakEwma // OK-gated
+	e2eEwma       *PeakEwma // cost-gated: OK always; non-OK only when e2e > afeE2eEwmaSeed
 }
 
 // SessionHandle wraps a Session with the counters the pool needs to
@@ -361,11 +361,22 @@ func (sl *sessionList) OnSessionClosed(sh *SessionHandle) {
 	}
 }
 
-// RecordVRpcOutcome updates the AFE's PeakEwma trackers with an OK
-// response's e2e and backend latencies. Non-OK results are dropped so a
-// fast-failing AFE can't game LeastLatencyPicker into steering more
-// traffic at it. transportEwma tracks e2e − backend; e2eEwma tracks e2e
-// directly.
+// RecordVRpcOutcome updates the AFE's PeakEwma trackers from a completed
+// vRPC. Rule:
+//
+//   - transportEwma is OK-gated (only OK responses feed it) — its input is
+//     e2e−backend, and non-OK typically leaves backendDur=0, which would
+//     double-attribute the full elapsed time to transport.
+//   - e2eEwma is cost-gated, not OK-gated. OK responses always feed it.
+//     Non-OK responses feed it too, but ONLY when e2e > afeE2eEwmaSeed
+//     (>1ms). The seed acts as a fast-fail cutoff: sub-seed non-OK
+//     responses are almost always server-side rejections (INVALID_ARGUMENT,
+//     PERMISSION_DENIED) that reply in ~1ms — letting those into e2eEwma
+//     would make a fast-erroring AFE look artificially cheap and game
+//     LeastLatencyPicker into steering more traffic at it (the original
+//     SESSION_POOL_SPEC #2 concern). Above the seed the response was slow
+//     to fail (hang, timeout, transport stall) and the true cost belongs
+//     in the tracker so the picker steers away from the misbehaving AFE.
 //
 // Deliberately drops sl.mu between the map read and the PeakEwma
 // updates (the only method in this file that does): PeakEwma is
@@ -375,7 +386,7 @@ func (sl *sessionList) OnSessionClosed(sh *SessionHandle) {
 // deleted, PeakEwma struct still allocated) and is harmlessly ignored
 // once GC collects the AFE.
 func (sl *sessionList) RecordVRpcOutcome(sh *SessionHandle, e2e, backend time.Duration, ok bool) {
-	if !ok || sh == nil {
+	if sh == nil {
 		return
 	}
 	sl.mu.Lock()
@@ -384,11 +395,20 @@ func (sl *sessionList) RecordVRpcOutcome(sh *SessionHandle, e2e, backend time.Du
 	if afe == nil {
 		return
 	}
-	if e2e > 0 {
-		afe.e2eEwma.Update(e2e)
+	if ok {
+		if e2e > 0 {
+			afe.e2eEwma.Update(e2e)
+		}
+		if transport := e2e - backend; transport > 0 {
+			afe.transportEwma.Update(transport)
+		}
+		return
 	}
-	if transport := e2e - backend; transport > 0 {
-		afe.transportEwma.Update(transport)
+	// Non-OK: feed e2eEwma iff the response was slow to fail. Skip the
+	// transport tracker (see doc — backendDur=0 on error would double-
+	// attribute).
+	if e2e > afeE2eEwmaSeed {
+		afe.e2eEwma.Update(e2e)
 	}
 }
 

@@ -16,6 +16,7 @@ package internal
 
 import (
 	"testing"
+	"time"
 )
 
 // makeSnapshot builds an AfeSnapshot pointing at a fresh afeHandle with
@@ -188,6 +189,74 @@ func TestPickDecision_RecordsCandidatesAndReason(t *testing.T) {
 	}
 	if len(dec2.Candidates) != len(snaps) {
 		t.Errorf("LeastLatency Candidates len = %d, want %d (K covered all)", len(dec2.Candidates), len(snaps))
+	}
+}
+
+// TestLeastInFlightAfePicker_EwmaGate_DeprioritizesOutlier pins the rogue-
+// AFE guard: LeastInFlight prefers low inflight, but when a candidate's
+// E2eCost exceeds the gate its cost gets an additive penalty that pushes
+// it behind any healthy candidate — even one with strictly higher
+// inflight.
+func TestLeastInFlightAfePicker_EwmaGate_DeprioritizesOutlier(t *testing.T) {
+	restore := setLeastInFlightEwmaGate(10*time.Millisecond, 1_000_000_000)
+	t.Cleanup(restore)
+
+	// Rogue AFE has FEWER inflight (would win under plain LeastInFlight)
+	// but its E2eCost is above the gate. The healthy peer wins despite
+	// higher inflight.
+	snaps := []AfeSnapshot{
+		makeSnapshot(1, 1, float64(25*time.Millisecond)), // rogue: min inflight, gated
+		makeSnapshot(2, 5, float64(3*time.Millisecond)),  // healthy: higher inflight, under gate
+	}
+	p := NewLeastInFlightAfePicker(len(snaps), true)
+	for i := 0; i < 200; i++ {
+		id, _, _ := p.PickAfe([]AfeSnapshot{snaps[0], snaps[1]})
+		if id != 2 {
+			t.Fatalf("iter %d: picked rogue AFE %d, want healthy AFE 2", i, id)
+		}
+	}
+}
+
+// TestLeastInFlightAfePicker_EwmaGate_NeverStarve pins the fallback: when
+// EVERY candidate is above the gate, the least-inflight outlier still
+// wins (penalty is additive, not a hard exclude — starving the pool is
+// worse than sending to a hot AFE).
+func TestLeastInFlightAfePicker_EwmaGate_NeverStarve(t *testing.T) {
+	restore := setLeastInFlightEwmaGate(10*time.Millisecond, 1_000_000_000)
+	t.Cleanup(restore)
+
+	snaps := []AfeSnapshot{
+		makeSnapshot(1, 5, float64(50*time.Millisecond)),
+		makeSnapshot(2, 1, float64(30*time.Millisecond)), // min inflight among outliers
+		makeSnapshot(3, 3, float64(20*time.Millisecond)),
+	}
+	p := NewLeastInFlightAfePicker(len(snaps), true)
+	for i := 0; i < 200; i++ {
+		id, _, _ := p.PickAfe([]AfeSnapshot{snaps[0], snaps[1], snaps[2]})
+		if id != 2 {
+			t.Fatalf("iter %d: picked AFE %d, want 2 (least inflight among all-outlier candidates)", i, id)
+		}
+	}
+}
+
+// TestLeastInFlightAfePicker_EwmaGate_HealthyUnchanged pins that with no
+// outliers in the ready set, the gate is a no-op — plain
+// LeastInFlight behavior is preserved (regression guard).
+func TestLeastInFlightAfePicker_EwmaGate_HealthyUnchanged(t *testing.T) {
+	restore := setLeastInFlightEwmaGate(10*time.Millisecond, 1_000_000_000)
+	t.Cleanup(restore)
+
+	snaps := []AfeSnapshot{
+		makeSnapshot(1, 5, float64(3*time.Millisecond)),
+		makeSnapshot(2, 1, float64(4*time.Millisecond)), // min inflight, under gate
+		makeSnapshot(3, 3, float64(2*time.Millisecond)),
+	}
+	p := NewLeastInFlightAfePicker(len(snaps), true)
+	for i := 0; i < 200; i++ {
+		id, _, _ := p.PickAfe([]AfeSnapshot{snaps[0], snaps[1], snaps[2]})
+		if id != 2 {
+			t.Fatalf("iter %d: picked AFE %d, want 2 (least inflight, no gate)", i, id)
+		}
 	}
 }
 
