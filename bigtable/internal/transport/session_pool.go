@@ -183,11 +183,19 @@ type SessionPoolImpl struct {
 	debugEnabled bool
 }
 
-// noteVRpcOutcome forwards the outcome to the AFE's PeakEwma trackers
-// (OK-gated). The consecutive-failure counter is NOT reset here —
-// only a successful session-open (onActive) clears it. Resetting on
-// per-vRPC OK would let one long-lived healthy session mask a run
-// of failed opens and keep the breaker from tripping.
+// noteVRpcOutcome forwards the outcome to sessionList.RecordVRpcOutcome,
+// which updates two per-AFE things (OK-gated PeakEwma, quarantine
+// state machine). Two counters share the name "consecutive failures"
+// in this package; only the second is touched here:
+//
+//   - SessionPoolImpl.consecutiveFailures (pool-scope session-open
+//     breaker) is NOT reset here. Only onActive clears it. Resetting
+//     on per-vRPC OK would let one long-lived healthy session mask a
+//     run of failed opens and keep that breaker from tripping.
+//   - afeHandle.consecFailures (per-AFE vRPC quarantine breaker) IS
+//     reset by an OK here, via RecordVRpcOutcome. AFE health lives
+//     on the vRPC timescale, so per-vRPC OK is exactly the signal
+//     that clears the per-AFE counter.
 func (p *SessionPoolImpl) noteVRpcOutcome(sh *SessionHandle, e2e, backend time.Duration, ok bool) {
 	p.sl.RecordVRpcOutcome(sh, e2e, backend, ok)
 }
