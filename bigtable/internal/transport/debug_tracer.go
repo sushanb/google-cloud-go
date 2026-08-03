@@ -164,25 +164,31 @@ const (
 	tagSessionListStartedNilSession = "session_list_started_nil_session"
 
 	// tagSessionListAfeQuarantineTripped fires when an AFE's consecutive
-	// non-OK vRPC count crosses afeQuarantineFailureThreshold and the
-	// AFE enters the quarantine window (excluded from ReadyAfes for
-	// afeQuarantineDuration). Sustained emission means one or more AFEs
-	// are chronically bad; a single trip may just be a transient blip
-	// followed by recovery.
+	// non-OK vRPC count crosses the quarantine threshold and the AFE
+	// enters the quarantine window (excluded from ReadyAfes for
+	// sessionList.quarWindow). Sustained emission means one or more
+	// AFEs are chronically bad; a single trip may just be a transient
+	// blip followed by recovery.
 	tagSessionListAfeQuarantineTripped = "session_list_afe_quarantine_tripped"
 
-	// tagSessionListAfeQuarantineRecovered fires when any OK vRPC on a
-	// currently-quarantined AFE clears the window. Fires for three
-	// paths, not just the strict "half-open probe" one: (a) the
-	// post-window probe attempt succeeds; (b) a slow in-flight vRPC
-	// that started before the trip completes OK mid-window; (c) an OK
-	// lands on this AFE during the pool-wide suppression window (≥70%
-	// quarantined, filter skipped, this AFE was picked and returned
-	// OK). Not a strict probe-success counter — read it as "churn
-	// signal": a large Tripped:Recovered ratio means AFEs are staying
-	// bad long enough for the pool to age them out rather than
-	// probe-recovering.
-	tagSessionListAfeQuarantineRecovered = "session_list_afe_quarantine_recovered"
+	// tagSessionListAfeQuarantineProbeOK fires when an OK vRPC lands on
+	// a quarantined AFE AFTER its window has elapsed — the natural
+	// half-open probe succeeded and the AFE is fully healthy again.
+	// Tripped:ProbeOK ratio is the "does quarantine heal" signal — a
+	// large gap means AFEs are staying bad long enough to age out
+	// rather than probe-recovering.
+	tagSessionListAfeQuarantineProbeOK = "session_list_afe_quarantine_probe_ok"
+
+	// tagSessionListAfeQuarantineInWindowOK fires when an OK vRPC lands
+	// on a quarantined AFE BEFORE its window has elapsed. Two paths
+	// reach this: (a) a slow in-flight vRPC that started before the
+	// trip completes OK mid-window; (b) an OK landed because pool-wide
+	// suppression re-exposed this AFE to the picker despite the
+	// quarantine. Distinct from ProbeOK because the operational read
+	// is different — InWindowOK counts "we picked through despite the
+	// quarantine and got lucky", ProbeOK counts "the AFE healed on
+	// its own schedule."
+	tagSessionListAfeQuarantineInWindowOK = "session_list_afe_quarantine_in_window_ok"
 
 	// Client configuration polling.
 	tagClientConfigPollFailed     = "client_config_poll_failed"

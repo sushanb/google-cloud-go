@@ -212,13 +212,16 @@ func TestPool_UnknownAFE_BucketedAtZero(t *testing.T) {
 // end-to-end quarantine path through the real picker: three AFEs with
 // equal capacity, one is tripped via sustained failed vRPC outcomes,
 // subsequent CheckoutSession calls must all land on the other two.
-// Complements the unit-test coverage in session_list_test.go, which
-// only exercises sessionList.ReadyAfes directly.
+// Complements the unit-test coverage in session_list_quarantine_test.go,
+// which exercises sessionList.ReadyAfes directly.
+//
+// Uses the pool's production quarantine tuning (5 failures / 30 s
+// window). We can't inject test-scale tuning into the pool's internal
+// sessionList without a constructor knob, but the production defaults
+// are cheap enough for this test — 5 setup failures + a 400-checkout
+// loop fit inside the 30-second window with room to spare, so the
+// AFE stays quarantined through the assertion phase.
 func TestPool_Quarantine_SteersTrafficAwayFromFailingAFE(t *testing.T) {
-	// 3-failure trip keeps the setup phase short; 5-second window is
-	// long enough that the 400-checkout loop below runs well inside it
-	// (no accidental half-open re-entry).
-	withQuarantineTuning(t, 3, 5*time.Second)
 	p := newTestPool(t, 1, 30)
 	defer p.Close()
 
@@ -234,7 +237,7 @@ func TestPool_Quarantine_SteersTrafficAwayFromFailingAFE(t *testing.T) {
 	// (bypasses the picker, so we don't need to know which AFE the
 	// picker would have chosen).
 	bad := tripHandles[AfeID(101)]
-	for i := 0; i < 3; i++ {
+	for i := 0; i < defaultAfeQuarantineFailureThreshold; i++ {
 		p.sl.RecordVRpcOutcome(bad, 1*time.Nanosecond, 0, false)
 	}
 
