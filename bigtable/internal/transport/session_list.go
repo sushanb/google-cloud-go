@@ -38,6 +38,49 @@ const (
 	// NOT "empty since" — a recently-active AFE is kept even if refCount
 	// just hit 0.
 	afePruneMaxIdle = 10 * time.Minute
+
+	// afeQuarantinePoolWideSuppressPct: when this fraction or more of
+	// AFEs in the ready set are currently quarantined, ReadyAfes skips
+	// the quarantine filter and returns every ready AFE unfiltered.
+	// Rationale: a broad backend outage will trip quarantine on most or
+	// all AFEs; excluding them all leaves the picker with nothing and
+	// starves every caller. Falling back to the raw ready set lets
+	// PeakEwma triage among a bad-versus-worse choice. Mirrors Java's
+	// ChannelPoolHealthChecker.POOLWIDE_BAD_CHANNEL_CIRCUITBREAKER_PERCENT
+	// (70%) at the AFE layer — Java applies the guard to channel
+	// evictions; the failure-mode-avoidance rationale is identical.
+	afeQuarantinePoolWideSuppressPct = 70
+)
+
+// Package-private so unit tests can shrink them without production
+// timing (production timing is 30 s × 5 failures, unusable inside a
+// -short go-test budget). Held in mutable vars rather than const only
+// because Go has no better in-package test-time-override primitive.
+//
+// NOTE: not safe to tune while a concurrent goroutine is inside
+// RecordVRpcOutcome or ReadyAfes reading these — the reads are under
+// sl.mu but the tuning writes are not. Today the two callers of
+// withQuarantineTuning (session_list_test.go's quarantine suite) all
+// run single-goroutine, so this hasn't bitten. If you add a test that
+// mixes tuning with a running stress driver, `-race` will fire; the
+// right fix is to move these into a config struct owned by
+// sessionList, populated by newSessionList / a newSessionListForTest
+// sibling, and drop the package globals entirely.
+var (
+	// afeQuarantineFailureThreshold: consecutive non-OK vRPC outcomes on
+	// a single AFE that trip its quarantine. 5 mirrors Java's per-channel
+	// CONSECUTIVE_OPEN_SESSION_FAILURE_THRESHOLD — different layer, same
+	// "small burst tolerates noise / big burst is a real problem" curve.
+	afeQuarantineFailureThreshold = 5
+
+	// afeQuarantineDuration: how long an AFE stays excluded from
+	// ReadyAfes after tripping. When the window expires the AFE re-enters
+	// the ready set half-open; the next OK there clears the state, the
+	// next non-OK also resets the counter (see afeHandle.recordOutcomeLocked)
+	// so it takes another full threshold-worth of failures to re-trip.
+	// 30 s matches Java's PROBE_INTERVAL — the same "how long is long
+	// enough for a transient blip to pass" answer.
+	afeQuarantineDuration = 30 * time.Second
 )
 
 // State model
@@ -85,6 +128,13 @@ type AfeID int64
 // score without holding sessionList.mu. The picker returns an AfeID
 // which Checkout re-resolves under sl.mu — no *afeHandle escapes.
 // Cost fields are PeakEwma nanoseconds as float64.
+//
+// Deliberately does NOT expose quarantine state: quarantined AFEs are
+// filtered out of ReadyAfes before pickers see them (with the pool-wide
+// suppression edge as the sole exception), so no current picker needs
+// to score on QuarantinedUntil / ConsecFailures. Debug views read
+// AfeSnapshotRow instead. Add to this type only when a picker starts
+// consuming the signal.
 type AfeSnapshot struct {
 	ID             AfeID
 	IdleCount      int
@@ -109,6 +159,20 @@ type afeHandle struct {
 	lastConnected time.Time // touched on OnSessionStarted + ReleaseToPool; drives Prune
 	transportEwma *PeakEwma // OK-gated
 	e2eEwma       *PeakEwma // OK-gated
+	// consecFailures counts consecutive non-OK vRPC outcomes on this
+	// AFE. Reset to 0 on the next OK. Crossing afeQuarantineFailureThreshold
+	// arms quarantinedUntil once per crossing (a burst inside the window
+	// keeps growing the count but does not extend the window). NOT reset
+	// when the quarantine window expires — the first outcome after the
+	// window decides: OK zeroes both, non-OK re-quarantines immediately
+	// (still ≥ threshold, and quarantinedUntil was cleared by the
+	// lazy-expiry path in RecordVRpcOutcome). Guarded by sessionList.mu.
+	consecFailures int
+	// quarantinedUntil is the wall-clock time this AFE's exclusion
+	// window ends. Zero when not currently quarantined. Read by
+	// ReadyAfes (filter gate) and by RecordVRpcOutcome (trip gate and
+	// lazy-expiry). Guarded by sessionList.mu.
+	quarantinedUntil time.Time
 }
 
 // SessionHandle wraps a Session with the counters the pool needs to
@@ -361,27 +425,38 @@ func (sl *sessionList) OnSessionClosed(sh *SessionHandle) {
 	}
 }
 
-// RecordVRpcOutcome updates the AFE's PeakEwma trackers with an OK
-// response's e2e and backend latencies. Non-OK results are dropped so a
-// fast-failing AFE can't game LeastLatencyPicker into steering more
-// traffic at it. transportEwma tracks e2e − backend; e2eEwma tracks e2e
-// directly.
-//
-// Deliberately drops sl.mu between the map read and the PeakEwma
-// updates (the only method in this file that does): PeakEwma is
-// internally locked and this runs on every completed vRPC. If a
-// concurrent OnSessionClosed + Prune detaches the bucket in between,
-// the update lands on a live-but-orphan tracker (afeHandles map entry
-// deleted, PeakEwma struct still allocated) and is harmlessly ignored
-// once GC collects the AFE.
+// RecordVRpcOutcome folds one completed vRPC's outcome into the AFE's
+// per-bucket state: forwards it to the per-afeHandle state machine
+// (afeHandle.recordOutcomeLocked) under sl.mu, then — outside the
+// lock — updates PeakEwma on success and fires the trip/recover debug
+// tags. PeakEwma is deliberately updated with sl.mu released because
+// PeakEwma is internally locked and this runs on every completed vRPC;
+// keeping it off the innermost lock avoids serializing every reader in
+// the pool through sl.mu. If OnSessionClosed + Prune detaches the
+// bucket between the map lookup and the PeakEwma call, the update
+// lands on a live-but-orphan tracker and is harmlessly ignored once
+// GC collects the AFE.
 func (sl *sessionList) RecordVRpcOutcome(sh *SessionHandle, e2e, backend time.Duration, ok bool) {
-	if !ok || sh == nil {
+	if sh == nil {
 		return
 	}
 	sl.mu.Lock()
 	afe := sl.handleToAfe[sh]
-	sl.mu.Unlock()
 	if afe == nil {
+		sl.mu.Unlock()
+		return
+	}
+	tripped, recovered := afe.recordOutcomeLocked(ok, time.Now(),
+		afeQuarantineFailureThreshold, afeQuarantineDuration)
+	sl.mu.Unlock()
+
+	if tripped {
+		recordDebugTag(tagSessionListAfeQuarantineTripped)
+	}
+	if recovered {
+		recordDebugTag(tagSessionListAfeQuarantineRecovered)
+	}
+	if !ok {
 		return
 	}
 	if e2e > 0 {
@@ -392,19 +467,116 @@ func (sl *sessionList) RecordVRpcOutcome(sh *SessionHandle, e2e, backend time.Du
 	}
 }
 
+// recordOutcomeLocked is the per-AFE quarantine state machine. Called
+// under sessionList.mu; returns whether this outcome flipped the AFE
+// into quarantine (tripped) or out of it (recovered), so the caller
+// can fire the corresponding debug tag after releasing the lock.
+//
+//   - OK  → resets consecFailures to 0 and clears any live
+//     quarantinedUntil. Reports recovered=true iff a window was
+//     active — which covers BOTH the post-window half-open probe AND
+//     any OK arriving mid-window (a slow in-flight vRPC that started
+//     before the trip, or an OK landing on this AFE during the
+//     pool-wide suppression window). The tag's semantics are "any OK
+//     on a currently-quarantined AFE", not "half-open probe
+//     succeeded" strictly.
+//   - non-OK, window active (now < quarantinedUntil) → bumps
+//     consecFailures but does NOT extend the window. Without this
+//     trip-once gate a full outage would refresh the window on every
+//     failure and the AFE would never re-enter for a probe.
+//   - non-OK, window expired (now ≥ quarantinedUntil) → clears the
+//     stale window AND resets consecFailures. The AFE effectively
+//     starts a fresh count; re-tripping requires another full
+//     threshold-worth of failures. This is what makes "half-open" a
+//     real second chance rather than a "one strike and you're out for
+//     another window" gate.
+//   - non-OK, no window → bumps consecFailures. Crossing threshold
+//     arms quarantinedUntil = now + window and reports tripped=true.
+//
+// Never touches PeakEwma. The caller owns that after releasing sl.mu.
+func (a *afeHandle) recordOutcomeLocked(ok bool, now time.Time, threshold int, window time.Duration) (tripped, recovered bool) {
+	if ok {
+		if !a.quarantinedUntil.IsZero() {
+			recovered = true
+		}
+		a.consecFailures = 0
+		a.quarantinedUntil = time.Time{}
+		return
+	}
+	if !a.quarantinedUntil.IsZero() && !now.Before(a.quarantinedUntil) {
+		// Window elapsed — treat as a fresh half-open probe attempt.
+		// Reset the counter alongside the window so the probe failure
+		// alone doesn't re-quarantine; only another full threshold
+		// burst does.
+		a.consecFailures = 0
+		a.quarantinedUntil = time.Time{}
+	}
+	a.consecFailures++
+	if a.consecFailures >= threshold && a.quarantinedUntil.IsZero() {
+		a.quarantinedUntil = now.Add(window)
+		tripped = true
+	}
+	return
+}
+
+// isQuarantinedAt reports whether this AFE is currently excluded from
+// the picker at the given instant. Zero quarantinedUntil (the vast
+// majority of AFEs the vast majority of the time) short-circuits to
+// false without a time comparison.
+func (a *afeHandle) isQuarantinedAt(now time.Time) bool {
+	return !a.quarantinedUntil.IsZero() && now.Before(a.quarantinedUntil)
+}
+
 // ReadyAfes returns an immutable snapshot of AFEs with at least one
 // idle session, plus the per-AFE fields a picker needs to score them
 // (idle/inflight counts and current EWMA costs). Membership matches
 // invariant I3 — len(afe.sessions) > 0. The picker can iterate this
 // slice without holding sessionList.mu.
+//
+// Quarantine filter: AFEs whose isQuarantinedAt(now) reports true are
+// dropped so the picker routes traffic elsewhere. The filter is a
+// live now-vs-until check: the moment now ≥ quarantinedUntil, the
+// AFE re-appears in the returned slice; the next vRPC there decides
+// (via RecordVRpcOutcome / afeHandle.recordOutcomeLocked) whether it
+// recovers or eventually re-trips.
+//
+// Pool-wide suppression: if ≥ afeQuarantinePoolWideSuppressPct of the
+// ready AFEs are currently quarantined, ReadyAfes skips the filter
+// and returns every ready AFE unfiltered. In a broad outage every AFE
+// trips; excluding them all would leave the picker with an empty set
+// and starve every caller. The suppression lets PeakEwma triage among
+// a bad-versus-worse choice — same rationale as Java's
+// ChannelPoolHealthChecker.POOLWIDE_BAD_CHANNEL_CIRCUITBREAKER_PERCENT
+// guard, applied here to AFE eligibility rather than channel
+// evictions. Denominator note: we divide by the ready-set size, not
+// the full afeHandles map — an AFE with no idle sessions can't be
+// picked regardless of quarantine, so it shouldn't dilute the
+// "fraction of pickable-if-not-quarantined AFEs that are bad" signal.
+// (Java divides by total pool size at the channel layer because every
+// channel is always "eligible" in principle.) When total==1 the guard
+// trivially always fires — intentional: quarantining the only AFE
+// with idle sessions would starve every caller.
 func (sl *sessionList) ReadyAfes() []AfeSnapshot {
 	sl.mu.Lock()
 	defer sl.mu.Unlock()
-	if len(sl.afesWithReady) == 0 {
+	total := len(sl.afesWithReady)
+	if total == 0 {
 		return nil
 	}
-	out := make([]AfeSnapshot, 0, len(sl.afesWithReady))
+	now := time.Now()
+	quarantined := 0
 	for _, afe := range sl.afesWithReady {
+		if afe.isQuarantinedAt(now) {
+			quarantined++
+		}
+	}
+	// Integer math to avoid float rounding on the threshold boundary.
+	suppress := quarantined*100 >= total*afeQuarantinePoolWideSuppressPct
+	out := make([]AfeSnapshot, 0, total)
+	for _, afe := range sl.afesWithReady {
+		if !suppress && afe.isQuarantinedAt(now) {
+			continue
+		}
 		idle := len(afe.sessions)
 		inflight := afe.refCount - idle
 		if inflight < 0 {
@@ -473,6 +645,16 @@ type AfeSnapshotRow struct {
 	// aging window and gives operators a quick "when did I last see
 	// this AFE?" answer.
 	LastConnected time.Time
+	// QuarantinedUntil is the wall-clock time at which this AFE's
+	// consecutive-failure quarantine window expires. Zero when the AFE
+	// isn't currently quarantined. Read by afez/loadz to render a
+	// "Quarantined" column so operators can immediately see why the
+	// picker is bypassing an AFE that otherwise looks healthy.
+	QuarantinedUntil time.Time
+	// ConsecFailures is the current consecutive non-OK vRPC count for
+	// this AFE. Reset to 0 on the next OK. Values ≥ afeQuarantineFailureThreshold
+	// mean this AFE is currently or was recently quarantined.
+	ConsecFailures int
 }
 
 // Snapshot returns a stable, human-readable view of every AFE bucket,
@@ -487,12 +669,14 @@ func (sl *sessionList) Snapshot() []AfeSnapshotRow {
 	for _, afe := range sl.afeHandles {
 		idle := len(afe.sessions)
 		rows = append(rows, AfeSnapshotRow{
-			ID:            afe.id,
-			RefCount:      afe.refCount,
-			IdleCount:     idle,
-			TransportEwma: time.Duration(afe.transportEwma.Value()),
-			E2eEwma:       time.Duration(afe.e2eEwma.Value()),
-			LastConnected: afe.lastConnected,
+			ID:               afe.id,
+			RefCount:         afe.refCount,
+			IdleCount:        idle,
+			TransportEwma:    time.Duration(afe.transportEwma.Value()),
+			E2eEwma:          time.Duration(afe.e2eEwma.Value()),
+			LastConnected:    afe.lastConnected,
+			QuarantinedUntil: afe.quarantinedUntil,
+			ConsecFailures:   afe.consecFailures,
 		})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })

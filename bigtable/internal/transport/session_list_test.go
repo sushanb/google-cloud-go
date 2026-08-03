@@ -660,6 +660,390 @@ func TestSessionList_OnSessionClosed_ThenClosing_LateClosingNoOp(t *testing.T) {
 	checkInvariants(t, sl)
 }
 
+// withQuarantineTuning shrinks the quarantine threshold and duration
+// for the enclosing test so the trip / half-open / recovery paths can
+// be exercised inside a -short go-test budget. Restores the production
+// values via t.Cleanup. Not safe under t.Parallel() — the current
+// session_list_test.go tests don't parallelize, matching the concurrent
+// stress-test's shared-state pattern.
+func withQuarantineTuning(t *testing.T, threshold int, duration time.Duration) {
+	t.Helper()
+	oldT, oldD := afeQuarantineFailureThreshold, afeQuarantineDuration
+	afeQuarantineFailureThreshold = threshold
+	afeQuarantineDuration = duration
+	t.Cleanup(func() {
+		afeQuarantineFailureThreshold = oldT
+		afeQuarantineDuration = oldD
+	})
+}
+
+// failN feeds n non-OK vRPC outcomes with a stub 1-ns latency to sh.
+// Setup helper for the quarantine tests, all of which do the same loop.
+func failN(sl *sessionList, sh *SessionHandle, n int) {
+	for i := 0; i < n; i++ {
+		sl.RecordVRpcOutcome(sh, 1*time.Nanosecond, 0, false)
+	}
+}
+
+// snapshotByID returns sl.Snapshot() indexed by AfeID. Used by tests
+// that add a healthy neighbor AFE (to keep pool-wide suppression at
+// bay) and need to inspect just the tripped bucket.
+func snapshotByID(sl *sessionList) map[AfeID]AfeSnapshotRow {
+	rows := sl.Snapshot()
+	out := make(map[AfeID]AfeSnapshotRow, len(rows))
+	for _, r := range rows {
+		out[r.ID] = r
+	}
+	return out
+}
+
+// readyByID mirrors snapshotByID for ReadyAfes.
+func readyByID(sl *sessionList) map[AfeID]AfeSnapshot {
+	rows := sl.ReadyAfes()
+	out := make(map[AfeID]AfeSnapshot, len(rows))
+	for _, r := range rows {
+		out[r.ID] = r
+	}
+	return out
+}
+
+func TestSessionList_Quarantine_CountsFailures_TripsAtThreshold(t *testing.T) {
+	withQuarantineTuning(t, 3, 50*time.Millisecond)
+	sl := newSessionList()
+	// Two AFEs so the pool-wide 70% suppression guard doesn't fire when
+	// one gets quarantined (1/2 = 50% < 70%).
+	h := makeHandleWithAfe(t, 1)
+	sl.OnSessionStarted(h)
+	sl.OnSessionStarted(makeHandleWithAfe(t, 2))
+
+	// Feed threshold-1 failures — counter climbs, no trip yet.
+	for i := 0; i < 2; i++ {
+		sl.RecordVRpcOutcome(h, 1*time.Nanosecond, 0, false)
+	}
+	if got := snapshotByID(sl)[1]; got.ConsecFailures != 2 {
+		t.Errorf("after 2 failures: ConsecFailures = %d, want 2", got.ConsecFailures)
+	}
+	if got := snapshotByID(sl)[1]; !got.QuarantinedUntil.IsZero() {
+		t.Errorf("after 2 failures: QuarantinedUntil = %v, want zero (below threshold)", got.QuarantinedUntil)
+	}
+	if _, ok := readyByID(sl)[1]; !ok {
+		t.Error("after 2 failures: AFE 1 missing from ReadyAfes (should still be eligible)")
+	}
+
+	// The threshold-th failure trips.
+	sl.RecordVRpcOutcome(h, 1*time.Nanosecond, 0, false)
+	row := snapshotByID(sl)[1]
+	if row.ConsecFailures != 3 {
+		t.Errorf("post-trip ConsecFailures = %d, want 3", row.ConsecFailures)
+	}
+	if row.QuarantinedUntil.IsZero() {
+		t.Errorf("post-trip QuarantinedUntil = zero, want non-zero")
+	}
+	if _, ok := readyByID(sl)[1]; ok {
+		t.Error("post-trip AFE 1 still in ReadyAfes (should be excluded)")
+	}
+	if _, ok := readyByID(sl)[2]; !ok {
+		t.Error("post-trip AFE 2 missing from ReadyAfes (should be unaffected)")
+	}
+	checkInvariants(t, sl)
+}
+
+func TestSessionList_Quarantine_ResetsOnOK_BelowThreshold(t *testing.T) {
+	withQuarantineTuning(t, 5, 50*time.Millisecond)
+	sl := newSessionList()
+	h := makeHandleWithAfe(t, 1)
+	sl.OnSessionStarted(h)
+
+	for i := 0; i < 4; i++ {
+		sl.RecordVRpcOutcome(h, 1*time.Nanosecond, 0, false)
+	}
+	sl.RecordVRpcOutcome(h, 5*time.Millisecond, 1*time.Millisecond, true)
+
+	row := sl.Snapshot()[0]
+	if row.ConsecFailures != 0 {
+		t.Errorf("ConsecFailures = %d, want 0 (reset on OK)", row.ConsecFailures)
+	}
+	if !row.QuarantinedUntil.IsZero() {
+		t.Errorf("QuarantinedUntil = %v, want zero", row.QuarantinedUntil)
+	}
+	// One more failure — counter starts fresh at 1, still eligible.
+	sl.RecordVRpcOutcome(h, 1*time.Nanosecond, 0, false)
+	if got := sl.Snapshot()[0].ConsecFailures; got != 1 {
+		t.Errorf("post-reset failure: ConsecFailures = %d, want 1", got)
+	}
+	checkInvariants(t, sl)
+}
+
+func TestSessionList_Quarantine_ExcludedFromReadyAfes(t *testing.T) {
+	withQuarantineTuning(t, 2, 50*time.Millisecond)
+	sl := newSessionList()
+	hA := makeHandleWithAfe(t, 1)
+	hB := makeHandleWithAfe(t, 2)
+	sl.OnSessionStarted(hA)
+	sl.OnSessionStarted(hB)
+
+	// Trip AFE 1 only.
+	for i := 0; i < 2; i++ {
+		sl.RecordVRpcOutcome(hA, 1*time.Nanosecond, 0, false)
+	}
+
+	ready := sl.ReadyAfes()
+	if len(ready) != 1 {
+		t.Fatalf("ReadyAfes len = %d, want 1 (AFE 1 quarantined, AFE 2 healthy)", len(ready))
+	}
+	if ready[0].ID != AfeID(2) {
+		t.Errorf("ReadyAfes[0].ID = %d, want 2", ready[0].ID)
+	}
+	checkInvariants(t, sl)
+}
+
+func TestSessionList_Quarantine_WindowExpires_HalfOpenReadyAfes(t *testing.T) {
+	withQuarantineTuning(t, 2, 30*time.Millisecond)
+	sl := newSessionList()
+	h := makeHandleWithAfe(t, 1)
+	sl.OnSessionStarted(h)
+	// Healthy neighbor to keep pool-wide suppression from firing.
+	sl.OnSessionStarted(makeHandleWithAfe(t, 2))
+
+	for i := 0; i < 2; i++ {
+		sl.RecordVRpcOutcome(h, 1*time.Nanosecond, 0, false)
+	}
+	if _, ok := readyByID(sl)[1]; ok {
+		t.Fatal("pre-expiry AFE 1 still in ReadyAfes (should be quarantined)")
+	}
+
+	// Wait past the quarantine window; ReadyAfes should re-include the
+	// AFE without any explicit "reset" call — the filter is a live
+	// now-vs-until comparison.
+	time.Sleep(60 * time.Millisecond)
+	if _, ok := readyByID(sl)[1]; !ok {
+		t.Error("post-expiry AFE 1 missing from ReadyAfes (should be half-open)")
+	}
+	checkInvariants(t, sl)
+}
+
+func TestSessionList_Quarantine_HalfOpen_OKClears(t *testing.T) {
+	withQuarantineTuning(t, 2, 30*time.Millisecond)
+	sl := newSessionList()
+	h := makeHandleWithAfe(t, 1)
+	sl.OnSessionStarted(h)
+
+	for i := 0; i < 2; i++ {
+		sl.RecordVRpcOutcome(h, 1*time.Nanosecond, 0, false)
+	}
+	time.Sleep(60 * time.Millisecond)
+
+	// Probe OK — should zero counter AND clear window explicitly.
+	sl.RecordVRpcOutcome(h, 5*time.Millisecond, 1*time.Millisecond, true)
+	row := sl.Snapshot()[0]
+	if row.ConsecFailures != 0 {
+		t.Errorf("post-probe-OK ConsecFailures = %d, want 0", row.ConsecFailures)
+	}
+	if !row.QuarantinedUntil.IsZero() {
+		t.Errorf("post-probe-OK QuarantinedUntil = %v, want zero", row.QuarantinedUntil)
+	}
+	checkInvariants(t, sl)
+}
+
+// TestSessionList_Quarantine_HalfOpen_ProbeFailResetsCounter_ReTripsOnBurst
+// pins the reset-on-lazy-expiry contract. A single failure right after
+// the window has elapsed must NOT re-quarantine — it starts a fresh
+// counter at 1. Re-tripping requires another full threshold-worth of
+// failures, i.e. a real burst rather than one straggler.
+func TestSessionList_Quarantine_HalfOpen_ProbeFailResetsCounter_ReTripsOnBurst(t *testing.T) {
+	withQuarantineTuning(t, 2, 30*time.Millisecond)
+	sl := newSessionList()
+	h := makeHandleWithAfe(t, 1)
+	sl.OnSessionStarted(h)
+	// Healthy neighbor to keep pool-wide suppression from firing.
+	sl.OnSessionStarted(makeHandleWithAfe(t, 2))
+
+	failN(sl, h, 2)
+	firstWindow := snapshotByID(sl)[1].QuarantinedUntil
+	time.Sleep(60 * time.Millisecond)
+
+	// Single post-window failure: lazy-expiry resets the counter (to 0),
+	// then this failure bumps it to 1. Below threshold → NOT re-tripped.
+	failN(sl, h, 1)
+	row := snapshotByID(sl)[1]
+	if !row.QuarantinedUntil.IsZero() {
+		t.Errorf("single post-window failure re-quarantined: QuarantinedUntil = %v, want zero (counter should have reset)", row.QuarantinedUntil)
+	}
+	if row.ConsecFailures != 1 {
+		t.Errorf("post-lazy-expiry ConsecFailures = %d, want 1", row.ConsecFailures)
+	}
+
+	// Now the second failure crosses threshold and re-quarantines with
+	// a fresh window (which must be later than the first).
+	failN(sl, h, 1)
+	row = snapshotByID(sl)[1]
+	if row.QuarantinedUntil.IsZero() {
+		t.Fatal("second post-window failure did not re-trip")
+	}
+	if !row.QuarantinedUntil.After(firstWindow) {
+		t.Errorf("re-tripped window %v not after first window %v", row.QuarantinedUntil, firstWindow)
+	}
+	if _, ok := readyByID(sl)[1]; ok {
+		t.Error("post-re-trip AFE 1 still in ReadyAfes (should be re-excluded)")
+	}
+	checkInvariants(t, sl)
+}
+
+// TestSessionList_Quarantine_MidWindowOKClears pins the "any OK during
+// an active window recovers" branch of recordOutcomeLocked (as
+// distinct from the post-window half-open probe). This is what a
+// mid-window in-flight vRPC completing OK looks like, or an OK landing
+// on an AFE that pool-wide suppression re-exposed to the picker.
+func TestSessionList_Quarantine_MidWindowOKClears(t *testing.T) {
+	// Long window so we're firmly inside it when the OK arrives — no
+	// sleep between the trip and the OK.
+	withQuarantineTuning(t, 2, 500*time.Millisecond)
+	sl := newSessionList()
+	h := makeHandleWithAfe(t, 1)
+	sl.OnSessionStarted(h)
+	sl.OnSessionStarted(makeHandleWithAfe(t, 2)) // neighbor for suppression math
+
+	failN(sl, h, 2)
+	if snapshotByID(sl)[1].QuarantinedUntil.IsZero() {
+		t.Fatal("setup: AFE 1 should be quarantined after threshold failures")
+	}
+
+	// OK arrives mid-window; both counter and window clear.
+	sl.RecordVRpcOutcome(h, 5*time.Millisecond, 1*time.Millisecond, true)
+	row := snapshotByID(sl)[1]
+	if !row.QuarantinedUntil.IsZero() {
+		t.Errorf("mid-window OK: QuarantinedUntil = %v, want zero", row.QuarantinedUntil)
+	}
+	if row.ConsecFailures != 0 {
+		t.Errorf("mid-window OK: ConsecFailures = %d, want 0", row.ConsecFailures)
+	}
+	if _, ok := readyByID(sl)[1]; !ok {
+		t.Error("mid-window OK: AFE 1 missing from ReadyAfes (should be back)")
+	}
+	checkInvariants(t, sl)
+}
+
+func TestSessionList_Quarantine_TripOnceWhileInWindow(t *testing.T) {
+	withQuarantineTuning(t, 2, 500*time.Millisecond)
+	sl := newSessionList()
+	h := makeHandleWithAfe(t, 1)
+	sl.OnSessionStarted(h)
+
+	for i := 0; i < 2; i++ {
+		sl.RecordVRpcOutcome(h, 1*time.Nanosecond, 0, false)
+	}
+	firstWindow := sl.Snapshot()[0].QuarantinedUntil
+	// Additional failures during the window: counter grows, window
+	// does NOT shift. Refreshing the window on every failure would
+	// mean a persistent outage never re-enters half-open.
+	time.Sleep(5 * time.Millisecond)
+	for i := 0; i < 20; i++ {
+		sl.RecordVRpcOutcome(h, 1*time.Nanosecond, 0, false)
+	}
+	row := sl.Snapshot()[0]
+	if !row.QuarantinedUntil.Equal(firstWindow) {
+		t.Errorf("in-window window shifted: got %v, want %v", row.QuarantinedUntil, firstWindow)
+	}
+	if row.ConsecFailures < 22 {
+		t.Errorf("in-window ConsecFailures = %d, want >= 22 (counter keeps growing)", row.ConsecFailures)
+	}
+	checkInvariants(t, sl)
+}
+
+func TestSessionList_Quarantine_PoolWideSuppression(t *testing.T) {
+	withQuarantineTuning(t, 2, 500*time.Millisecond)
+	sl := newSessionList()
+	hA := makeHandleWithAfe(t, 1)
+	hB := makeHandleWithAfe(t, 2)
+	hC := makeHandleWithAfe(t, 3)
+	sl.OnSessionStarted(hA)
+	sl.OnSessionStarted(hB)
+	sl.OnSessionStarted(hC)
+
+	// Trip all three (100% ≥ 70% suppression threshold).
+	for _, h := range []*SessionHandle{hA, hB, hC} {
+		failN(sl, h, 2)
+	}
+
+	ready := sl.ReadyAfes()
+	if len(ready) != 3 {
+		t.Fatalf("all-quarantined ReadyAfes len = %d, want 3 (suppression should surface every ready AFE)", len(ready))
+	}
+	// The picker-facing snapshot deliberately omits QuarantinedUntil,
+	// so verify the underlying quarantine state via Snapshot() —
+	// suppression must not have cleared it.
+	snaps := snapshotByID(sl)
+	for _, id := range []AfeID{1, 2, 3} {
+		if snaps[id].QuarantinedUntil.IsZero() {
+			t.Errorf("AFE %d: QuarantinedUntil = zero after suppression, want the trip window intact", id)
+		}
+	}
+	checkInvariants(t, sl)
+}
+
+// TestSessionList_Quarantine_SuppressionTogglesOnRecovery exercises
+// the interesting boundary of the pool-wide guard: 3 AFEs all
+// quarantined → suppression fires → one recovers via OK → 2/3 = 66% <
+// 70% → suppression lifts → the two still-quarantined AFEs are back
+// to being filtered, so the picker sees only the recovered one.
+func TestSessionList_Quarantine_SuppressionTogglesOnRecovery(t *testing.T) {
+	withQuarantineTuning(t, 2, 500*time.Millisecond)
+	sl := newSessionList()
+	hA := makeHandleWithAfe(t, 1)
+	hB := makeHandleWithAfe(t, 2)
+	hC := makeHandleWithAfe(t, 3)
+	sl.OnSessionStarted(hA)
+	sl.OnSessionStarted(hB)
+	sl.OnSessionStarted(hC)
+
+	for _, h := range []*SessionHandle{hA, hB, hC} {
+		failN(sl, h, 2)
+	}
+	if got := len(sl.ReadyAfes()); got != 3 {
+		t.Fatalf("setup: all-quarantined ReadyAfes len = %d, want 3 (suppression)", got)
+	}
+
+	// One AFE recovers via an OK. Now 2/3 = 66% < 70% → suppression
+	// no longer fires, and the two still-quarantined AFEs are excluded.
+	sl.RecordVRpcOutcome(hB, 5*time.Millisecond, 1*time.Millisecond, true)
+
+	ready := readyByID(sl)
+	if len(ready) != 1 {
+		t.Fatalf("post-recovery ReadyAfes len = %d, want 1 (suppression should have lifted)", len(ready))
+	}
+	if _, ok := ready[2]; !ok {
+		t.Errorf("post-recovery ReadyAfes = %+v, want AFE 2 (the recovered one)", ready)
+	}
+	checkInvariants(t, sl)
+}
+
+func TestSessionList_Quarantine_SnapshotFieldsPopulated(t *testing.T) {
+	withQuarantineTuning(t, 2, 500*time.Millisecond)
+	sl := newSessionList()
+	hA := makeHandleWithAfe(t, 1) // will trip
+	hB := makeHandleWithAfe(t, 2) // stays healthy
+	sl.OnSessionStarted(hA)
+	sl.OnSessionStarted(hB)
+
+	for i := 0; i < 2; i++ {
+		sl.RecordVRpcOutcome(hA, 1*time.Nanosecond, 0, false)
+	}
+	sl.RecordVRpcOutcome(hB, 5*time.Millisecond, 1*time.Millisecond, true)
+
+	rows := sl.Snapshot()
+	byID := map[AfeID]AfeSnapshotRow{}
+	for _, r := range rows {
+		byID[r.ID] = r
+	}
+	if a := byID[1]; a.ConsecFailures != 2 || a.QuarantinedUntil.IsZero() {
+		t.Errorf("AFE 1 row = %+v, want ConsecFailures=2 and QuarantinedUntil non-zero", a)
+	}
+	if b := byID[2]; b.ConsecFailures != 0 || !b.QuarantinedUntil.IsZero() {
+		t.Errorf("AFE 2 row = %+v, want ConsecFailures=0 and QuarantinedUntil zero", b)
+	}
+	checkInvariants(t, sl)
+}
+
 // TestSessionList_ConcurrentOps_MaintainsInvariants stress-tests the
 // mutex discipline. N goroutines drive random OnSessionStarted /
 // Checkout / ReleaseToPool / OnSessionClosing / OnSessionClosed on a
