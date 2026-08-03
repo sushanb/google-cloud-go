@@ -207,3 +207,55 @@ func TestPool_UnknownAFE_BucketedAtZero(t *testing.T) {
 		t.Errorf("Snapshot = %+v, want a single AFE 0 row", rows)
 	}
 }
+
+// TestPool_Quarantine_SteersTrafficAwayFromFailingAFE exercises the
+// end-to-end quarantine path through the real picker: three AFEs with
+// equal capacity, one is tripped via sustained failed vRPC outcomes,
+// subsequent CheckoutSession calls must all land on the other two.
+// Complements the unit-test coverage in session_list_test.go, which
+// only exercises sessionList.ReadyAfes directly.
+func TestPool_Quarantine_SteersTrafficAwayFromFailingAFE(t *testing.T) {
+	// 3-failure trip keeps the setup phase short; 5-second window is
+	// long enough that the 400-checkout loop below runs well inside it
+	// (no accidental half-open re-entry).
+	withQuarantineTuning(t, 3, 5*time.Second)
+	p := newTestPool(t, 1, 30)
+	defer p.Close()
+
+	afes := []AfeID{101, 202, 303}
+	tripHandles := map[AfeID]*SessionHandle{}
+	for _, a := range afes {
+		h1 := injectActiveOnAfe(t, p, "s", a)
+		injectActiveOnAfe(t, p, "s", a)
+		tripHandles[a] = h1
+	}
+
+	// Trip AFE 101 by feeding non-OK outcomes directly to sessionList
+	// (bypasses the picker, so we don't need to know which AFE the
+	// picker would have chosen).
+	bad := tripHandles[AfeID(101)]
+	for i := 0; i < 3; i++ {
+		p.sl.RecordVRpcOutcome(bad, 1*time.Nanosecond, 0, false)
+	}
+
+	counts := map[AfeID]int{}
+	const N = 400
+	for i := 0; i < N; i++ {
+		// recordLatency=0 so checkoutAndRelease doesn't itself feed
+		// RecordVRpcOutcome — we want the quarantine state we set up to
+		// stay put, not get reset by an OK vRPC in the middle of the loop.
+		sh := checkoutAndRelease(t, p, 0, true)
+		counts[sh.session.AfeID()]++
+	}
+
+	if counts[101] != 0 {
+		t.Errorf("quarantined AFE 101 received %d picks / %d, want 0", counts[101], N)
+	}
+	// Remaining traffic should split roughly evenly between AFE 202 and
+	// AFE 303 (LeastInFlight picker with equal capacity → ~200 each).
+	for _, a := range []AfeID{202, 303} {
+		if counts[a] < 150 || counts[a] > 250 {
+			t.Errorf("healthy AFE %d picks = %d/%d, want 150-250 (~200)", a, counts[a], N)
+		}
+	}
+}
