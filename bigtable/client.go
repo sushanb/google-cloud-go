@@ -124,6 +124,18 @@ type ClientConfig struct {
 	// idle session pool matter. Default (false) keeps the current
 	// behavior: session client is always constructed.
 	DisableSession bool
+
+	// EnableDebug turns on the session-pool debug recorders (per-pool
+	// snapshots, latency histograms, pick decisions, slow-vRPC log,
+	// checkout/dispatch timing histograms) that back the pages served
+	// by bigtable/debugview. Default false — production workloads that
+	// only care about the OTel metrics can leave it off and pay zero
+	// hot-path cost. Set true when you plan to serve /debug/timings or
+	// scrape debug snapshots programmatically.
+	//
+	// Ignored when DisableSession is true (no session client to
+	// instrument). Flipping the flag requires rebuilding the client.
+	EnableDebug bool
 }
 
 // MetricsProvider is a wrapper for the built-in metrics meter provider.
@@ -315,7 +327,7 @@ func NewClientWithConfig(ctx context.Context, project, instance string, config C
 		// in (endpoint, scopes, user-agent, interceptors) — passing
 		// bare opts leaves the resolver target empty and the dial
 		// aborts with "passthrough: received empty target in Build()".
-		sc, sessionErr := session.NewClient(ctx, project, instance, config.AppProfile, metricsProvider, featureFlagsProto, o...)
+		sc, sessionErr := session.NewClient(ctx, project, instance, config.AppProfile, metricsProvider, featureFlagsProto, config.EnableDebug, o...)
 		if sessionErr != nil {
 			// Best-effort cleanup of the classic pool since we won't
 			// return c to the caller. Go through the ManagedChannelPool

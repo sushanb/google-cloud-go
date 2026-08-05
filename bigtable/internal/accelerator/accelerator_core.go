@@ -102,7 +102,9 @@ var newSessionClient = func(
 		EnableDirectAccess: true,
 	})
 
-	return session.NewClient(ctx, project, instance, appProfile, metricsProvider, featureFlags, opts...)
+	// enableDebug=false: accelerator is an in-process gRPC channel
+	// proxy with no HTTP debug surface, so skip the pool recorders.
+	return session.NewClient(ctx, project, instance, appProfile, metricsProvider, featureFlags, false, opts...)
 }
 
 // Channel is an in-process grpc.ClientConnInterface backed by
