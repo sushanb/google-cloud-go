@@ -468,7 +468,25 @@ func (s *Session) routeVRPCFrame(rpcID int64, frameName, nilTag string, counter 
 		})
 		return
 	}
+	// Per-step timings for the success path — populated only when the
+	// session's debug flag is on so the readLoop pays no time.Now()
+	// syscalls in production. Fires once via OnRouteFrameTimings at the
+	// end so the pool records five deltas (drain, deliver, hook, total,
+	// and implicitly the uninstrumented tail) with one hook call.
+	var (
+		timings       RouteFrameTimings
+		timingsOn     = s.debugEnabled
+		routeStart    time.Time
+		tDrain        time.Time
+	)
+	if timingsOn {
+		routeStart = time.Now()
+		tDrain = routeStart
+	}
 	drained, cancel, ok := s.drainSlot(rpc)
+	if timingsOn {
+		timings.DrainSlot = time.Since(tDrain)
+	}
 	if !ok {
 		return
 	}
@@ -480,16 +498,34 @@ func (s *Session) routeVRPCFrame(rpcID int64, frameName, nilTag string, counter 
 	} else {
 		// resultChan is cap-1 and drainSlot serialized this write; the
 		// send never blocks.
+		var tDeliver time.Time
+		if timingsOn {
+			tDeliver = time.Now()
+		}
 		drained.resultChan <- result
+		if timingsOn {
+			timings.DeliverResult = time.Since(tDeliver)
+		}
 	}
 	// v3: drainSlot success is the sole "session became free" signal.
 	// Fires on every drain (not just the cancelled branch) so the pool
 	// re-enqueues the session in its AFE idle queue and wakes one
 	// parked Checkout waiter. Invoke's return path in the pool no
 	// longer performs the re-enqueue or the wake.
+	var tHook time.Time
+	if timingsOn {
+		tHook = time.Now()
+	}
 	s.hooks.onSlotDrained()
+	if timingsOn {
+		timings.OnSlotDrained = time.Since(tHook)
+	}
 	if State(s.state.Load()) == StateClosing {
 		s.signalQuiescent()
+	}
+	if timingsOn {
+		timings.Total = time.Since(routeStart)
+		s.hooks.onRouteFrameTimings(timings)
 	}
 }
 

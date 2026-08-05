@@ -79,6 +79,12 @@ type SessionHooks struct {
 	// when the session's debug gate is on. Owners route it into a pool-
 	// wide histogram; nil-safe when no owner wants the signal.
 	OnInvokeTimings func(t InvokeTimings)
+	// OnRouteFrameTimings fires once at the end of routeVRPCFrame on
+	// the success path (state accepted, active vRPC matched), carrying
+	// per-step wall-clock durations for the readLoop's response-handling
+	// tail. Gated on the session's debug flag. Owners route it into a
+	// pool-wide histogram; nil-safe.
+	OnRouteFrameTimings func(t RouteFrameTimings)
 }
 
 // InvokeTimings carries the per-step wall-clock breakdown of one
@@ -103,6 +109,32 @@ type InvokeTimings struct {
 	Await          time.Duration // awaitInvokeResult (outer total)
 	AwaitChanRecv  time.Duration // block on resultChan / ctx.Done
 	AwaitDecode    time.Duration // processResult: Decode + Stats capture
+}
+
+// RouteFrameTimings carries the per-step wall-clock breakdown of one
+// routeVRPCFrame success-path call (readLoop-side response handling).
+// Early-exit paths (wrong state, nil active vRPC, id mismatch, drainSlot
+// race loss) leave every field zero. Same batched-hook contract as
+// InvokeTimings — one fire per frame, no per-step allocation. Populated
+// only when the session's debug gate is on.
+//
+// Sum of DrainSlot + DeliverResult + OnSlotDrained is <= Total; the
+// difference is the small state check / event bookkeeping / signalQuiescent
+// tail — measured indirectly as (Total - sum) rather than another timer.
+type RouteFrameTimings struct {
+	// DrainSlot is time in s.drainSlot (slotMu acquire + pointer swaps).
+	DrainSlot time.Duration
+	// DeliverResult is time to hand the result off on the caller's cap-1
+	// resultChan. Should never block by construction; instrumented so a
+	// non-zero p50 flags an invariant slip.
+	DeliverResult time.Duration
+	// OnSlotDrained is time in the pool-owned hook — for SessionPoolImpl
+	// that's sl.ReleaseToPool + signalFree. The readLoop's critical-path
+	// overhead before the next frame can be processed.
+	OnSlotDrained time.Duration
+	// Total is end-to-end wall clock across the success path
+	// (drainSlot through signalQuiescent).
+	Total time.Duration
 }
 
 func (h SessionHooks) onStart(ctx context.Context) {
@@ -138,6 +170,12 @@ func (h SessionHooks) onClose(s *Session, err error) {
 func (h SessionHooks) onInvokeTimings(t InvokeTimings) {
 	if h.OnInvokeTimings != nil {
 		h.OnInvokeTimings(t)
+	}
+}
+
+func (h SessionHooks) onRouteFrameTimings(t RouteFrameTimings) {
+	if h.OnRouteFrameTimings != nil {
+		h.OnRouteFrameTimings(t)
 	}
 }
 

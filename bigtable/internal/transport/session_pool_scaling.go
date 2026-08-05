@@ -250,6 +250,15 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 			p.m.sessionAwaitChanRecvHist.record(t.AwaitChanRecv)
 			p.m.sessionAwaitDecodeHist.record(t.AwaitDecode)
 		},
+		// Fed by routeVRPCFrame's success path; same debug gate as
+		// OnInvokeTimings — the readLoop pays no time.Now() calls when
+		// the pool's debug flag is off.
+		OnRouteFrameTimings: func(t RouteFrameTimings) {
+			p.m.routeDrainSlotHist.record(t.DrainSlot)
+			p.m.routeDeliverResultHist.record(t.DeliverResult)
+			p.m.routeOnSlotDrainedHist.record(t.OnSlotDrained)
+			p.m.routeFrameTotalHist.record(t.Total)
+		},
 	}
 	s := NewSession(sessionName, stream, hooks, p.sessionType,
 		WithSessionPoolName(p.poolName), WithSessionLogger(log.Default()),

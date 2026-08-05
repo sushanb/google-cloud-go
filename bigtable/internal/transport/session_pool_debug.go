@@ -88,6 +88,16 @@ type poolMetrics struct {
 	sessionAwaitChanRecvHist  latencyHist // block on resultChan / ctx.Done
 	sessionAwaitDecodeHist    latencyHist // processResult: Decode + Stats capture
 
+	// routeVRPCFrame timings (readLoop-side response handling), fired
+	// via SessionHooks.OnRouteFrameTimings once per successful frame.
+	// DrainSlot + DeliverResult + OnSlotDrained sum to <= Total; the
+	// difference is the state check + event bookkeeping + signalQuiescent
+	// tail (measured indirectly rather than with another timer).
+	routeDrainSlotHist     latencyHist // s.drainSlot
+	routeDeliverResultHist latencyHist // drained.resultChan <- result
+	routeOnSlotDrainedHist latencyHist // s.hooks.onSlotDrained
+	routeFrameTotalHist    latencyHist // end-to-end success path
+
 	// checkoutFastOnlyHist and checkoutSlowWaitHist split the outer
 	// checkoutTotalHist by outcome: fast-only records only when the
 	// caller returned from the first pick attempt; slow-wait records
@@ -506,6 +516,10 @@ func (p *SessionPoolImpl) CheckoutTimings() CheckoutTimingsSnapshot {
 		{"session_await_result", &p.m.sessionAwaitHist},
 		{"session_await_chan_recv", &p.m.sessionAwaitChanRecvHist},
 		{"session_await_decode", &p.m.sessionAwaitDecodeHist},
+		{"route_frame_total", &p.m.routeFrameTotalHist},
+		{"route_drain_slot", &p.m.routeDrainSlotHist},
+		{"route_deliver_result", &p.m.routeDeliverResultHist},
+		{"route_on_slot_drained", &p.m.routeOnSlotDrainedHist},
 	}
 	out := CheckoutTimingsSnapshot{
 		Segments: make([]TimingSegment, 0, len(segs)),
