@@ -92,6 +92,11 @@ type dispatchMethodMetrics struct {
 	chainedHist dispatchLatencyHist // retry-loop total (chained(...))
 	calls       atomic.Int64
 	poolGetMiss atomic.Int64 // pool.get returned nil, method never invoked
+	// attempts counts every baseHandler entry — one per attempt. A ratio
+	// attempts/calls > 1 flags retries firing. Divergence from the ideal
+	// 1.0 pinpoints methods paying the retry cost invisible in the total
+	// / chained histograms (which lump attempts together).
+	attempts atomic.Int64
 }
 
 // dispatchMetrics is per-sessionClient. Keyed by method label so we
@@ -132,21 +137,22 @@ func (m *dispatchMetrics) forMethod(method string) *dispatchMethodMetrics {
 // snapshot. Populated for every method dispatch has ever been called
 // with on this Client.
 type DispatchMethodTimings struct {
-	Method       string
-	Calls        int64
-	PoolGetMiss  int64
-	TotalP50     time.Duration
-	TotalP95     time.Duration
-	TotalP99     time.Duration
-	TotalN       uint64
-	PoolGetP50   time.Duration
-	PoolGetP95   time.Duration
-	PoolGetP99   time.Duration
-	PoolGetN     uint64
-	ChainedP50   time.Duration
-	ChainedP95   time.Duration
-	ChainedP99   time.Duration
-	ChainedN     uint64
+	Method      string
+	Calls       int64
+	PoolGetMiss int64
+	Attempts    int64 // cumulative baseHandler entries; Attempts/Calls > 1 = retries
+	TotalP50    time.Duration
+	TotalP95    time.Duration
+	TotalP99    time.Duration
+	TotalN      uint64
+	PoolGetP50  time.Duration
+	PoolGetP95  time.Duration
+	PoolGetP99  time.Duration
+	PoolGetN    uint64
+	ChainedP50  time.Duration
+	ChainedP95  time.Duration
+	ChainedP99  time.Duration
+	ChainedN    uint64
 }
 
 // snapshot returns one DispatchMethodTimings per known method,
@@ -174,6 +180,7 @@ func (m *dispatchMetrics) snapshot() []DispatchMethodTimings {
 			Method:      name,
 			Calls:       mm.calls.Load(),
 			PoolGetMiss: mm.poolGetMiss.Load(),
+			Attempts:    mm.attempts.Load(),
 			TotalP50:    tp50, TotalP95: tp95, TotalP99: tp99, TotalN: tn,
 			PoolGetP50: gp50, PoolGetP95: gp95, PoolGetP99: gp99, PoolGetN: gn,
 			ChainedP50: cp50, ChainedP95: cp95, ChainedP99: cp99, ChainedN: cn,

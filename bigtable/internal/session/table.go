@@ -279,6 +279,9 @@ func dispatch[Args any, R any, Resp interface {
 	})
 
 	baseHandler := func(attemptCtx context.Context, request interface{}) (interface{}, error) {
+		if mm != nil {
+			mm.attempts.Add(1)
+		}
 		attemptTracer := metrics.FromContext(attemptCtx)
 		attemptTracer.RecordAttemptStart()
 		result, err := pool.Invoke(attemptCtx, spec.desc, request)

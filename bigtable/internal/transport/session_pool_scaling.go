@@ -247,6 +247,8 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 			p.m.sessionBuildRequestHist.record(t.BuildRequest)
 			p.m.sessionSendHist.record(t.Send)
 			p.m.sessionAwaitHist.record(t.Await)
+			p.m.sessionAwaitChanRecvHist.record(t.AwaitChanRecv)
+			p.m.sessionAwaitDecodeHist.record(t.AwaitDecode)
 		},
 	}
 	s := NewSession(sessionName, stream, hooks, p.sessionType,

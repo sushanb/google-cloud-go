@@ -203,11 +203,15 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 		return result, tagErr(StateTransportFailure, fmt.Errorf("send vRPC request: %w", sendErr))
 	}
 
-	var tAwait time.Time
+	var (
+		tAwait      time.Time
+		timingsPtr  *InvokeTimings
+	)
 	if timingsOn {
 		tAwait = time.Now()
+		timingsPtr = &timings
 	}
-	err = s.awaitInvokeResult(ctx, rpc, desc, &result)
+	err = s.awaitInvokeResult(ctx, rpc, desc, &result, timingsPtr)
 	if timingsOn {
 		timings.Await = time.Since(tAwait)
 		s.hooks.onInvokeTimings(timings)
@@ -279,21 +283,46 @@ func buildInvokeRequest(ctx context.Context, rpcID int64, reqBytes []byte, attem
 // dropped. Otherwise mark the slot as cancelled — activeRPC stays set
 // so a concurrent Invoke fails claimSlot with Uncommitted rather than
 // racing to id-mismatch the abandoned response.
-func (s *Session) awaitInvokeResult(ctx context.Context, rpc *vrpcImpl, desc VRpcDescriptor, result *InvokeResult) error {
+func (s *Session) awaitInvokeResult(ctx context.Context, rpc *vrpcImpl, desc VRpcDescriptor, result *InvokeResult, timings *InvokeTimings) error {
+	tRecv := time.Now()
 	select {
 	case <-ctx.Done():
 		select {
 		case res := <-rpc.resultChan:
-			return s.processResult(desc, result, res)
+			if timings != nil {
+				timings.AwaitChanRecv = time.Since(tRecv)
+			}
+			return s.processResultTimed(desc, result, res, timings)
 		default:
+		}
+		if timings != nil {
+			timings.AwaitChanRecv = time.Since(tRecv)
 		}
 		cancelErr := tagErr(StateTransportFailure, ctx.Err())
 		stillActive := s.markCancelled(rpc, vrpcResult{err: cancelErr})
 		s.recordCtxDone(ctx, rpc, desc.Method(), result.SentAt, stillActive)
 		return cancelErr
 	case res := <-rpc.resultChan:
+		if timings != nil {
+			timings.AwaitChanRecv = time.Since(tRecv)
+		}
+		return s.processResultTimed(desc, result, res, timings)
+	}
+}
+
+// processResultTimed wraps processResult with the AwaitDecode
+// stopwatch. Kept as a thin adapter so processResult itself stays
+// unaware of the debug plumbing and every non-Invoke caller (should
+// none arise; none today) can invoke it directly without paying a
+// nil-check.
+func (s *Session) processResultTimed(desc VRpcDescriptor, result *InvokeResult, res vrpcResult, timings *InvokeTimings) error {
+	if timings == nil {
 		return s.processResult(desc, result, res)
 	}
+	tDecode := time.Now()
+	err := s.processResult(desc, result, res)
+	timings.AwaitDecode = time.Since(tDecode)
+	return err
 }
 
 // processResult unpacks a resultChan payload into result and returns

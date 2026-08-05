@@ -244,11 +244,27 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 	// checkoutStart anchors both the caller-visible total and each
 	// per-segment sample below. debugEnabled gates every time.Now/record
 	// so instrumentation is free (no syscall, no atomic add) when off.
-	var checkoutStart time.Time
+	//
+	// slowPathEntered is captured by the defer via closure so the total
+	// gets recorded into either checkoutFastOnlyHist (fast path took the
+	// return) or checkoutSlowWaitHist (caller parked on the waiter queue
+	// at least once). checkoutTotalHist always records — kept for the
+	// pooled view, and so callers wanting to compare against the split
+	// buckets have a coherent single line to reason from.
+	var (
+		checkoutStart   time.Time
+		slowPathEntered bool
+	)
 	if p.debugEnabled {
 		checkoutStart = time.Now()
 		defer func() {
-			p.m.checkoutTotalHist.record(time.Since(checkoutStart))
+			total := time.Since(checkoutStart)
+			p.m.checkoutTotalHist.record(total)
+			if slowPathEntered {
+				p.m.checkoutSlowWaitHist.record(total)
+			} else {
+				p.m.checkoutFastOnlyHist.record(total)
+			}
 		}()
 	}
 
@@ -270,7 +286,6 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		p.m.checkoutEmptyKickHist.record(time.Since(tKick))
 	}
 
-	slowPathEntered := false
 	for {
 		// Snapshot closed + picker under p.mu; everything after runs
 		// outside the lock so concurrent CheckoutSession calls parallelize.

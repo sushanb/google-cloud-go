@@ -161,6 +161,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 type timingsData struct {
 	At           time.Time
 	Enabled      bool
+	Summary      []summaryLine
 	Pools        []poolTimingRow
 	Dispatch     []session.DispatchMethodTimings
 	RefreshEvery time.Duration
@@ -172,6 +173,16 @@ type poolTimingRow struct {
 	Segments   []btransport.TimingSegment
 	Counts     btransport.PathCounts
 	CapturedAt time.Time
+}
+
+// summaryLine is one row in the "at a glance" panel above the raw
+// tables. Value is pre-formatted for HTML; Hint appears as a small
+// gray annotation. The panel is skipped entirely when no line has
+// enough sample volume to render (Enabled=false or all-zero pools).
+type summaryLine struct {
+	Label string
+	Value string
+	Hint  string
 }
 
 func buildTimingsData(p Provider) timingsData {
@@ -193,7 +204,102 @@ func buildTimingsData(p Provider) timingsData {
 		})
 	}
 	data.Dispatch = p.DispatchTimings()
+	data.Summary = buildSummary(data.Pools, data.Dispatch)
 	return data
+}
+
+// segByName pulls a segment out of a pool's Segments slice; nil when
+// missing. Keeps buildSummary readable — it's iterating a small
+// fixed-shape slice per pool, so linear scan is fine.
+func segByName(segs []btransport.TimingSegment, name string) *btransport.TimingSegment {
+	for i := range segs {
+		if segs[i].Name == name {
+			return &segs[i]
+		}
+	}
+	return nil
+}
+
+// buildSummary distills the raw histograms into the handful of
+// operator-facing facts that the ranked recommendation calls out:
+// where does the wall-clock go, how healthy is the checkout path,
+// are retries firing. Emits at most one row per fact per pool /
+// per method; skips a fact when the underlying histogram has no
+// samples yet so the panel doesn't fill with "—" during warmup.
+func buildSummary(pools []poolTimingRow, disp []session.DispatchMethodTimings) []summaryLine {
+	var out []summaryLine
+	for _, pool := range pools {
+		invoke := segByName(pool.Segments, "session_invoke_total")
+		await := segByName(pool.Segments, "session_await_result")
+		chanRecv := segByName(pool.Segments, "session_await_chan_recv")
+		decode := segByName(pool.Segments, "session_await_decode")
+
+		// Where does session_invoke_total go? Prefer chan_recv over
+		// await_result — chan_recv isolates the pure server round-trip.
+		if invoke != nil && chanRecv != nil && invoke.P50 > 0 {
+			pct := 100.0 * float64(chanRecv.P50) / float64(invoke.P50)
+			out = append(out, summaryLine{
+				Label: fmt.Sprintf("pool %s · server round-trip share", pool.Name),
+				Value: fmt.Sprintf("%.1f%%", pct),
+				Hint:  fmt.Sprintf("chan_recv p50 %s / invoke_total p50 %s", shortDur(chanRecv.P50), shortDur(invoke.P50)),
+			})
+		} else if invoke != nil && await != nil && invoke.P50 > 0 {
+			pct := 100.0 * float64(await.P50) / float64(invoke.P50)
+			out = append(out, summaryLine{
+				Label: fmt.Sprintf("pool %s · await share", pool.Name),
+				Value: fmt.Sprintf("%.1f%%", pct),
+				Hint:  fmt.Sprintf("await p50 %s / invoke_total p50 %s", shortDur(await.P50), shortDur(invoke.P50)),
+			})
+		}
+		if decode != nil && decode.N > 0 {
+			out = append(out, summaryLine{
+				Label: fmt.Sprintf("pool %s · decode p99", pool.Name),
+				Value: shortDur(decode.P99),
+				Hint:  "large p99 = big response payload or CPU-bound handler",
+			})
+		}
+
+		// Checkout health — fast vs slow path share.
+		total := pool.Counts.FastPathHits + pool.Counts.SlowPathHits
+		if total > 0 {
+			slowPct := 100.0 * float64(pool.Counts.SlowPathHits) / float64(total)
+			out = append(out, summaryLine{
+				Label: fmt.Sprintf("pool %s · slow-path share", pool.Name),
+				Value: fmt.Sprintf("%.2f%%", slowPct),
+				Hint:  fmt.Sprintf("slow=%d fast=%d", pool.Counts.SlowPathHits, pool.Counts.FastPathHits),
+			})
+		}
+		if pool.Counts.FastPathHits > 0 && pool.Counts.PickLostRace > 0 {
+			racePct := 100.0 * float64(pool.Counts.PickLostRace) / float64(pool.Counts.FastPathHits)
+			out = append(out, summaryLine{
+				Label: fmt.Sprintf("pool %s · pick-lost-race share", pool.Name),
+				Value: fmt.Sprintf("%.3f%%", racePct),
+				Hint:  fmt.Sprintf("lost=%d fast=%d", pool.Counts.PickLostRace, pool.Counts.FastPathHits),
+			})
+		}
+
+		// Slow-wait latency (only rendered when the slow path fired).
+		if sw := segByName(pool.Segments, "checkout_slow_wait"); sw != nil && sw.N > 0 {
+			out = append(out, summaryLine{
+				Label: fmt.Sprintf("pool %s · slow-wait p99", pool.Name),
+				Value: shortDur(sw.P99),
+				Hint:  fmt.Sprintf("n=%d — the tail cost of pool saturation", sw.N),
+			})
+		}
+	}
+	// Dispatch: avg attempts per call. >1.02 flags retries firing.
+	for _, m := range disp {
+		if m.Calls == 0 {
+			continue
+		}
+		avg := float64(m.Attempts) / float64(m.Calls)
+		out = append(out, summaryLine{
+			Label: fmt.Sprintf("dispatch %s · avg attempts/call", m.Method),
+			Value: fmt.Sprintf("%.3f", avg),
+			Hint:  fmt.Sprintf("attempts=%d calls=%d — >1.02 means retries are firing", m.Attempts, m.Calls),
+		})
+	}
+	return out
 }
 
 // shortDur formats a Duration compactly for the dashboard cells.
@@ -237,6 +343,7 @@ th{background:#f4f4f4;text-align:left}
 td:first-child,th:first-child{text-align:left}
 .meta{color:#666;font-size:.8em;margin-bottom:1em}
 .counts td{background:#fafafa}
+.summary td b{color:#1a73e8}
 .warn{color:#b06000}
 a.jsonlink{color:#1a73e8;text-decoration:none;font-size:.8em}
 a.jsonlink:hover{text-decoration:underline}
@@ -258,6 +365,16 @@ are still zero because no traffic has flowed. Kick a ReadRow / MutateRow and
 refresh.</p>
 {{end}}
 
+{{if .Summary}}
+<h2>at a glance</h2>
+<table class="summary">
+<tr><th>signal</th><th>value</th><th>hint</th></tr>
+{{range .Summary}}
+<tr><td>{{.Label}}</td><td><b>{{.Value}}</b></td><td class="meta">{{.Hint}}</td></tr>
+{{end}}
+</table>
+{{end}}
+
 {{range .Pools}}
 <h2>pool <code>{{.Name}}</code> <span class="meta">picker={{.PickerName}} · captured {{.CapturedAt.Format "15:04:05.000"}}</span></h2>
 <h3>latency segments</h3>
@@ -277,12 +394,12 @@ refresh.</p>
 {{if .Dispatch}}
 <h2>dispatch timings (per method)</h2>
 <table>
-<tr><th>method</th><th>calls</th><th>pool_get_miss</th>
+<tr><th>method</th><th>calls</th><th>attempts</th><th>pool_get_miss</th>
 <th>total p50</th><th>total p95</th><th>total p99</th>
 <th>pool_get p50</th><th>pool_get p95</th><th>pool_get p99</th>
 <th>chained p50</th><th>chained p95</th><th>chained p99</th></tr>
 {{range .Dispatch}}
-<tr><td>{{.Method}}</td><td>{{.Calls}}</td><td>{{.PoolGetMiss}}</td>
+<tr><td>{{.Method}}</td><td>{{.Calls}}</td><td>{{.Attempts}}</td><td>{{.PoolGetMiss}}</td>
 <td>{{dur .TotalP50}}</td><td>{{dur .TotalP95}}</td><td>{{dur .TotalP99}}</td>
 <td>{{dur .PoolGetP50}}</td><td>{{dur .PoolGetP95}}</td><td>{{dur .PoolGetP99}}</td>
 <td>{{dur .ChainedP50}}</td><td>{{dur .ChainedP95}}</td><td>{{dur .ChainedP99}}</td></tr>

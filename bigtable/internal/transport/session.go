@@ -86,12 +86,23 @@ type SessionHooks struct {
 // on early exit (state guard fail, claimSlot loss, Send error) the
 // downstream fields are zero. Consumers ignore zero durations —
 // latencyHist.record treats non-positive as a no-op.
+//
+// Await is the outer total for awaitInvokeResult; AwaitChanRecv and
+// AwaitDecode further break Await into "blocked on server response"
+// vs "proto decode of the received frame" — the two components that
+// matter when the outer Await histogram shows all the wall-clock
+// spent inside Session.Invoke lives here. AwaitChanRecv is populated
+// for every awaitInvokeResult call (ctx-cancel or success);
+// AwaitDecode is populated only on the success path that runs
+// processResult with a decodable payload.
 type InvokeTimings struct {
-	Encode       time.Duration // desc.Encode
-	ClaimSlot    time.Duration // claimSlot under slotMu
-	BuildRequest time.Duration // buildInvokeRequest
-	Send         time.Duration // Session.Send (wire enqueue)
-	Await        time.Duration // awaitInvokeResult (blocks on server)
+	Encode         time.Duration // desc.Encode
+	ClaimSlot      time.Duration // claimSlot under slotMu
+	BuildRequest   time.Duration // buildInvokeRequest
+	Send           time.Duration // Session.Send (wire enqueue)
+	Await          time.Duration // awaitInvokeResult (outer total)
+	AwaitChanRecv  time.Duration // block on resultChan / ctx.Done
+	AwaitDecode    time.Duration // processResult: Decode + Stats capture
 }
 
 func (h SessionHooks) onStart(ctx context.Context) {

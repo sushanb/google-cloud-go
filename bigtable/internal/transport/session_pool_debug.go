@@ -80,11 +80,22 @@ type poolMetrics struct {
 
 	// Session.Invoke internal step timings, fired via
 	// SessionHooks.OnInvokeTimings once per call.
-	sessionEncodeHist       latencyHist // desc.Encode
-	sessionClaimSlotHist    latencyHist // claimSlot
-	sessionBuildRequestHist latencyHist // buildInvokeRequest
-	sessionSendHist         latencyHist // Send (wire enqueue)
-	sessionAwaitHist        latencyHist // awaitInvokeResult (blocks on server response)
+	sessionEncodeHist         latencyHist // desc.Encode
+	sessionClaimSlotHist      latencyHist // claimSlot
+	sessionBuildRequestHist   latencyHist // buildInvokeRequest
+	sessionSendHist           latencyHist // Send (wire enqueue)
+	sessionAwaitHist          latencyHist // awaitInvokeResult (outer total)
+	sessionAwaitChanRecvHist  latencyHist // block on resultChan / ctx.Done
+	sessionAwaitDecodeHist    latencyHist // processResult: Decode + Stats capture
+
+	// checkoutFastOnlyHist and checkoutSlowWaitHist split the outer
+	// checkoutTotalHist by outcome: fast-only records only when the
+	// caller returned from the first pick attempt; slow-wait records
+	// only when the caller went through the parked-waiter path. Keeps
+	// the two very different latency distributions from being averaged
+	// into an uninterpretable overall percentile.
+	checkoutFastOnlyHist latencyHist
+	checkoutSlowWaitHist latencyHist
 
 	// Counters for path frequency.
 	checkoutFastPathHits atomic.Int64 // picked && Checkout returned a session
@@ -480,6 +491,8 @@ func (p *SessionPoolImpl) CheckoutTimings() CheckoutTimingsSnapshot {
 		h    *latencyHist
 	}{
 		{"checkout_total", &p.m.checkoutTotalHist},
+		{"checkout_fast_only", &p.m.checkoutFastOnlyHist},
+		{"checkout_slow_wait", &p.m.checkoutSlowWaitHist},
 		{"checkout_empty_kick", &p.m.checkoutEmptyKickHist},
 		{"checkout_ready_afes", &p.m.checkoutReadyAfesHist},
 		{"checkout_pick_afe", &p.m.checkoutPickAfeHist},
@@ -491,6 +504,8 @@ func (p *SessionPoolImpl) CheckoutTimings() CheckoutTimingsSnapshot {
 		{"session_build_request", &p.m.sessionBuildRequestHist},
 		{"session_send", &p.m.sessionSendHist},
 		{"session_await_result", &p.m.sessionAwaitHist},
+		{"session_await_chan_recv", &p.m.sessionAwaitChanRecvHist},
+		{"session_await_decode", &p.m.sessionAwaitDecodeHist},
 	}
 	out := CheckoutTimingsSnapshot{
 		Segments: make([]TimingSegment, 0, len(segs)),
