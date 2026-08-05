@@ -89,6 +89,7 @@ func newTestTable(t *testing.T, readInv, writeInv Invoker) (*sessionTable, *sdkm
 		&btransport.VRpcDescriptorImpl{MethodName: "test.MutateRow"},
 		nil,
 		factory,
+		newDispatchMetrics(),
 	)
 	return tbl, reader
 }
@@ -500,7 +501,7 @@ func TestSessionTable_Close_CallsBothReleasers(t *testing.T) {
 		func() error { writes++; return nil },
 		&btransport.VRpcDescriptorImpl{MethodName: "test.ReadRow"},
 		&btransport.VRpcDescriptorImpl{MethodName: "test.MutateRow"},
-		nil, nil,
+		nil, nil, newDispatchMetrics(),
 	)
 	if err := tbl.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -523,7 +524,7 @@ func TestSessionTable_Close_NilWriteReleaserOK(t *testing.T) {
 		nil,
 		&btransport.VRpcDescriptorImpl{MethodName: "test.ReadRow"},
 		nil,
-		nil, nil,
+		nil, nil, newDispatchMetrics(),
 	)
 	if err := tbl.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -547,7 +548,7 @@ func TestSessionTable_Close_JoinsErrors(t *testing.T) {
 		func() error { return writeErr },
 		&btransport.VRpcDescriptorImpl{MethodName: "test.ReadRow"},
 		&btransport.VRpcDescriptorImpl{MethodName: "test.MutateRow"},
-		nil, nil,
+		nil, nil, newDispatchMetrics(),
 	)
 	err := tbl.Close()
 	if err == nil {
@@ -574,7 +575,7 @@ func TestSessionTable_Close_ReleasersIdempotent(t *testing.T) {
 		nil,
 		&btransport.VRpcDescriptorImpl{MethodName: "test.ReadRow"},
 		nil,
-		nil, nil,
+		nil, nil, newDispatchMetrics(),
 	)
 	if err := tbl.Close(); err != nil {
 		t.Fatalf("Close #1: %v", err)
@@ -628,7 +629,7 @@ func TestSessionTable_Close_RacingLazyOpen_NoLeak(t *testing.T) {
 		nil,
 		&btransport.VRpcDescriptorImpl{MethodName: "test.ReadRow"},
 		nil,
-		nil, nil,
+		nil, nil, newDispatchMetrics(),
 	)
 
 	var (
@@ -674,7 +675,7 @@ func TestSessionTable_Close_BeforeLazyOpen_EarlyBail(t *testing.T) {
 		nil,
 		&btransport.VRpcDescriptorImpl{MethodName: "test.ReadRow"},
 		nil,
-		nil, nil,
+		nil, nil, newDispatchMetrics(),
 	)
 
 	if err := tbl.Close(); err != nil {

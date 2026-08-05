@@ -241,16 +241,36 @@ func NewSessionPoolImpl(id uint64, poolName string, streamFactory func(ctx conte
 // count is 0; if all are busy, the caller parks on the FIFO waiter queue
 // until a drainSlot wake fires.
 func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, error) {
+	// checkoutStart anchors both the caller-visible total and each
+	// per-segment sample below. debugEnabled gates every time.Now/record
+	// so instrumentation is free (no syscall, no atomic add) when off.
+	var checkoutStart time.Time
+	if p.debugEnabled {
+		checkoutStart = time.Now()
+		defer func() {
+			p.m.checkoutTotalHist.record(time.Since(checkoutStart))
+		}()
+	}
+
 	// One-shot kick if the pool is empty. Cheap check; Tick
 	// gates on its own in-progress flag so a duplicate goroutine here
 	// exits immediately.
+	var tKick time.Time
+	if p.debugEnabled {
+		tKick = time.Now()
+	}
 	p.mu.Lock()
 	closed := p.closed
 	p.mu.Unlock()
 	if !closed && p.sl.ReadyCount() == 0 {
+		p.m.checkoutEmptyKicks.Add(1)
 		p.spawnTickOnce(p.poolCtx)
 	}
+	if p.debugEnabled {
+		p.m.checkoutEmptyKickHist.record(time.Since(tKick))
+	}
 
+	slowPathEntered := false
 	for {
 		// Snapshot closed + picker under p.mu; everything after runs
 		// outside the lock so concurrent CheckoutSession calls parallelize.
@@ -264,16 +284,44 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 
 		// Two-tier pick: picker chooses an AFE from the ready snapshot,
 		// then sessionList dequeues one idle session in that AFE.
+		var tReady time.Time
+		if p.debugEnabled {
+			tReady = time.Now()
+		}
 		ready := p.sl.ReadyAfes()
+		if p.debugEnabled {
+			p.m.checkoutReadyAfesHist.record(time.Since(tReady))
+		}
+
 		pickerName := picker.Name()
+		var tPick time.Time
+		if p.debugEnabled {
+			tPick = time.Now()
+		}
 		afeID, picked, decision := picker.PickAfe(ready)
+		if p.debugEnabled {
+			p.m.checkoutPickAfeHist.record(time.Since(tPick))
+		}
 		p.recordPickDecision(decision, pickerName)
 		if picked {
+			var tFast time.Time
+			if p.debugEnabled {
+				tFast = time.Now()
+			}
 			if idle := p.sl.Checkout(afeID); idle != nil {
 				idle.IncOutstanding()
 				idle.IncPicks()
+				if p.debugEnabled {
+					p.m.checkoutFastPathHist.record(time.Since(tFast))
+				}
+				p.m.checkoutFastPathHits.Add(1)
 				return idle, nil
 			}
+			// Picker chose this AFE but its ready session was taken
+			// (concurrent Checkout / OnClosing eviction). Counter tells
+			// us how often the picker's view raced against the actual
+			// idle queue.
+			p.m.checkoutPickLostRace.Add(1)
 		}
 
 		// Slow path: picker returned nil or 2 checkoutSession raced and returned the same AFE id. Dying sessions leave sl.readyCount
@@ -281,7 +329,15 @@ func (p *SessionPoolImpl) CheckoutSession(ctx context.Context) (*SessionHandle, 
 		// maxSessions gate reflects only live-or-starting sessions —
 		// a miss just means all live sessions are busy.
 		if p.sl.ReadyCount() < p.sizer.MaxSessions() {
+			p.m.checkoutRefillKicks.Add(1)
 			p.spawnTickOnce(p.poolCtx)
+		}
+
+		// First time this caller enters the wait path — count once so
+		// repeated re-pick loops don't inflate the slow-path share.
+		if !slowPathEntered {
+			slowPathEntered = true
+			p.m.checkoutSlowPathHits.Add(1)
 		}
 
 		// Park in the FIFO waiter queue. Each free-session event wakes
@@ -538,13 +594,35 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 		p.noteVRpcOutcome(sh, latency-poolWait, backendDur, invokeErr == nil)
 	}()
 
-	var result InvokeResult
+	var (
+		result       InvokeResult
+		sessionStart time.Time
+		sessionDur   time.Duration
+	)
+	if p.debugEnabled {
+		sessionStart = time.Now()
+	}
 	result, invokeErr = sh.session.Invoke(ctx, desc, req)
+	if p.debugEnabled {
+		sessionDur = time.Since(sessionStart)
+		p.m.sessionInvokeHist.record(sessionDur)
+	}
 	// PeerInfo is set once at session-open and never mutated; a shared
 	// read here lets callers stamp per-attempt transport labels without
 	// reaching back through the pool.
 	result.PeerInfo = sh.session.PeerInfo()
 	latency = time.Since(start)
+	// invokeOverhead = pool Invoke time NOT covered by CheckoutSession
+	// wait and NOT covered by Session.Invoke — the residue is pool-side
+	// bookkeeping (defer setup, PeerInfo read, histograms, slow-vRPC
+	// filter). Useful to isolate "is the pool wrapper itself slow?" from
+	// the two big buckets.
+	if p.debugEnabled {
+		overhead := latency - poolWait - sessionDur
+		if overhead > 0 {
+			p.m.invokeOverheadHist.record(overhead)
+		}
+	}
 	// Pool-level histograms feed the debug UI (per-session ring buffers
 	// are too small). BackendLatency only records when the server
 	// populated Stats; TotalLatency records for every call.

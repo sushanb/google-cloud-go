@@ -254,6 +254,12 @@ type LoadBalancingSnapshot struct {
 	// newest-last. Powers the "recent picks" table.
 	Recent []PickHistoryEvent
 
+	// Timings is the per-segment latency breakdown of CheckoutSession
+	// + SessionPoolImpl.Invoke + Session.Invoke internals plus the
+	// cumulative fast-path / slow-path / pick-lost-race counters.
+	// Populated when the pool's debugEnabled gate is on.
+	Timings CheckoutTimingsSnapshot
+
 	// CapturedAt is the snapshot wall-clock.
 	CapturedAt time.Time
 }
@@ -431,6 +437,7 @@ func (p *SessionPoolImpl) LoadBalancingSnapshot() LoadBalancingSnapshot {
 		AFEs:       p.sl.Snapshot(),
 		PickCounts: countsInt64,
 		Recent:     p.snapshotPickHistory(),
+		Timings:    p.CheckoutTimings(),
 		CapturedAt: time.Now(),
 	}
 }

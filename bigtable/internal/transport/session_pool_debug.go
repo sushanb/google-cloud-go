@@ -66,6 +66,32 @@ type poolMetrics struct {
 	backendLatencyHist   latencyHist
 	totalLatencyHist     latencyHist
 	transportLatencyHist latencyHist
+
+	// CheckoutSession sub-timings + SessionPoolImpl.Invoke breakdown.
+	// All record() calls are gated on debugEnabled at the caller to
+	// avoid the time.Now() cost when instrumentation is off.
+	checkoutTotalHist       latencyHist // full CheckoutSession duration
+	checkoutEmptyKickHist   latencyHist // p.mu snapshot + ReadyCount + spawnTickOnce probe
+	checkoutReadyAfesHist   latencyHist // p.sl.ReadyAfes()
+	checkoutPickAfeHist     latencyHist // picker.PickAfe()
+	checkoutFastPathHist    latencyHist // p.sl.Checkout + IncOutstanding + IncPicks on hit
+	sessionInvokeHist       latencyHist // sh.session.Invoke() only (excludes checkout wait)
+	invokeOverheadHist      latencyHist // SessionPoolImpl.Invoke minus (checkout+session.Invoke)
+
+	// Session.Invoke internal step timings, fired via
+	// SessionHooks.OnInvokeTimings once per call.
+	sessionEncodeHist       latencyHist // desc.Encode
+	sessionClaimSlotHist    latencyHist // claimSlot
+	sessionBuildRequestHist latencyHist // buildInvokeRequest
+	sessionSendHist         latencyHist // Send (wire enqueue)
+	sessionAwaitHist        latencyHist // awaitInvokeResult (blocks on server response)
+
+	// Counters for path frequency.
+	checkoutFastPathHits atomic.Int64 // picked && Checkout returned a session
+	checkoutSlowPathHits atomic.Int64 // parked on waiter queue at least once
+	checkoutPickLostRace atomic.Int64 // picker chose an AFE but Checkout returned nil
+	checkoutEmptyKicks   atomic.Int64 // opening empty-pool kick fired spawnTickOnce
+	checkoutRefillKicks  atomic.Int64 // slow-path spawnTickOnce fired (ready < max)
 }
 
 // SlowVRpcEvent is one row in the pool's slow-vRPC log.
@@ -413,6 +439,78 @@ func (p *SessionPoolImpl) snapshotAfePickCounts() map[AfeID]int64 {
 	out := make(map[AfeID]int64, len(p.m.afePickCounts))
 	for k, v := range p.m.afePickCounts {
 		out[k] = v
+	}
+	return out
+}
+
+// CheckoutTimingsSnapshot is one row per timed segment of CheckoutSession
+// and SessionPoolImpl.Invoke plus per-step Session.Invoke internals.
+// P50/P95/P99 are computed from the pool's lifetime latencyHist so the
+// numbers survive session churn. N is the total sample count in the
+// bucket. Counts.* are cumulative path-frequency counters.
+type CheckoutTimingsSnapshot struct {
+	Segments []TimingSegment
+	Counts   PathCounts
+}
+
+// TimingSegment is one bar in the CheckoutTimingsSnapshot table.
+type TimingSegment struct {
+	Name string
+	P50  time.Duration
+	P95  time.Duration
+	P99  time.Duration
+	N    uint64
+}
+
+// PathCounts is the cumulative frequency of each CheckoutSession outcome.
+type PathCounts struct {
+	FastPathHits int64
+	SlowPathHits int64
+	PickLostRace int64
+	EmptyKicks   int64
+	RefillKicks  int64
+}
+
+// CheckoutTimings returns the fixed-order snapshot of per-segment timing
+// histograms and path counters. Lock-free — the underlying latencyHists
+// are read via atomic loads.
+func (p *SessionPoolImpl) CheckoutTimings() CheckoutTimingsSnapshot {
+	segs := []struct {
+		name string
+		h    *latencyHist
+	}{
+		{"checkout_total", &p.m.checkoutTotalHist},
+		{"checkout_empty_kick", &p.m.checkoutEmptyKickHist},
+		{"checkout_ready_afes", &p.m.checkoutReadyAfesHist},
+		{"checkout_pick_afe", &p.m.checkoutPickAfeHist},
+		{"checkout_fast_path", &p.m.checkoutFastPathHist},
+		{"pool_invoke_overhead", &p.m.invokeOverheadHist},
+		{"session_invoke_total", &p.m.sessionInvokeHist},
+		{"session_encode", &p.m.sessionEncodeHist},
+		{"session_claim_slot", &p.m.sessionClaimSlotHist},
+		{"session_build_request", &p.m.sessionBuildRequestHist},
+		{"session_send", &p.m.sessionSendHist},
+		{"session_await_result", &p.m.sessionAwaitHist},
+	}
+	out := CheckoutTimingsSnapshot{
+		Segments: make([]TimingSegment, 0, len(segs)),
+		Counts: PathCounts{
+			FastPathHits: p.m.checkoutFastPathHits.Load(),
+			SlowPathHits: p.m.checkoutSlowPathHits.Load(),
+			PickLostRace: p.m.checkoutPickLostRace.Load(),
+			EmptyKicks:   p.m.checkoutEmptyKicks.Load(),
+			RefillKicks:  p.m.checkoutRefillKicks.Load(),
+		},
+	}
+	for _, s := range segs {
+		p50, p95, p99, n := s.h.snapshot()
+		out.Segments = append(out.Segments, TimingSegment{
+			Name: s.name,
+			P50:  p50,
+			P95:  p95,
+			P99:  p99,
+			N:    n,
+		})
 	}
 	return out
 }

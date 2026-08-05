@@ -91,6 +91,9 @@ func (m *mockSessionClient) MeterProvider() metric.MeterProvider { return nil }
 func (m *mockSessionClient) SessionDebug() btransport.SessionDebugProvider { return nil }
 func (m *mockSessionClient) ChannelDebug() btransport.ChannelDebugProvider { return nil }
 func (m *mockSessionClient) ConfigDebug() btransport.ConfigDebugProvider   { return nil }
+func (m *mockSessionClient) DispatchTimings() []session.DispatchMethodTimings {
+	return nil
+}
 
 func (m *mockSessionClient) AddSessionLoadListener(func(float64)) func() { return func() {} }
 

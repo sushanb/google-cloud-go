@@ -109,6 +109,15 @@ type Client interface {
 	ChannelDebug() btransport.ChannelDebugProvider
 	ConfigDebug() btransport.ConfigDebugProvider
 
+	// DispatchTimings returns per-method latency histograms and call
+	// counters for the shared dispatch() helper (session.Table.ReadRow
+	// / MutateRow → dispatch → pool.Invoke). Rows ordered by method
+	// label; empty slice when no calls have completed yet or debug is
+	// off. Diagnoses "is time going into pool.get / retry-chain /
+	// something else?" — the pool-level checkout timings live on the
+	// LoadBalancingSnapshot returned by SessionDebug.
+	DispatchTimings() []DispatchMethodTimings
+
 	// AddSessionLoadListener registers a listener invoked every time
 	// the server-driven ClientConfigurationManager reports a new
 	// session-load ratio (0.0 = classic-only, 1.0 = session-only).

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	btpb "cloud.google.com/go/bigtable/apiv2/bigtablepb"
 	metrics "cloud.google.com/go/bigtable/internal/metrics"
@@ -79,6 +80,10 @@ type sessionTable struct {
 	// insert instead of leaking a fresh pool that the releaser missed.
 	// See guardOpen for the interleaving rules.
 	closed atomic.Bool
+	// dispatchMetrics is shared with the owning sessionClient. dispatch
+	// records per-method timings here; nil is a no-op (test-only paths
+	// may skip wiring metrics).
+	dispatchMetrics *dispatchMetrics
 }
 
 // newSessionTable is the internal constructor. Callers (sessionClient)
@@ -96,15 +101,17 @@ func newSessionTable(
 	writeVRpcDesc btransport.VRpcDescriptor,
 	md metadata.MD,
 	metricsFactory *metrics.Factory,
+	dm *dispatchMetrics,
 ) *sessionTable {
 	t := &sessionTable{
-		tableID:        tableID,
-		readVRpcDesc:   readVRpcDesc,
-		writeVRpcDesc:  writeVRpcDesc,
-		md:             md,
-		metricsFactory: metricsFactory,
-		closeRead:      closeRead,
-		closeWrite:     closeWrite,
+		tableID:         tableID,
+		readVRpcDesc:    readVRpcDesc,
+		writeVRpcDesc:   writeVRpcDesc,
+		md:              md,
+		metricsFactory:  metricsFactory,
+		closeRead:       closeRead,
+		closeWrite:      closeWrite,
+		dispatchMetrics: dm,
 	}
 	// Wrap the raw openers with a closed-bit guard so an open racing
 	// with Close either bails early or cleans up its own insert. Nil
@@ -231,11 +238,29 @@ func dispatch[Args any, R any, Resp interface {
 	proto.Message
 }](ctx context.Context, t *sessionTable, spec opSpec[Args, R, Resp]) (Resp, error) {
 	var zero Resp
+
+	// Per-method metrics bucket; nil-safe (test paths may omit).
+	mm := t.dispatchMetrics.forMethod(spec.method)
+	dispatchStart := time.Now()
+	if mm != nil {
+		mm.calls.Add(1)
+		defer func() {
+			mm.totalHist.record(time.Since(dispatchStart))
+		}()
+	}
+
+	poolGetStart := time.Now()
 	pool, poolErr := spec.pool.get()
+	if mm != nil {
+		mm.poolGetHist.record(time.Since(poolGetStart))
+	}
 	if poolErr != nil {
 		return zero, fmt.Errorf("session %s pool open: %w", spec.method, poolErr)
 	}
 	if pool == nil {
+		if mm != nil {
+			mm.poolGetMiss.Add(1)
+		}
 		return zero, spec.errNoPool
 	}
 
@@ -267,7 +292,11 @@ func dispatch[Args any, R any, Resp interface {
 
 	ctx = btransport.WithVRpcMetadata(ctx, spec.desc.Method(), 0)
 	chained := btransport.ChainInterceptors(retryInterceptor)
+	chainedStart := time.Now()
 	res, err := chained(ctx, spec.args, baseHandler)
+	if mm != nil {
+		mm.chainedHist.record(time.Since(chainedStart))
+	}
 	if ownedTracer {
 		mt.SetCurrOpStatus(metrics.GrpcCodeOf(err))
 	}

@@ -74,6 +74,24 @@ type SessionHooks struct {
 	OnSlotDrained func()
 	OnClosing     func(s *Session)
 	OnClose       func(s *Session, err error)
+	// OnInvokeTimings fires once at the end of Session.Invoke, carrying
+	// per-step wall-clock durations captured on the hot path. Only fired
+	// when the session's debug gate is on. Owners route it into a pool-
+	// wide histogram; nil-safe when no owner wants the signal.
+	OnInvokeTimings func(t InvokeTimings)
+}
+
+// InvokeTimings carries the per-step wall-clock breakdown of one
+// Session.Invoke call. All fields are populated for the success path;
+// on early exit (state guard fail, claimSlot loss, Send error) the
+// downstream fields are zero. Consumers ignore zero durations —
+// latencyHist.record treats non-positive as a no-op.
+type InvokeTimings struct {
+	Encode       time.Duration // desc.Encode
+	ClaimSlot    time.Duration // claimSlot under slotMu
+	BuildRequest time.Duration // buildInvokeRequest
+	Send         time.Duration // Session.Send (wire enqueue)
+	Await        time.Duration // awaitInvokeResult (blocks on server)
 }
 
 func (h SessionHooks) onStart(ctx context.Context) {
@@ -103,6 +121,12 @@ func (h SessionHooks) onClosing(s *Session) {
 func (h SessionHooks) onClose(s *Session, err error) {
 	if h.OnClose != nil {
 		h.OnClose(s, err)
+	}
+}
+
+func (h SessionHooks) onInvokeTimings(t InvokeTimings) {
+	if h.OnInvokeTimings != nil {
+		h.OnInvokeTimings(t)
 	}
 }
 

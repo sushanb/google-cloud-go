@@ -102,12 +102,26 @@ func (s *Session) drainSlot(expect *vrpcImpl) (rpc *vrpcImpl, cancel *vrpcResult
 func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface{}) (result InvokeResult, err error) {
 	startTime := time.Now()
 
+	// timings is only populated when the session's debug gate is on,
+	// and only fired to the hook on the paths that finish (or are far
+	// enough into the send/await sequence to be worth attributing).
+	// Zero durations are ignored by latencyHist.record.
+	var timings InvokeTimings
+	timingsOn := s.debugEnabled
+
 	if st := State(s.state.Load()); st != StateReady {
 		return result, tagErr(StateUncommitted,
 			unavailable(ErrSessionNotActive, "session is not active (state: %v)", st))
 	}
 
+	var tEncode time.Time
+	if timingsOn {
+		tEncode = time.Now()
+	}
 	reqBytes, err := desc.Encode(req)
+	if timingsOn {
+		timings.Encode = time.Since(tEncode)
+	}
 	if err != nil {
 		return result, tagErr(StateUncommitted, fmt.Errorf("encode vRPC request: %w", err))
 	}
@@ -123,7 +137,15 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 	// Claim the single in-flight slot. A losing claim means a prior vRPC
 	// on this session has not drained on the wire yet — return Uncommitted
 	// so the retryer picks another session.
-	if !s.claimSlot(rpc) {
+	var tClaim time.Time
+	if timingsOn {
+		tClaim = time.Now()
+	}
+	claimed := s.claimSlot(rpc)
+	if timingsOn {
+		timings.ClaimSlot = time.Since(tClaim)
+	}
+	if !claimed {
 		return result, tagErr(StateUncommitted,
 			unavailable(ErrSessionNotActive,
 				"session %q busy: prior vRPC has not drained on the wire", s.logName))
@@ -137,13 +159,28 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 	if attempt > 1 {
 		s.noteRetryAttempt(ctx, desc.Method(), attempt)
 	}
+	var tBuild time.Time
+	if timingsOn {
+		tBuild = time.Now()
+	}
 	sessionReq := buildInvokeRequest(ctx, rpcID, reqBytes, attempt, startTime)
+	if timingsOn {
+		timings.BuildRequest = time.Since(tBuild)
+	}
 
 	// Capture SentAt immediately before the frame is handed to Send so
 	// downstream metrics can compute client-side blocking latency as
 	// (SentAt - attemptStart) without double-counting encode/setup overhead.
 	result.SentAt = time.Now()
-	if sendErr := s.Send(sessionReq); sendErr != nil {
+	var tSend time.Time
+	if timingsOn {
+		tSend = time.Now()
+	}
+	sendErr := s.Send(sessionReq)
+	if timingsOn {
+		timings.Send = time.Since(tSend)
+	}
+	if sendErr != nil {
 		// Synchronous Send failed: no server response is ever coming,
 		// so this call must free the slot itself. Other paths don't need
 		// this branch — sendMessage there is async and failures come
@@ -160,10 +197,21 @@ func (s *Session) Invoke(ctx context.Context, desc VRpcDescriptor, req interface
 		if State(s.state.Load()) == StateClosing {
 			s.signalQuiescent()
 		}
+		if timingsOn {
+			s.hooks.onInvokeTimings(timings)
+		}
 		return result, tagErr(StateTransportFailure, fmt.Errorf("send vRPC request: %w", sendErr))
 	}
 
+	var tAwait time.Time
+	if timingsOn {
+		tAwait = time.Now()
+	}
 	err = s.awaitInvokeResult(ctx, rpc, desc, &result)
+	if timingsOn {
+		timings.Await = time.Since(tAwait)
+		s.hooks.onInvokeTimings(timings)
+	}
 	return result, err
 }
 

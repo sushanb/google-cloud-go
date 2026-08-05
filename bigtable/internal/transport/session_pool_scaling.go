@@ -238,6 +238,16 @@ func (p *SessionPoolImpl) createSession(ctx context.Context) error {
 		},
 		OnClosing: func(_ *Session) { p.onClosing(sh) },
 		OnClose:   func(_ *Session, err error) { p.onClose(sh, err) },
+		// Fed by Session.Invoke; gated inside Session on s.debugEnabled
+		// (mirrors p.debugEnabled) so this closure only fires when the
+		// pool actually wants the samples.
+		OnInvokeTimings: func(t InvokeTimings) {
+			p.m.sessionEncodeHist.record(t.Encode)
+			p.m.sessionClaimSlotHist.record(t.ClaimSlot)
+			p.m.sessionBuildRequestHist.record(t.BuildRequest)
+			p.m.sessionSendHist.record(t.Send)
+			p.m.sessionAwaitHist.record(t.Await)
+		},
 	}
 	s := NewSession(sessionName, stream, hooks, p.sessionType,
 		WithSessionPoolName(p.poolName), WithSessionLogger(log.Default()),

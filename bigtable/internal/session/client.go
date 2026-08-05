@@ -250,6 +250,18 @@ type sessionClient struct {
 	sessionPoolsMu sync.Mutex
 	sessionPools   map[poolKey]*managedSessionPool
 	nextPoolID     atomic.Uint64
+
+	// dispatchMetrics carries per-method timing histograms + call
+	// counters for the shared dispatch() helper in table.go. Populated
+	// lock-free from the hot path; snapshot via DispatchTimings().
+	dispatchMetrics *dispatchMetrics
+}
+
+// DispatchTimings returns the per-method dispatch-level latency
+// breakdown (total dispatch, lazy pool.get, retry-chain) plus call and
+// pool-miss counters. Rows are stable-ordered by method label.
+func (sc *sessionClient) DispatchTimings() []DispatchMethodTimings {
+	return sc.dispatchMetrics.snapshot()
 }
 
 // NewClient constructs a standalone session.Client. It owns the
@@ -390,6 +402,7 @@ func newSessionClientFromParts(channelPool ChannelPool, stub btpb.BigtableClient
 		enableDebug:       cfg.EnableDebug,
 		featureFlagsProto: cfg.FeatureFlagsProto,
 		sessionPools:      make(map[poolKey]*managedSessionPool),
+		dispatchMetrics:   newDispatchMetrics(),
 	}
 	// stub == nil only happens on the test-only newSessionClientFromParts
 	// path (unit tests wiring a fake ChannelPool without a real gRPC stub).
@@ -449,7 +462,7 @@ func (sc *sessionClient) OpenTable(tableID string) TableAPI {
 		writeKey)
 	closeRead := sc.buildLazyReleaser(readKey)
 	closeWrite := sc.buildLazyReleaser(writeKey)
-	return newSessionTable(tableID, openRead, openWrite, closeRead, closeWrite, btransport.READ_ROW, btransport.MUTATE_ROW, sc.perResourceMetadata(fullName, "table_name", fullName), sc.metricsFactory)
+	return newSessionTable(tableID, openRead, openWrite, closeRead, closeWrite, btransport.READ_ROW, btransport.MUTATE_ROW, sc.perResourceMetadata(fullName, "table_name", fullName), sc.metricsFactory, sc.dispatchMetrics)
 }
 
 // OpenAuthorizedView returns a TableAPI for an authorized view.
@@ -467,7 +480,7 @@ func (sc *sessionClient) OpenAuthorizedView(table, view string) TableAPI {
 		writeKey)
 	closeRead := sc.buildLazyReleaser(readKey)
 	closeWrite := sc.buildLazyReleaser(writeKey)
-	return newSessionTable(table, openRead, openWrite, closeRead, closeWrite, btransport.READ_ROW_AUTH_VIEW, btransport.MUTATE_ROW_AUTH_VIEW, sc.perResourceMetadata(fullName, "authorized_view_name", fullName), sc.metricsFactory)
+	return newSessionTable(table, openRead, openWrite, closeRead, closeWrite, btransport.READ_ROW_AUTH_VIEW, btransport.MUTATE_ROW_AUTH_VIEW, sc.perResourceMetadata(fullName, "authorized_view_name", fullName), sc.metricsFactory, sc.dispatchMetrics)
 }
 
 // OpenMaterializedView returns a read-only TableAPI for a
@@ -485,7 +498,7 @@ func (sc *sessionClient) OpenMaterializedView(view string) TableAPI {
 		},
 		readKey)
 	closeRead := sc.buildLazyReleaser(readKey)
-	return newSessionTable("", openRead, nil, closeRead, nil, btransport.READ_ROW_MAT_VIEW, nil, sc.perResourceMetadata(fullName, "materialized_view_name", fullName), sc.metricsFactory)
+	return newSessionTable("", openRead, nil, closeRead, nil, btransport.READ_ROW_MAT_VIEW, nil, sc.perResourceMetadata(fullName, "materialized_view_name", fullName), sc.metricsFactory, sc.dispatchMetrics)
 }
 
 // Close tears down in a phased order that keeps late callbacks from
