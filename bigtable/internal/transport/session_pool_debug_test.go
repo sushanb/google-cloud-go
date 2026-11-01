@@ -301,3 +301,27 @@ func TestRecordPickDecision_ZeroWinnerNotCounted(t *testing.T) {
 		t.Errorf("pickHistory len = %d, want 1 (no-candidate events must still be logged)", got)
 	}
 }
+
+func TestRecordPickDecision_AfePickCountsBounded(t *testing.T) {
+	p := newTestPool(t, 1, 10)
+
+	// Pick AFE 1 multiple times so it has a high count.
+	for i := 0; i < 5; i++ {
+		p.recordPickDecision(PickDecision{Winner: AfeID(1), Reason: "test"}, "least-inflight")
+	}
+
+	// Pick unique AFEs up to maxAfePickCounts + 50.
+	for id := 2; id <= maxAfePickCounts+50; id++ {
+		p.recordPickDecision(PickDecision{Winner: AfeID(id), Reason: "test"}, "least-inflight")
+	}
+
+	snap := p.snapshotAfePickCounts()
+	if len(snap) != maxAfePickCounts {
+		t.Fatalf("len(afePickCounts) = %d, want capped at maxAfePickCounts (%d)", len(snap), maxAfePickCounts)
+	}
+
+	// AFE 1 must still be retained because its pick count was high.
+	if snap[1] != 5 {
+		t.Errorf("counts[1] = %d, want 5 (frequently-picked AFE must not be evicted)", snap[1])
+	}
+}

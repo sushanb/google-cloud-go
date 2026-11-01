@@ -19,6 +19,7 @@
 package internal
 
 import (
+	"math"
 	"math/bits"
 	"sync"
 	"sync/atomic"
@@ -319,6 +320,9 @@ func (p *SessionPoolImpl) recordSlowVRpc(ev SlowVRpcEvent) {
 // that never got a session. Empty Session cell in the sessionz table
 // marks "checkout never returned a handle".
 func (p *SessionPoolImpl) recordCheckoutFailure(checkoutStart time.Time, desc VRpcDescriptor, err error) {
+	if !p.debugEnabled {
+		return
+	}
 	poolWait := time.Since(checkoutStart)
 	p.m.totalLatencyHist.record(poolWait)
 	if poolWait <= defaultSlowThreshold {
@@ -347,6 +351,10 @@ func (p *SessionPoolImpl) snapshotSlowVRpcs() []SlowVRpcEvent {
 // maxPickHistory sizes the pick-decision ring for ~1s of decisions at a
 // few thousand picks/sec.
 const maxPickHistory = 500
+
+// maxAfePickCounts bounds the per-AFE cumulative counter map so churned
+// or rotated AFEs do not grow the map indefinitely.
+const maxAfePickCounts = 512
 
 // PickHistoryEvent is one row in the pick-decision log. Populated even
 // for no-candidate picks so loadz can show the fallback frequency.
@@ -383,7 +391,22 @@ func (p *SessionPoolImpl) recordPickDecision(d PickDecision, pickerName string) 
 		}
 	}
 	if d.Winner != 0 {
-		p.m.afePickCounts[d.Winner]++
+		if _, ok := p.m.afePickCounts[d.Winner]; ok {
+			p.m.afePickCounts[d.Winner]++
+		} else {
+			for len(p.m.afePickCounts) >= maxAfePickCounts {
+				var minKey AfeID
+				var minCount int64 = math.MaxInt64
+				for k, v := range p.m.afePickCounts {
+					if v < minCount {
+						minCount = v
+						minKey = k
+					}
+				}
+				delete(p.m.afePickCounts, minKey)
+			}
+			p.m.afePickCounts[d.Winner] = 1
+		}
 	}
 	p.m.pickHistoryMu.Unlock()
 }

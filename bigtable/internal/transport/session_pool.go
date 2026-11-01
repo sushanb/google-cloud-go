@@ -522,7 +522,9 @@ func (p *SessionPoolImpl) Invoke(ctx context.Context, desc VRpcDescriptor, req i
 	if err != nil {
 		// Record checkout failure so pool-exhaustion incidents show up
 		// in sessionz's slow-vRPC table and latency histograms.
-		p.recordCheckoutFailure(checkoutStart, desc, err)
+		if p.debugEnabled {
+			p.recordCheckoutFailure(checkoutStart, desc, err)
+		}
 		return InvokeResult{}, err
 	}
 	// poolWait is the queue-time spent inside CheckoutSession waiting
